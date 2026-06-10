@@ -234,6 +234,33 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .failures = failures,
         });
     }
+    if (routes.Routes.matchGroupDocumentArtifactPlacementUpdate(path)) |artifact_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);
+        defer ctx.alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
+        defer ctx.alloc.free(decoded_artifact_name);
+        var parsed = std.json.parseFromSlice(db_mod.types.DocumentArtifactChildRangePlacementUpdate, ctx.alloc, req.body, .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact placement request");
+        };
+        defer parsed.deinit();
+        const handled = (writes.updateDocumentArtifactChildRangePlacementGroupLocal(
+            ctx.alloc,
+            artifact_route.group_id,
+            artifact_route.table_name,
+            decoded_key,
+            decoded_artifact_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact placement request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        if (!handled) return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, .{ .placement = "updated" });
+    }
     if (routes.Routes.matchGroupDocumentArtifactReprocess(path)) |artifact_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.key);
@@ -534,6 +561,26 @@ test "internal group write routes validate transaction status requests" {
     try std.testing.expectEqualStrings("invalid transaction request", resp.body);
 }
 
+test "internal group write routes update document artifact child range placement" {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement",
+        .body = "{\"range_id\":\"range:000000\",\"placement\":\"remote\",\"owner_group_id\":7002,\"placement_generation\":3,\"route_status\":\"remote_committed\",\"split_eligible\":true}",
+    }, "/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"placement\":\"updated\"") != null);
+}
+
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
 
@@ -695,6 +742,7 @@ const TestWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
             },
         };
     }
@@ -739,6 +787,28 @@ const TestWriteSource = struct {
 
     fn txnStatusGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !?db_mod.types.TxnStatus {
         return .pending;
+    }
+
+    fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        if (group_id != 7) return null;
+        if (!std.mem.eql(u8, table_name, "docs")) return null;
+        if (!std.mem.eql(u8, doc_key, "doc/a")) return false;
+        if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return false;
+        if (!std.mem.eql(u8, update.range_id, "range:000000")) return false;
+        if (!std.mem.eql(u8, update.placement, "remote")) return false;
+        if (update.owner_group_id != 7002) return false;
+        if (update.placement_generation != 3) return false;
+        if (update.route_status == null or !std.mem.eql(u8, update.route_status.?, "remote_committed")) return false;
+        if (update.split_eligible != true) return false;
+        return true;
     }
 };
 

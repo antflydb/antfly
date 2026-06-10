@@ -1985,6 +1985,14 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             req: db_mod.types.DocumentArtifactTableReprocessRequest,
         ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        update_document_artifact_child_range_placement: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
         reprocess_document_artifact_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2001,6 +2009,15 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             req: db_mod.types.DocumentArtifactTableReprocessRequest,
         ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        update_document_artifact_child_range_placement_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+        ) anyerror!?bool = null,
         local_runtime_statuses: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2237,6 +2254,18 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
     }
 
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, update);
+    }
+
     pub fn reprocessDocumentArtifactRangeGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -2247,6 +2276,19 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, artifact_name, req);
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const fn_ptr = self.vtable.update_document_artifact_child_range_placement_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
     }
 
     pub fn localRuntimeStatuses(
@@ -2336,6 +2378,7 @@ pub const BoundTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -2390,6 +2433,19 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return try self.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
+    }
+
+    fn updateDocumentArtifactChildRangePlacement(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
     }
 
     fn createTable(
@@ -5295,8 +5351,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
+                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -6569,6 +6627,19 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn updateDocumentArtifactChildRangePlacement(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+    }
+
     fn reprocessDocumentArtifactGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6618,6 +6689,69 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            break :blk result;
+        };
+        if (handled) {
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, .data);
+        }
+        return handled;
+    }
+
+    fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const handled = if (self.write_cache) |cache| blk: {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            break :blk try cached.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
+        } else blk: {
+            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
+            defer if (indexes_json) |value| alloc.free(value);
+            var db = if (indexes_json) |value|
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    self.visibleRootGeneration(group_id),
+                    null,
+                    .default,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                )
+            else
+                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            const result = try db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk result;
         };
@@ -6959,8 +7093,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
+                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -7388,6 +7524,37 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 
+    fn updateDocumentArtifactChildRangePlacement(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            return switch (route.*) {
+                .local => try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update),
+                .remote => |remote| blk: {
+                    const body = try std.json.Stringify.valueAlloc(alloc, update, .{ .emit_null_optional_fields = false });
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = client.fetchGroupDocumentArtifactChildRangePlacementUpdate(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
+                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
+                        else => return err,
+                    };
+                    defer response.deinit(alloc);
+                    break :blk true;
+                },
+            };
+        }
+        return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+    }
+
     fn reprocessDocumentArtifactGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7404,6 +7571,30 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         const handled = try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
+        if (handled) {
+            try drainManagedDbBeforeClose(cached.db);
+            self.invalidateManagedCache(table_name);
+        }
+        return handled;
+    }
+
+    fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const handled = try cached.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
         if (handled) {
             try drainManagedDbBeforeClose(cached.db);
             self.invalidateManagedCache(table_name);
@@ -10396,6 +10587,33 @@ test "bound table sources inspect and reprocess document artifact manifests" {
     try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
     try std.testing.expectEqual(@as(u64, 1), manifest.generation);
     try std.testing.expectEqualStrings("text", manifest.route_type);
+
+    try std.testing.expectEqual(@as(?bool, true), try write_source.source().updateDocumentArtifactChildRangePlacement(
+        alloc,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .{
+            .range_id = "range:000000",
+            .placement = "remote",
+            .owner_group_id = 7002,
+            .placement_generation = 3,
+            .route_status = "remote_committed",
+            .split_eligible = true,
+        },
+    ));
+    var moved = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqualStrings("remote", moved.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7002), moved.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 3), moved.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("remote_committed", moved.child_ranges[0].route_status.?);
 
     try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
         alloc,

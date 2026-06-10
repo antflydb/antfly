@@ -89,6 +89,7 @@ pub const Routes = struct {
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = ":reprocess";
+    pub const placement_update_suffix = ":placement";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -493,6 +494,7 @@ pub const Routes = struct {
         if (artifacts_index == 0) return null;
         const key = document_rest[0..artifacts_index];
         const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (std.mem.endsWith(u8, artifact_name, placement_update_suffix)) return null;
         if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
         return .{
             .table_name = table_name,
@@ -736,6 +738,10 @@ pub const Routes = struct {
         return matchGroupDocumentArtifactWithReprocess(path, true);
     }
 
+    pub fn matchGroupDocumentArtifactPlacementUpdate(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithControlSuffix(path, placement_update_suffix);
+    }
+
     pub fn matchGroupTableArtifactReprocess(path: []const u8) ?GroupTableArtifact {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -775,6 +781,34 @@ pub const Routes = struct {
     }
 
     fn matchGroupDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?GroupDocumentArtifact {
+        if (reprocess) return matchGroupDocumentArtifactWithControlSuffix(path, reprocess_suffix);
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        const table_rest = rest[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const document_rest = table_rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (std.mem.endsWith(u8, artifact_name, reprocess_suffix) or
+            std.mem.endsWith(u8, artifact_name, placement_update_suffix))
+        {
+            return null;
+        }
+        if (key.len == 0 or artifact_name.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    fn matchGroupDocumentArtifactWithControlSuffix(path: []const u8, suffix: []const u8) ?GroupDocumentArtifact {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
@@ -787,12 +821,8 @@ pub const Routes = struct {
         if (artifacts_index == 0) return null;
         const key = document_rest[0..artifacts_index];
         var artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
-        if (reprocess) {
-            if (!std.mem.endsWith(u8, artifact_name, reprocess_suffix)) return null;
-            artifact_name = artifact_name[0 .. artifact_name.len - reprocess_suffix.len];
-        } else if (std.mem.endsWith(u8, artifact_name, reprocess_suffix)) {
-            return null;
-        }
+        if (!std.mem.endsWith(u8, artifact_name, suffix)) return null;
+        artifact_name = artifact_name[0 .. artifact_name.len - suffix.len];
         if (key.len == 0 or artifact_name.len == 0) return null;
         return .{
             .group_id = group.group_id,
@@ -1089,6 +1119,10 @@ test "public api routes compile" {
     const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
+    const group_placement_update = Routes.matchGroupDocumentArtifactPlacementUpdate("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement").?;
+    try std.testing.expectEqual(@as(u64, 7), group_placement_update.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_placement_update.artifact_name);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement") == null);
     const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);
