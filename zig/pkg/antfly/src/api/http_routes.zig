@@ -90,6 +90,7 @@ pub const Routes = struct {
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = ":reprocess";
     pub const placement_update_suffix = ":placement";
+    pub const child_range_batch_suffix = ":child-range-batch";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -742,6 +743,10 @@ pub const Routes = struct {
         return matchGroupDocumentArtifactWithControlSuffix(path, placement_update_suffix);
     }
 
+    pub fn matchGroupDocumentArtifactChildRangeBatch(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithControlSuffix(path, child_range_batch_suffix);
+    }
+
     pub fn matchGroupTableArtifactReprocess(path: []const u8) ?GroupTableArtifact {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -795,7 +800,8 @@ pub const Routes = struct {
         const key = document_rest[0..artifacts_index];
         const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
         if (std.mem.endsWith(u8, artifact_name, reprocess_suffix) or
-            std.mem.endsWith(u8, artifact_name, placement_update_suffix))
+            std.mem.endsWith(u8, artifact_name, placement_update_suffix) or
+            std.mem.endsWith(u8, artifact_name, child_range_batch_suffix))
         {
             return null;
         }
@@ -1122,7 +1128,11 @@ test "public api routes compile" {
     const group_placement_update = Routes.matchGroupDocumentArtifactPlacementUpdate("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement").?;
     try std.testing.expectEqual(@as(u64, 7), group_placement_update.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_placement_update.artifact_name);
+    const group_child_range_batch = Routes.matchGroupDocumentArtifactChildRangeBatch("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch").?;
+    try std.testing.expectEqual(@as(u64, 7), group_child_range_batch.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_child_range_batch.artifact_name);
     try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement") == null);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch") == null);
     const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);

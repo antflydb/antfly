@@ -77,6 +77,7 @@ pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("db.zig").DB;
+pub const DocumentArtifactChildRangeApplyBatch = @import("db.zig").DocumentArtifactChildRangeApplyBatch;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;
 pub const ReplayProgress = @import("db.zig").ReplayProgress;

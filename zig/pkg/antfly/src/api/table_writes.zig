@@ -1993,6 +1993,15 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
         ) anyerror!?bool = null,
+        apply_document_artifact_child_range_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
         reprocess_document_artifact_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2018,6 +2027,15 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
         ) anyerror!?bool = null,
+        apply_document_artifact_child_range_batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+        ) anyerror!?u64 = null,
         local_runtime_statuses: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2266,6 +2284,19 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, update);
     }
 
+    pub fn applyDocumentArtifactChildRangeBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
     pub fn reprocessDocumentArtifactRangeGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -2289,6 +2320,19 @@ pub const TableWriteSource = struct {
     ) !?bool {
         const fn_ptr = self.vtable.update_document_artifact_child_range_placement_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const fn_ptr = self.vtable.apply_document_artifact_child_range_batch_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
     }
 
     pub fn localRuntimeStatuses(
@@ -2379,6 +2423,8 @@ pub const BoundTableWriteSource = struct {
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
+                .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
+                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -2446,6 +2492,32 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return try self.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
+    }
+
+    fn applyDocumentArtifactChildRangeBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
+    fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        _: []const u8,
+        _: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.applyDocumentArtifactChildRangeBatch(child_batch);
     }
 
     fn createTable(
@@ -5352,9 +5424,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
+                .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
+                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -6640,6 +6714,18 @@ pub const ProvisionedTableWriteSource = struct {
         return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
     }
 
+    fn applyDocumentArtifactChildRangeBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
     fn reprocessDocumentArtifactGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6763,6 +6849,69 @@ pub const ProvisionedTableWriteSource = struct {
             self.notifyLocalChange(table_name, .data);
         }
         return handled;
+    }
+
+    fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        _: []const u8,
+        _: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const sequence = if (self.write_cache) |cache| blk: {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            break :blk try cached.db.applyDocumentArtifactChildRangeBatch(child_batch);
+        } else blk: {
+            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
+            defer if (indexes_json) |value| alloc.free(value);
+            var db = if (indexes_json) |value|
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                    alloc,
+                    path,
+                    value,
+                    null,
+                    null,
+                    self.visibleRootGeneration(group_id),
+                    null,
+                    .default_async,
+                    self.backend_runtime,
+                    self.antfly_provider,
+                    self.secret_store,
+                    self.remote_content,
+                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                )
+            else
+                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            const result = try db.applyDocumentArtifactChildRangeBatch(child_batch);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            break :blk result;
+        };
+        if (sequence > 0) {
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, .data);
+        }
+        return sequence;
     }
 
     fn reprocessDocumentArtifactRangeGroupLocal(
@@ -7094,9 +7243,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
+                .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
+                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -7555,6 +7706,39 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
     }
 
+    fn applyDocumentArtifactChildRangeBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            return switch (route.*) {
+                .local => try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch),
+                .remote => |remote| blk: {
+                    const body = try encodeRemoteDocumentArtifactChildRangeApplyBatch(alloc, child_batch);
+                    defer alloc.free(body);
+                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var response = client.fetchGroupDocumentArtifactChildRangeBatchApply(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
+                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
+                        else => return err,
+                    };
+                    defer response.deinit(alloc);
+                    var parsed = std.json.parseFromSlice(struct { sequence: u64 = 0 }, alloc, response.body, .{}) catch break :blk null;
+                    defer parsed.deinit();
+                    break :blk parsed.value.sequence;
+                },
+            };
+        }
+        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+    }
+
     fn reprocessDocumentArtifactGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7600,6 +7784,30 @@ pub const HostedProvisionedTableWriteSource = struct {
             self.invalidateManagedCache(table_name);
         }
         return handled;
+    }
+
+    fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        _: []const u8,
+        _: []const u8,
+        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+    ) !?u64 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.invalidateManagedCache(table_name);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        const sequence = try cached.db.applyDocumentArtifactChildRangeBatch(child_batch);
+        if (sequence > 0) {
+            if (self.shouldDrainAfterBatch(child_batch.sync_level)) try drainManagedDbBeforeClose(cached.db);
+            self.invalidateManagedCache(table_name);
+        }
+        return sequence;
     }
 
     fn reprocessDocumentArtifactRangeGroupLocal(
@@ -10519,6 +10727,13 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn encodeRemoteDocumentArtifactChildRangeApplyBatch(
+    alloc: std.mem.Allocator,
+    child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, child_batch, .{ .emit_null_optional_fields = false });
 }
 
 test "bound table write source applies batch writes" {
