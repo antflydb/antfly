@@ -13105,15 +13105,17 @@ fn computeDocumentExtractionAssetRequestDerived(
         defer alloc.free(unit_key);
         const unit_range_id = try documentExtractionRangeIdAlloc(alloc, unit_index / document_extraction_range_target_children);
         defer alloc.free(unit_range_id);
+        const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
-        if (unit_unchanged and
+        if (!force_reprocess and
+            unit_unchanged and
             try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
         {
             try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
             continue;
         }
-        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_range_id);
+        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
         defer alloc.free(payload);
         try artifact_writes.append(alloc, .{
             .key = try alloc.dupe(u8, unit_key),
@@ -13139,7 +13141,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             });
         }
 
-        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
     }
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -13234,6 +13236,12 @@ fn collectDocumentExtractionDesiredKeys(
 const DocumentExtractionUnitDescriptor = struct {
     key: []const u8,
     fingerprint: []const u8,
+};
+
+const DocumentExtractionRangeRoute = struct {
+    range_id: []const u8,
+    route_status: []const u8 = "local_committed",
+    owner_group_id: u64 = 0,
 };
 
 fn documentExtractionUnitDescriptorsFromKeysAlloc(
@@ -13408,6 +13416,7 @@ fn appendDocumentUnitChunkWrites(
     unit: document_extraction_mod.Unit,
     desired_chunk_keys: []const []const u8,
     chunk_range_base_index: usize,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
@@ -13439,7 +13448,8 @@ fn appendDocumentUnitChunkWrites(
             defer alloc.free(chunk_key);
             const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
             const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_range_id);
+            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, chunk_key),
                 .value = try alloc.dupe(u8, payload),
@@ -13569,8 +13579,9 @@ fn buildDocumentUnitChunkPayloadAlloc(
     unit: document_extraction_mod.Unit,
     chunk: chunker_mod.Chunk,
     include_payload: bool,
-    range_id: []const u8,
+    route: DocumentExtractionRangeRoute,
 ) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
@@ -13578,10 +13589,10 @@ fn buildDocumentUnitChunkPayloadAlloc(
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
-    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_id"), .{ .string = try alloc.dupe(u8, range_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_id"), .{ .string = try alloc.dupe(u8, route.range_id) });
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_kind"), .{ .string = try alloc.dupe(u8, "chunk") });
-    try obj.put(alloc, try alloc.dupe(u8, "_artifact_route_status"), .{ .string = try alloc.dupe(u8, "local_committed") });
-    try obj.put(alloc, try alloc.dupe(u8, "_artifact_owner_group_id"), .{ .integer = 0 });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_route_status"), .{ .string = try alloc.dupe(u8, route.route_status) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_owner_group_id"), .{ .integer = owner_group_id });
     try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
         .scope = .unit,
         .parent_doc_key = doc_key,
@@ -13786,15 +13797,16 @@ fn documentUnitPayloadAlloc(
     unit: document_extraction_mod.Unit,
     source_url: []const u8,
     content_type: []const u8,
-    range_id: []const u8,
+    route: DocumentExtractionRangeRoute,
 ) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
     return try std.json.Stringify.valueAlloc(alloc, .{
         ._parent_doc_key = doc_key,
         ._artifact_name = artifact_name,
-        ._artifact_range_id = range_id,
+        ._artifact_range_id = route.range_id,
         ._artifact_range_kind = "unit",
-        ._artifact_route_status = "local_committed",
-        ._artifact_owner_group_id = 0,
+        ._artifact_route_status = route.route_status,
+        ._artifact_owner_group_id = owner_group_id,
         .unit_id = unit.unit_id,
         .unit_type = unit.unit_type,
         .text = unit.text,
@@ -14159,6 +14171,20 @@ fn findDocumentArtifactChildRange(
         }
     }
     return null;
+}
+
+fn documentExtractionRangeRoute(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) DocumentExtractionRangeRoute {
+    const range = findDocumentArtifactChildRange(ranges, range_id, range_kind, artifact_name) orelse return .{ .range_id = range_id };
+    return .{
+        .range_id = range_id,
+        .route_status = range.route_status orelse "local_committed",
+        .owner_group_id = range.owner_group_id orelse 0,
+    };
 }
 
 fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
@@ -29254,7 +29280,7 @@ test "db document unit payload preserves pdf page provenance" {
         .char_end = 5,
     };
 
-    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", "range:000000");
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
     defer alloc.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -29723,6 +29749,10 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqual(@as(?u64, 2), after.child_ranges[0].placement_generation);
     try std.testing.expectEqualStrings("remote_committed", after.child_ranges[0].route_status.?);
     try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"op\":\"keep\"") != null);
+    const routed_unit_payload = try db.core.store.get(alloc, after.child_ranges[0].start_key);
+    defer alloc.free(routed_unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_owner_group_id\":7001") != null);
 
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
     try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:missing", "document_units_v1")) == null);
