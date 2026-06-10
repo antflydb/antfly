@@ -411,6 +411,7 @@ Current implementation status:
 - Public artifact list, manifest inspection, and reprocess routes now apply the caller's effective source-row filter before exposing or mutating artifact control-plane state; hidden source documents return `404` to avoid leaking artifact existence.
 - Artifact inspection responses now expose typed source URL, source fingerprint, content type, manifest version, child range descriptors, and merge-plan generation/granularity summaries in addition to preserving raw manifest/state JSON.
 - Public/internal routing now includes a bounded operational table-range repair endpoint, `POST /db/v1/tables/{table}/artifacts/{artifact}:reprocess`, with `from_key`, `to_key`, and `limit` controls plus scanned/reprocessed/skipped/failed counts and per-key failure codes. Hosted/provisioned implementations fan this out to shard-local group handlers and aggregate the bounded pass response.
+- Public authorization now classifies artifact list and manifest inspection as table-read operations, and per-document/table-range artifact reprocess as table-admin operations, before row-filter checks hide source documents the caller cannot see.
 - PDF mechanical extraction now emits page-level provenance on units and unit-derived chunks, including `page_number`, a stable `page_label`, `page_bbox`, and source-document character spans. Mechanically empty pages are preserved as stable `page` units with `method: "pdf_ocr_pending"` and `extraction_status: "pending_ocr"` so scanned PDFs have deterministic OCR fallback targets. `page_rotation` remains nullable until the PDF reader exposes rotation.
 - Unit payloads are emitted as derived documents for full-text indexes whose source artifact matches the document-unit artifact name.
 - The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract, including unit fingerprints in state.
@@ -418,7 +419,7 @@ Current implementation status:
 Still remaining in Phase 1:
 
 - Add deeper PDF provenance such as rotation and text-region bounding boxes as the PDF reader exposes them.
-- Define the broader permission model for artifact inspection and reprocess controls, especially admin-only detail expansion and long-running/background table-wide operations.
+- Define admin-only detail expansion for artifact inspection and long-running/background table-wide reprocess operations beyond the bounded synchronous repair endpoint.
 
 ### Phase 2: Unit-aware chunking and indexing
 
@@ -690,7 +691,7 @@ This gives downstream systems a stable contract without blocking richer extracto
 The high-level model is settled enough to start implementation. The pieces that still need concrete product/API decisions are:
 
 - Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
-- Inspection API shape: admin-only versus public deep details, filter-aware/user-facing repair policy, per-shard cursors, and long-running table-wide reprocessing jobs. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, source-row row-filter enforcement for per-document operations, bounded table-range repair, and hosted/provisioned routing now exist.
+- Inspection API shape: admin-only deep-detail expansion, filter-aware/user-facing repair policy, per-shard cursors, and long-running table-wide reprocessing jobs. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, source-row row-filter enforcement for per-document operations, route-level read/admin permission classification, bounded table-range repair, and hosted/provisioned routing now exist.
 - Split thresholds: the first unit-level defaults are implemented and manifest-recorded as 256 units or 1 MiB of unit text per range. Oversized single units remain one unit range, while their derived chunks split on chunk boundaries with 256 chunks per range.
 - File route config: the first public shape is `route_preset` plus limited ordered overrides, with `mixed_files` as the default built-in route preset and `explicit_only` as the fail-closed mode. Future design work can decide whether to expose named preset variants beyond those two.
 - Reprocessing semantics: background job scheduling, priority, concurrency, per-shard cursors, and durable progress reporting beyond the bounded synchronous table-range repair endpoint.
