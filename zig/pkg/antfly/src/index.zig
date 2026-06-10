@@ -611,6 +611,14 @@ pub const IndexWriter = struct {
     alloc: Allocator,
     current: *IndexSnapshot,
     mu: std.atomic.Mutex,
+    // Guards the load+retain in acquireSnapshot against the publish in the
+    // swap sites. Without it a reader can load `current`, lose the CPU, and
+    // retain a snapshot the writer has already swapped out and released to
+    // refcount zero — resurrecting freed memory and crashing on the next
+    // segment walk (observed as segfaults in layoutStats during merges).
+    // Critical sections are a pointer load + refcount op, so a spinlock is
+    // appropriate; the heavy release/deinit stays outside it.
+    snapshot_mu: std.atomic.Mutex,
     next_segment_id: u64,
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
@@ -619,6 +627,19 @@ pub const IndexWriter = struct {
         while (!self.mu.tryLock()) {
             spinOrYield();
         }
+    }
+
+    fn lockSnapshotMutex(self: *IndexWriter) void {
+        while (!self.snapshot_mu.tryLock()) {
+            spinOrYield();
+        }
+    }
+
+    /// Publish a new snapshot. Must be the only way `current` is replaced.
+    fn publishSnapshot(self: *IndexWriter, new_snap: *IndexSnapshot) void {
+        self.lockSnapshotMutex();
+        @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
+        self.snapshot_mu.unlock();
     }
 
     pub fn init(alloc: Allocator) !IndexWriter {
@@ -641,6 +662,7 @@ pub const IndexWriter = struct {
             .alloc = alloc,
             .current = snap,
             .mu = .unlocked,
+            .snapshot_mu = .unlocked,
             .next_segment_id = 1,
             .next_epoch = 1,
             .retired_segment_cleanup = null,
@@ -668,7 +690,11 @@ pub const IndexWriter = struct {
 
     /// Get the current snapshot with an incremented ref count.
     /// Caller MUST call release() when done. Safe for concurrent use.
+    /// Load+retain happens under snapshot_mu so a concurrent publish cannot
+    /// release the loaded snapshot to zero before we retain it.
     pub fn acquireSnapshot(self: *IndexWriter) *IndexSnapshot {
+        self.lockSnapshotMutex();
+        defer self.snapshot_mu.unlock();
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
     }
 
@@ -754,7 +780,7 @@ pub const IndexWriter = struct {
         old.retired_segment_cleanup = self.retired_segment_cleanup;
 
         // Atomic swap so concurrent readers see a consistent pointer.
-        @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
+        self.publishSnapshot(new_snap);
 
         // Release writer's reference to old snapshot.
         old.release();
@@ -878,7 +904,7 @@ pub const IndexWriter = struct {
         };
         self.next_epoch += 1;
 
-        @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
+        self.publishSnapshot(new_snap);
         old.release();
         owned = null;
     }
