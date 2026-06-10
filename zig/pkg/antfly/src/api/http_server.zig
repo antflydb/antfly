@@ -5040,17 +5040,15 @@ pub const ApiHttpServer = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
-        // Signal background enrichment to yield the embedder while this
-        // interactive query executes (see enrichment_types.public_query_inflight).
-        _ = db_mod.enrichment_types.public_query_inflight.fetchAdd(1, .monotonic);
-        defer _ = db_mod.enrichment_types.public_query_inflight.fetchSub(1, .monotonic);
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.EndOfStream => {
+                // TableReadChurn: the read cache gave up opening a table that
+                // was being invalidated faster than an open completes.
+                error.EndOfStream, error.TableReadChurn => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
                     sleepNs(retry_poll_ns);

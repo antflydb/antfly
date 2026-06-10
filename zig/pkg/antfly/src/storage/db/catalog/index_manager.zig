@@ -761,9 +761,18 @@ pub const IndexManager = struct {
     // Indexes whose persisted artifacts failed to open (e.g. UnsupportedVersion).
     // Their configs are quarantined into status_only_index_configs so the
     // catalog, status reporting, and drop/recreate keep working while the
-    // runtime index stays absent; this map carries the per-index load error.
-    // Keys are duped index names; values are static @errorName memory.
-    failed_index_loads: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // runtime index stays absent; this map carries the per-index load error
+    // and retry/backoff state for self-healing (retryFailedIndexLoads).
+    // Keys are duped index names; err_name values are static @errorName memory.
+    failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+
+    pub const FailedIndexLoad = struct {
+        err_name: []const u8,
+        retry_attempts: u32 = 0,
+        // Monotonic deadline before which retryFailedIndexLoads skips this
+        // index. 0 = due immediately (first retry happens on the next tick).
+        next_retry_ns: u64 = 0,
+    };
 
     pub const TextIndex = struct {
         apply_mutex: *std.atomic.Mutex,
@@ -1587,7 +1596,7 @@ pub const IndexManager = struct {
     /// Load error recorded for `name` during the last catalog load, or null
     /// if the index loaded normally (or is not configured).
     pub fn loadFailure(self: *const IndexManager, name: []const u8) ?[]const u8 {
-        return self.failed_index_loads.get(name);
+        return (self.failed_index_loads.get(name) orelse return null).err_name;
     }
 
     pub fn hasLoadFailures(self: *const IndexManager) bool {
@@ -1624,7 +1633,100 @@ pub const IndexManager = struct {
         // The clone is owned by status_only_index_configs from here on.
         const name_key = try self.alloc.dupe(u8, cfg.name);
         errdefer self.alloc.free(name_key);
-        try self.failed_index_loads.put(self.alloc, name_key, @errorName(err));
+        try self.failed_index_loads.put(self.alloc, name_key, .{ .err_name = @errorName(err) });
+    }
+
+    const quarantine_retry_base_backoff_ns: u64 = 30 * std.time.ns_per_s;
+    const quarantine_retry_max_backoff_ns: u64 = 10 * std.time.ns_per_min;
+
+    fn quarantineRetryBackoffNs(attempts: u32) u64 {
+        const shift: u6 = @intCast(@min(attempts, 5));
+        return @min(quarantine_retry_base_backoff_ns << shift, quarantine_retry_max_backoff_ns);
+    }
+
+    pub const QuarantineRetryResult = struct {
+        recovered: usize = 0,
+        remaining: usize = 0,
+    };
+
+    /// Re-attempts opening quarantined indexes whose backoff deadline has
+    /// passed (all of them when `force` is set). A successful open registers
+    /// the runtime index, removes the quarantined config from the
+    /// status-only list, and clears the recorded load error — the same end
+    /// state as a clean open-time load. A failed attempt updates the
+    /// recorded error and pushes the next attempt out exponentially
+    /// (30s..10min). `remaining` is the quarantine count after this pass,
+    /// read under the catalog lock so callers can stop polling at zero.
+    pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.failed_index_loads.count() == 0) return .{};
+
+        var due_names = std.ArrayListUnmanaged([]const u8).empty;
+        defer due_names.deinit(self.alloc);
+        var it = self.failed_index_loads.iterator();
+        while (it.next()) |entry| {
+            if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
+            // Keys are owned by the map and stable across the value updates
+            // below (no inserts/removes until the success path).
+            try due_names.append(self.alloc, entry.key_ptr.*);
+        }
+
+        var recovered: usize = 0;
+        for (due_names.items) |name| {
+            const cfg = blk: {
+                for (self.status_only_index_configs) |*candidate| {
+                    if (std.mem.eql(u8, candidate.name, name)) break :blk candidate.*;
+                }
+                // Config vanished (concurrent drop); clear the stale record.
+                self.dropFailedIndexLoad(name);
+                continue;
+            };
+            var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
+                const record = self.failed_index_loads.getPtr(name) orelse continue;
+                record.err_name = @errorName(err);
+                record.retry_attempts +|= 1;
+                record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
+                std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
+                    name,
+                    record.retry_attempts,
+                    @errorName(err),
+                });
+                continue;
+            };
+            // Pre-allocate the shrunken status-only list so registration and
+            // de-quarantine commit together once the open has succeeded.
+            const old = self.status_only_index_configs;
+            const replacement: []types.IndexConfig = if (old.len <= 1)
+                &.{}
+            else
+                self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                    opened.deinit(self);
+                    return err;
+                };
+            self.appendOpenedIndex(opened) catch |err| {
+                if (replacement.len > 0) self.alloc.free(replacement);
+                opened.deinit(self);
+                return err;
+            };
+            var wi: usize = 0;
+            for (old) |old_cfg| {
+                if (std.mem.eql(u8, old_cfg.name, name)) {
+                    var removed = old_cfg;
+                    removed.deinit(self.alloc);
+                    continue;
+                }
+                replacement[wi] = old_cfg;
+                wi += 1;
+            }
+            if (old.len > 0) self.alloc.free(old);
+            self.status_only_index_configs = replacement;
+            // Log before dropFailedIndexLoad frees the `name` key buffer.
+            std.log.info("quarantined index recovered name={s} kind={s}", .{ name, @tagName(cfg.kind) });
+            self.dropFailedIndexLoad(name);
+            recovered += 1;
+        }
+        return .{ .recovered = recovered, .remaining = self.failed_index_loads.count() };
     }
 
     fn accountFullTextPendingBytes(self: *IndexManager, pending_bytes: u64) !void {
@@ -6474,8 +6576,8 @@ pub const IndexManager = struct {
                 .index = i,
                 .size = seg.data.bytes().len,
                 .doc_count = seg.reader.doc_count,
-                .deleted_count = if (seg.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-                .has_deletions = seg.deleted != null,
+                .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
+                .has_deletions = seg.shared.deleted != null,
             });
         }
         if (infos.items.len < 2) return null;
@@ -6511,7 +6613,7 @@ pub const IndexManager = struct {
             const source_seg = &snap.segments[seg_idx];
             source[i] = .{
                 .id = source_seg.id,
-                .deleted = if (source_seg.deleted) |*deleted| try deleted.clone(self.alloc) else null,
+                .deleted = if (source_seg.shared.deleted) |*deleted| try deleted.clone(self.alloc) else null,
             };
             source_initialized += 1;
             merge_indices[i] = seg_idx;
@@ -6582,9 +6684,9 @@ pub const IndexManager = struct {
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
             if (source.deleted) |expected| {
-                const current_deleted = seg.deleted orelse return false;
+                const current_deleted = seg.shared.deleted orelse return false;
                 if (!current_deleted.eql(&expected)) return false;
-            } else if (seg.deleted != null) {
+            } else if (seg.shared.deleted != null) {
                 return false;
             }
         }

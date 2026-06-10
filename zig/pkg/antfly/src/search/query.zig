@@ -1333,7 +1333,7 @@ pub fn executeFilter(
         defer bm.deinit();
 
         // Remove deleted docs
-        if (seg.deleted) |d| bm.andNotWith(&d);
+        if (seg.shared.deleted) |d| bm.andNotWith(&d);
 
         // Collect with offset
         var iter = bm.iterator();
