@@ -2267,6 +2267,10 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
         try putJsonString(alloc, &obj, "parent_doc_key", hit.id);
     }
 
+    if (try hierarchyAncestorsJsonValue(alloc, hit.artifact_ref, hit.id, hit.stored_data)) |ancestors| {
+        try obj.put(alloc, try alloc.dupe(u8, "ancestors"), ancestors);
+    }
+
     if (hit.chunk_hits.len > 0) {
         var chunks = try std.json.Array.initCapacity(alloc, hit.chunk_hits.len);
         errdefer chunks.deinit();
@@ -2304,10 +2308,95 @@ fn chunkHitJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, 
             try putJsonString(alloc, &hierarchy, "parent_unit_id", unit_id);
         }
         try hierarchy.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
+        if (try hierarchyAncestorsJsonValue(alloc, hit.artifact_ref, hit.id, hit.stored_data)) |ancestors| {
+            try hierarchy.put(alloc, try alloc.dupe(u8, "ancestors"), ancestors);
+        }
         try obj.put(alloc, try alloc.dupe(u8, "hierarchy"), .{ .object = hierarchy });
     }
 
     return .{ .object = obj };
+}
+
+fn hierarchyAncestorsJsonValue(
+    alloc: std.mem.Allocator,
+    artifact_ref_opt: ?db_mod.types.ArtifactRef,
+    hit_id: []const u8,
+    stored_data: ?[]const u8,
+) !?std.json.Value {
+    var ancestors = std.json.ObjectMap.empty;
+    errdefer ancestors.deinit(alloc);
+
+    var source = std.json.ObjectMap.empty;
+    errdefer source.deinit(alloc);
+    const source_id = if (artifact_ref_opt) |artifact_ref| artifact_ref.document_id else hit_id;
+    try putJsonString(alloc, &source, "id", source_id);
+    if (artifact_ref_opt == null) {
+        if (stored_data) |raw| {
+            try source.put(alloc, try alloc.dupe(u8, "document"), try parseStoredSourceValue(alloc, raw));
+        }
+    }
+    try ancestors.put(alloc, try alloc.dupe(u8, "source"), .{ .object = source });
+
+    const artifact_ref = artifact_ref_opt orelse {
+        return .{ .object = ancestors };
+    };
+
+    if (try hierarchyUnitAncestorJsonValue(alloc, artifact_ref, stored_data)) |unit| {
+        try ancestors.put(alloc, try alloc.dupe(u8, "unit"), unit);
+    }
+
+    return .{ .object = ancestors };
+}
+
+fn hierarchyUnitAncestorJsonValue(
+    alloc: std.mem.Allocator,
+    artifact_ref: db_mod.types.ArtifactRef,
+    stored_data: ?[]const u8,
+) !?std.json.Value {
+    const unit_id = artifact_ref.unit_id orelse if (artifact_ref.source) |source| source.unit_id else null;
+    if (unit_id == null and stored_data == null) return null;
+
+    var unit = std.json.ObjectMap.empty;
+    errdefer unit.deinit(alloc);
+    if (unit_id) |id| try putJsonString(alloc, &unit, "id", id);
+
+    if (stored_data) |raw| {
+        const stored = try parseStoredSourceValue(alloc, raw);
+        if (artifact_ref.kind == .asset and artifact_ref.unit_id != null) {
+            try unit.put(alloc, try alloc.dupe(u8, "document"), stored);
+            return .{ .object = unit };
+        }
+
+        if (stored == .object) {
+            const stored_obj = stored.object;
+            try copyOptionalJsonField(alloc, &unit, stored_obj, "unit_id", "id");
+            try copyOptionalJsonField(alloc, &unit, stored_obj, "_parent_unit_key", "key");
+            try copyOptionalJsonField(alloc, &unit, stored_obj, "_source_artifact_name", "artifact_name");
+            try copyOptionalJsonField(alloc, &unit, stored_obj, "_source_field", "source_field");
+            try copyOptionalJsonField(alloc, &unit, stored_obj, "provenance", "provenance");
+        }
+    }
+
+    return if (unit.count() > 0) .{ .object = unit } else null;
+}
+
+fn copyOptionalJsonField(
+    alloc: std.mem.Allocator,
+    out: *std.json.ObjectMap,
+    source: std.json.ObjectMap,
+    source_key: []const u8,
+    dest_key: []const u8,
+) !void {
+    const value = source.get(source_key) orelse return;
+    if (std.mem.eql(u8, dest_key, "id") and out.get("id") != null) return;
+    try out.put(alloc, try alloc.dupe(u8, dest_key), try cloneJsonValueAlloc(alloc, value));
+}
+
+fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    return parsed.value;
 }
 
 fn artifactRefJsonValue(alloc: std.mem.Allocator, artifact_ref: db_mod.types.ArtifactRef) !std.json.Value {
@@ -2407,7 +2496,7 @@ test "api query contract serializes derived hierarchy ancestry" {
         .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
         .score = 0.7,
         .stored_data = try alloc.dupe(u8,
-            \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001"}
+            \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1","_source_field":"body"}
         ),
         .artifact_ref = .{
             .document_id = try alloc.dupe(u8, "doc:a"),
@@ -2430,12 +2519,60 @@ test "api query contract serializes derived hierarchy ancestry" {
     const hierarchy = hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
     try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
+    const source_ancestor = hierarchy.object.get("ancestors").?.object.get("source").?.object;
+    try std.testing.expectEqualStrings("doc:a", source_ancestor.get("id").?.string);
     const chunks = hierarchy.object.get("chunks").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), chunks.len);
     const chunk_hierarchy = chunks[0].object.get("hierarchy").?.object;
     try std.testing.expectEqualStrings("chunk", chunk_hierarchy.get("level").?.string);
     try std.testing.expectEqualStrings("page:000001", chunk_hierarchy.get("parent_unit_id").?.string);
     try std.testing.expectEqual(@as(i64, 3), chunk_hierarchy.get("artifact").?.object.get("chunk_id").?.integer);
+    const unit_ancestor = chunk_hierarchy.get("ancestors").?.object.get("unit").?.object;
+    try std.testing.expectEqualStrings("page:000001", unit_ancestor.get("id").?.string);
+    try std.testing.expectEqualStrings("document_units_v1", unit_ancestor.get("artifact_name").?.string);
+    try std.testing.expectEqualStrings("body", unit_ancestor.get("source_field").?.string);
+}
+
+test "api query contract serializes hydrated unit ancestor for direct unit hits" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE"),
+        .score = 0.9,
+        .stored_data = try alloc.dupe(u8,
+            \\{"unit_id":"page:000001","unit_type":"page","text":"unit text","provenance":{"method":"pdf_text","page_number":1}}
+        ),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_units_v1"),
+            .kind = .asset,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .return_mode = .chunk,
+        .include_stored = true,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+    const hierarchy = hit.object.get("hierarchy").?.object;
+    try std.testing.expectEqualStrings("unit", hierarchy.get("level").?.string);
+    const ancestors = hierarchy.get("ancestors").?.object;
+    try std.testing.expectEqualStrings("doc:a", ancestors.get("source").?.object.get("id").?.string);
+    const unit = ancestors.get("unit").?.object;
+    try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
+    try std.testing.expectEqualStrings("unit text", unit.get("document").?.object.get("text").?.string);
 }
 
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {

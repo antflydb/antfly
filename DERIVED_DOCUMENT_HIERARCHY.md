@@ -435,6 +435,7 @@ Current implementation status:
 - Sparse indexes can plan against explicit sparse embedding enrichments and search unit-derived chunk embedding artifacts using unit-aware public artifact IDs.
 - Chunk-backed full-text/vector result shaping can return unit-derived chunks directly with `return_mode: "chunk"` or as nested child hits with `return_mode: "parent_with_chunks"`.
 - Public query responses now emit a stable `hierarchy` envelope for derived unit/chunk/embedding hits and source-level rollups, including `level`, `parent_doc_key`, optional `parent_unit_id`, artifact identity, and nested child chunks.
+- Hierarchy responses now include a stable `ancestors` envelope when response-local data can hydrate it: source-level payloads carry `ancestors.source.document`, unit hits carry `ancestors.unit.document`, and chunk hits expose unit ancestry fields and provenance recovered from the chunk payload.
 - Public artifact IDs now round-trip document-unit asset artifacts, so unit-level hits can be exposed as first-class derived hierarchy results instead of opaque internal keys.
 - Public hierarchy controls now accept `return_level: "unit"` and map it onto the existing derived-artifact return path while reserving mention-level responses for a later graph evidence schema.
 - Document units now carry source-document character spans where the extractor can compute them, and chunk artifacts now emit a `provenance` envelope with explicit `offset_basis`, chunk-local `char_start`/`char_end`, unit-local offsets for unit chunks, and document-global offsets when available.
@@ -446,7 +447,7 @@ Current implementation status:
 Still remaining in Phase 2:
 
 - Public query requests now accept initial `hierarchy` controls that map `source`, `unit`, and `chunk` return levels plus source rollups onto the existing derived-artifact result modes.
-- Query results now expose matched chunks through existing chunk return modes and include a stable hierarchy envelope, but first-class `mention` return levels and hydrated ancestor source/unit payloads still need a stricter response contract.
+- Query results now expose matched chunks through existing chunk return modes and include a stable hierarchy envelope with response-local ancestor hydration. First-class `mention` return levels and DB-backed source/unit hydration for direct chunk hits still need a stricter execution contract.
 - Chunk payloads preserve unit ancestry and explicit unit-local/document-global offset provenance; future extractor-specific offsets such as PDF bounding boxes and OCR coordinates still need a richer format-specific provenance contract.
 - Incremental chunk reuse is currently key-stable by unit id and chunk id and backed by parent-owned range/merge descriptors with per-unit fingerprints. The local execution path can skip stable artifact/vector-only unit subtrees when existing artifacts prove the subtree is already materialized.
 
