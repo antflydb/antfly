@@ -6080,6 +6080,30 @@ pub const DB = struct {
                 self.alloc.free(state_key);
                 state_key_owned = false;
             }
+
+            const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+            defer self.alloc.free(mention_state_name);
+            const mention_state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, mention_state_name);
+            var mention_state_key_owned = true;
+            errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
+
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsDeleteKey(deletes.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try deletes.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                }
+            }
+
+            if (!containsDeleteKey(deletes.items, mention_state_key)) {
+                try deletes.append(self.alloc, mention_state_key);
+                mention_state_key_owned = false;
+            } else {
+                self.alloc.free(mention_state_key);
+                mention_state_key_owned = false;
+            }
         }
     }
 
@@ -18632,6 +18656,13 @@ fn concatArtifactKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []cons
     return out;
 }
 
+fn concatKVPairSlices(alloc: Allocator, lhs: []const docstore_mod.KVPair, rhs: []const docstore_mod.KVPair) ![]docstore_mod.KVPair {
+    const out = try alloc.alloc(docstore_mod.KVPair, lhs.len + rhs.len);
+    @memcpy(out[0..lhs.len], lhs);
+    for (rhs, 0..) |write, i| out[lhs.len + i] = write;
+    return out;
+}
+
 const GraphMaterializationOptions = struct {
     require_resolution_contract: bool = false,
 };
@@ -18777,6 +18808,14 @@ fn materializeMentionEdgesForResolutionKey(
         }
         writes.deinit(alloc);
     }
+    var mention_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (mention_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        mention_writes.deinit(alloc);
+    }
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (deletes.items) |key| alloc.free(@constCast(key));
@@ -18786,7 +18825,7 @@ fn materializeMentionEdgesForResolutionKey(
     if (raw_resolution) |raw| {
         const raw_extraction = loadSourceExtractionForResolution(alloc, store, parsed_key.doc_key, cfg.source_artifact) catch null;
         defer if (raw_extraction) |raw_src| alloc.free(raw_src);
-        const mention_writes = try mentionEdgeWritesFromResolutionAlloc(
+        const mention_edge_writes = try mentionEdgeWritesFromResolutionAlloc(
             alloc,
             index_name,
             parsed_key.doc_key,
@@ -18795,8 +18834,8 @@ fn materializeMentionEdgesForResolutionKey(
             source.mention_edge_type,
             cfg,
         );
-        defer freeGraphWrites(alloc, mention_writes);
-        for (mention_writes) |write| {
+        defer freeGraphWrites(alloc, mention_edge_writes);
+        for (mention_edge_writes) |write| {
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
@@ -18808,6 +18847,15 @@ fn materializeMentionEdgesForResolutionKey(
             payload_owned = false;
             try appendUniqueOwnedKey(alloc, changed, key);
         }
+        try appendMentionEvidenceArtifactsFromResolution(
+            alloc,
+            &mention_writes,
+            changed,
+            parsed_key.doc_key,
+            raw,
+            raw_extraction,
+            cfg,
+        );
     }
 
     if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
@@ -18828,8 +18876,32 @@ fn materializeMentionEdgesForResolutionKey(
     });
     state_value_owned = false;
 
-    if (writes.items.len > 0 or deletes.items.len > 0) {
-        try store.putBatch(writes.items, deletes.items);
+    const mention_state_name = try mentionArtifactStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(mention_state_name);
+    const mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, mention_state_name);
+    defer alloc.free(mention_state_key);
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key)) |previous_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            if (containsStoreWriteKey(mention_writes.items, previous_key)) continue;
+            try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+            try appendUniqueOwnedKey(alloc, changed, previous_key);
+        }
+    }
+
+    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, mention_writes.items);
+    var mention_state_value_owned = true;
+    defer if (mention_state_value_owned) alloc.free(mention_state_value);
+    try mention_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, mention_state_key),
+        .value = mention_state_value,
+    });
+    mention_state_value_owned = false;
+
+    if (writes.items.len > 0 or mention_writes.items.len > 0 or deletes.items.len > 0) {
+        const combined = try concatKVPairSlices(alloc, writes.items, mention_writes.items);
+        defer alloc.free(combined);
+        try store.putBatch(combined, deletes.items);
     }
 }
 
@@ -18871,6 +18943,31 @@ fn resolverConfigForResolutionArtifact(
 
 fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn mentionArtifactStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mention_artifacts\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn resolutionMentionArtifactNameAlloc(
+    alloc: Allocator,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+    local_id: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "_resolution_mention\x1f{s}\x1f{s}\x1f{s}", .{ source_artifact, resolution_artifact, local_id });
+}
+
+fn resolutionMentionArtifactKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+    local_id: []const u8,
+) ![]u8 {
+    const name = try resolutionMentionArtifactNameAlloc(alloc, source_artifact, resolution_artifact, local_id);
+    defer alloc.free(name);
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
 }
 
 fn resolutionMentionStateKeysForGraphSourceAlloc(
@@ -18928,10 +19025,25 @@ fn extractionConfidenceForLocalId(entities: []const resolver_lib.ExtractedEntity
     return null;
 }
 
+fn extractionEntityForLocalId(entities: []const resolver_lib.ExtractedEntity, local_id: []const u8) ?resolver_lib.ExtractedEntity {
+    for (entities) |entity| {
+        if (std.mem.eql(u8, entity.local_id, local_id)) return entity;
+    }
+    return null;
+}
+
 fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
     return switch (decision) {
         .new, .match => true,
         .review => false,
+    };
+}
+
+fn decisionName(decision: resolver_lib.Decision) []const u8 {
+    return switch (decision) {
+        .new => "new",
+        .match => "match",
+        .review => "review",
     };
 }
 
@@ -18991,6 +19103,79 @@ fn mentionEdgeWritesFromResolutionAlloc(
         });
     }
     return try writes.toOwnedSlice(alloc);
+}
+
+fn appendMentionEvidenceArtifactsFromResolution(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    changed: *std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    resolution_raw: []const u8,
+    extraction_raw: ?[]const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+) !void {
+    var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return;
+    defer parsed_resolution.deinit();
+    var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
+        resolver_lib.parseExtractionEntities(alloc, raw) catch null
+    else
+        null;
+    defer if (parsed_extraction) |*parsed| parsed.deinit();
+
+    for (parsed_resolution.entities) |entity| {
+        if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
+        if (entity.doc_ref.key.len == 0) continue;
+        const extraction_entity = if (parsed_extraction) |parsed|
+            extractionEntityForLocalId(parsed.entities, entity.local_id)
+        else
+            null;
+        const key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        const payload = try mentionEvidencePayloadAlloc(alloc, doc_key, cfg, entity, extraction_entity);
+        var payload_owned = true;
+        errdefer if (payload_owned) alloc.free(payload);
+        try writes.append(alloc, .{ .key = key, .value = payload });
+        key_owned = false;
+        payload_owned = false;
+        try appendUniqueOwnedKey(alloc, changed, key);
+    }
+}
+
+fn mentionEvidencePayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+    entity: resolver_lib.ResolvedEntity,
+    extraction_entity: ?resolver_lib.ExtractedEntity,
+) ![]u8 {
+    const mention_label = if (extraction_entity) |source| source.label else entity.label;
+    const mention_text = if (extraction_entity) |source| source.text else entity.surface_form;
+    const mention_confidence = if (extraction_entity) |source| source.confidence else entity.confidence;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._schema = "antfly.resolution_mention.v1",
+        ._parent_doc_key = doc_key,
+        ._artifact_kind = "resolution_mention",
+        .source_artifact = cfg.source_artifact,
+        .resolution_artifact = cfg.resolution_artifact,
+        .resolver = cfg.name,
+        .resolver_table = cfg.table,
+        .config_generation = cfg.config_generation,
+        .local_id = entity.local_id,
+        .decision = decisionName(entity.decision),
+        .confidence = entity.confidence,
+        .canonical = .{
+            .table = entity.doc_ref.table,
+            .key = entity.doc_ref.key,
+            .name = entity.canonical_name,
+            .label = entity.label,
+        },
+        .mention = .{
+            .text = mention_text,
+            .label = mention_label,
+            .confidence = mention_confidence,
+        },
+    }, .{});
 }
 
 fn graphWritesFromArtifactValueAlloc(
@@ -27048,6 +27233,19 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
     }
 
+    const ada_mention_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e0");
+    defer alloc.free(ada_mention_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_mention_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_schema\":\"antfly.resolution_mention.v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"source_artifact\":\"relations_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"resolution_artifact\":\"resolution_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"local_id\":\"e0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"key\":\"person/ada_lovelace\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"text\":\"Ada Lovelace\"") != null);
+    }
+
     // Outbound: doc:a mentions both canonical entities.
     {
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
@@ -27079,6 +27277,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
     }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_mention_key));
 }
 
 test "db resolver removal retires resolution artifacts and mention graph state" {
@@ -27148,6 +27347,13 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         defer alloc.free(raw);
         try std.testing.expect(raw.len > 0);
     }
+    const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e0");
+    defer alloc.free(mention_artifact_key);
+    {
+        const raw = try db.core.store.get(alloc, mention_artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
+    }
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
         defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
@@ -27165,6 +27371,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, mention_artifact_key));
     {
         const raw = try db.core.store.get(alloc, asset_key);
         defer alloc.free(raw);
