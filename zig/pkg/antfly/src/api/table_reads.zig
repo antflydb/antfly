@@ -253,6 +253,7 @@ pub const ProvisionedTableReadCache = struct {
     ) !Lease {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         const io = self.threaded.io();
+        var stale_epoch_retries: u8 = 0;
         while (true) {
             self.mutex.lockUncancelable(io);
             const open_epoch = self.epoch;
@@ -308,7 +309,21 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if (self.epoch != open_epoch) {
+            if (self.epoch != open_epoch and stale_epoch_retries < 2) {
+                // The cache was invalidated while we were opening (table
+                // dropped/recreated, or the writer published). Retry a
+                // bounded number of times — but only a bounded number:
+                // during startup catch-up or heal backfill the writer
+                // publishes after every batch, bumping the epoch faster
+                // than a fresh open can complete, and unbounded retry here
+                // livelocks every query behind this open until the churn
+                // pauses (observed in the field as ~100s of queries all
+                // timing out and then flushing at once). After the retries
+                // we serve the DB we just opened — it is a consistent
+                // snapshot at the requested generation, at worst slightly
+                // stale; a genuinely dropped table fails downstream with
+                // NotFound instead of stalling everyone here.
+                stale_epoch_retries += 1;
                 self.ready.broadcast(io);
                 db.close();
                 self.mutex.unlock(io);
