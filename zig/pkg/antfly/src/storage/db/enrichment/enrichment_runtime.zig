@@ -4593,7 +4593,7 @@ fn appendDocumentExtractionKeyRanges(
         try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
         try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
         try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
-        try appendJsonFieldString(alloc, out, &first, "split_boundary", "unit");
+        try appendJsonFieldString(alloc, out, &first, "split_boundary", documentExtractionSplitBoundary(range_kind));
         try appendJsonFieldString(alloc, out, &first, "placement", if (previous_range) |range| range.placement else "parent");
         try appendJsonFieldU64(alloc, out, &first, "owner_group_id", if (previous_range) |range| range.owner_group_id orelse 0 else 0);
         try appendJsonFieldU64(alloc, out, &first, "placement_generation", if (previous_range) |range| range.placement_generation orelse 0 else 0);
@@ -4612,6 +4612,11 @@ fn appendDocumentExtractionKeyRanges(
         range_index.* += 1;
         start = end;
     }
+}
+
+fn documentExtractionSplitBoundary(range_kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, range_kind, "chunk")) return "chunk";
+    return "unit";
 }
 
 fn documentExtractionRangeEnd(
@@ -5638,6 +5643,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"child_ranges\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"unit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_boundary\":\"chunk\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"text_bytes\":11") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_policy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_target_children\":256") != null);
