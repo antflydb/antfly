@@ -1965,6 +1965,46 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
     try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key", null, null)) == null);
 }
 
+test "processChangedExtraction accepts a dedicated mention artifact" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "entity_mentions_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const mention_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "entity_mentions_v1");
+    defer alloc.free(mention_key);
+    try map.store().put(mention_key,
+        \\{
+        \\  "_schema": "antfly.entity_mention.v1",
+        \\  "local_id": "m0",
+        \\  "label": "person",
+        \\  "text": "Ada Lovelace",
+        \\  "confidence": 0.84
+        \\}
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, mention_key, null, null)).?;
+    defer alloc.free(outcome.resolution_key);
+    try testing.expectEqual(resolver_lib.RunResult.written, outcome.result);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try testing.expectEqualStrings(resolution_key, outcome.resolution_key);
+
+    const stored = (try map.store().get(alloc, resolution_key)).?;
+    defer alloc.free(stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"local_id\":\"m0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"person/ada_lovelace\"") != null);
+}
+
 test "processChangedExtraction scopes unit asset resolution under the source artifact key" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{.{

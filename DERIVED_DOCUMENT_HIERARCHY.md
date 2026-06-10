@@ -492,6 +492,7 @@ Current implementation status:
 - Graph artifact sources can now target asset-backed document units and chunk-backed document chunks, not only root asset artifacts.
 - Managed graph replay retains chunk artifact changes, matches decoded artifact refs against the configured graph artifact source, and stores per-unit/per-chunk graph materialization state so one source document's child artifacts do not clobber each other's replay state.
 - Graph source templates can use `_artifact.value...` paths, allowing unit/chunk payload ancestry such as `_parent_unit_key` and `_parent_unit_id` to become graph edge source IDs and evidence metadata.
+- Resolvers can consume dedicated mention artifacts using the `antfly.entity_mention.v1` single-mention schema (`local_id`/`id`, `label`, `text`, optional `confidence`, optional `embedding`) in addition to legacy extraction artifacts with an `entities` array.
 - Resolution replay now materializes first-class `antfly.resolution_mention.v1` evidence artifacts for canonical resolver decisions. Each artifact is keyed by source artifact, resolution artifact, and local mention ID, stores the resolver decision, canonical DocRef, mention text/label/confidence, and explicit mention/source/resolution artifact keys, and is retired through durable state alongside the existing doc-to-entity mention edges.
 - Resolver replay accepts unit asset artifacts and chunk artifacts as source artifacts and scopes their resolution artifacts under the source artifact key, so unit/chunk-level entity extraction can resolve without colliding at the parent document's resolution artifact key.
 - Public hierarchy controls now accept `return_level: "mention"`. Query responses recognize `antfly.resolution_mention.v1` artifact hits and emit `hierarchy.level: "mention"` plus an `evidence` envelope with mention, canonical, resolver, source artifact, and resolution artifact references.
@@ -500,7 +501,6 @@ Current implementation status:
 
 Still remaining in Phase 4:
 
-- Extend the same resolver/source-artifact contract to dedicated mention artifacts.
 - Extend graph-neighborhood evidence rollups beyond path edge metadata into richer canonical entity/edge response envelopes.
 
 ### Phase 5: More file types and OCR fallback
