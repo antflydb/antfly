@@ -12191,7 +12191,7 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
-        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
@@ -12218,7 +12218,7 @@ fn encodeThinReplayRecordPayload(
     }
     for (deleted_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
-        if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+        if (internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
             if (internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
@@ -15149,14 +15149,12 @@ fn appendPrecomputedGraphSourceArtifactKey(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    if (!internal_keys.isAssetArtifactKey(artifact_key)) return;
     var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, artifact_key)) orelse return;
     defer artifact_ref.deinit(self.alloc);
-    if (artifact_ref.kind != .asset) return;
 
     for (self.core.graphIndexes()) |graph_entry| {
         const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) continue;
+        if (!graphArtifactSourceConsumesRef(self.core.index_manager, source, artifact_ref)) continue;
 
         var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer graph_store_writes.deinit(self.alloc);
@@ -15182,7 +15180,9 @@ fn appendPrecomputedGraphSourceArtifactKey(
             }
         }
 
-        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, artifact_ref.name);
+        const state_name = try graphArtifactStateNameAlloc(self.alloc, artifact_ref);
+        defer self.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, state_name);
         defer self.alloc.free(state_key);
         if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
             defer freeOwnedConstKeySlice(self.alloc, previous_keys);
@@ -15194,7 +15194,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 try delete_keys.append(self.alloc, owned_key);
                 try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
             }
-        } else {
+        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(self.alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
@@ -15251,8 +15251,56 @@ fn storeDocumentValueForGraphSource(
 }
 
 fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
-    const cfg = index_manager.getEnrichment(.asset, artifact_name) orelse return "";
-    return cfg.content_type;
+    if (index_manager.getEnrichment(.asset, artifact_name)) |cfg| return cfg.content_type;
+    if (index_manager.getEnrichment(.chunk, artifact_name) != null) return "application/json";
+    return "";
+}
+
+fn graphArtifactSourceConsumesRef(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: types.ArtifactRef,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRef(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+fn graphAssetSourceConsumesAssetRef(index_manager: *const index_manager_mod.IndexManager, artifact_ref: types.ArtifactRef) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id != null) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
+fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) bool {
+    return artifact_ref.kind == .asset and artifact_ref.unit_id == null and artifact_ref.chunk_id == null and artifact_ref.source == null;
+}
+
+fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
+    if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) return try alloc.dupe(u8, artifact_ref.name);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.appendSlice(alloc, artifact_ref.name);
+    try list.append(alloc, '\x1f');
+    try list.appendSlice(alloc, @tagName(artifact_ref.kind));
+    if (artifact_ref.unit_id) |unit_id| {
+        try list.append(alloc, '\x1f');
+        try list.appendSlice(alloc, "unit:");
+        try list.appendSlice(alloc, unit_id);
+    }
+    if (artifact_ref.chunk_id) |chunk_id| {
+        const chunk_part = try std.fmt.allocPrint(alloc, "chunk:{d}", .{chunk_id});
+        defer alloc.free(chunk_part);
+        try list.append(alloc, '\x1f');
+        try list.appendSlice(alloc, chunk_part);
+    }
+    return try list.toOwnedSlice(alloc);
 }
 
 fn shouldPrecomputeGeneratedRequest(
@@ -17636,10 +17684,11 @@ fn managedIndexBatchApplicability(
                 if (std.mem.eql(u8, delete.index_name, index_ref.name)) return .relevant;
             }
             for (batch.changed_artifact_keys) |artifact_key| {
-                if (internal_keys.isAssetArtifactKey(artifact_key)) {
+                if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
                     var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer artifact_ref.deinit(index_manager.alloc);
-                    if (artifact_ref.kind == .asset and index_manager.graphIndexConsumesAssetArtifact(index_ref.name, artifact_ref.name)) return .relevant;
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) return .relevant;
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
@@ -18605,10 +18654,9 @@ fn materializeGraphSourceArtifactsForIndex(
             try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
             continue;
         }
-        if (!internal_keys.isAssetArtifactKey(artifact_key)) continue;
         var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind != .asset or !std.mem.eql(u8, artifact_ref.name, source.artifact_name)) continue;
+        if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -18650,7 +18698,9 @@ fn materializeGraphSourceArtifactsForIndex(
             }
         }
 
-        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, artifact_ref.name);
+        const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
         defer alloc.free(state_key);
         if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
             defer freeOwnedConstKeySlice(alloc, previous_keys);
@@ -18659,7 +18709,7 @@ fn materializeGraphSourceArtifactsForIndex(
                 try deletes.append(alloc, try alloc.dupe(u8, previous_key));
                 try appendUniqueOwnedKey(alloc, &changed, previous_key);
             }
-        } else {
+        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
@@ -26744,6 +26794,61 @@ test "db graph index materializes relation asset artifacts into graph edge artif
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
+}
+
+test "db graph index materializes unit-derived chunk artifacts into graph edge artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 64,
+    });
+    try db.addIndex(.{
+        .name = "chunk_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"document_chunks_v1","format":"extraction_relation"},
+        \\  "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
+        \\  "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,ZG9jOmI=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const edges = try db.getEdges(alloc, "chunk_graph", unit_key, "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"unit\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"document_chunks_v1\"") != null);
 }
 
 test "db graph replay blocks resolution artifact without resolver contract" {

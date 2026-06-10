@@ -486,6 +486,18 @@ Still remaining in Phase 3:
 - Store mentions and relation evidence as child artifacts.
 - Link evidence to canonical graph nodes and edges.
 
+Current implementation status:
+
+- Graph artifact sources can now target asset-backed document units and chunk-backed document chunks, not only root asset artifacts.
+- Managed graph replay retains chunk artifact changes, matches decoded artifact refs against the configured graph artifact source, and stores per-unit/per-chunk graph materialization state so one source document's child artifacts do not clobber each other's replay state.
+- Graph source templates can use `_artifact.value...` paths, allowing unit/chunk payload ancestry such as `_parent_unit_key` and `_parent_unit_id` to become graph edge source IDs and evidence metadata.
+
+Still remaining in Phase 4:
+
+- Define the first-class mention artifact schema for entity extraction over units/chunks.
+- Subscribe mention artifacts into canonical resolver namespaces without assuming a root asset-only source contract.
+- Add hierarchy-aware graph query result shaping for mention-level hits and evidence rollups.
+
 ### Phase 5: More file types and OCR fallback
 
 - Add DOCX, PPTX, XLSX, image OCR, scanned PDF fallback, email, archives, and audio transcripts.

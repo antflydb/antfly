@@ -5806,7 +5806,11 @@ pub const IndexManager = struct {
                 var graph_cfg_moved = false;
                 errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
                 if (graph_cfg.artifact_source) |source| {
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
                 if (graph_cfg.shorthand_asset) |*asset| {
                     asset.deinit(self.alloc);
@@ -6073,7 +6077,11 @@ pub const IndexManager = struct {
                     if (graph_cfg.shorthand_asset) |asset| {
                         if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
                     }
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
             },
             else => {},
@@ -12245,7 +12253,10 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     if (trimmed.len == 0) return;
     if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
-    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, expr, "_doc.key")) return;
+    if (std.mem.eql(u8, expr, "_artifact.value")) return;
+    if (std.mem.startsWith(u8, expr, "_artifact.value.")) return;
+    return error.InvalidIndexConfig;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
