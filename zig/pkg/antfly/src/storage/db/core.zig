@@ -152,6 +152,13 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PrimaryStoreOwner) ?u64 {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *PrimaryStoreOwner) void {
         switch (self.*) {
             .none, .mem => {},
@@ -194,11 +201,25 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn lsmBackend(self: *PrimaryStoreOwner) ?*lsm_backend_mod.Backend {
+        return switch (self.*) {
+            .none, .mem => null,
+            .lsm => |owner| owner.handle.backend,
+        };
+    }
+
     pub fn runLsmMaintenanceStep(self: *PrimaryStoreOwner) !bool {
         return switch (self.*) {
             .none, .mem => false,
             .lsm => |owner| try owner.handle.backend.runMaintenanceStep(),
         };
+    }
+
+    pub fn runDueLsmObsoleteReclaim(self: *PrimaryStoreOwner) !bool {
+        const backend = self.lsmBackend() orelse return false;
+        if (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable == 0) return false;
+        _ = try backend.runMaintenanceStep();
+        return true;
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
