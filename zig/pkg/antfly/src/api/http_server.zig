@@ -1461,10 +1461,11 @@ pub const ApiHttpServer = struct {
 
         var doc_count: u64 = 0;
         for (local_statuses.items) |item| doc_count +|= item.stats.doc_count;
+        const direct_lsm_status = try self.bestEffortLsmStorageStatus(table_name);
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items) orelse try self.bestEffortLsmStorageStatus(table_name),
+            .lsm = direct_lsm_status orelse liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
         };
     }
 
@@ -13070,6 +13071,110 @@ test "api http server table status uses runtime stats without probing storage" {
     var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed.value.storage_status.empty);
+}
+
+test "api http server storage status prefers direct lsm stats over runtime cache" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        runtime_status_calls: std.atomic.Value(u32) = .init(0),
+        lsm_status_calls: std.atomic.Value(u32) = .init(0),
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                    .lsm_storage_stats = lsmStorageStats,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn localRuntimeStatuses(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.runtime_status_calls.fetchAdd(1, .monotonic);
+            const items = try allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 7,
+                .stats = .{ .doc_count = 5 },
+                .lsm_storage_stats = .{
+                    .maintenance = .{
+                        .total_runs = 72,
+                        .total_run_bytes = 8246715092,
+                        .obsolete_paths = 133,
+                        .obsolete_paths_pinned_by_readers = 133,
+                    },
+                    .write = .{},
+                    .maintenance_score = 387208,
+                    .maintenance_debt_hint = 387209,
+                },
+            };
+            return .{ .items = items };
+        }
+
+        fn lsmStorageStats(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?table_reads.LsmStorageStats {
+            _ = allocator;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.lsm_status_calls.fetchAdd(1, .monotonic);
+            return .{
+                .maintenance = .{
+                    .total_runs = 9,
+                    .total_run_bytes = 4235293264,
+                    .obsolete_paths = 0,
+                    .obsolete_paths_pinned_by_readers = 0,
+                },
+                .write = .{},
+                .maintenance_score = 0,
+                .maintenance_debt_hint = 0,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
+    try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), reads.lsm_status_calls.load(.monotonic));
+    try std.testing.expectEqual(false, status.empty);
+    try std.testing.expectEqual(@as(u64, 9), status.lsm.?.run_count);
+    try std.testing.expectEqual(@as(u64, 4235293264), status.lsm.?.run_bytes);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_path_count);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_paths_pinned_by_readers);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.maintenance_score);
 }
 
 test "api http server serves local index runtime backfill status" {
