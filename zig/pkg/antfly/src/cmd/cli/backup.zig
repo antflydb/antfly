@@ -52,6 +52,11 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     const bid = backup_id orelse cli.fatal("--backup-id is required", .{});
 
     if (table_name) |tbl| {
+        if (format) |value| {
+            if (!std.mem.eql(u8, value, "native")) {
+                cli.fatal("portable table backups are not supported; omit --format or use --format native", .{});
+            }
+        }
         try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = format });
         std.debug.print("Backup command successful.\n", .{});
         return;
