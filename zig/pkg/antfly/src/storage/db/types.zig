@@ -429,6 +429,15 @@ pub const DocumentArtifactChildRange = struct {
     }
 };
 
+pub const DocumentArtifactChildRangePlacementUpdate = struct {
+    range_id: []const u8,
+    placement: []const u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]const u8 = null,
+    split_eligible: ?bool = null,
+};
+
 pub const DocumentArtifactManifest = struct {
     document_id: []u8,
     artifact_name: []u8,

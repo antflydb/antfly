@@ -4736,6 +4736,91 @@ pub const DB = struct {
         };
     }
 
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: types.DocumentArtifactChildRangePlacementUpdate,
+    ) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        };
+        defer alloc.free(manifest);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, manifest, .{ .allocate = .alloc_always });
+        if (manifest_value != .object) return error.InvalidArgument;
+        const child_ranges = manifest_value.object.getPtr("child_ranges") orelse return error.InvalidArgument;
+        if (child_ranges.* != .array) return error.InvalidArgument;
+
+        var changed = false;
+        for (child_ranges.array.items) |*item| {
+            if (item.* != .object) return error.InvalidArgument;
+            const range_id = item.object.get("range_id") orelse return error.InvalidArgument;
+            if (range_id != .string) return error.InvalidArgument;
+            if (!std.mem.eql(u8, range_id.string, update.range_id)) continue;
+
+            try putLeakyJsonStringField(arena_alloc, &item.object, "placement", update.placement);
+            if (update.owner_group_id) |owner_group_id| try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", owner_group_id);
+            if (update.placement_generation) |placement_generation| try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", placement_generation);
+            if (update.route_status) |route_status| try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", route_status);
+            if (update.split_eligible) |split_eligible| try item.object.put(arena_alloc, "split_eligible", .{ .bool = split_eligible });
+            changed = true;
+            break;
+        }
+
+        if (!changed) {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        }
+
+        const updated_manifest = try std.json.Stringify.valueAlloc(alloc, manifest_value, .{});
+        defer alloc.free(updated_manifest);
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{manifest_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = manifest_key,
+            .value = updated_manifest,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        self.notifyResolverReplayRuntimes(sequence);
+        return true;
+    }
+
     pub fn reprocessDocumentArtifact(
         self: *DB,
         alloc: Allocator,
@@ -11508,6 +11593,15 @@ pub const DB = struct {
 
 fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     db_query_projection.freeJsonValue(alloc, value);
+}
+
+fn putLeakyJsonStringField(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try obj.put(alloc, key, .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn putLeakyJsonU64Field(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: u64) !void {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidArgument;
+    try obj.put(alloc, key, .{ .integer = @intCast(value) });
 }
 
 fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
@@ -29544,6 +29638,31 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expectEqualStrings("unit_fingerprint", inspected.merge_operation_granularity);
     try std.testing.expect(inspected.merge_operation_count > 0);
     try std.testing.expect(inspected.state_json != null);
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7001,
+        .placement_generation = 2,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqualStrings("remote", moved.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7001), moved.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 2), moved.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("remote_committed", moved.child_ranges[0].route_status.?);
+    try std.testing.expectEqual(@as(?bool, true), moved.child_ranges[0].split_eligible);
+    try std.testing.expect(std.mem.indexOf(u8, moved.manifest_json, "\"owner_group_id\":7001") != null);
+    try std.testing.expect(!try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:missing",
+        .placement = "remote",
+    }));
+    try std.testing.expect(!try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:missing", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+    }));
 
     var artifact_list = try db.listDocumentArtifactManifests(alloc, "doc:a");
     defer artifact_list.deinit(alloc);
