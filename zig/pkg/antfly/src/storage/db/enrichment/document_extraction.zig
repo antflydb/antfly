@@ -106,12 +106,14 @@ const ExtractorType = enum {
     pdf,
     html,
     text,
+    email,
     unsupported,
 
     fn parse(value: []const u8) ?ExtractorType {
         if (std.mem.eql(u8, value, "pdf")) return .pdf;
         if (std.mem.eql(u8, value, "html")) return .html;
         if (std.mem.eql(u8, value, "text")) return .text;
+        if (std.mem.eql(u8, value, "email")) return .email;
         if (std.mem.eql(u8, value, "unsupported")) return .unsupported;
         return null;
     }
@@ -307,6 +309,9 @@ pub fn extractDownloadedAlloc(
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
     }
+    if (isEmailContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractEmailAlloc(alloc, downloaded.data, content_type, "email");
+    }
     if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);
     }
@@ -337,6 +342,7 @@ fn extractWithRouteAlloc(
         .pdf => try extractPdfAlloc(alloc, bytes, content_type),
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
+        .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
         .unsupported => try unsupportedResultAlloc(alloc, content_type, "matched_unsupported_route"),
     };
 }
@@ -450,6 +456,188 @@ fn extractSingleTextUnitAlloc(
     };
 }
 
+fn extractEmailAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    unit_prefix: []const u8,
+) !Result {
+    const split = emailHeaderBodySplit(bytes) orelse return try unsupportedResultAlloc(alloc, content_type, "invalid_rfc822_message");
+    const headers = bytes[0..split.header_end];
+    const body = bytes[split.body_start..];
+
+    var units = std.ArrayListUnmanaged(Unit).empty;
+    errdefer {
+        for (units.items) |*unit| unit.deinit(alloc);
+        units.deinit(alloc);
+    }
+
+    if (headers.len > 0) {
+        const header_text = try normalizeEmailHeaderTextAlloc(alloc, headers);
+        errdefer alloc.free(header_text);
+        if (header_text.len > 0) {
+            const unit_id = try std.fmt.allocPrint(alloc, "{s}:headers", .{unit_prefix});
+            errdefer alloc.free(unit_id);
+            try units.append(alloc, .{
+                .unit_id = unit_id,
+                .unit_type = try alloc.dupe(u8, "email_headers"),
+                .text = header_text,
+                .method = try alloc.dupe(u8, "email_rfc822"),
+                .char_start = 0,
+                .char_end = std.math.cast(u32, split.header_end),
+            });
+        } else {
+            alloc.free(header_text);
+        }
+    }
+
+    const body_text = try emailBodyTextAlloc(alloc, headers, body);
+    errdefer alloc.free(body_text);
+    if (body_text.len > 0) {
+        const unit_id = try std.fmt.allocPrint(alloc, "{s}:body", .{unit_prefix});
+        errdefer alloc.free(unit_id);
+        try units.append(alloc, .{
+            .unit_id = unit_id,
+            .unit_type = try alloc.dupe(u8, "email_body"),
+            .text = body_text,
+            .method = try alloc.dupe(u8, "email_rfc822"),
+            .char_start = std.math.cast(u32, split.body_start),
+            .char_end = std.math.cast(u32, bytes.len),
+        });
+    } else {
+        alloc.free(body_text);
+    }
+
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, "email"),
+        .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+const EmailHeaderBodySplit = struct {
+    header_end: usize,
+    body_start: usize,
+};
+
+fn emailHeaderBodySplit(bytes: []const u8) ?EmailHeaderBodySplit {
+    if (std.mem.indexOf(u8, bytes, "\r\n\r\n")) |pos| {
+        if (!looksLikeEmailHeaders(bytes[0..pos])) return null;
+        return .{ .header_end = pos, .body_start = pos + 4 };
+    }
+    if (std.mem.indexOf(u8, bytes, "\n\n")) |pos| {
+        if (!looksLikeEmailHeaders(bytes[0..pos])) return null;
+        return .{ .header_end = pos, .body_start = pos + 2 };
+    }
+    return null;
+}
+
+fn looksLikeEmailHeaders(headers: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |raw_line| {
+        const line = trimTrailingCarriageReturn(raw_line);
+        if (line.len == 0) continue;
+        if (line[0] == ' ' or line[0] == '\t') continue;
+        if (std.mem.indexOfScalar(u8, line, ':') != null) return true;
+    }
+    return false;
+}
+
+fn normalizeEmailHeaderTextAlloc(alloc: Allocator, headers: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    var first = true;
+    while (lines.next()) |raw_line| {
+        const line = trimTrailingCarriageReturn(raw_line);
+        if (line.len == 0) continue;
+        if (line[0] == ' ' or line[0] == '\t') {
+            try out.append(alloc, ' ');
+            try out.appendSlice(alloc, std.mem.trim(u8, line, " \t"));
+            continue;
+        }
+        if (!first) try out.append(alloc, '\n');
+        first = false;
+        try out.appendSlice(alloc, line);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn emailBodyTextAlloc(alloc: Allocator, headers: []const u8, body: []const u8) ![]u8 {
+    const encoding = emailHeaderValue(headers, "content-transfer-encoding") orelse "";
+    if (std.ascii.eqlIgnoreCase(encoding, "base64")) {
+        return decodeBase64BodyAlloc(alloc, body) catch try alloc.dupe(u8, body);
+    }
+    if (std.ascii.eqlIgnoreCase(encoding, "quoted-printable")) {
+        return try decodeQuotedPrintableAlloc(alloc, body);
+    }
+    return try alloc.dupe(u8, body);
+}
+
+fn emailHeaderValue(headers: []const u8, name_lower: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |raw_line| {
+        const line = trimTrailingCarriageReturn(raw_line);
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, name_lower)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn trimTrailingCarriageReturn(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
+}
+
+fn decodeBase64BodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    var compact = std.ArrayListUnmanaged(u8).empty;
+    defer compact.deinit(alloc);
+    for (body) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        try compact.append(alloc, byte);
+    }
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(compact.items);
+    const decoded = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, compact.items);
+    return decoded;
+}
+
+fn decodeQuotedPrintableAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < body.len) {
+        if (body[i] != '=') {
+            try out.append(alloc, body[i]);
+            i += 1;
+            continue;
+        }
+        if (i + 1 < body.len and body[i + 1] == '\n') {
+            i += 2;
+            continue;
+        }
+        if (i + 2 < body.len and body[i + 1] == '\r' and body[i + 2] == '\n') {
+            i += 3;
+            continue;
+        }
+        if (i + 2 < body.len) {
+            const hi = std.fmt.charToDigit(body[i + 1], 16) catch null;
+            const lo = std.fmt.charToDigit(body[i + 2], 16) catch null;
+            if (hi != null and lo != null) {
+                try out.append(alloc, @as(u8, @intCast(hi.? * 16 + lo.?)));
+                i += 3;
+                continue;
+            }
+        }
+        try out.append(alloc, body[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn htmlToTextAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -499,6 +687,12 @@ fn isHtmlContent(content_type: []const u8, filename: []const u8, source_url: []c
         return true;
     }
     return looksLikeHtml(bytes);
+}
+
+fn isEmailContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
+    if (contentTypeEquals(content_type, "message/rfc822")) return true;
+    if (hasExtension(filename, ".eml") or hasExtension(source_url, ".eml")) return true;
+    return contentTypeAllowsTextSniff(content_type) and emailHeaderBodySplit(bytes) != null;
 }
 
 fn isTextContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
@@ -687,6 +881,49 @@ test "document extraction sniffs utf8 text bytes without metadata" {
     try std.testing.expectEqualStrings("document:000001", result.units[0].unit_id);
     try std.testing.expectEqualStrings("document", result.units[0].unit_type);
     try std.testing.expectEqualStrings("plain text\nsecond line", result.units[0].text);
+}
+
+test "document extraction routes rfc822 email into header and body units" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "message/rfc822"),
+        .data = try alloc.dupe(u8, "Subject: Alpha\r\nFrom: a@example.test\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20world=\r\n!"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/message.eml", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("email", result.route_type);
+    try std.testing.expectEqual(@as(usize, 2), result.units.len);
+    try std.testing.expectEqualStrings("email:headers", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("email_headers", result.units[0].unit_type);
+    try std.testing.expect(std.mem.indexOf(u8, result.units[0].text, "Subject: Alpha") != null);
+    try std.testing.expectEqualStrings("email:body", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("email_body", result.units[1].unit_type);
+    try std.testing.expectEqualStrings("Hello world!", result.units[1].text);
+    try std.testing.expectEqualStrings("email_rfc822", result.units[1].method);
+}
+
+test "document extraction routes configured email extractor with unit prefix" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/octet-stream"),
+        .data = try alloc.dupe(u8, "Subject: Alpha\n\nBody"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var config = try parseConfig(alloc,
+        \\{"routes":[{"match":{"extension":"mail"},"extractor":{"type":"email","unit":"message"}}],"filename":"thread.mail"}
+    );
+    defer config.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/download", config);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("email", result.route_type);
+    try std.testing.expectEqual(@as(usize, 2), result.units.len);
+    try std.testing.expectEqualStrings("message:headers", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("message:body", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("Body", result.units[1].text);
 }
 
 test "document extraction applies source metadata fields from row json" {

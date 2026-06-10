@@ -392,7 +392,7 @@ Current implementation status:
 - `asset` enrichments can now use producer type `document_extraction`.
 - The producer is handled internally rather than by the external model-backed asset producer runtime.
 - The source field resolves to a URL, including `data:` URLs through the existing remote-content downloader path.
-- Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, and simple HTML into canonical units.
+- Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, simple HTML, and RFC 822 email into canonical units.
 - The initial route config now supports ordered built-in routes for `pdf`, `html`, `text`, and `unsupported` extractors, matched by exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
 - The default detector now sniffs PDF magic, common HTML prefixes, and valid UTF-8 plain text for missing or generic content-type metadata, so mixed-file tables can still produce canonical units when upstream file metadata is incomplete.
 - Route matching can hydrate effective filename and content type from per-row source metadata fields such as `source.filename_field` and `source.content_type_field`, so one mixed-file table can route documents without one enrichment per MIME type.
@@ -512,8 +512,12 @@ Still remaining in Phase 4:
 
 ### Phase 5: More file types and OCR fallback
 
-- Add DOCX, PPTX, XLSX, image OCR, scanned PDF fallback, email, archives, and audio transcripts.
+- Add DOCX, PPTX, XLSX, image OCR, scanned PDF fallback, archives, and audio transcripts.
 - Track extraction method, OCR use, page/section coordinates, and confidence in provenance metadata.
+
+Current implementation status:
+
+- RFC 822 email extraction now routes `message/rfc822` and `.eml` content into the canonical `document_units_v1` artifact, emitting deterministic `email_headers` and `email_body` units with `email_rfc822` provenance. The email body extractor decodes common `base64` and `quoted-printable` transfer encodings while keeping multipart/deeper MIME expansion as future work.
 
 ## Open Questions And Proposed Direction
 
