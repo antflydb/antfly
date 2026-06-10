@@ -216,6 +216,14 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
 }
 
+fn elapsedNsSince(start_ns: u128) u64 {
+    if (start_ns == 0) return 0;
+    const now = embedTimingNowNs();
+    if (now <= start_ns) return 0;
+    const elapsed = now - start_ns;
+    return @intCast(@min(elapsed, @as(u128, std.math.maxInt(u64))));
+}
+
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     var bytes: [8]u8 = undefined;
     try fillRandomBytes(&bytes);
@@ -1585,8 +1593,10 @@ pub const Node = struct {
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
+            const sparse_pipeline_start = embedTimingNowNs();
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            self.metrics.recordEmbedBatch(sparse_texts.len, totalTextBytes(sparse_texts), elapsedNsSince(sparse_pipeline_start));
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -1625,10 +1635,11 @@ pub const Node = struct {
                 .message = embedRequestOptionErrorMessage(err),
             });
         };
-        const pipeline_start = embedTimingStart();
+        const pipeline_start = embedTimingNowNs();
         const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
-        logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+        self.metrics.recordEmbedBatch(inputs.total_count, denseEmbedInputBytes(&inputs), elapsedNsSince(pipeline_start));
+        logEmbedTiming("embed.pipeline", inputs.total_count, if (embedTimingEnabled()) pipeline_start else 0);
         defer {
             for (embeddings) |e| ctx.allocator.free(e);
             ctx.allocator.free(embeddings);
@@ -6936,6 +6947,20 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.UnknownContentPartType => "unsupported content part type",
         else => "invalid embedding input",
     };
+}
+
+fn totalTextBytes(texts: []const []const u8) usize {
+    var total: usize = 0;
+    for (texts) |text| total += text.len;
+    return total;
+}
+
+fn denseEmbedInputBytes(inputs: *const ParsedDenseEmbedInputs) usize {
+    var total: usize = 0;
+    for (inputs.texts.items) |item| total += item.text.len;
+    for (inputs.images.items) |item| total += item.bytes.len;
+    for (inputs.audio.items) |item| total += item.bytes.len;
+    return total;
 }
 
 fn embedDenseInputs(

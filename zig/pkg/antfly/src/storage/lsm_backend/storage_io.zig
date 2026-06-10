@@ -31,7 +31,11 @@ const supports_posix_fd_cache = supports_native_storage and
 // dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
 // error sets that do not include it.
 const supports_evented_runtime = false;
-const max_cached_native_fds: usize = 1024;
+// Keep this per-store cache comfortably below common macOS soft fd limits.
+// A table can own several native LSM stores (primary, dense, text, etc.),
+// and oversized per-store caches can starve HTTP listeners of descriptors
+// during large loads with hundreds of table files.
+const max_cached_native_fds: usize = 64;
 const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
 const max_posix_io_chunk: usize = 64 * 1024 * 1024;
 
@@ -2343,6 +2347,29 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "native fd cache evicts to per-store budget" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+
+    const base_nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+    for (0..max_cached_native_fds + 8) |i| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-fd-cache-{d}-{d}", .{ base_nonce, i });
+        try native.storage().writeFileAbsolute(path, "x");
+        defer native.storage().deleteFileAbsolute(path) catch {};
+
+        const bytes = try native.storage().readFileAlloc(std.testing.allocator, path, 8);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings("x", bytes);
+    }
+
+    const stats = native.snapshotStats();
+    try std.testing.expect(stats.fd_cache_entries < stats.fd_cache_capacity);
+    try std.testing.expectEqual(max_cached_native_fds, stats.fd_cache_capacity);
 }
 
 test "native copied storage handle fails closed after owner deinit" {
