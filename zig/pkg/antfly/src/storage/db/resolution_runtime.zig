@@ -29,6 +29,7 @@ const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
+const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
@@ -119,6 +120,38 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, artifact_name: []
     return resolverForArtifact(resolvers, artifact_name) != null;
 }
 
+const ParsedSourceArtifactKey = struct {
+    doc_key: []u8,
+    artifact_name: []u8,
+    resolution_scope_key: []u8,
+
+    fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        alloc.free(self.resolution_scope_key);
+        self.* = undefined;
+    }
+};
+
+fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != .asset) return null;
+
+    const doc_key = try alloc.dupe(u8, artifact_ref.document_id);
+    errdefer alloc.free(doc_key);
+    const artifact_name = try alloc.dupe(u8, artifact_ref.name);
+    errdefer alloc.free(artifact_name);
+    const resolution_scope_key = if (artifact_ref.unit_id != null) try alloc.dupe(u8, key) else try alloc.dupe(u8, artifact_ref.document_id);
+    errdefer alloc.free(resolution_scope_key);
+
+    return .{
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+        .resolution_scope_key = resolution_scope_key,
+    };
+}
+
 pub fn resolverForResolutionArtifact(
     resolvers: []const ResolverConfig,
     resolution_artifact: []const u8,
@@ -183,9 +216,8 @@ pub fn processChangedExtraction(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !?ProcessOutcome {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
-    defer gpa.free(parsed.doc_key);
-    defer gpa.free(parsed.artifact_name);
+    var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
+    defer parsed.deinit(gpa);
 
     const cfg = resolverForArtifact(resolvers, parsed.artifact_name) orelse return null;
     return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder);
@@ -200,9 +232,8 @@ fn processChangedExtractionWithConfig(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !?ProcessOutcome {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return null;
-    defer gpa.free(parsed.doc_key);
-    defer gpa.free(parsed.artifact_name);
+    var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
+    defer parsed.deinit(gpa);
     if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) return null;
 
     var resolver = try resolver_lib.Resolver.initFromParts(
@@ -214,7 +245,7 @@ fn processChangedExtractionWithConfig(
     );
     defer resolver.deinit();
 
-    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.doc_key, cfg.resolution_artifact);
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
 
     // Candidate blocking: if configured and the caller didn't supply a provider,
@@ -261,7 +292,7 @@ fn processChangedExtractionWithConfig(
 
     // Human-curation overrides recorded for this document take precedence over
     // the scorer, and survive re-resolution (replay-stable curation).
-    const override_key = try reviewOverrideArtifactKeyAlloc(gpa, parsed.doc_key, cfg.source_artifact, cfg.resolution_artifact);
+    const override_key = try reviewOverrideArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.source_artifact, cfg.resolution_artifact);
     defer gpa.free(override_key);
     const override_raw = try store.get(gpa, override_key);
     defer if (override_raw) |r| gpa.free(r);
@@ -295,9 +326,8 @@ fn processChangedExtractionForAllResolvers(
     embedder: ?embedder_mod.DenseEmbedder,
     journal_keys: *std.ArrayListUnmanaged([]const u8),
 ) !usize {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(gpa, changed_key)) orelse return 0;
-    defer gpa.free(parsed.doc_key);
-    defer gpa.free(parsed.artifact_name);
+    var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return 0;
+    defer parsed.deinit(gpa);
 
     var processed: usize = 0;
     for (resolvers) |*cfg| {
@@ -852,11 +882,9 @@ fn sourceArtifactInSet(source_artifacts: []const []const u8, artifact_name: []co
 }
 
 fn assetSourceIndexMarkerKeyForAssetKeyAlloc(alloc: std.mem.Allocator, artifact_key: []const u8) !?[]u8 {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return null;
-    defer {
-        alloc.free(parsed.doc_key);
-        alloc.free(parsed.artifact_name);
-    }
+    var parsed = (try parseSourceArtifactKeyAlloc(alloc, artifact_key)) orelse return null;
+    defer parsed.deinit(alloc);
+    if (!std.mem.eql(u8, parsed.resolution_scope_key, parsed.doc_key)) return null;
     return try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
 }
 
@@ -922,10 +950,8 @@ fn reresolveAll(
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             _ = value;
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!internal_keys.isAssetArtifactKey(key)) return;
-            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
-            defer self.gpa.free(parsed.doc_key);
-            defer self.gpa.free(parsed.artifact_name);
+            var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
+            defer parsed.deinit(self.gpa);
             if (!resolverConsumesArtifact(self.resolvers, parsed.artifact_name)) return;
             try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
         }
@@ -998,11 +1024,8 @@ fn repairAssetSourceIndexWindow(
             if (self.last_scan_key) |previous| self.gpa.free(previous);
             self.last_scan_key = try self.gpa.dupe(u8, key);
 
-            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.gpa, key)) orelse return;
-            defer {
-                self.gpa.free(parsed.doc_key);
-                self.gpa.free(parsed.artifact_name);
-            }
+            var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
+            defer parsed.deinit(self.gpa);
             if (!sourceArtifactInSet(self.source_artifacts, parsed.artifact_name)) return;
             try self.candidates.append(self.gpa, try self.gpa.dupe(u8, key));
         }
@@ -1087,7 +1110,8 @@ pub fn enqueueReresolveBacklogWindow(
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (!internal_keys.isAssetArtifactKey(value)) return;
+            var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, value)) orelse return;
+            defer parsed.deinit(self.gpa);
             if (self.out.items.len >= self.limit) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
@@ -1939,6 +1963,38 @@ test "processChangedExtraction resolves and persists the resolution artifact" {
 
     // A non-asset key is ignored.
     try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, "not-an-artifact-key", null, null)) == null);
+}
+
+test "processChangedExtraction scopes unit asset resolution under the source artifact key" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "document_units_v1",
+        .resolution_artifact = "unit_resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(unit_key);
+    try map.store().put(unit_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    const outcome = (try processChangedExtraction(alloc, &resolvers, map.store(), null, unit_key, null, null)).?;
+    defer alloc.free(outcome.resolution_key);
+
+    const expected_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, unit_key, "unit_resolution_v1");
+    defer alloc.free(expected_resolution_key);
+    try testing.expectEqualStrings(expected_resolution_key, outcome.resolution_key);
+
+    const stored = (try map.store().get(alloc, expected_resolution_key)).?;
+    defer alloc.free(stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"person/ada_lovelace\"") != null);
 }
 
 test "resolveExtraction returns null when no resolver consumes the artifact" {

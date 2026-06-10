@@ -6028,6 +6028,24 @@ pub const DB = struct {
             try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
         }
 
+        const root_lower = [_]u8{internal_keys.user_namespace};
+        const root_upper = [_]u8{internal_keys.user_namespace + 1};
+        const resolution_rows = try self.core.store.scanRange(self.alloc, root_lower[0..], root_upper[0..]);
+        defer docstore_mod.DocStore.freeResults(self.alloc, resolution_rows);
+        for (resolution_rows) |row| {
+            const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(self.alloc, row.key)) orelse continue;
+            defer {
+                self.alloc.free(parsed.doc_key);
+                self.alloc.free(parsed.artifact_name);
+            }
+            if (!std.mem.eql(u8, parsed.artifact_name, cfg.resolution_artifact)) continue;
+            if (!containsDeleteKey(deletes.items, row.key)) {
+                try deletes.append(self.alloc, try self.alloc.dupe(u8, row.key));
+                try appendUniqueOwnedKey(self.alloc, &changed, row.key);
+            }
+            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        }
+
         if (deletes.items.len == 0 and changed.items.len == 0) return null;
 
         const sequence = self.core.reserveDerivedAppendSequence();
@@ -19011,12 +19029,32 @@ fn loadSourceExtractionForResolution(
     doc_key: []const u8,
     source_artifact: []const u8,
 ) !?[]u8 {
+    if (try sourceArtifactKeyFromResolutionScopeAlloc(alloc, doc_key, source_artifact)) |source_key| {
+        defer alloc.free(source_key);
+        return store.get(alloc, source_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
     const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
     defer alloc.free(extraction_key);
     return store.get(alloc, extraction_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+}
+
+fn sourceArtifactKeyFromResolutionScopeAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) !?[]u8 {
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != .asset) return null;
+    if (!std.mem.eql(u8, artifact_ref.name, source_artifact)) return null;
+    return try alloc.dupe(u8, doc_key);
+}
+
+fn sourceArtifactKeyForResolutionAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) ![]u8 {
+    if (try sourceArtifactKeyFromResolutionScopeAlloc(alloc, doc_key, source_artifact)) |source_key| return source_key;
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
 }
 
 fn extractionConfidenceForLocalId(entities: []const resolver_lib.ExtractedEntity, local_id: []const u8) ?f64 {
@@ -19123,7 +19161,7 @@ fn appendMentionEvidenceArtifactsFromResolution(
     else
         null;
     defer if (parsed_extraction) |*parsed| parsed.deinit();
-    const source_artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", cfg.source_artifact);
+    const source_artifact_key = try sourceArtifactKeyForResolutionAlloc(alloc, doc_key, cfg.source_artifact);
     defer alloc.free(source_artifact_key);
 
     for (parsed_resolution.entities) |entity| {
