@@ -44,6 +44,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
+const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
 
 /// applied-sequence checkpoint scope; also used by the replay prune watermark
 /// so resolution records survive until the worker consumes them.
@@ -110,19 +111,32 @@ pub fn resolverForArtifact(
     resolvers: []const ResolverConfig,
     artifact_name: []const u8,
 ) ?*const ResolverConfig {
+    return resolverForArtifactKind(resolvers, .asset, artifact_name);
+}
+
+pub fn resolverForArtifactKind(
+    resolvers: []const ResolverConfig,
+    source_artifact_kind: SourceArtifactKind,
+    artifact_name: []const u8,
+) ?*const ResolverConfig {
     for (resolvers) |*cfg| {
-        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) return cfg;
+        if (resolverMatchesArtifact(cfg, source_artifact_kind, artifact_name)) return cfg;
     }
     return null;
 }
 
-fn resolverConsumesArtifact(resolvers: []const ResolverConfig, artifact_name: []const u8) bool {
-    return resolverForArtifact(resolvers, artifact_name) != null;
+fn resolverMatchesArtifact(cfg: *const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
+    return cfg.source_artifact_kind.matches(source_artifact_kind) and std.mem.eql(u8, cfg.source_artifact, artifact_name);
+}
+
+fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_kind: SourceArtifactKind, artifact_name: []const u8) bool {
+    return resolverForArtifactKind(resolvers, source_artifact_kind, artifact_name) != null;
 }
 
 const ParsedSourceArtifactKey = struct {
     doc_key: []u8,
     artifact_name: []u8,
+    source_artifact_kind: SourceArtifactKind,
     resolution_scope_key: []u8,
 
     fn deinit(self: *ParsedSourceArtifactKey, alloc: std.mem.Allocator) void {
@@ -148,6 +162,11 @@ fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?Pars
     return .{
         .doc_key = doc_key,
         .artifact_name = artifact_name,
+        .source_artifact_kind = switch (artifact_ref.kind) {
+            .asset => .asset,
+            .chunk => .chunk,
+            else => unreachable,
+        },
         .resolution_scope_key = resolution_scope_key,
     };
 }
@@ -219,7 +238,7 @@ pub fn processChangedExtraction(
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
 
-    const cfg = resolverForArtifact(resolvers, parsed.artifact_name) orelse return null;
+    const cfg = resolverForArtifactKind(resolvers, parsed.source_artifact_kind, parsed.artifact_name) orelse return null;
     return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder);
 }
 
@@ -234,7 +253,7 @@ fn processChangedExtractionWithConfig(
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
-    if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) return null;
+    if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) return null;
 
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
@@ -331,7 +350,7 @@ fn processChangedExtractionForAllResolvers(
 
     var processed: usize = 0;
     for (resolvers) |*cfg| {
-        if (!std.mem.eql(u8, cfg.source_artifact, parsed.artifact_name)) continue;
+        if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) continue;
         const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder)) orelse continue;
         processed += 1;
         switch (outcome.result) {
@@ -874,9 +893,30 @@ fn appendUniqueBorrowedString(alloc: std.mem.Allocator, list: *std.ArrayListUnma
     try list.append(alloc, value);
 }
 
-fn sourceArtifactInSet(source_artifacts: []const []const u8, artifact_name: []const u8) bool {
+const SourceSubscription = struct {
+    kind: SourceArtifactKind,
+    artifact_name: []const u8,
+
+    fn matches(self: SourceSubscription, parsed: ParsedSourceArtifactKey) bool {
+        return self.kind.matches(parsed.source_artifact_kind) and std.mem.eql(u8, self.artifact_name, parsed.artifact_name);
+    }
+};
+
+fn appendUniqueSourceSubscription(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(SourceSubscription),
+    value: SourceSubscription,
+) !void {
+    if (value.artifact_name.len == 0) return;
+    for (list.items) |existing| {
+        if (existing.kind == value.kind and std.mem.eql(u8, existing.artifact_name, value.artifact_name)) return;
+    }
+    try list.append(alloc, value);
+}
+
+fn sourceArtifactInSet(source_artifacts: []const SourceSubscription, parsed: ParsedSourceArtifactKey) bool {
     for (source_artifacts) |source_artifact| {
-        if (std.mem.eql(u8, source_artifact, artifact_name)) return true;
+        if (source_artifact.matches(parsed)) return true;
     }
     return false;
 }
@@ -952,7 +992,7 @@ fn reresolveAll(
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer parsed.deinit(self.gpa);
-            if (!resolverConsumesArtifact(self.resolvers, parsed.artifact_name)) return;
+            if (!resolverConsumesArtifact(self.resolvers, parsed.source_artifact_kind, parsed.artifact_name)) return;
             try self.out.append(self.gpa, try self.gpa.dupe(u8, key));
         }
     };
@@ -988,7 +1028,7 @@ fn reresolveAll(
 fn repairAssetSourceIndexWindow(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
-    source_artifacts: []const []const u8,
+    source_artifacts: []const SourceSubscription,
     resume_after: ?[]const u8,
     max_records: usize,
     out: *std.ArrayListUnmanaged([]const u8),
@@ -1002,7 +1042,7 @@ fn repairAssetSourceIndexWindow(
 
     const Collector = struct {
         gpa: std.mem.Allocator,
-        source_artifacts: []const []const u8,
+        source_artifacts: []const SourceSubscription,
         resume_after: ?[]const u8,
         limit: usize,
         scanned: usize = 0,
@@ -1026,7 +1066,7 @@ fn repairAssetSourceIndexWindow(
 
             var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer parsed.deinit(self.gpa);
-            if (!sourceArtifactInSet(self.source_artifacts, parsed.artifact_name)) return;
+            if (!sourceArtifactInSet(self.source_artifacts, parsed)) return;
             try self.candidates.append(self.gpa, try self.gpa.dupe(u8, key));
         }
     };
@@ -1049,23 +1089,31 @@ fn repairAssetSourceIndexWindow(
         else => return err,
     };
 
-    var repaired: usize = 0;
+    var queued: usize = 0;
     for (candidate_keys.items) |asset_key| {
-        const marker_key = (try assetSourceIndexMarkerKeyForAssetKeyAlloc(gpa, asset_key)) orelse continue;
-        defer gpa.free(marker_key);
-        const existing = try store.get(gpa, marker_key);
-        defer if (existing) |raw| gpa.free(raw);
-        if (existing) |raw| {
-            if (std.mem.eql(u8, raw, asset_key)) continue;
+        var parsed = (try parseSourceArtifactKeyAlloc(gpa, asset_key)) orelse continue;
+        defer parsed.deinit(gpa);
+        if (parsed.source_artifact_kind == .asset) {
+            const marker_key = (try assetSourceIndexMarkerKeyForAssetKeyAlloc(gpa, asset_key)) orelse {
+                try out.append(gpa, try gpa.dupe(u8, asset_key));
+                queued += 1;
+                continue;
+            };
+            defer gpa.free(marker_key);
+            const existing = try store.get(gpa, marker_key);
+            defer if (existing) |raw| gpa.free(raw);
+            if (existing) |raw| {
+                if (std.mem.eql(u8, raw, asset_key)) continue;
+            }
+            try store.put(marker_key, asset_key);
         }
-        try store.put(marker_key, asset_key);
         try out.append(gpa, try gpa.dupe(u8, asset_key));
-        repaired += 1;
+        queued += 1;
     }
 
     const repair_complete = !collector.limit_reached;
     return .{
-        .queued = repaired,
+        .queued = queued,
         .complete = repair_complete,
         .repair_complete = repair_complete,
         .repair_resume_after = collector.last_scan_key,
@@ -1088,10 +1136,20 @@ pub fn enqueueReresolveBacklogWindow(
         for (asset_keys.items) |k| gpa.free(@constCast(k));
         asset_keys.deinit(gpa);
     }
-    var source_artifacts = std.ArrayListUnmanaged([]const u8).empty;
-    defer source_artifacts.deinit(gpa);
-    for (resolvers) |cfg| try appendUniqueBorrowedString(gpa, &source_artifacts, cfg.source_artifact);
-    std.mem.sort([]const u8, source_artifacts.items, {}, struct {
+    var source_subscriptions = std.ArrayListUnmanaged(SourceSubscription).empty;
+    defer source_subscriptions.deinit(gpa);
+    var asset_source_artifacts = std.ArrayListUnmanaged([]const u8).empty;
+    defer asset_source_artifacts.deinit(gpa);
+    for (resolvers) |cfg| {
+        try appendUniqueSourceSubscription(gpa, &source_subscriptions, .{
+            .kind = cfg.source_artifact_kind,
+            .artifact_name = cfg.source_artifact,
+        });
+        if (cfg.source_artifact_kind != .chunk) {
+            try appendUniqueBorrowedString(gpa, &asset_source_artifacts, cfg.source_artifact);
+        }
+    }
+    std.mem.sort([]const u8, asset_source_artifacts.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
@@ -1131,7 +1189,7 @@ pub fn enqueueReresolveBacklogWindow(
     errdefer if (collector.last_index_key) |key| gpa.free(key);
     var source_index_complete = true;
     if (resume_after != null) {
-        for (source_artifacts.items) |source_artifact| {
+        for (asset_source_artifacts.items) |source_artifact| {
             const prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(gpa, source_artifact);
             defer gpa.free(prefix);
             const upper = (try internal_keys.nextPrefixAlloc(gpa, prefix)) orelse continue;
@@ -1158,7 +1216,7 @@ pub fn enqueueReresolveBacklogWindow(
 
     const remaining = limit -| asset_keys.items.len;
     var repair_result: ReresolveEnqueueResult = if (repair_resume_after != null and remaining > 0)
-        try repairAssetSourceIndexWindow(gpa, store, source_artifacts.items, repair_resume_after, remaining, &asset_keys)
+        try repairAssetSourceIndexWindow(gpa, store, source_subscriptions.items, repair_resume_after, remaining, &asset_keys)
     else
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
@@ -2043,6 +2101,7 @@ test "processChangedExtraction scopes chunk artifact resolution under the source
         .name = "kg",
         .table = "entities",
         .source_artifact = "document_chunks_v1",
+        .source_artifact_kind = .chunk,
         .resolution_artifact = "chunk_resolution_v1",
         .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
         .config_generation = 1,
@@ -2069,6 +2128,29 @@ test "processChangedExtraction scopes chunk artifact resolution under the source
     try testing.expect(std.mem.indexOf(u8, stored, "\"person/ada_lovelace\"") != null);
 }
 
+test "processChangedExtraction ignores chunk artifacts without a chunk subscription" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "document_chunks_v1",
+        .resolution_artifact = "chunk_resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 0);
+    defer alloc.free(chunk_key);
+    try map.store().put(chunk_key,
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "Ada Lovelace" } ] }
+    );
+
+    try testing.expect((try processChangedExtraction(alloc, &resolvers, map.store(), null, chunk_key, null, null)) == null);
+}
+
 test "resolveExtraction returns null when no resolver consumes the artifact" {
     const alloc = testing.allocator;
     const resolvers = [_]ResolverConfig{.{
@@ -2081,6 +2163,7 @@ test "resolveExtraction returns null when no resolver consumes the artifact" {
     try testing.expect((try resolveExtraction(alloc, &resolvers, "other_artifact", test_extraction, &.{})) == null);
     try testing.expect(resolverForArtifact(&resolvers, "relations_v1") != null);
     try testing.expect(resolverForArtifact(&resolvers, "nope") == null);
+    try testing.expect(resolverForArtifactKind(&resolvers, .chunk, "relations_v1") == null);
 }
 
 /// In-memory store with the erased-store txn shape, for testing DbArtifactStore.
@@ -2695,6 +2778,42 @@ test "enqueueReresolveBacklogWindow repairs legacy asset source index markers" {
     const repaired_marker = (try store.get(alloc, marker_key)).?;
     defer alloc.free(repaired_marker);
     try testing.expectEqualStrings(extraction_key, repaired_marker);
+}
+
+test "enqueueReresolveBacklogWindow queues chunk source subscriptions from repair scans" {
+    const alloc = testing.allocator;
+    const resolvers = [_]ResolverConfig{.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "document_chunks_v1",
+        .source_artifact_kind = .chunk,
+        .resolution_artifact = "chunk_resolution_v1",
+        .key_template = "{{ slug _entity.text }}",
+        .config_generation = 1,
+    }};
+
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const store = map.store();
+
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 3);
+    defer alloc.free(chunk_key);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_chunks_v1");
+    defer alloc.free(asset_key);
+    try store.put(chunk_key, test_extraction);
+    try store.put(asset_key, test_extraction);
+
+    var writer = CaptureWriter{ .alloc = alloc };
+    defer writer.deinit();
+
+    var first = try enqueueReresolveBacklogWindow(alloc, store, &resolvers, "", "", 16, &writer, CaptureWriter.writeFn);
+    defer first.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), first.queued);
+    try testing.expect(first.complete);
+    try testing.expect(first.repair_complete);
+    try testing.expectEqual(@as(u64, 1), writer.calls);
+    try testing.expectEqual(@as(usize, 1), writer.keys.items.len);
+    try testing.expectEqualStrings(chunk_key, writer.keys.items[0]);
 }
 
 test "recordReviewDecision makes re-resolution honor a curated override" {

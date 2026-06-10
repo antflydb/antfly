@@ -501,6 +501,7 @@ Current implementation status:
 - Resolvers can consume dedicated mention artifacts using the `antfly.entity_mention.v1` single-mention schema (`local_id`/`id`, `label`, `text`, optional `confidence`, optional `embedding`) in addition to legacy extraction artifacts with an `entities` array.
 - Resolution replay now materializes first-class `antfly.resolution_mention.v1` evidence artifacts for canonical resolver decisions. Each artifact is keyed by source artifact, resolution artifact, and local mention ID, stores the resolver decision, canonical DocRef, mention text/label/confidence, and explicit mention/source/resolution artifact keys, and is retired through durable state alongside the existing doc-to-entity mention edges.
 - Resolver replay accepts unit asset artifacts and chunk artifacts as source artifacts and scopes their resolution artifacts under the source artifact key, so unit/chunk-level entity extraction can resolve without colliding at the parent document's resolution artifact key.
+- Resolver configs now declare a source subscription as `(source_artifact_kind, source_artifact)`, where the kind is `asset`, `chunk`, or `any`. The legacy default is `asset`, which preserves root/unit asset behavior; chunk-level mention streams opt into `chunk`, and bounded re-resolution repair scans enqueue matching chunk artifacts directly because they are shardable children rather than root asset-source-index entries.
 - Public hierarchy controls now accept `return_level: "mention"`. Query responses recognize `antfly.resolution_mention.v1` artifact hits and emit `hierarchy.level: "mention"` plus an `evidence` envelope with mention, canonical, resolver, source artifact, and resolution artifact references.
 - Canonical mention provenance edges now roll up the durable evidence behind the edge in metadata: `target_table`, `mention_count`, and `mention_artifact_keys`. Multiple local mentions that resolve to the same canonical entity remain one graph edge, but the graph edge keeps links back to all underlying mention artifacts.
 - Graph path response shaping now preserves edge metadata end-to-end, including local shortest-path results, distributed graph result cloning, remote graph result parsing, and public `PathEdge.metadata` JSON serialization. Mention provenance rollups can therefore surface through graph paths, not only through low-level edge reads.
@@ -631,7 +632,7 @@ Document extraction and entity mention extraction are evidence-producing enrichm
 Recommended direction:
 
 - Store `entity_mentions_v1` as derived child artifacts under source documents.
-- Feed mention artifacts into a resolver process for a configured entity namespace.
+- Feed mention artifacts into a resolver process through an explicit `(source_artifact_kind, source_artifact)` subscription for a configured entity namespace.
 - Store canonical entities as normal records in an entity table or dedicated graph namespace.
 - Store evidence links from canonical entities/edges back to mention artifacts.
 - Re-run resolution incrementally when mention artifacts change.
@@ -693,7 +694,7 @@ The high-level model is settled enough to start implementation. The pieces that 
 - Split thresholds: the first unit-level defaults are implemented and manifest-recorded as 256 units or 1 MiB of unit text per range. Oversized single units remain one unit range, while their derived chunks split on chunk boundaries with 256 chunks per range.
 - File route config: the first public shape is `route_preset` plus limited ordered overrides, with `mixed_files` as the default built-in route preset and `explicit_only` as the fail-closed mode. Future design work can decide whether to expose named preset variants beyond those two.
 - Reprocessing semantics: background job scheduling, priority, concurrency, per-shard cursors, and durable progress reporting beyond the bounded synchronous table-range repair endpoint.
-- Entity resolver contract: how mention artifacts are subscribed into canonical graph/entity namespaces.
+- Entity resolver namespace policy: the durable subscription contract now exists; the remaining product/API decision is how resolver names, canonical entity tables, and graph namespaces are governed across tenants and teams.
 
 These should be resolved as separate implementation RFCs once Phase 1 proves the artifact layout and extraction lifecycle.
 

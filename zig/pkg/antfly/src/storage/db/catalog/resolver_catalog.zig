@@ -44,13 +44,29 @@ pub fn fusionStrategy(name: []const u8) ?matcher.FusionStrategy {
     return null;
 }
 
+pub const ResolverSourceArtifactKind = enum {
+    /// Root and unit-scoped asset artifacts. This is the legacy default.
+    asset,
+    /// Chunk-scoped artifacts produced under an asset or unit.
+    chunk,
+    /// Consume every artifact kind with the configured artifact name.
+    any,
+
+    pub fn matches(self: ResolverSourceArtifactKind, actual: ResolverSourceArtifactKind) bool {
+        return self == .any or self == actual;
+    }
+};
+
 pub const ResolverConfig = struct {
     /// Catalog name of the resolver.
     name: []const u8,
     /// Entity table that canonical entities live in.
     table: []const u8,
-    /// Extraction artifact this resolver consumes (asset artifact name).
+    /// Extraction artifact this resolver consumes.
     source_artifact: []const u8,
+    /// Kind of extraction artifact this resolver consumes. Existing configs
+    /// default to asset artifacts; chunk-level mention streams must opt in.
+    source_artifact_kind: ResolverSourceArtifactKind = .asset,
     /// Resolution artifact this resolver writes.
     resolution_artifact: []const u8,
     /// Template that renders a canonical entity key from a mention.
@@ -99,6 +115,7 @@ pub const ResolverConfig = struct {
             .name = try alloc.dupe(u8, cfg.name),
             .table = try alloc.dupe(u8, cfg.table),
             .source_artifact = try alloc.dupe(u8, cfg.source_artifact),
+            .source_artifact_kind = cfg.source_artifact_kind,
             .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
             .key_template = try alloc.dupe(u8, cfg.key_template),
             .type_must_match = cfg.type_must_match,
@@ -193,6 +210,7 @@ test "resolver catalog round trip" {
             .name = "knowledge_graph",
             .table = "entities",
             .source_artifact = "relations_v1",
+            .source_artifact_kind = .chunk,
             .resolution_artifact = "resolution_v1",
             .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
             .scorer_json = "{\"comparisons\":[],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}",
@@ -219,6 +237,7 @@ test "resolver catalog round trip" {
     try std.testing.expectEqualStrings("knowledge_graph", decoded[0].name);
     try std.testing.expectEqualStrings("entities", decoded[0].table);
     try std.testing.expectEqualStrings("relations_v1", decoded[0].source_artifact);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.chunk, decoded[0].source_artifact_kind);
     try std.testing.expectEqualStrings("resolution_v1", decoded[0].resolution_artifact);
     try std.testing.expectEqualStrings("{{ lower _entity.label }}/{{ slug _entity.canonical_text }}", decoded[0].key_template);
     try std.testing.expect(decoded[0].type_must_match);
@@ -226,6 +245,7 @@ test "resolver catalog round trip" {
     try std.testing.expect(decoded[0].scorer_json.len > 0);
 
     try std.testing.expectEqualStrings("people_only", decoded[1].name);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.asset, decoded[1].source_artifact_kind);
     try std.testing.expect(!decoded[1].type_must_match);
     try std.testing.expectEqual(@as(usize, 0), decoded[1].scorer_json.len);
     try std.testing.expectEqual(@as(u64, 0), decoded[1].config_generation);
@@ -239,6 +259,29 @@ test "resolver catalog round trip preserves order and empty list" {
     const decoded_empty = try deserializeCatalog(alloc, empty);
     defer alloc.free(decoded_empty);
     try std.testing.expectEqual(@as(usize, 0), decoded_empty.len);
+}
+
+test "resolver catalog defaults legacy source artifact kind to asset" {
+    const alloc = std.testing.allocator;
+
+    const decoded = try deserializeCatalog(alloc,
+        \\[
+        \\  {
+        \\    "name": "legacy",
+        \\    "table": "entities",
+        \\    "source_artifact": "relations_v1",
+        \\    "resolution_artifact": "resolution_v1",
+        \\    "key_template": "{{ slug _entity.text }}"
+        \\  }
+        \\]
+    );
+    defer {
+        for (decoded) |*cfg| cfg.deinit(alloc);
+        alloc.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.asset, decoded[0].source_artifact_kind);
 }
 
 test "resolver config validates fusion strategy and folds confidence into the weight" {
