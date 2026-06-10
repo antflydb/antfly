@@ -5705,6 +5705,7 @@ pub const DB = struct {
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);
         }
@@ -5715,6 +5716,7 @@ pub const DB = struct {
                 .target = try alloc.dupe(u8, item.target),
                 .edge_type = try alloc.dupe(u8, item.edge_type),
                 .weight = item.weight,
+                .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
             };
             initialized_edges += 1;
             total_weight += item.weight;

@@ -1309,6 +1309,7 @@ pub const GraphPatternMatch = struct {
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
         self.* = undefined;

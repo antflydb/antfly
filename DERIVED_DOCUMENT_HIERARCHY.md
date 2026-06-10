@@ -496,11 +496,12 @@ Current implementation status:
 - Resolver replay accepts unit asset artifacts and chunk artifacts as source artifacts and scopes their resolution artifacts under the source artifact key, so unit/chunk-level entity extraction can resolve without colliding at the parent document's resolution artifact key.
 - Public hierarchy controls now accept `return_level: "mention"`. Query responses recognize `antfly.resolution_mention.v1` artifact hits and emit `hierarchy.level: "mention"` plus an `evidence` envelope with mention, canonical, resolver, source artifact, and resolution artifact references.
 - Canonical mention provenance edges now roll up the durable evidence behind the edge in metadata: `target_table`, `mention_count`, and `mention_artifact_keys`. Multiple local mentions that resolve to the same canonical entity remain one graph edge, but the graph edge keeps links back to all underlying mention artifacts.
+- Graph path response shaping now preserves edge metadata end-to-end, including local shortest-path results, distributed graph result cloning, remote graph result parsing, and public `PathEdge.metadata` JSON serialization. Mention provenance rollups can therefore surface through graph paths, not only through low-level edge reads.
 
 Still remaining in Phase 4:
 
 - Extend the same resolver/source-artifact contract to dedicated mention artifacts.
-- Extend graph-neighborhood evidence rollups beyond mention-edge metadata into richer neighborhood response shaping for canonical entities/edges.
+- Extend graph-neighborhood evidence rollups beyond path edge metadata into richer canonical entity/edge response envelopes.
 
 ### Phase 5: More file types and OCR fallback
 

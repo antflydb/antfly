@@ -3382,9 +3382,15 @@ fn toOpenApiPathEdges(
             .target = edge.target,
             .type = edge.edge_type,
             .weight = edge.weight,
+            .metadata = try pathEdgeMetadataJsonValue(alloc, edge.metadata),
         };
     }
     return out;
+}
+
+fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
+    if (metadata.len == 0) return null;
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
 }
 
 fn toOpenApiOptionalPathEdges(
@@ -3399,7 +3405,7 @@ test "api query contract preserves algebraic graph path provenance" {
     const alloc = std.testing.allocator;
     const path_nodes: []const []const u8 = &.{ "A", "B", "C" };
     const path_edges: []const graph_query_mod.PathEdgeInfo = &.{
-        .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0 },
+        .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2}" },
         .{ .source = "B", .target = "C", .edge_type = "e", .weight = 3.0 },
     };
     const provenance: []const []const u8 = &.{ "A\x1fe\x1fB", "B\x1fe\x1fC" };
@@ -3435,6 +3441,7 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqual(@as(usize, 2), encoded[0].path_edges.?.len);
     try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type.?);
     try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight.?);
+    try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.object.get("mention_count").?.integer);
     try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
     try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
     try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);

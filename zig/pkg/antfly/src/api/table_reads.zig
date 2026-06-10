@@ -13306,6 +13306,7 @@ fn cloneRemoteGraphNodePathEdges(
             .target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest),
             .edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest),
             .weight = item.weight orelse return error.InvalidQueryRequest,
+            .metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "",
         };
     }
     return edges;
@@ -13339,6 +13340,7 @@ fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
             .target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest),
             .edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest),
             .weight = item.weight orelse return error.InvalidQueryRequest,
+            .metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "",
         };
     }
     return edges;
