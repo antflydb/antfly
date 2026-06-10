@@ -480,11 +480,12 @@ Current implementation status:
 - The distributed write abstraction, hosted/provisioned sources, HTTP client, and internal group write route now expose that child-range placement update, so a split worker can advance a parent-owned manifest even when the parent group leader is remote to the caller.
 - Sync and async document extraction rebuilds preserve existing child-range placement metadata by stable range descriptor identity, preventing a later reprocess from resetting a split range back to parent-owned/local defaults.
 - Unit and chunk child artifact payloads now carry descriptor-derived range routing fields (`_artifact_range_id`, `_artifact_range_kind`, `_artifact_route_status`, `_artifact_owner_group_id`). Local writers derive those values from the same deterministic child range ordering as the manifest, and forced reprocess rewrites unchanged child records with the current descriptor route metadata instead of resetting them to local defaults.
+- The DB storage layer now has a direct child-range artifact apply primitive that can commit internal artifact writes/deletes plus the derived replay record on a destination shard without reclassifying child artifacts as user source rows.
 - Manifests now include a durable `coverage_plan` stating that full-text replay remains `stored_artifact_required`, replay suppression is false, and coverage watermarks are required before any future suppression. This keeps stable-unit replay correctness explicit rather than relying on an implicit code-path convention.
 
 Still remaining in Phase 3:
 
-- Route child writes and deletes to remote child-range owners when descriptors no longer point at the parent shard.
+- Expose the child-range artifact apply primitive through internal group routing and use it when descriptors no longer point at the parent shard.
 - Add the automatic split trigger that calls the durable child-range placement update when an artifact range actually moves away from the parent shard.
 
 ### Phase 4: Graph extraction over units

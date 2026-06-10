@@ -203,6 +203,16 @@ pub const ReplayProgress = struct {
     active: bool = false,
 };
 
+pub const DocumentArtifactChildRangeApplyBatch = struct {
+    artifact_writes: []const types.BatchWrite = &.{},
+    artifact_delete_keys: []const []const u8 = &.{},
+    documents: []const derived_types.DerivedDocument = &.{},
+    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
+    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
+    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
+    sync_level: types.SyncLevel = .full_index,
+};
+
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
 
 pub const QueryVisibilityChange = enum {
@@ -3495,6 +3505,152 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
         });
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (child_batch.artifact_writes.len == 0 and
+            child_batch.artifact_delete_keys.len == 0 and
+            child_batch.documents.len == 0 and
+            child_batch.dense_embeddings.len == 0 and
+            child_batch.sparse_embeddings.len == 0 and
+            child_batch.generated_enrichment_refs.len == 0)
+        {
+            return 0;
+        }
+
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer store_writes.deinit(self.alloc);
+        var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer delete_keys.deinit(self.alloc);
+        var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_keys.items) |key| self.alloc.free(key);
+            owned_store_keys.deinit(self.alloc);
+        }
+        var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_values.items) |value| self.alloc.free(value);
+            owned_store_values.deinit(self.alloc);
+        }
+        var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_delete_keys.items) |key| self.alloc.free(key);
+            owned_delete_keys.deinit(self.alloc);
+        }
+        var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed_artifact_keys.items) |key| self.alloc.free(key);
+            changed_artifact_keys.deinit(self.alloc);
+        }
+        var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (materialized_graph_artifact_writes.items) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            materialized_graph_artifact_writes.deinit(self.alloc);
+        }
+
+        for (child_batch.artifact_writes) |write| {
+            try store_writes.append(self.alloc, .{
+                .key = write.key,
+                .value = write.value,
+            });
+            try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, write.key);
+        }
+        for (child_batch.artifact_delete_keys) |key| {
+            try delete_keys.append(self.alloc, key);
+            if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+                try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, key);
+            }
+        }
+
+        try appendPrecomputedGraphSourceArtifacts(
+            self,
+            child_batch.artifact_writes,
+            child_batch.artifact_delete_keys,
+            &materialized_graph_artifact_writes,
+            &store_writes,
+            &delete_keys,
+            &owned_delete_keys,
+            &changed_artifact_keys,
+        );
+
+        if (child_batch.artifact_writes.len > 0 or materialized_graph_artifact_writes.items.len > 0) {
+            try self.core.appendArtifactPresenceMarker(&store_writes);
+        }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            child_batch.artifact_delete_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const derived_seed = derived_types.DerivedBatch{
+            .sequence = sequence,
+            .documents = child_batch.documents,
+            .deleted_keys = child_batch.artifact_delete_keys,
+            .changed_artifact_keys = changed_artifact_keys.items,
+            .dense_embeddings = child_batch.dense_embeddings,
+            .sparse_embeddings = child_batch.sparse_embeddings,
+            .generated_enrichment_refs = child_batch.generated_enrichment_refs,
+        };
+        var derived_batch = try derived_types.cloneBatch(self.alloc, derived_seed);
+        defer derived_types.deinitDerivedBatch(self.alloc, &derived_batch);
+        derived_batch.sequence = sequence;
+
+        var sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, derived_batch);
+        defer sync_targets.deinit(self.alloc);
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(
+            self.backend_runtime.io(),
+            store_writes.items,
+            delete_keys.items,
+            .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            },
+        );
+        if (shouldAppendSplitDelta(self)) {
+            try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
+        }
+
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        var pressure_ctx = self.batchContext();
+        try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
+        try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, child_batch.sync_level, sync_targets);
+        if (self.executor.hasWorkers()) {
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, child_batch.sync_level, sequence, sync_targets);
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        } else {
+            if (syncLevelRequiresDerivedVisibility(child_batch.sync_level)) {
+                if (child_batch.sync_level == .full_text) {
+                    try applyDerivedBatchTargetsProfiled(self, derived_batch, sync_targets.full_text_indexes, null);
+                } else {
+                    try applyDerivedBatchProfiled(self, derived_batch, null);
+                }
+            }
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        }
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        return sequence;
     }
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
@@ -29618,6 +29774,51 @@ test "db document extraction skips stable unit local rewrites without text consu
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+}
+
+test "db applies document artifact child range batch without source row write" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const artifact_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(artifact_key);
+    const artifact_value =
+        "{\"_parent_doc_key\":\"doc:a\",\"_artifact_name\":\"document_units_v1\",\"_artifact_range_id\":\"range:000000\",\"_artifact_range_kind\":\"unit\",\"_artifact_route_status\":\"remote_committed\",\"_artifact_owner_group_id\":7002,\"unit_id\":\"page:000001\",\"text\":\"alpha\"}";
+    const writes = [_]types.BatchWrite{.{
+        .key = artifact_key,
+        .value = artifact_value,
+    }};
+
+    const sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = writes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(sequence > 0);
+
+    const stored = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(artifact_value, stored);
+
+    const source_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(source_store_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, source_store_key));
+
+    const deletes = [_][]const u8{artifact_key};
+    const delete_sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(delete_sequence > sequence);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
 }
 
 test "db document extraction manifest inspection and reprocess API" {
