@@ -59,6 +59,7 @@ pub const ProvenanceOptions = struct {
     page_rotation: ?i32 = null,
     extraction_method: ?[]const u8 = null,
     extraction_status: ?[]const u8 = null,
+    confidence: ?f64 = null,
     ocr_used: bool = false,
     ocr_confidence: ?f64 = null,
     ocr_bbox: ?[4]f64 = null,
@@ -137,6 +138,7 @@ fn appendProvenanceFields(
     if (options.page_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "page_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
     if (options.page_rotation) |value| try provenance.put(alloc, try alloc.dupe(u8, "page_rotation"), .{ .integer = value });
     if (options.extraction_status) |value| try putString(alloc, &provenance, "extraction_status", value);
+    if (options.confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
     try provenance.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     if (options.ocr_confidence) |value| try provenance.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
     if (options.ocr_bbox) |bbox| try provenance.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
@@ -178,7 +180,7 @@ fn appendFormatProvenance(
     provenance: *std.json.ObjectMap,
     options: ProvenanceOptions,
 ) !void {
-    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and !options.ocr_used and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
+    if (options.page_number == null and options.page_label == null and options.page_bbox == null and options.page_rotation == null and options.extraction_status == null and options.confidence == null and !options.ocr_used and options.ocr_confidence == null and options.ocr_bbox == null and !options.transcript_used and options.transcript_confidence == null and options.extraction_warning == null) return;
 
     var format = std.json.ObjectMap.empty;
     errdefer {
@@ -194,6 +196,7 @@ fn appendFormatProvenance(
     try putString(alloc, &format, "coordinate_system", "source_page_points");
     try putString(alloc, &format, "extraction_method", options.extraction_method orelse "mechanical_text");
     if (options.extraction_status) |value| try putString(alloc, &format, "extraction_status", value);
+    if (options.confidence) |value| try format.put(alloc, try alloc.dupe(u8, "confidence"), .{ .float = value });
     try format.put(alloc, try alloc.dupe(u8, "ocr_used"), .{ .bool = options.ocr_used });
     if (options.ocr_confidence) |value| try format.put(alloc, try alloc.dupe(u8, "ocr_confidence"), .{ .float = value });
     if (options.ocr_bbox) |bbox| try format.put(alloc, try alloc.dupe(u8, "ocr_bbox"), .{ .array = try jsonFloatArrayAlloc(alloc, &bbox) });
@@ -298,6 +301,7 @@ test "append artifact fields stores unit-local and document-global provenance" {
         .page_bbox = .{ 0, 0, 612, 792 },
         .page_rotation = 90,
         .extraction_method = "pdf_text",
+        .confidence = 0.94,
     });
     const provenance = obj.get("provenance").?.object;
     try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
@@ -314,6 +318,8 @@ test "append artifact fields stores unit-local and document-global provenance" {
     try std.testing.expectEqualStrings("antfly.document_format_provenance.v1", format_provenance.get("schema").?.string);
     try std.testing.expectEqualStrings("source_page_points", format_provenance.get("coordinate_system").?.string);
     try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
+    try std.testing.expectEqual(@as(f64, 0.94), provenance.get("confidence").?.float);
+    try std.testing.expectEqual(@as(f64, 0.94), format_provenance.get("confidence").?.float);
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
     try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);

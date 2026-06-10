@@ -14063,6 +14063,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_rotation = unit.page_rotation,
         .extraction_method = unit.method,
         .extraction_status = unit.extraction_status,
+        .confidence = documentUnitConfidence(unit),
         .ocr_used = unit.ocr_used,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
@@ -14305,6 +14306,7 @@ fn documentUnitPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
+        .confidence = documentUnitConfidence(unit),
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -14316,6 +14318,7 @@ fn documentUnitPayloadAlloc(
             .extraction_status = unit.extraction_status,
             .source_sha256 = unit.source_sha256,
             .byte_length = unit.byte_length,
+            .confidence = documentUnitConfidence(unit),
             .ocr_used = unit.ocr_used,
             .ocr_confidence = unit.ocr_confidence,
             .ocr_bbox = unit.ocr_bbox,
@@ -14338,6 +14341,7 @@ fn documentUnitPayloadAlloc(
                 .extraction_status = unit.extraction_status,
                 .source_sha256 = unit.source_sha256,
                 .byte_length = unit.byte_length,
+                .confidence = documentUnitConfidence(unit),
                 .ocr_used = unit.ocr_used,
                 .ocr_confidence = unit.ocr_confidence,
                 .ocr_bbox = unit.ocr_bbox,
@@ -14351,6 +14355,10 @@ fn documentUnitPayloadAlloc(
             },
         },
     }, .{});
+}
+
+fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
+    return unit.ocr_confidence orelse unit.transcript_confidence;
 }
 
 const document_extraction_range_target_children = 256;
@@ -30707,6 +30715,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("invoice total", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("ocr_confidence").?.float, 0.0001);
     const bbox = parsed.value.object.get("ocr_bbox").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), bbox.len);
@@ -30714,6 +30723,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
     try std.testing.expectApproxEqAbs(@as(f64, 42), jsonTestNumber(bbox[3]), 0.0001);
     try std.testing.expectEqualStrings("low contrast", parsed.value.object.get("extraction_warning").?.string);
     const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("ocr_confidence").?.float, 0.0001);
     try std.testing.expectEqualStrings("low contrast", provenance.get("extraction_warning").?.string);
 }
@@ -30767,8 +30777,10 @@ test "db document extraction completes audio transcription with transcriber prod
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("spoken words", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), parsed.value.object.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), parsed.value.object.get("transcript_confidence").?.float, 0.0001);
     const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("transcript_confidence").?.float, 0.0001);
 }
 

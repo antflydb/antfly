@@ -2269,6 +2269,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_rotation = unit.page_rotation,
         .extraction_method = unit.method,
         .extraction_status = unit.extraction_status,
+        .confidence = documentUnitConfidence(unit),
         .ocr_used = unit.ocr_used,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
@@ -4318,6 +4319,7 @@ fn documentUnitPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
+        .confidence = documentUnitConfidence(unit),
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -4329,6 +4331,7 @@ fn documentUnitPayloadAlloc(
             .extraction_status = unit.extraction_status,
             .source_sha256 = unit.source_sha256,
             .byte_length = unit.byte_length,
+            .confidence = documentUnitConfidence(unit),
             .ocr_used = unit.ocr_used,
             .ocr_confidence = unit.ocr_confidence,
             .ocr_bbox = unit.ocr_bbox,
@@ -4351,6 +4354,7 @@ fn documentUnitPayloadAlloc(
                 .extraction_status = unit.extraction_status,
                 .source_sha256 = unit.source_sha256,
                 .byte_length = unit.byte_length,
+                .confidence = documentUnitConfidence(unit),
                 .ocr_used = unit.ocr_used,
                 .ocr_confidence = unit.ocr_confidence,
                 .ocr_bbox = unit.ocr_bbox,
@@ -4364,6 +4368,10 @@ fn documentUnitPayloadAlloc(
             },
         },
     }, .{});
+}
+
+fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
+    return unit.ocr_confidence orelse unit.transcript_confidence;
 }
 
 const document_extraction_range_target_children = 256;
