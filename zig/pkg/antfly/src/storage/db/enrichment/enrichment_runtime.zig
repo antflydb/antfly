@@ -1785,22 +1785,54 @@ fn processDocumentExtractionAsset(
         deletes.deinit(runtime.alloc);
     }
 
+    var previous_unit_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
+    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
+    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
+    var previous_chunk_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
     if (existing_state) |state| {
-        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-        for (previous_keys) |previous_key| {
+        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
+        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+    }
+
+    if (existing_state != null) {
+        for (previous_unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         }
-        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
         for (previous_chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         }
     }
+
+    const in_progress_manifest = try documentExtractionManifestPayloadAlloc(
+        runtime.alloc,
+        request.doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        extraction,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        from_generation,
+        from_generation,
+        to_generation,
+        "in_progress",
+    );
+    defer runtime.alloc.free(in_progress_manifest);
+    const in_progress_key = try runtime.alloc.dupe(u8, manifest_key);
+    defer runtime.alloc.free(in_progress_key);
+    const in_progress_writes = [_]KVPair{.{ .key = in_progress_key, .value = in_progress_manifest }};
+    try storePutBatchWithRetry(runtime, in_progress_writes[0..], &.{});
 
     const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, false);
     defer {
@@ -1842,18 +1874,6 @@ fn processDocumentExtractionAsset(
         try appendRuntimeDocumentUnitChunkWrites(runtime, request.doc_key, artifact_name, unit_key, unit, &writes, window);
     }
 
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
-    if (existing_state) |state| {
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
-    }
-
     const manifest = try documentExtractionManifestPayloadAlloc(
         runtime.alloc,
         request.doc_key,
@@ -1867,8 +1887,10 @@ fn processDocumentExtractionAsset(
         previous_unit_keys,
         previous_unit_descriptors,
         previous_chunk_keys,
+        to_generation,
         from_generation,
         to_generation,
+        "converged",
     );
     errdefer runtime.alloc.free(manifest);
     try writes.append(runtime.alloc, .{
@@ -4284,8 +4306,10 @@ fn documentExtractionManifestPayloadAlloc(
     previous_unit_keys: []const []const u8,
     previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
     previous_chunk_keys: []const []const u8,
+    manifest_generation: u64,
     from_generation: u64,
     to_generation: u64,
+    merge_status: []const u8,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -4295,7 +4319,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
     try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
     try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
-    try appendJsonFieldU64(alloc, &out, &first, "generation", to_generation);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
     try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
@@ -4315,7 +4339,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
     try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
     try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
-    try appendJsonFieldString(alloc, &out, &merge_first, "status", "converged");
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", merge_status);
     try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
     try appendJsonFieldName(alloc, &out, &merge_first, "operations");
     try out.append(alloc, '[');
@@ -5112,8 +5136,10 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         &previous_unit_keys,
         &previous_descriptors,
         &previous_chunk_keys,
+        5,
         4,
         5,
+        "converged",
     );
     defer alloc.free(manifest);
 
@@ -5124,6 +5150,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"text_bytes\":11") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"merge_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
@@ -5132,6 +5159,30 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"delete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+
+    const in_progress = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:text/plain,same",
+        "source-fingerprint",
+        extraction,
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        4,
+        4,
+        5,
+        "in_progress",
+    );
+    defer alloc.free(in_progress);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"from_generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"to_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"status\":\"in_progress\"") != null);
 }
 
 test "extractSourceText with template renders all document fields" {

@@ -473,13 +473,13 @@ Current implementation status:
 - Stable units whose unit fingerprint matches previous state can skip local artifact rewrites and embedding regeneration when the stored unit, chunk, and embedding artifacts already exist.
 - Full-text consumers for stable units are still routed through derived-document upserts that read from the stored unit/chunk artifacts. This avoids silent index holes without requiring the producer to prove every text shard already contains the child document.
 - The first implementation records range placement as `parent`; it establishes the parent-owned descriptor contract without moving child writes to separate shards yet.
+- Asynchronous document extraction now durably writes an `in_progress` merge plan before child artifact writes and replaces it with the converged plan after the child range batch commits. The in-progress manifest keeps the last committed generation while its merge plan records the intended `to_generation`, so replay after a crash does not skip a generation.
 
 Still remaining in Phase 3:
 
 - Route child writes and deletes through range descriptors instead of writing every child locally with the parent batch.
 - Add ownership and placement updates when an artifact range splits away from the parent shard.
 - Add durable coverage/watermark checks if we want to suppress even the stored-artifact full-text replay for already-covered child documents.
-- Make merge plans durable in an in-progress state for asynchronous child-range workers rather than only writing the converged summary after local synchronous work.
 
 ### Phase 4: Graph extraction over units
 

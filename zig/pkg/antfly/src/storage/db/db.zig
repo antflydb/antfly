@@ -13053,8 +13053,10 @@ fn computeDocumentExtractionAssetRequestDerived(
         previous_unit_keys,
         previous_unit_descriptors,
         previous_chunk_keys,
+        to_generation,
         from_generation,
         to_generation,
+        "converged",
     );
     defer alloc.free(manifest);
     try artifact_writes.append(alloc, .{
@@ -14082,8 +14084,10 @@ fn documentExtractionManifestPayloadAlloc(
     previous_unit_keys: []const []const u8,
     previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
     previous_chunk_keys: []const []const u8,
+    manifest_generation: u64,
     from_generation: u64,
     to_generation: u64,
+    merge_status: []const u8,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -14093,7 +14097,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
     try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
     try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
-    try appendJsonFieldU64(alloc, &out, &first, "generation", to_generation);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
     try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
@@ -14113,7 +14117,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
     try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
     try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
-    try appendJsonFieldString(alloc, &out, &merge_first, "status", "converged");
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", merge_status);
     try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
     try appendJsonFieldName(alloc, &out, &merge_first, "operations");
     try out.append(alloc, '[');
@@ -29277,12 +29281,15 @@ test "db document extraction manifest classifies unit fingerprint keeps" {
         &previous_unit_keys,
         &previous_descriptors,
         &previous_chunk_keys,
+        2,
         1,
         2,
+        "converged",
     );
     defer alloc.free(manifest);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"upsert\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
