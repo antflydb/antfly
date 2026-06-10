@@ -41,12 +41,37 @@ pub const Chunk = struct {
     }
 };
 
+pub const ProvenanceScope = enum {
+    document,
+    unit,
+};
+
+pub const ProvenanceOptions = struct {
+    scope: ProvenanceScope = .document,
+    parent_doc_key: ?[]const u8 = null,
+    parent_unit_key: ?[]const u8 = null,
+    parent_unit_id: ?[]const u8 = null,
+    source_artifact_name: ?[]const u8 = null,
+    document_char_base: ?u32 = null,
+};
+
 pub fn appendArtifactFields(
     alloc: Allocator,
     obj: *std.json.ObjectMap,
     source_field: []const u8,
     chunk: Chunk,
     include_payload: bool,
+) !void {
+    return try appendArtifactFieldsWithProvenance(alloc, obj, source_field, chunk, include_payload, .{});
+}
+
+pub fn appendArtifactFieldsWithProvenance(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    source_field: []const u8,
+    chunk: Chunk,
+    include_payload: bool,
+    provenance: ProvenanceOptions,
 ) !void {
     try obj.put(alloc, try alloc.dupe(u8, "_chunk_id"), .{ .integer = chunk.chunk_id });
     try obj.put(alloc, try alloc.dupe(u8, "_mime_type"), .{ .string = try alloc.dupe(u8, chunk.mime_type) });
@@ -56,6 +81,7 @@ pub fn appendArtifactFields(
     if (chunk.end_time_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_end_time_ms"), .{ .float = value });
     if (chunk.frame_index) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
     if (chunk.frame_delay_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
+    try appendProvenanceFields(alloc, obj, source_field, chunk, provenance);
 
     if (!include_payload) return;
 
@@ -66,6 +92,65 @@ pub fn appendArtifactFields(
         errdefer alloc.free(encoded);
         try obj.put(alloc, try alloc.dupe(u8, "_data"), .{ .string = encoded });
     }
+}
+
+fn appendProvenanceFields(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    source_field: []const u8,
+    chunk: Chunk,
+    options: ProvenanceOptions,
+) !void {
+    var provenance = std.json.ObjectMap.empty;
+    errdefer {
+        var it = provenance.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        provenance.deinit(alloc);
+    }
+
+    try putString(alloc, &provenance, "source_field", source_field);
+    try putString(alloc, &provenance, "offset_basis", switch (options.scope) {
+        .document => "document",
+        .unit => "unit",
+    });
+    if (options.parent_doc_key) |value| try putString(alloc, &provenance, "parent_doc_key", value);
+    if (options.parent_unit_key) |value| try putString(alloc, &provenance, "parent_unit_key", value);
+    if (options.parent_unit_id) |value| try putString(alloc, &provenance, "parent_unit_id", value);
+    if (options.source_artifact_name) |value| try putString(alloc, &provenance, "source_artifact_name", value);
+
+    if (chunk.start_offset) |start| {
+        try provenance.put(alloc, try alloc.dupe(u8, "char_start"), .{ .integer = start });
+        switch (options.scope) {
+            .document => try provenance.put(alloc, try alloc.dupe(u8, "document_char_start"), .{ .integer = start }),
+            .unit => {
+                try provenance.put(alloc, try alloc.dupe(u8, "unit_char_start"), .{ .integer = start });
+                if (options.document_char_base) |base| {
+                    try provenance.put(alloc, try alloc.dupe(u8, "document_char_start"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(start)) });
+                }
+            },
+        }
+    }
+    if (chunk.end_offset) |end| {
+        try provenance.put(alloc, try alloc.dupe(u8, "char_end"), .{ .integer = end });
+        switch (options.scope) {
+            .document => try provenance.put(alloc, try alloc.dupe(u8, "document_char_end"), .{ .integer = end }),
+            .unit => {
+                try provenance.put(alloc, try alloc.dupe(u8, "unit_char_end"), .{ .integer = end });
+                if (options.document_char_base) |base| {
+                    try provenance.put(alloc, try alloc.dupe(u8, "document_char_end"), .{ .integer = @as(i64, @intCast(base)) + @as(i64, @intCast(end)) });
+                }
+            },
+        }
+    }
+
+    try obj.put(alloc, try alloc.dupe(u8, "provenance"), .{ .object = provenance });
+}
+
+fn putString(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
 }
 
 fn base64EncodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
@@ -103,6 +188,55 @@ test "append artifact fields stores text offsets and payload" {
     try std.testing.expectEqualStrings("text/plain", obj.get("_mime_type").?.string);
     try std.testing.expectEqual(@as(i64, 7), obj.get("_start_offset").?.integer);
     try std.testing.expectEqualStrings("hello", obj.get("body").?.string);
+    const provenance = obj.get("provenance").?.object;
+    try std.testing.expectEqualStrings("document", provenance.get("offset_basis").?.string);
+    try std.testing.expectEqualStrings("body", provenance.get("source_field").?.string);
+    try std.testing.expectEqual(@as(i64, 7), provenance.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), provenance.get("char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), provenance.get("document_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), provenance.get("document_char_end").?.integer);
+}
+
+test "append artifact fields stores unit-local and document-global provenance" {
+    const alloc = std.testing.allocator;
+    var obj = std.json.ObjectMap.empty;
+    defer {
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr.*);
+        }
+        obj.deinit(alloc);
+    }
+
+    const chunk = Chunk{
+        .chunk_id = 2,
+        .text = try alloc.dupe(u8, "world"),
+        .start_offset = 5,
+        .end_offset = 10,
+    };
+    defer {
+        var mutable = chunk;
+        mutable.deinit(alloc);
+    }
+
+    try appendArtifactFieldsWithProvenance(alloc, &obj, "text", chunk, true, .{
+        .scope = .unit,
+        .parent_doc_key = "doc:a",
+        .parent_unit_key = "doc:a/document_units_v1/page:000001",
+        .parent_unit_id = "page:000001",
+        .source_artifact_name = "document_units_v1",
+        .document_char_base = 100,
+    });
+    const provenance = obj.get("provenance").?.object;
+    try std.testing.expectEqualStrings("unit", provenance.get("offset_basis").?.string);
+    try std.testing.expectEqualStrings("doc:a", provenance.get("parent_doc_key").?.string);
+    try std.testing.expectEqualStrings("page:000001", provenance.get("parent_unit_id").?.string);
+    try std.testing.expectEqualStrings("document_units_v1", provenance.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("unit_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), provenance.get("unit_char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 105), provenance.get("document_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 110), provenance.get("document_char_end").?.integer);
 }
 
 test "append artifact fields stores binary metadata and base64 payload" {

@@ -1946,7 +1946,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
             defer runtime.alloc.free(chunk_key);
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit.unit_id, chunk, true);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true);
             try writes.append(runtime.alloc, .{
                 .key = try runtime.alloc.dupe(u8, chunk_key),
                 .value = try runtime.alloc.dupe(u8, payload),
@@ -1985,18 +1985,25 @@ fn buildDocumentUnitChunkPayloadAlloc(
     artifact_name: []const u8,
     source_artifact_name: []const u8,
     source_field: []const u8,
-    unit_id: []const u8,
+    unit: document_extraction_mod.Unit,
     chunk: chunker_mod.Chunk,
     include_payload: bool,
 ) ![]u8 {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
-    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
-    try chunk_artifact_mod.appendArtifactFields(alloc, &obj, source_field, chunk, include_payload);
+    try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
+        .scope = .unit,
+        .parent_doc_key = doc_key,
+        .parent_unit_key = unit_key,
+        .parent_unit_id = unit.unit_id,
+        .source_artifact_name = source_artifact_name,
+        .document_char_base = unit.char_start,
+    });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
 
@@ -3882,6 +3889,8 @@ fn documentUnitPayloadAlloc(
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
+            .char_start = unit.char_start,
+            .char_end = unit.char_end,
             .source_content_type = content_type,
         },
     }, .{});

@@ -13160,7 +13160,7 @@ fn appendDocumentUnitChunkWrites(
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
             defer alloc.free(chunk_key);
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit.unit_id, chunk, true);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true);
             try artifact_writes.append(alloc, .{
                 .key = try alloc.dupe(u8, chunk_key),
                 .value = try alloc.dupe(u8, payload),
@@ -13287,18 +13287,25 @@ fn buildDocumentUnitChunkPayloadAlloc(
     artifact_name: []const u8,
     source_artifact_name: []const u8,
     source_field: []const u8,
-    unit_id: []const u8,
+    unit: document_extraction_mod.Unit,
     chunk: chunker_mod.Chunk,
     include_payload: bool,
 ) ![]u8 {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
     try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
-    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
     try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
     try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
-    try chunk_artifact_mod.appendArtifactFields(alloc, &obj, source_field, chunk, include_payload);
+    try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
+        .scope = .unit,
+        .parent_doc_key = doc_key,
+        .parent_unit_key = unit_key,
+        .parent_unit_id = unit.unit_id,
+        .source_artifact_name = source_artifact_name,
+        .document_char_base = unit.char_start,
+    });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
 
@@ -13332,6 +13339,16 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    if (unit.char_start) |char_start| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_start, .big);
+        hasher.update(&buf);
+    }
+    if (unit.char_end) |char_end| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_end, .big);
         hasher.update(&buf);
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -13480,6 +13497,8 @@ fn documentUnitPayloadAlloc(
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
+            .char_start = unit.char_start,
+            .char_end = unit.char_end,
             .source_content_type = content_type,
         },
     }, .{});
@@ -28875,6 +28894,16 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_artifact_name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_source_artifact_name\":\"document_units_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"text\":\"alpha beta gamma\"") != null);
+    var parsed_chunk_payload = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+    defer parsed_chunk_payload.deinit();
+    const chunk_provenance = parsed_chunk_payload.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("unit", chunk_provenance.get("offset_basis").?.string);
+    try std.testing.expectEqualStrings("document:000001", chunk_provenance.get("parent_unit_id").?.string);
+    try std.testing.expectEqualStrings("document_units_v1", chunk_provenance.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 0), chunk_provenance.get("unit_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), chunk_provenance.get("unit_char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), chunk_provenance.get("document_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), chunk_provenance.get("document_char_end").?.integer);
 
     const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_chunk_dense_v1");
     defer alloc.free(dense_artifact_key);

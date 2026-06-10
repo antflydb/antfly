@@ -45,6 +45,8 @@ pub const Unit = struct {
     text: []u8,
     method: []u8,
     page_number: ?u32 = null,
+    char_start: ?u32 = null,
+    char_end: ?u32 = null,
 
     pub fn deinit(self: *Unit, alloc: Allocator) void {
         alloc.free(self.unit_id);
@@ -361,16 +363,22 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     }
 
     var page_num: usize = 1;
+    var cursor: usize = 0;
     while (page_num <= page_count) : (page_num += 1) {
         const text = try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
+        const char_start = std.math.cast(u32, cursor);
+        const char_end = std.math.cast(u32, cursor + text.len);
         units[initialized] = .{
             .unit_id = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num}),
             .unit_type = try alloc.dupe(u8, "page"),
             .text = text,
             .method = try alloc.dupe(u8, "pdf_text"),
             .page_number = @intCast(page_num),
+            .char_start = char_start,
+            .char_end = char_end,
         };
+        cursor += text.len;
         initialized += 1;
     }
 
@@ -402,6 +410,8 @@ fn extractSingleTextUnitAlloc(
         .unit_type = try alloc.dupe(u8, unit_type),
         .text = text,
         .method = try alloc.dupe(u8, method),
+        .char_start = 0,
+        .char_end = std.math.cast(u32, text.len),
     };
     return .{
         .content_type = try alloc.dupe(u8, content_type),
@@ -526,6 +536,8 @@ test "document extraction extracts text data uri content as single document unit
     try std.testing.expectEqual(@as(usize, 1), result.units.len);
     try std.testing.expectEqualStrings("document:000001", result.units[0].unit_id);
     try std.testing.expectEqualStrings("alpha beta", result.units[0].text);
+    try std.testing.expectEqual(@as(?u32, 0), result.units[0].char_start);
+    try std.testing.expectEqual(@as(?u32, 10), result.units[0].char_end);
 }
 
 test "document extraction routes configured extensions into text units" {
