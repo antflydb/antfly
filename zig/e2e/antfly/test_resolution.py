@@ -165,7 +165,7 @@ class _Api:
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(
-            f"{self.url}/tables/{table}/lookup/{quote(key, safe='')}", timeout=timeout
+            f"{self.url}/tables/{table}/documents/{quote(key, safe='')}", timeout=timeout
         )
         if response.status_code == 404:
             return None
