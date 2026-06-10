@@ -107,6 +107,9 @@ const ExtractorType = enum {
     html,
     text,
     email,
+    docx,
+    pptx,
+    xlsx,
     unsupported,
 
     fn parse(value: []const u8) ?ExtractorType {
@@ -114,6 +117,9 @@ const ExtractorType = enum {
         if (std.mem.eql(u8, value, "html")) return .html;
         if (std.mem.eql(u8, value, "text")) return .text;
         if (std.mem.eql(u8, value, "email")) return .email;
+        if (std.mem.eql(u8, value, "docx")) return .docx;
+        if (std.mem.eql(u8, value, "pptx")) return .pptx;
+        if (std.mem.eql(u8, value, "xlsx")) return .xlsx;
         if (std.mem.eql(u8, value, "unsupported")) return .unsupported;
         return null;
     }
@@ -312,6 +318,15 @@ pub fn extractDownloadedAlloc(
     if (isEmailContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractEmailAlloc(alloc, downloaded.data, content_type, "email");
     }
+    if (isDocxContent(content_type, config.filename, source_url)) {
+        return try extractDocxAlloc(alloc, downloaded.data, content_type);
+    }
+    if (isPptxContent(content_type, config.filename, source_url)) {
+        return try extractPptxAlloc(alloc, downloaded.data, content_type);
+    }
+    if (isXlsxContent(content_type, config.filename, source_url)) {
+        return try extractXlsxAlloc(alloc, downloaded.data, content_type);
+    }
     if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);
     }
@@ -343,6 +358,9 @@ fn extractWithRouteAlloc(
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
         .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
+        .docx => try extractDocxAlloc(alloc, bytes, content_type),
+        .pptx => try extractPptxAlloc(alloc, bytes, content_type),
+        .xlsx => try extractXlsxAlloc(alloc, bytes, content_type),
         .unsupported => try unsupportedResultAlloc(alloc, content_type, "matched_unsupported_route"),
     };
 }
@@ -498,6 +516,580 @@ fn extractEmailAlloc(
         .route_type = try alloc.dupe(u8, "email"),
         .units = try units.toOwnedSlice(alloc),
     };
+}
+
+fn extractDocxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
+    const document_xml = (try zipEntryDataAlloc(alloc, bytes, "word/document.xml")) orelse return error.MissingDocxDocumentXml;
+    defer alloc.free(document_xml);
+
+    var units = std.ArrayListUnmanaged(Unit).empty;
+    errdefer {
+        for (units.items) |*unit| unit.deinit(alloc);
+        units.deinit(alloc);
+    }
+
+    var section_index: usize = 1;
+    var segment_start: usize = 0;
+    var search_start: usize = 0;
+    while (findXmlTagStart(document_xml, search_start, "sectPr")) |tag_start| {
+        const section_text = try ooxmlXmlTextAlloc(alloc, document_xml[segment_start..tag_start], .word);
+        errdefer alloc.free(section_text);
+        if (section_text.len > 0) {
+            try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text);
+            section_index += 1;
+        } else {
+            alloc.free(section_text);
+        }
+        const tag_end = xmlTagEnd(document_xml, tag_start) orelse tag_start + 1;
+        if (findXmlEndTagAfter(document_xml, tag_end, "sectPr")) |end_tag| {
+            segment_start = end_tag;
+            search_start = end_tag;
+        } else {
+            segment_start = tag_end;
+            search_start = tag_end;
+        }
+    }
+
+    const section_text = try ooxmlXmlTextAlloc(alloc, document_xml[segment_start..], .word);
+    errdefer alloc.free(section_text);
+    if (section_text.len > 0) {
+        try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text);
+    } else {
+        alloc.free(section_text);
+    }
+
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, "docx"),
+        .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+fn extractPptxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
+    const entries = try zipEntriesAlloc(alloc, bytes);
+    defer alloc.free(entries);
+
+    var parts = std.ArrayListUnmanaged(OoxmlPart).empty;
+    defer {
+        for (parts.items) |*part| part.deinit(alloc);
+        parts.deinit(alloc);
+    }
+    for (entries) |entry| {
+        const slide_index = pptxSlideIndex(entry.name) orelse continue;
+        const xml = try zipEntryDataFromEntryAlloc(alloc, bytes, entry);
+        defer alloc.free(xml);
+        const text = try ooxmlXmlTextAlloc(alloc, xml, .presentation);
+        errdefer alloc.free(text);
+        if (text.len == 0) {
+            alloc.free(text);
+            continue;
+        }
+        try parts.append(alloc, .{ .index = slide_index, .text = text });
+    }
+    std.mem.sort(OoxmlPart, parts.items, {}, OoxmlPart.lessThan);
+
+    var units = std.ArrayListUnmanaged(Unit).empty;
+    errdefer {
+        for (units.items) |*unit| unit.deinit(alloc);
+        units.deinit(alloc);
+    }
+    for (parts.items, 1..) |*part, ordinal| {
+        const text = part.text;
+        part.text = &.{};
+        try appendOwnedUnit(alloc, &units, "slide:{d:0>6}", .{ordinal}, "slide", "pptx_text", text);
+    }
+
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, "pptx"),
+        .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+fn extractXlsxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
+    var shared_strings: [][]u8 = &.{};
+    defer freeStringList(alloc, shared_strings);
+    if (try zipEntryDataAlloc(alloc, bytes, "xl/sharedStrings.xml")) |shared_xml| {
+        defer alloc.free(shared_xml);
+        shared_strings = try xlsxSharedStringsAlloc(alloc, shared_xml);
+    }
+
+    const entries = try zipEntriesAlloc(alloc, bytes);
+    defer alloc.free(entries);
+
+    var parts = std.ArrayListUnmanaged(OoxmlPart).empty;
+    defer {
+        for (parts.items) |*part| part.deinit(alloc);
+        parts.deinit(alloc);
+    }
+    for (entries) |entry| {
+        const sheet_index = xlsxSheetIndex(entry.name) orelse continue;
+        const xml = try zipEntryDataFromEntryAlloc(alloc, bytes, entry);
+        defer alloc.free(xml);
+        const text = try xlsxSheetTextAlloc(alloc, xml, shared_strings);
+        errdefer alloc.free(text);
+        if (text.len == 0) {
+            alloc.free(text);
+            continue;
+        }
+        try parts.append(alloc, .{ .index = sheet_index, .text = text });
+    }
+    std.mem.sort(OoxmlPart, parts.items, {}, OoxmlPart.lessThan);
+
+    var units = std.ArrayListUnmanaged(Unit).empty;
+    errdefer {
+        for (units.items) |*unit| unit.deinit(alloc);
+        units.deinit(alloc);
+    }
+    for (parts.items, 1..) |*part, ordinal| {
+        const text = part.text;
+        part.text = &.{};
+        try appendOwnedUnit(alloc, &units, "sheet:{d:0>6}", .{ordinal}, "sheet", "xlsx_text", text);
+    }
+
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, "xlsx"),
+        .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+fn appendOwnedUnit(
+    alloc: Allocator,
+    units: *std.ArrayListUnmanaged(Unit),
+    comptime unit_id_fmt: []const u8,
+    unit_id_args: anytype,
+    unit_type: []const u8,
+    method: []const u8,
+    text: []u8,
+) !void {
+    errdefer alloc.free(text);
+    const unit_id = try std.fmt.allocPrint(alloc, unit_id_fmt, unit_id_args);
+    errdefer alloc.free(unit_id);
+    const owned_type = try alloc.dupe(u8, unit_type);
+    errdefer alloc.free(owned_type);
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    try units.append(alloc, .{
+        .unit_id = unit_id,
+        .unit_type = owned_type,
+        .text = text,
+        .method = owned_method,
+    });
+}
+
+const ZipEntry = struct {
+    name: []const u8,
+    compression_method: std.zip.CompressionMethod,
+    compressed_size: usize,
+    uncompressed_size: usize,
+    local_file_header_offset: usize,
+};
+
+fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
+    const end_pos = std.mem.lastIndexOf(u8, bytes, &std.zip.end_record_sig) orelse return error.ZipNoEndRecord;
+    if (end_pos + 22 > bytes.len) return error.ZipTruncated;
+    const record_count = std.mem.readInt(u16, bytes[end_pos + 10 ..][0..2], .little);
+    const central_directory_size = std.mem.readInt(u32, bytes[end_pos + 12 ..][0..4], .little);
+    const central_directory_offset = std.mem.readInt(u32, bytes[end_pos + 16 ..][0..4], .little);
+    const comment_len = std.mem.readInt(u16, bytes[end_pos + 20 ..][0..2], .little);
+    if (end_pos + 22 + @as(usize, comment_len) > bytes.len) return error.ZipTruncated;
+    if (central_directory_offset == std.math.maxInt(u32) or central_directory_size == std.math.maxInt(u32) or record_count == std.math.maxInt(u16)) {
+        return error.Zip64Unsupported;
+    }
+    const cd_start: usize = @intCast(central_directory_offset);
+    const cd_size: usize = @intCast(central_directory_size);
+    if (cd_start > bytes.len or cd_size > bytes.len - cd_start) return error.ZipTruncated;
+
+    var entries = try alloc.alloc(ZipEntry, record_count);
+    var initialized: usize = 0;
+    errdefer alloc.free(entries);
+
+    var cursor = cd_start;
+    while (initialized < record_count) : (initialized += 1) {
+        if (cursor + 46 > cd_start + cd_size or cursor + 46 > bytes.len) return error.ZipTruncated;
+        if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &std.zip.central_file_header_sig)) return error.ZipBadCdOffset;
+        const flags = std.mem.readInt(u16, bytes[cursor + 8 ..][0..2], .little);
+        if ((flags & 0x0001) != 0) return error.ZipEncryptionUnsupported;
+        const compression_method: std.zip.CompressionMethod = @enumFromInt(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little));
+        switch (compression_method) {
+            .store, .deflate => {},
+            else => return error.UnsupportedCompressionMethod,
+        }
+        const compressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 20 ..][0..4], .little);
+        const uncompressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 24 ..][0..4], .little);
+        const name_len = std.mem.readInt(u16, bytes[cursor + 28 ..][0..2], .little);
+        const extra_len = std.mem.readInt(u16, bytes[cursor + 30 ..][0..2], .little);
+        const comment_len_entry = std.mem.readInt(u16, bytes[cursor + 32 ..][0..2], .little);
+        const local_offset_u32 = std.mem.readInt(u32, bytes[cursor + 42 ..][0..4], .little);
+        if (compressed_size_u32 == std.math.maxInt(u32) or uncompressed_size_u32 == std.math.maxInt(u32) or local_offset_u32 == std.math.maxInt(u32)) {
+            return error.Zip64Unsupported;
+        }
+        const name_start = cursor + 46;
+        const name_end = name_start + @as(usize, name_len);
+        if (name_end > bytes.len) return error.ZipTruncated;
+        entries[initialized] = .{
+            .name = bytes[name_start..name_end],
+            .compression_method = compression_method,
+            .compressed_size = @intCast(compressed_size_u32),
+            .uncompressed_size = @intCast(uncompressed_size_u32),
+            .local_file_header_offset = @intCast(local_offset_u32),
+        };
+        cursor = name_end + @as(usize, extra_len) + @as(usize, comment_len_entry);
+        if (cursor > cd_start + cd_size) return error.ZipTruncated;
+    }
+    if (cursor != cd_start + cd_size) return error.ZipCdSizeMismatch;
+    return entries;
+}
+
+fn zipEntryDataAlloc(alloc: Allocator, bytes: []const u8, wanted_name: []const u8) !?[]u8 {
+    const entries = try zipEntriesAlloc(alloc, bytes);
+    defer alloc.free(entries);
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, wanted_name)) {
+            return try zipEntryDataFromEntryAlloc(alloc, bytes, entry);
+        }
+    }
+    return null;
+}
+
+fn zipEntryDataFromEntryAlloc(alloc: Allocator, bytes: []const u8, entry: ZipEntry) ![]u8 {
+    const offset = entry.local_file_header_offset;
+    if (offset + 30 > bytes.len) return error.ZipTruncated;
+    if (!std.mem.eql(u8, bytes[offset .. offset + 4], &std.zip.local_file_header_sig)) return error.ZipBadFileOffset;
+    const name_len = std.mem.readInt(u16, bytes[offset + 26 ..][0..2], .little);
+    const extra_len = std.mem.readInt(u16, bytes[offset + 28 ..][0..2], .little);
+    const data_start = offset + 30 + @as(usize, name_len) + @as(usize, extra_len);
+    if (data_start > bytes.len or entry.compressed_size > bytes.len - data_start) return error.ZipTruncated;
+    const compressed = bytes[data_start .. data_start + entry.compressed_size];
+    return switch (entry.compression_method) {
+        .store => try alloc.dupe(u8, compressed),
+        .deflate => try inflateRawAlloc(alloc, compressed, entry.uncompressed_size),
+        else => error.UnsupportedCompressionMethod,
+    };
+}
+
+fn inflateRawAlloc(alloc: Allocator, compressed: []const u8, expected_size: usize) ![]u8 {
+    var in: std.Io.Reader = .fixed(compressed);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&in, .raw, &flate_buffer);
+    _ = try decompress.reader.streamRemaining(&out.writer);
+    const inflated = try out.toOwnedSlice();
+    errdefer alloc.free(inflated);
+    if (inflated.len != expected_size) return error.ZipDecompressSizeMismatch;
+    return inflated;
+}
+
+const OoxmlTextMode = enum {
+    word,
+    presentation,
+};
+
+fn ooxmlXmlTextAlloc(alloc: Allocator, xml: []const u8, mode: OoxmlTextMode) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var in_text = false;
+    var cursor: usize = 0;
+    while (cursor < xml.len) {
+        const tag_start = std.mem.indexOfScalarPos(u8, xml, cursor, '<') orelse {
+            if (in_text) try appendXmlDecodedText(alloc, &out, xml[cursor..]);
+            break;
+        };
+        if (in_text and tag_start > cursor) try appendXmlDecodedText(alloc, &out, xml[cursor..tag_start]);
+        const tag_end_pos = xmlTagEnd(xml, tag_start) orelse break;
+        const tag = xml[tag_start + 1 .. tag_end_pos - 1];
+        const local = xmlTagLocalName(tag) orelse {
+            cursor = tag_end_pos;
+            continue;
+        };
+        const is_end = xmlTagIsEnd(tag);
+        const is_self_closing = xmlTagIsSelfClosing(tag);
+        if (std.mem.eql(u8, local, "t")) {
+            if (is_end) {
+                in_text = false;
+            } else if (!is_self_closing) {
+                in_text = true;
+            }
+        } else if (mode == .word and !is_end and (std.mem.eql(u8, local, "tab") or std.mem.eql(u8, local, "br"))) {
+            try appendOoxmlSeparator(alloc, &out, if (std.mem.eql(u8, local, "tab")) '\t' else '\n');
+        } else if ((mode == .word or mode == .presentation) and is_end and std.mem.eql(u8, local, "p")) {
+            try appendOoxmlSeparator(alloc, &out, '\n');
+        }
+        cursor = tag_end_pos;
+    }
+    trimTrailingAsciiWhitespace(&out);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendXmlDecodedText(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] != '&') {
+            try out.append(alloc, text[i]);
+            i += 1;
+            continue;
+        }
+        const semi_offset = std.mem.indexOfScalar(u8, text[i..], ';') orelse {
+            try out.append(alloc, text[i]);
+            i += 1;
+            continue;
+        };
+        const entity = text[i + 1 .. i + semi_offset];
+        if (std.mem.eql(u8, entity, "amp")) {
+            try out.append(alloc, '&');
+        } else if (std.mem.eql(u8, entity, "lt")) {
+            try out.append(alloc, '<');
+        } else if (std.mem.eql(u8, entity, "gt")) {
+            try out.append(alloc, '>');
+        } else if (std.mem.eql(u8, entity, "quot")) {
+            try out.append(alloc, '"');
+        } else if (std.mem.eql(u8, entity, "apos")) {
+            try out.append(alloc, '\'');
+        } else if (entity.len > 1 and entity[0] == '#') {
+            const codepoint = if (entity.len > 2 and (entity[1] == 'x' or entity[1] == 'X'))
+                std.fmt.parseInt(u21, entity[2..], 16) catch null
+            else
+                std.fmt.parseInt(u21, entity[1..], 10) catch null;
+            if (codepoint) |cp| {
+                var buf: [4]u8 = undefined;
+                const len = try std.unicode.utf8Encode(cp, &buf);
+                try out.appendSlice(alloc, buf[0..len]);
+            } else {
+                try out.appendSlice(alloc, text[i .. i + semi_offset + 1]);
+            }
+        } else {
+            try out.appendSlice(alloc, text[i .. i + semi_offset + 1]);
+        }
+        i += semi_offset + 1;
+    }
+}
+
+fn appendOoxmlSeparator(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), sep: u8) !void {
+    if (out.items.len == 0) return;
+    const last = out.items[out.items.len - 1];
+    if (last == sep) return;
+    if (sep == '\n' and (last == ' ' or last == '\t')) trimTrailingHorizontalWhitespace(out);
+    try out.append(alloc, sep);
+}
+
+fn trimTrailingAsciiWhitespace(out: *std.ArrayListUnmanaged(u8)) void {
+    while (out.items.len > 0 and std.ascii.isWhitespace(out.items[out.items.len - 1])) {
+        _ = out.pop();
+    }
+}
+
+fn trimTrailingHorizontalWhitespace(out: *std.ArrayListUnmanaged(u8)) void {
+    while (out.items.len > 0 and (out.items[out.items.len - 1] == ' ' or out.items[out.items.len - 1] == '\t')) {
+        _ = out.pop();
+    }
+}
+
+fn findXmlTagStart(xml: []const u8, start: usize, local_name: []const u8) ?usize {
+    var cursor = start;
+    while (std.mem.indexOfScalarPos(u8, xml, cursor, '<')) |pos| {
+        const tag_end_pos = xmlTagEnd(xml, pos) orelse return null;
+        const tag = xml[pos + 1 .. tag_end_pos - 1];
+        if (!xmlTagIsEnd(tag)) {
+            if (xmlTagLocalName(tag)) |local| {
+                if (std.mem.eql(u8, local, local_name)) return pos;
+            }
+        }
+        cursor = tag_end_pos;
+    }
+    return null;
+}
+
+fn findXmlEndTagAfter(xml: []const u8, start: usize, local_name: []const u8) ?usize {
+    var cursor = start;
+    while (std.mem.indexOfScalarPos(u8, xml, cursor, '<')) |pos| {
+        const tag_end_pos = xmlTagEnd(xml, pos) orelse return null;
+        const tag = xml[pos + 1 .. tag_end_pos - 1];
+        if (xmlTagIsEnd(tag)) {
+            if (xmlTagLocalName(tag)) |local| {
+                if (std.mem.eql(u8, local, local_name)) return tag_end_pos;
+            }
+        }
+        cursor = tag_end_pos;
+    }
+    return null;
+}
+
+fn xmlTagEnd(xml: []const u8, tag_start: usize) ?usize {
+    const offset = std.mem.indexOfScalarPos(u8, xml, tag_start, '>') orelse return null;
+    return offset + 1;
+}
+
+fn xmlTagIsEnd(tag: []const u8) bool {
+    const trimmed = std.mem.trim(u8, tag, " \t\r\n");
+    return trimmed.len > 0 and trimmed[0] == '/';
+}
+
+fn xmlTagIsSelfClosing(tag: []const u8) bool {
+    const trimmed = std.mem.trim(u8, tag, " \t\r\n");
+    return trimmed.len > 0 and trimmed[trimmed.len - 1] == '/';
+}
+
+fn xmlTagLocalName(tag: []const u8) ?[]const u8 {
+    var trimmed = std.mem.trim(u8, tag, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed[0] == '/' or trimmed[0] == '?' or trimmed[0] == '!') {
+        trimmed = std.mem.trim(u8, trimmed[1..], " \t\r\n");
+    }
+    if (trimmed.len == 0) return null;
+    const name_end = std.mem.indexOfAny(u8, trimmed, " \t\r\n/") orelse trimmed.len;
+    const qname = trimmed[0..name_end];
+    const colon = std.mem.lastIndexOfScalar(u8, qname, ':') orelse return qname;
+    return qname[colon + 1 ..];
+}
+
+const OoxmlPart = struct {
+    index: usize,
+    text: []u8,
+
+    fn deinit(self: *OoxmlPart, alloc: Allocator) void {
+        if (self.text.len > 0) alloc.free(self.text);
+        self.* = undefined;
+    }
+
+    fn lessThan(_: void, lhs: OoxmlPart, rhs: OoxmlPart) bool {
+        return lhs.index < rhs.index;
+    }
+};
+
+fn pptxSlideIndex(name: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, name, "ppt/slides/slide") or !std.mem.endsWith(u8, name, ".xml")) return null;
+    const start = "ppt/slides/slide".len;
+    return std.fmt.parseInt(usize, name[start .. name.len - ".xml".len], 10) catch null;
+}
+
+fn xlsxSheetIndex(name: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, name, "xl/worksheets/sheet") or !std.mem.endsWith(u8, name, ".xml")) return null;
+    const start = "xl/worksheets/sheet".len;
+    return std.fmt.parseInt(usize, name[start .. name.len - ".xml".len], 10) catch null;
+}
+
+fn xlsxSharedStringsAlloc(alloc: Allocator, xml: []const u8) ![][]u8 {
+    var strings = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (strings.items) |string| alloc.free(string);
+        strings.deinit(alloc);
+    }
+    var cursor: usize = 0;
+    while (findXmlTagStart(xml, cursor, "si")) |si_start| {
+        const si_start_end = xmlTagEnd(xml, si_start) orelse break;
+        const si_end = findXmlEndTagAfter(xml, si_start_end, "si") orelse break;
+        const text = try ooxmlXmlTextAlloc(alloc, xml[si_start_end .. si_end - "</si>".len], .word);
+        errdefer alloc.free(text);
+        try strings.append(alloc, text);
+        cursor = si_end;
+    }
+    return try strings.toOwnedSlice(alloc);
+}
+
+fn freeStringList(alloc: Allocator, strings: [][]u8) void {
+    for (strings) |string| alloc.free(string);
+    if (strings.len > 0) alloc.free(strings);
+}
+
+fn xlsxSheetTextAlloc(alloc: Allocator, xml: []const u8, shared_strings: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = 0;
+    var first_row = true;
+    while (findXmlTagStart(xml, cursor, "row")) |row_start| {
+        const row_start_end = xmlTagEnd(xml, row_start) orelse break;
+        const row_end = findXmlEndTagAfter(xml, row_start_end, "row") orelse break;
+        const row = xml[row_start_end .. row_end - "</row>".len];
+        const row_text = try xlsxRowTextAlloc(alloc, row, shared_strings);
+        defer alloc.free(row_text);
+        if (row_text.len > 0) {
+            if (!first_row) try out.append(alloc, '\n');
+            first_row = false;
+            try out.appendSlice(alloc, row_text);
+        }
+        cursor = row_end;
+    }
+    trimTrailingAsciiWhitespace(&out);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn xlsxRowTextAlloc(alloc: Allocator, row_xml: []const u8, shared_strings: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = 0;
+    var first_cell = true;
+    while (findXmlTagStart(row_xml, cursor, "c")) |cell_start| {
+        const cell_start_end = xmlTagEnd(row_xml, cell_start) orelse break;
+        const cell_end = findXmlEndTagAfter(row_xml, cell_start_end, "c") orelse break;
+        const start_tag = row_xml[cell_start + 1 .. cell_start_end - 1];
+        const cell = row_xml[cell_start_end .. cell_end - "</c>".len];
+        const cell_text = try xlsxCellTextAlloc(alloc, start_tag, cell, shared_strings);
+        defer alloc.free(cell_text);
+        if (cell_text.len > 0) {
+            if (!first_cell) try out.append(alloc, '\t');
+            first_cell = false;
+            try out.appendSlice(alloc, cell_text);
+        }
+        cursor = cell_end;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn xlsxCellTextAlloc(alloc: Allocator, start_tag: []const u8, cell_xml: []const u8, shared_strings: []const []const u8) ![]u8 {
+    if (xmlTagHasAttrValue(start_tag, "t", "s")) {
+        const value = try xmlFirstElementTextAlloc(alloc, cell_xml, "v");
+        defer alloc.free(value);
+        const index = std.fmt.parseInt(usize, std.mem.trim(u8, value, " \t\r\n"), 10) catch return try alloc.alloc(u8, 0);
+        if (index >= shared_strings.len) return try alloc.alloc(u8, 0);
+        return try alloc.dupe(u8, shared_strings[index]);
+    }
+    if (xmlTagHasAttrValue(start_tag, "t", "inlineStr")) {
+        return try ooxmlXmlTextAlloc(alloc, cell_xml, .word);
+    }
+    return try xmlFirstElementTextAlloc(alloc, cell_xml, "v");
+}
+
+fn xmlFirstElementTextAlloc(alloc: Allocator, xml: []const u8, local_name: []const u8) ![]u8 {
+    const start = findXmlTagStart(xml, 0, local_name) orelse return try alloc.alloc(u8, 0);
+    const start_end = xmlTagEnd(xml, start) orelse return try alloc.alloc(u8, 0);
+    const end = findXmlEndTagAfter(xml, start_end, local_name) orelse return try alloc.alloc(u8, 0);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendXmlDecodedText(alloc, &out, xml[start_end .. end - (local_name.len + 3)]);
+    trimTrailingAsciiWhitespace(&out);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn xmlTagHasAttrValue(tag: []const u8, attr_name: []const u8, expected: []const u8) bool {
+    var cursor: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, tag, cursor, '=')) |eq| {
+        const name_start = blk: {
+            var pos = eq;
+            while (pos > 0 and !std.ascii.isWhitespace(tag[pos - 1])) pos -= 1;
+            break :blk pos;
+        };
+        const name = xmlLocalName(std.mem.trim(u8, tag[name_start..eq], " \t\r\n"));
+        var value_start = eq + 1;
+        while (value_start < tag.len and std.ascii.isWhitespace(tag[value_start])) value_start += 1;
+        if (value_start >= tag.len or (tag[value_start] != '"' and tag[value_start] != '\'')) {
+            cursor = eq + 1;
+            continue;
+        }
+        const quote = tag[value_start];
+        const value_body_start = value_start + 1;
+        const value_end_offset = std.mem.indexOfScalar(u8, tag[value_body_start..], quote) orelse return false;
+        const value = tag[value_body_start .. value_body_start + value_end_offset];
+        if (std.mem.eql(u8, name, attr_name) and std.mem.eql(u8, value, expected)) return true;
+        cursor = value_body_start + value_end_offset + 1;
+    }
+    return false;
+}
+
+fn xmlLocalName(qname: []const u8) []const u8 {
+    const colon = std.mem.lastIndexOfScalar(u8, qname, ':') orelse return qname;
+    return qname[colon + 1 ..];
 }
 
 const EmailHeaderBodySplit = struct {
@@ -839,6 +1431,21 @@ fn isEmailContent(content_type: []const u8, filename: []const u8, source_url: []
     return contentTypeAllowsTextSniff(content_type) and emailHeaderBodySplit(bytes) != null;
 }
 
+fn isDocxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+    if (contentTypeEquals(content_type, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")) return true;
+    return hasExtension(filename, ".docx") or hasExtension(source_url, ".docx");
+}
+
+fn isPptxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+    if (contentTypeEquals(content_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) return true;
+    return hasExtension(filename, ".pptx") or hasExtension(source_url, ".pptx");
+}
+
+fn isXlsxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+    if (contentTypeEquals(content_type, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) return true;
+    return hasExtension(filename, ".xlsx") or hasExtension(source_url, ".xlsx");
+}
+
 fn isTextContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeStartsWith(content_type, "text/")) return true;
     if (contentTypeEquals(content_type, "application/json")) return true;
@@ -935,6 +1542,79 @@ const TestDownloadedContent = struct {
         alloc.free(self.data);
     }
 };
+
+const TestZipEntry = struct {
+    name: []const u8,
+    data: []const u8,
+};
+
+fn buildStoredZipAlloc(alloc: Allocator, entries: []const TestZipEntry) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var central = std.ArrayListUnmanaged(u8).empty;
+    defer central.deinit(alloc);
+
+    for (entries) |entry| {
+        const offset = out.items.len;
+        const crc = std.hash.crc.Crc32.hash(entry.data);
+        try appendZipLe32(alloc, &out, 0x04034b50);
+        try appendZipLe16(alloc, &out, 20);
+        try appendZipLe16(alloc, &out, 0);
+        try appendZipLe16(alloc, &out, 0);
+        try appendZipLe16(alloc, &out, 0);
+        try appendZipLe16(alloc, &out, 0);
+        try appendZipLe32(alloc, &out, crc);
+        try appendZipLe32(alloc, &out, @intCast(entry.data.len));
+        try appendZipLe32(alloc, &out, @intCast(entry.data.len));
+        try appendZipLe16(alloc, &out, @intCast(entry.name.len));
+        try appendZipLe16(alloc, &out, 0);
+        try out.appendSlice(alloc, entry.name);
+        try out.appendSlice(alloc, entry.data);
+
+        try appendZipLe32(alloc, &central, 0x02014b50);
+        try appendZipLe16(alloc, &central, 20);
+        try appendZipLe16(alloc, &central, 20);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe32(alloc, &central, crc);
+        try appendZipLe32(alloc, &central, @intCast(entry.data.len));
+        try appendZipLe32(alloc, &central, @intCast(entry.data.len));
+        try appendZipLe16(alloc, &central, @intCast(entry.name.len));
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe16(alloc, &central, 0);
+        try appendZipLe32(alloc, &central, 0);
+        try appendZipLe32(alloc, &central, @intCast(offset));
+        try central.appendSlice(alloc, entry.name);
+    }
+
+    const central_offset = out.items.len;
+    try out.appendSlice(alloc, central.items);
+    try appendZipLe32(alloc, &out, 0x06054b50);
+    try appendZipLe16(alloc, &out, 0);
+    try appendZipLe16(alloc, &out, 0);
+    try appendZipLe16(alloc, &out, @intCast(entries.len));
+    try appendZipLe16(alloc, &out, @intCast(entries.len));
+    try appendZipLe32(alloc, &out, @intCast(central.items.len));
+    try appendZipLe32(alloc, &out, @intCast(central_offset));
+    try appendZipLe16(alloc, &out, 0);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendZipLe16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf, value, .little);
+    try out.appendSlice(alloc, &buf);
+}
+
+fn appendZipLe32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    try out.appendSlice(alloc, &buf);
+}
 
 test "document extraction extracts text data uri content as single document unit" {
     const alloc = std.testing.allocator;
@@ -1097,6 +1777,109 @@ test "document extraction extracts multipart rfc822 text parts" {
     try std.testing.expectEqualStrings("email:part:000002", result.units[2].unit_id);
     try std.testing.expectEqualStrings("email_html", result.units[2].method);
     try std.testing.expectEqualStrings("HTML body", result.units[2].text);
+}
+
+test "document extraction extracts docx sections from ooxml package" {
+    const alloc = std.testing.allocator;
+    const zip = try buildStoredZipAlloc(alloc, &.{
+        .{
+            .name = "word/document.xml",
+            .data =
+            \\<?xml version="1.0" encoding="UTF-8"?>
+            \\<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            \\  <w:body>
+            \\    <w:p><w:r><w:t>Alpha &amp; Beta</w:t></w:r></w:p>
+            \\    <w:p><w:r><w:t>First section</w:t></w:r><w:sectPr/></w:p>
+            \\    <w:p><w:r><w:t>Second section</w:t></w:r></w:p>
+            \\  </w:body>
+            \\</w:document>
+            ,
+        },
+    });
+    defer alloc.free(zip);
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        .data = try alloc.dupe(u8, zip),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/report.docx", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("docx", result.route_type);
+    try std.testing.expectEqual(@as(usize, 2), result.units.len);
+    try std.testing.expectEqualStrings("section:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("section", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("docx_text", result.units[0].method);
+    try std.testing.expectEqualStrings("Alpha & Beta\nFirst section", result.units[0].text);
+    try std.testing.expectEqualStrings("section:000002", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("Second section", result.units[1].text);
+}
+
+test "document extraction extracts pptx slides in numeric order" {
+    const alloc = std.testing.allocator;
+    const zip = try buildStoredZipAlloc(alloc, &.{
+        .{
+            .name = "ppt/slides/slide2.xml",
+            .data = "<p:sld xmlns:a=\"a\" xmlns:p=\"p\"><p:cSld><a:p><a:r><a:t>Second slide</a:t></a:r></a:p></p:cSld></p:sld>",
+        },
+        .{
+            .name = "ppt/slides/slide1.xml",
+            .data = "<p:sld xmlns:a=\"a\" xmlns:p=\"p\"><p:cSld><a:p><a:r><a:t>First slide</a:t></a:r></a:p></p:cSld></p:sld>",
+        },
+    });
+    defer alloc.free(zip);
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        .data = try alloc.dupe(u8, zip),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/deck.pptx", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("pptx", result.route_type);
+    try std.testing.expectEqual(@as(usize, 2), result.units.len);
+    try std.testing.expectEqualStrings("slide:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("slide", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("pptx_text", result.units[0].method);
+    try std.testing.expectEqualStrings("First slide", result.units[0].text);
+    try std.testing.expectEqualStrings("slide:000002", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("Second slide", result.units[1].text);
+}
+
+test "document extraction extracts xlsx sheets with shared strings" {
+    const alloc = std.testing.allocator;
+    const zip = try buildStoredZipAlloc(alloc, &.{
+        .{
+            .name = "xl/sharedStrings.xml",
+            .data = "<sst><si><t>Name</t></si><si><t>Ada &amp; Bob</t></si></sst>",
+        },
+        .{
+            .name = "xl/worksheets/sheet1.xml",
+            .data =
+            \\<worksheet>
+            \\  <sheetData>
+            \\    <row><c t="s"><v>0</v></c><c t="inlineStr"><is><t>Score</t></is></c></row>
+            \\    <row><c t="s"><v>1</v></c><c><v>42</v></c></row>
+            \\  </sheetData>
+            \\</worksheet>
+            ,
+        },
+    });
+    defer alloc.free(zip);
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        .data = try alloc.dupe(u8, zip),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/book.xlsx", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("xlsx", result.route_type);
+    try std.testing.expectEqual(@as(usize, 1), result.units.len);
+    try std.testing.expectEqualStrings("sheet:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("sheet", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("xlsx_text", result.units[0].method);
+    try std.testing.expectEqualStrings("Name\tScore\nAda & Bob\t42", result.units[0].text);
 }
 
 test "document extraction applies source metadata fields from row json" {
