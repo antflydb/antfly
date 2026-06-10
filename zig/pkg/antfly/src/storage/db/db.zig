@@ -58,6 +58,7 @@ else
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
+const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -944,6 +945,7 @@ const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
     wait_for_sync_level: bool = true,
+    force_generated_artifact_names: []const []const u8 = &.{},
 };
 
 pub const OpenProfile = struct {
@@ -3870,6 +3872,7 @@ pub const DB = struct {
                 effective_req,
                 extracted[0..extracted_initialized],
                 generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                opts.force_generated_artifact_names,
             );
 
             for (precomputed_generated.artifact_writes) |write| {
@@ -4658,6 +4661,57 @@ pub const DB = struct {
             .value = value,
             .artifact_ref = artifact_ref,
         };
+    }
+
+    pub fn getDocumentArtifactManifest(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?types.DocumentArtifactManifest {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        errdefer alloc.free(manifest);
+
+        const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(state_key);
+        const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        errdefer if (state) |value| alloc.free(value);
+
+        return try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !bool {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        const value = try self.get(alloc, doc_key) orelse return false;
+        defer alloc.free(value);
+
+        const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
+        const force_artifacts = [_][]const u8{artifact_name};
+        try self.batchInternal(.{
+            .writes = &writes,
+            .sync_level = .full_index,
+        }, null, .{
+            .force_generated_artifact_names = &force_artifacts,
+        });
+        return true;
     }
 
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
@@ -7484,6 +7538,7 @@ pub const DB = struct {
                         .name = try state.alloc.dupe(u8, source.name),
                         .kind = source.kind,
                         .chunk_id = source.chunk_id,
+                        .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
                     };
                     defer source_ref.deinit(state.alloc);
                     break :blk try artifact_ids.internalKeyForArtifactRefAlloc(state.alloc, source_ref);
@@ -12082,6 +12137,13 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
     try list.append(alloc, try alloc.dupe(u8, key));
 }
 
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |existing| {
+        if (std.mem.eql(u8, existing, name)) return true;
+    }
+    return false;
+}
+
 fn strippedStoredDocumentValueAlloc(
     alloc: Allocator,
     cleaned: []const u8,
@@ -12548,6 +12610,10 @@ fn computeAssetRequestDerived(
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    force_reprocess: bool,
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
     defer producer_cfg.deinit(alloc);
@@ -12559,6 +12625,10 @@ fn computeAssetRequestDerived(
     const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
+        if (producer_cfg.type == .document_extraction) {
+            try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
+            return;
+        }
         try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
         const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
         errdefer alloc.free(state_key);
@@ -12566,6 +12636,24 @@ fn computeAssetRequestDerived(
         return;
     }
     defer alloc.free(source_text.?);
+
+    if (producer_cfg.type == .document_extraction) {
+        return try computeDocumentExtractionAssetRequestDerived(
+            alloc,
+            db,
+            doc_value,
+            source_text.?,
+            request,
+            producer_cfg.config_json,
+            key,
+            artifact_writes,
+            artifact_delete_keys,
+            documents,
+            dense_embeddings,
+            sparse_embeddings,
+            force_reprocess,
+        );
+    }
 
     const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
         try renderSourcePartsJson(alloc, db, doc_value, request)
@@ -12623,6 +12711,1134 @@ fn computeAssetRequestDerived(
             .value = try alloc.dupe(u8, state_value.?),
         });
     }
+}
+
+fn computeDocumentExtractionAssetRequestDerived(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    source_url: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    config_json: []const u8,
+    manifest_key: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    force_reprocess: bool,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var config = try document_extraction_mod.parseConfig(alloc, config_json);
+    defer config.deinit(alloc);
+    try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
+
+    const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+        alloc,
+        db.remote_content,
+        db.secret_store,
+        source_url,
+        if (config.credentials.len > 0) config.credentials else null,
+    );
+    const downloaded = switch (fetched) {
+        .ok => |content| content,
+        .http_error => return error.RemoteDocumentFetchFailed,
+    };
+    var downloaded_mut = downloaded;
+    defer downloaded_mut.deinit(alloc);
+
+    var extraction = try document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config);
+    defer extraction.deinit(alloc);
+
+    const source_fingerprint = try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
+    defer alloc.free(source_fingerprint);
+
+    var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_keys.items) |key| alloc.free(@constCast(key));
+        desired_unit_keys.deinit(alloc);
+    }
+    var desired_unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_fingerprints.items) |fingerprint| alloc.free(@constCast(fingerprint));
+        desired_unit_fingerprints.deinit(alloc);
+    }
+    var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_chunk_keys.items) |key| alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(alloc);
+    }
+
+    try collectDocumentExtractionDesiredKeys(alloc, db, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
+
+    const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
+    defer alloc.free(desired_unit_descriptors);
+
+    const new_state = try documentExtractionStateValueAlloc(alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
+    defer alloc.free(new_state);
+
+    const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(state_key);
+    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_state) |value| alloc.free(value);
+    const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_manifest) |value| alloc.free(value);
+
+    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
+    const to_generation = from_generation + 1;
+
+    var previous_unit_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
+    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
+    defer freeDocumentExtractionUnitDescriptors(alloc, previous_unit_descriptors);
+    var previous_chunk_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+
+    if (existing_state) |state| {
+        if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
+            if (existing_manifest) |value| {
+                try artifact_writes.append(alloc, .{
+                    .key = try alloc.dupe(u8, manifest_key),
+                    .value = try alloc.dupe(u8, value),
+                });
+                return;
+            }
+        }
+
+        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+        for (previous_unit_keys) |previous_key| {
+            if (containsDeleteKey(desired_unit_keys.items, previous_key)) continue;
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        for (previous_chunk_keys) |previous_key| {
+            if (containsDeleteKey(desired_chunk_keys.items, previous_key)) continue;
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+    }
+
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, false);
+    defer {
+        for (text_indexes) |name| alloc.free(name);
+        alloc.free(text_indexes);
+    }
+
+    for (extraction.units, desired_unit_descriptors) |unit, unit_descriptor| {
+        const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, request.doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(unit_key);
+        const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
+            unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
+        if (unit_unchanged and
+            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
+        {
+            try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+            continue;
+        }
+        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type);
+        defer alloc.free(payload);
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, unit_key),
+            .value = try alloc.dupe(u8, payload),
+        });
+        if (text_indexes.len > 0) {
+            const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+            errdefer {
+                for (targets) |target| alloc.free(target.index_name);
+                alloc.free(targets);
+            }
+            for (text_indexes, 0..) |index_name, i| {
+                targets[i] = .{
+                    .kind = .full_text,
+                    .index_name = try alloc.dupe(u8, index_name),
+                };
+            }
+            try documents.append(alloc, .{
+                .key = try alloc.dupe(u8, unit_key),
+                .action = .upsert,
+                .cleaned_value = try alloc.dupe(u8, payload),
+                .targets = targets,
+            });
+        }
+
+        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+    }
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        request.doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        extraction,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        from_generation,
+        to_generation,
+    );
+    defer alloc.free(manifest);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, manifest_key),
+        .value = try alloc.dupe(u8, manifest),
+    });
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, state_key),
+        .value = try alloc.dupe(u8, new_state),
+    });
+}
+
+fn appendDocumentExtractionDeleteKeys(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    manifest_key: []const u8,
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try artifact_delete_keys.append(alloc, try alloc.dupe(u8, manifest_key));
+    const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+    errdefer alloc.free(state_key);
+    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_state) |value| alloc.free(value);
+    if (existing_state) |state| {
+        const previous_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+    }
+    try artifact_delete_keys.append(alloc, state_key);
+}
+
+fn collectDocumentExtractionDesiredKeys(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    units: []const document_extraction_mod.Unit,
+    desired_unit_keys: *std.ArrayListUnmanaged([]const u8),
+    desired_unit_fingerprints: *std.ArrayListUnmanaged([]const u8),
+    desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (units) |unit| {
+        try desired_unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
+        try desired_unit_fingerprints.append(alloc, try documentExtractionUnitFingerprintAlloc(alloc, unit));
+        for (db.core.index_manager.enrichments.items) |entry| {
+            if (entry.kind != .chunk) continue;
+            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+            const chunks = if (entry.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+            else
+                try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+            defer chunker_mod.freeChunks(alloc, chunks);
+            for (chunks) |chunk| {
+                try desired_chunk_keys.append(alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            }
+        }
+    }
+}
+
+const DocumentExtractionUnitDescriptor = struct {
+    key: []const u8,
+    fingerprint: []const u8,
+};
+
+fn documentExtractionUnitDescriptorsFromKeysAlloc(
+    alloc: Allocator,
+    unit_keys: []const []const u8,
+    fingerprints: []const []const u8,
+) ![]DocumentExtractionUnitDescriptor {
+    if (unit_keys.len != fingerprints.len) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, unit_keys.len);
+    for (unit_keys, fingerprints, 0..) |key, fingerprint, i| {
+        out[i] = .{
+            .key = key,
+            .fingerprint = fingerprint,
+        };
+    }
+    return out;
+}
+
+fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []DocumentExtractionUnitDescriptor) void {
+    for (descriptors) |descriptor| {
+        if (descriptor.key.len > 0) alloc.free(@constCast(descriptor.key));
+        if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+    }
+    if (descriptors.len > 0) alloc.free(descriptors);
+}
+
+fn appendStoredFullTextDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try alloc.dupe(u8, index_name),
+        };
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .targets = targets,
+    });
+}
+
+fn appendDocumentUnitStoredFullTextDocuments(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    unit_text_indexes: []const []const u8,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    try appendStoredFullTextDocument(alloc, documents, unit_key, unit_text_indexes);
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+
+        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        defer {
+            for (chunk_text_indexes) |name| alloc.free(name);
+            alloc.free(chunk_text_indexes);
+        }
+        if (chunk_text_indexes.len == 0) continue;
+
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            try appendStoredFullTextDocument(alloc, documents, chunk_key, chunk_text_indexes);
+        }
+    }
+}
+
+fn storeKeyExists(alloc: Allocator, db: *DB, key: []const u8) !bool {
+    const value = db.core.getStoreValue(alloc, key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (value) |owned| alloc.free(owned);
+    return true;
+}
+
+fn documentUnitCanSkipLocalWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    unit_text_indexes: []const []const u8,
+) !bool {
+    _ = unit_text_indexes;
+    if (!(try storeKeyExists(alloc, db, unit_key))) return false;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            if (!(try storeKeyExists(alloc, db, chunk_key))) return false;
+            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, chunk_key, entry.name))) return false;
+        }
+    }
+    return true;
+}
+
+fn documentUnitChunkEmbeddingArtifactsPresent(
+    alloc: Allocator,
+    db: *DB,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+) !bool {
+    const runtime = db.enrichment_runtime;
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+
+        if (entry.expected_dims > 0) {
+            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+            defer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
+        } else {
+            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+            defer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
+        }
+
+        const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
+        defer alloc.free(artifact_key);
+        if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
+    }
+    return true;
+}
+
+fn appendDocumentUnitChunkWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+        if (chunks.len == 0) continue;
+
+        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        defer {
+            for (text_indexes) |name| alloc.free(name);
+            alloc.free(text_indexes);
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit.unit_id, chunk, true);
+            try artifact_writes.append(alloc, .{
+                .key = try alloc.dupe(u8, chunk_key),
+                .value = try alloc.dupe(u8, payload),
+            });
+
+            if (text_indexes.len > 0) {
+                const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                errdefer {
+                    for (targets) |target| alloc.free(target.index_name);
+                    alloc.free(targets);
+                }
+                for (text_indexes, 0..) |index_name, i| {
+                    targets[i] = .{
+                        .kind = .full_text,
+                        .index_name = try alloc.dupe(u8, index_name),
+                    };
+                }
+                try documents.append(alloc, .{
+                    .key = try alloc.dupe(u8, chunk_key),
+                    .action = .upsert,
+                    .cleaned_value = try alloc.dupe(u8, payload),
+                    .targets = targets,
+                });
+            }
+
+            try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, chunk_key, entry.name, entry.source_field, chunk, artifact_writes, dense_embeddings);
+            try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, chunk_key, entry.name, chunk, artifact_writes, sparse_embeddings);
+
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+}
+
+fn appendDocumentUnitChunkDenseEmbeddingWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    source_field: []const u8,
+    chunk: chunker_mod.Chunk,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const runtime = db.enrichment_runtime orelse return;
+    const dense_embedder = runtime.config.dense_embedder orelse return;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims == 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+        defer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        const vector = try dense_embedder.embedDense(alloc, entry.name, chunk_text, entry.expected_dims);
+        defer alloc.free(vector);
+        const artifact_key = try appendEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            chunk_key,
+            doc_key,
+            entry.name,
+            source_field,
+            chunk_key,
+            enrichment_artifact_codec.hashSource(chunk_text),
+            vector,
+        );
+        defer alloc.free(artifact_key);
+        try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, consumer_indexes);
+    }
+}
+
+fn appendDocumentUnitChunkSparseEmbeddingWrites(
+    alloc: Allocator,
+    db: *DB,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    chunk: chunker_mod.Chunk,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const runtime = db.enrichment_runtime orelse return;
+    const sparse_embedder = runtime.config.sparse_embedder orelse return;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims != 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+        defer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        var sparse = try sparse_embedder.embedSparse(alloc, entry.name, chunk_text);
+        defer sparse.deinit(alloc);
+        const artifact_key = try appendSparseEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            chunk_key,
+            entry.name,
+            enrichment_artifact_codec.hashSource(chunk_text),
+            sparse.indices,
+            sparse.values,
+        );
+        defer alloc.free(artifact_key);
+        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+    }
+}
+
+fn buildDocumentUnitChunkPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    unit_key: []const u8,
+    artifact_name: []const u8,
+    source_artifact_name: []const u8,
+    source_field: []const u8,
+    unit_id: []const u8,
+    chunk: chunker_mod.Chunk,
+    include_payload: bool,
+) ![]u8 {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
+    try chunk_artifact_mod.appendArtifactFields(alloc, &obj, source_field, chunk, include_payload);
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+}
+
+fn documentExtractionFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_url);
+    hasher.update(config_json);
+    hasher.update(configured_content_type);
+    hasher.update(configured_filename);
+    hasher.update(downloaded_content_type);
+    hasher.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(unit.unit_id);
+    hasher.update(unit.unit_type);
+    hasher.update(unit.text);
+    hasher.update(unit.method);
+    if (unit.page_number) |page_number| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn documentExtractionStateValueAlloc(
+    alloc: Allocator,
+    fingerprint: []const u8,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_extraction_state_v1",
+        .fingerprint = fingerprint,
+        .unit_keys = unit_keys,
+        .unit_descriptors = unit_descriptors,
+        .chunk_keys = chunk_keys,
+    }, .{});
+}
+
+fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "unit_keys");
+}
+
+fn documentExtractionStateChunkKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "chunk_keys");
+}
+
+fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const u8) ![]DocumentExtractionUnitDescriptor {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const descriptors_value = parsed.value.object.get("unit_descriptors") orelse return documentExtractionStateUnitDescriptorFallbackAlloc(alloc, parsed.value.object);
+    if (descriptors_value != .array) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, descriptors_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (descriptors_value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
+        const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
+        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, key_value.string),
+            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]DocumentExtractionUnitDescriptor {
+    const keys_value = object.get("unit_keys") orelse return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    if (keys_value != .array) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, item.string),
+            .fingerprint = "",
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_name: []const u8) ![]const []const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc([]const u8, 0);
+    const keys_value = parsed.value.object.get(field_name) orelse return try alloc.alloc([]const u8, 0);
+    if (keys_value != .array) return try alloc.alloc([]const u8, 0);
+    const out = try alloc.alloc([]const u8, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionUnitKeyStillPresent(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_key: []const u8,
+    units: []const document_extraction_mod.Unit,
+) !bool {
+    for (units) |unit| {
+        const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(key);
+        if (std.mem.eql(u8, previous_key, key)) return true;
+    }
+    return false;
+}
+
+fn documentUnitPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    source_url: []const u8,
+    content_type: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .text = unit.text,
+        .content_type = "text/plain",
+        .language = "",
+        .provenance = .{
+            .source_url = source_url,
+            .method = unit.method,
+            .ocr_used = false,
+            .page_number = unit.page_number,
+            .source_content_type = content_type,
+        },
+    }, .{});
+}
+
+const document_extraction_range_target_children = 256;
+
+fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) !u64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, manifest, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const generation = parsed.value.object.get("generation") orelse return 0;
+    if (generation != .integer or generation.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    const value = object.get(field_name) orelse return "";
+    if (value != .string) return "";
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .string) return null;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectU64(object: std.json.ObjectMap, field_name: []const u8) !u64 {
+    const value = object.get(field_name) orelse return 0;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
+    return std.math.cast(usize, try jsonObjectU64(object, field_name)) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn documentArtifactManifestFromJsonAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    manifest_json: []u8,
+    state_json: ?[]u8,
+) !types.DocumentArtifactManifest {
+    errdefer alloc.free(manifest_json);
+    errdefer if (state_json) |value| alloc.free(value);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+
+    const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
+        .document_id = @constCast(doc_key),
+        .name = @constCast(artifact_name),
+        .kind = .asset,
+    });
+    errdefer alloc.free(artifact_id);
+
+    const route_type = try jsonObjectStringDup(alloc, object, "route_type");
+    errdefer if (route_type.len > 0) alloc.free(route_type);
+    const unsupported_reason = try jsonObjectOptionalStringDup(alloc, object, "unsupported_reason");
+    errdefer if (unsupported_reason) |value| alloc.free(value);
+
+    var child_range_count: usize = 0;
+    if (object.get("child_ranges")) |value| {
+        if (value == .array) child_range_count = value.array.items.len;
+    }
+
+    var merge_status: []u8 = "";
+    var merge_operation_count: usize = 0;
+    if (object.get("merge_plan")) |value| {
+        if (value == .object) {
+            merge_status = try jsonObjectStringDup(alloc, value.object, "status");
+            if (value.object.get("operations")) |operations| {
+                if (operations == .array) merge_operation_count = operations.array.items.len;
+            }
+        }
+    }
+    errdefer if (merge_status.len > 0) alloc.free(merge_status);
+
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_artifact_name = try alloc.dupe(u8, artifact_name);
+    errdefer alloc.free(owned_artifact_name);
+
+    return .{
+        .document_id = owned_doc_key,
+        .artifact_name = owned_artifact_name,
+        .artifact_id = artifact_id,
+        .manifest_json = manifest_json,
+        .state_json = state_json,
+        .generation = try jsonObjectU64(object, "generation"),
+        .route_type = route_type,
+        .unsupported_reason = unsupported_reason,
+        .unit_count = try jsonObjectUsize(object, "unit_count"),
+        .chunk_count = try jsonObjectUsize(object, "chunk_count"),
+        .child_range_count = child_range_count,
+        .merge_status = merge_status,
+        .merge_operation_count = merge_operation_count,
+    };
+}
+
+fn appendJsonFieldName(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+    try appendJsonString(alloc, out, name);
+    try out.append(alloc, ':');
+}
+
+fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: []const u8) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try appendJsonString(alloc, out, value);
+}
+
+fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try out.appendSlice(alloc, if (value) "true" else "false");
+}
+
+fn appendDocumentExtractionRangeDescriptors(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    artifact_name: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+) !void {
+    var first_range = true;
+    var range_index: usize = 0;
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units);
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{});
+}
+
+fn appendDocumentExtractionKeyRanges(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_range: *bool,
+    range_index: *usize,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+) !void {
+    var start: usize = 0;
+    while (start < keys.len) {
+        const end = @min(start + document_extraction_range_target_children, keys.len);
+        if (first_range.*) {
+            first_range.* = false;
+        } else {
+            try out.append(alloc, ',');
+        }
+        var first = true;
+        try out.append(alloc, '{');
+        const range_id = try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index.*});
+        defer alloc.free(range_id);
+        try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
+        try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+        try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "split_boundary", "unit");
+        try appendJsonFieldString(alloc, out, &first, "placement", "parent");
+        try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
+        try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
+        try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
+        try appendJsonFieldUsize(alloc, out, &first, "child_count", end - start);
+        if (units.len >= end) {
+            var text_bytes: usize = 0;
+            for (units[start..end]) |unit| text_bytes += unit.text.len;
+            try appendJsonFieldUsize(alloc, out, &first, "text_bytes", text_bytes);
+        }
+        try out.append(alloc, '}');
+        range_index.* += 1;
+        start = end;
+    }
+}
+
+fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
+    var count: usize = 0;
+    for (keys) |key| {
+        if (!containsDeleteKey(exclude_keys, key)) count += 1;
+    }
+    return count;
+}
+
+fn unitDescriptorFingerprintMatches(descriptors: []const DocumentExtractionUnitDescriptor, key: []const u8, fingerprint: []const u8) bool {
+    if (fingerprint.len == 0) return false;
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.key, key) and std.mem.eql(u8, descriptor.fingerprint, fingerprint)) return true;
+    }
+    return false;
+}
+
+fn countUnitDescriptorsByFingerprintMatch(
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_match: bool,
+) usize {
+    var count: usize = 0;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched == want_match) count += 1;
+    }
+    return count;
+}
+
+fn appendDocumentExtractionUnitMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    artifact_name: []const u8,
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_fingerprint_match: bool,
+) !void {
+    const count = countUnitDescriptorsByFingerprintMatch(descriptors, comparison, want_fingerprint_match);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched != want_fingerprint_match) continue;
+        if (first_key == null) first_key = descriptor.key;
+        last_key = descriptor.key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", "unit");
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try appendJsonFieldBool(alloc, out, &first, "fingerprint_match", want_fingerprint_match);
+    try out.append(alloc, '}');
+}
+
+fn appendDocumentExtractionMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    exclude_keys: []const []const u8,
+) !void {
+    const count = countKeysNotIn(keys, exclude_keys);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (keys) |key| {
+        if (containsDeleteKey(exclude_keys, key)) continue;
+        if (first_key == null) first_key = key;
+        last_key = key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try out.append(alloc, '}');
+}
+
+fn documentExtractionManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    fingerprint: []const u8,
+    extraction: document_extraction_mod.Result,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+    previous_unit_keys: []const []const u8,
+    previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    previous_chunk_keys: []const []const u8,
+    from_generation: u64,
+    to_generation: u64,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
+    try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
+    try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.unsupported_reason.len > 0) {
+        try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.append(alloc, '[');
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units);
+    try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", "converged");
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.append(alloc, '[');
+    var first_operation = true;
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "keep", artifact_name, unit_descriptors, previous_unit_descriptors, true);
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "upsert", artifact_name, unit_descriptors, previous_unit_descriptors, false);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "upsert", "chunk", "derived_chunks", chunk_keys, &.{});
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "unit", artifact_name, previous_unit_keys, unit_keys);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "chunk", "derived_chunks", previous_chunk_keys, chunk_keys);
+    try out.append(alloc, ']');
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn extractAssetSourceValue(
@@ -12963,6 +14179,113 @@ const GraphArtifactClear = struct {
     }
 };
 
+const ChunkEmbeddingSource = struct {
+    key: []u8,
+    text: []u8,
+};
+
+fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
+    for (sources) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    if (sources.len > 0) alloc.free(sources);
+}
+
+fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []const u8) bool {
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.key, key)) return true;
+    }
+    return false;
+}
+
+fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(source_field) orelse return null;
+    if (source != .string or source.string.len == 0) return null;
+    return try alloc.dupe(u8, source.string);
+}
+
+fn collectChunkEmbeddingSourcesFromWrites(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    writes: []const types.BatchWrite,
+    artifact_name: []const u8,
+    source_field: []const u8,
+) !void {
+    for (writes) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (containsChunkEmbeddingSource(out.items, write.key)) continue;
+        const text = (try chunkPayloadTextAlloc(alloc, write.value, source_field)) orelse continue;
+        errdefer alloc.free(text);
+        try out.append(alloc, .{
+            .key = try alloc.dupe(u8, write.key),
+            .text = text,
+        });
+    }
+}
+
+fn collectChunkEmbeddingSourcesFromStore(
+    alloc: Allocator,
+    db: *DB,
+    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_field: []const u8,
+) !void {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const existing = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, existing);
+
+    for (existing) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        if (containsChunkEmbeddingSource(out.items, entry.key)) continue;
+        const text = (try chunkPayloadTextAlloc(alloc, entry.value, source_field)) orelse continue;
+        errdefer alloc.free(text);
+        try out.append(alloc, .{
+            .key = try alloc.dupe(u8, entry.key),
+            .text = text,
+        });
+    }
+}
+
+fn chunkEmbeddingSourcesForRequest(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+) ![]ChunkEmbeddingSource {
+    const artifact_name = requestArtifactName(request);
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            alloc.free(source.key);
+            alloc.free(source.text);
+        }
+        sources.deinit(alloc);
+    }
+
+    const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
+    for (chunks) |chunk| {
+        const chunk_text = chunk.text orelse continue;
+        if (chunk_text.len == 0) continue;
+        try sources.append(alloc, .{
+            .key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
+            .text = try alloc.dupe(u8, chunk_text),
+        });
+    }
+    if (sources.items.len > 0) return try sources.toOwnedSlice(alloc);
+
+    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, artifact_name, request.source_field);
+    try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
+    return try sources.toOwnedSlice(alloc);
+}
+
 fn appendDenseEmbeddingForConsumers(
     alloc: Allocator,
     dense_embeddings: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
@@ -13038,40 +14361,32 @@ fn computeDenseRequestImpl(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
-        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
-        defer chunk_texts.deinit(alloc);
-        var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (chunk_keys.items) |chunk_key| alloc.free(chunk_key);
-            chunk_keys.deinit(alloc);
-        }
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        defer freeChunkEmbeddingSources(alloc, sources);
+        if (sources.len == 0) return;
 
-        for (chunks) |chunk| {
-            const chunk_text = chunk.text orelse continue;
-            try chunk_texts.append(alloc, chunk_text);
-            try chunk_keys.append(alloc, try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, requestArtifactName(request), @intCast(chunk.chunk_id)));
-        }
-        if (chunk_texts.items.len == 0) return;
+        const chunk_texts = try alloc.alloc([]const u8, sources.len);
+        defer alloc.free(chunk_texts);
+        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
 
-        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts.items, request.expected_dims);
+        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts, request.expected_dims);
         defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        if (vectors.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
+        if (vectors.len != sources.len) return error.InvalidEmbeddingResponse;
 
-        for (chunk_keys.items, chunk_texts.items, vectors) |chunk_key, chunk_text, vector| {
+        for (sources, vectors) |source, vector| {
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
-                chunk_key,
+                source.key,
                 request.doc_key,
                 embedding_name,
                 request.source_field,
-                chunk_key,
-                enrichment_artifact_codec.hashSource(chunk_text),
+                source.key,
+                enrichment_artifact_codec.hashSource(source.text),
                 vector,
             );
             defer alloc.free(artifact_key);
-            try appendForConsumers(alloc, dense_embeddings, chunk_key, request.doc_key, artifact_key, vector, consumer_indexes);
+            try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
         }
         return;
     }
@@ -13150,38 +14465,30 @@ fn computeSparseRequestDerived(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
-        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
-        defer chunk_texts.deinit(alloc);
-        var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (chunk_keys.items) |chunk_key| alloc.free(chunk_key);
-            chunk_keys.deinit(alloc);
-        }
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        defer freeChunkEmbeddingSources(alloc, sources);
+        if (sources.len == 0) return;
 
-        for (chunks) |chunk| {
-            const chunk_text = chunk.text orelse continue;
-            try chunk_texts.append(alloc, chunk_text);
-            try chunk_keys.append(alloc, try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, requestArtifactName(request), @intCast(chunk.chunk_id)));
-        }
-        if (chunk_texts.items.len == 0) return;
+        const chunk_texts = try alloc.alloc([]const u8, sources.len);
+        defer alloc.free(chunk_texts);
+        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
 
-        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts.items);
+        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts);
         defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
-        if (sparse_batch.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
+        if (sparse_batch.len != sources.len) return error.InvalidEmbeddingResponse;
 
-        for (chunk_keys.items, sparse_batch) |chunk_key, sparse| {
+        for (sources, sparse_batch) |source, sparse| {
             const artifact_key = try appendSparseEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
-                chunk_key,
+                source.key,
                 embedding_name,
-                null,
+                enrichment_artifact_codec.hashSource(source.text),
                 sparse.indices,
                 sparse.values,
             );
             defer alloc.free(artifact_key);
-            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
         }
         return;
     }
@@ -13233,6 +14540,7 @@ fn prepareGeneratedEnrichments(
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     precompute_mode: GeneratedPrecomputeMode,
+    force_generated_artifact_names: []const []const u8,
 ) !PrecomputedGeneratedBatch {
     if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
 
@@ -13325,7 +14633,18 @@ fn prepareGeneratedEnrichments(
             }
 
             switch (request.kind) {
-                .asset => try computeAssetRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &artifact_delete_keys),
+                .asset => try computeAssetRequestDerived(
+                    self.alloc,
+                    self,
+                    cleaned,
+                    request,
+                    &artifact_writes,
+                    &artifact_delete_keys,
+                    &documents,
+                    &dense_embeddings,
+                    &sparse_embeddings,
+                    containsName(force_generated_artifact_names, requestArtifactName(request)),
+                ),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
                     error.MissingDenseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
@@ -26808,6 +28127,7 @@ const TestAssetProducer = struct {
         self.calls += 1;
         switch (request.producer_type) {
             .copy => {},
+            .document_extraction => {},
             .generator => self.generator_calls += 1,
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
@@ -26926,6 +28246,747 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
+test "db document extraction asset materializes unit artifacts from data url" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"artifact_type\":\"document_units\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_parent_doc_key\":\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_artifact_name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"alpha beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"text\"") != null);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"kind\":\"document_extraction_state_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "document:000001") == null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
+test "db document extraction routes mixed files using source metadata fields" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json =
+        \\{"type":"document_extraction","config":{"source":{"filename_field":"filename"},"routes":[{"match":{"extension":["md"]},"extractor":{"type":"text","unit":"note"}}]}}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:application/octet-stream;base64,YWxwaGEgYmV0YQ==\",\"filename\":\"notes.md\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "note:000001");
+    defer alloc.free(unit_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"text\"") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_id\":\"note:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_type\":\"note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"alpha beta\"") != null);
+}
+
+test "db document extraction stores unsupported file manifest without searchable units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_units",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"document_units_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:bin",
+            .value = "{\"url\":\"data:application/octet-stream;base64,AAEC\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bin", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:bin", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unsupported_reason\":\"unsupported_content_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":0") != null);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_keys\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\":[]") != null);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match_all = {} },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+}
+
+test "db document extraction manifest classifies unit fingerprint keeps" {
+    const alloc = std.testing.allocator;
+    const unit_keys = [_][]const u8{ "unit:a", "unit:b" };
+    const chunk_keys = [_][]const u8{};
+    const previous_unit_keys = [_][]const u8{ "unit:a", "unit:b" };
+    const previous_chunk_keys = [_][]const u8{};
+    const units = [_]document_extraction_mod.Unit{
+        .{
+            .unit_id = @constCast("unit:a"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("same"),
+            .method = @constCast("text"),
+        },
+        .{
+            .unit_id = @constCast("unit:b"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("changed"),
+            .method = @constCast("text"),
+        },
+    };
+    const extraction = document_extraction_mod.Result{
+        .content_type = @constCast("text/plain"),
+        .route_type = @constCast("text"),
+        .units = @constCast(units[0..]),
+    };
+    const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = "unit:a", .fingerprint = "same-fingerprint" },
+        .{ .key = "unit:b", .fingerprint = "new-fingerprint" },
+    };
+    const previous_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = "unit:a", .fingerprint = "same-fingerprint" },
+        .{ .key = "unit:b", .fingerprint = "old-fingerprint" },
+    };
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:text/plain,same",
+        "source-fingerprint",
+        extraction,
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        1,
+        2,
+    );
+    defer alloc.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"upsert\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:b\"") != null);
+}
+
+test "db document extraction skips stable unit local rewrites without text consumers" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+}
+
+test "db document extraction manifest inspection and reprocess API" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    var inspected = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer inspected.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", inspected.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", inspected.artifact_name);
+    try std.testing.expect(std.mem.startsWith(u8, inspected.artifact_id, "af1:asset:"));
+    try std.testing.expectEqual(@as(u64, 1), inspected.generation);
+    try std.testing.expectEqualStrings("text", inspected.route_type);
+    try std.testing.expectEqual(@as(usize, 1), inspected.unit_count);
+    try std.testing.expectEqual(@as(usize, 1), inspected.chunk_count);
+    try std.testing.expectEqual(@as(usize, 2), inspected.child_range_count);
+    try std.testing.expectEqualStrings("converged", inspected.merge_status);
+    try std.testing.expect(inspected.merge_operation_count > 0);
+    try std.testing.expect(inspected.state_json != null);
+
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), after.generation);
+    try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"op\":\"keep\"") != null);
+
+    try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
+    try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:missing", "document_units_v1")) == null);
+}
+
+test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "ft_document_units",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"document_units_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    const first_value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}";
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = first_value }},
+        .sync_level = .full_index,
+    });
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    const second_value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}";
+    var extracted = [_]mapper.ExtractedWrite{try mapper.extractWrite(alloc, "doc:a", second_value)};
+    defer extracted[0].deinit(alloc);
+    var precomputed = try prepareGeneratedEnrichments(&db, .{
+        .writes = &.{.{ .key = "doc:a", .value = second_value }},
+    }, &extracted, .all, &.{});
+    defer precomputed.deinit(alloc);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
+
+    try std.testing.expectEqual(first_calls, counting.calls);
+    try std.testing.expectEqual(@as(usize, 2), precomputed.documents.len);
+    var saw_unit_doc = false;
+    var saw_chunk_doc = false;
+    for (precomputed.documents) |doc| {
+        try std.testing.expectEqual(@as(?[]const u8, null), doc.cleaned_value);
+        if (std.mem.eql(u8, doc.key, unit_key)) saw_unit_doc = true;
+        if (std.mem.eql(u8, doc.key, chunk_key)) saw_chunk_doc = true;
+    }
+    try std.testing.expect(saw_unit_doc);
+    try std.testing.expect(saw_chunk_doc);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = second_value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    var unit_result = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer unit_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), unit_result.total_hits);
+
+    var chunk_result = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer chunk_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
+}
+
+test "db document extraction chunks units through source artifact enrichment" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_sparse_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "document_chunk_sparse_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\"}",
+    });
+    const embedding_cfg = db.core.index_manager.getEnrichment(.embedding, "document_chunk_dense_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("document_chunks_v1", embedding_cfg.source_artifact_name);
+    try std.testing.expectEqual(@as(u32, 3), embedding_cfg.expected_dims);
+    const dense_consumers = try db.core.index_manager.denseIndexesForEmbedding(alloc, "document_chunk_dense_v1", 3);
+    defer {
+        for (dense_consumers) |name| alloc.free(name);
+        alloc.free(dense_consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), dense_consumers.len);
+    try std.testing.expectEqualStrings("dv_document_chunks", dense_consumers[0]);
+    const sparse_consumers = try db.core.index_manager.sparseIndexesForEmbedding(alloc, "document_chunk_sparse_v1");
+    defer {
+        for (sparse_consumers) |name| alloc.free(name);
+        alloc.free(sparse_consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sparse_consumers.len);
+    try std.testing.expectEqualStrings("document_chunk_sparse_v1", sparse_consumers[0]);
+
+    const planned = try db.core.planGeneratedEnrichments(
+        alloc,
+        "doc:planned",
+        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        &.{},
+        &.{},
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, planned);
+    var saw_document_asset = false;
+    var saw_document_chunk_dense = false;
+    var saw_document_chunk_sparse = false;
+    for (planned) |request| {
+        if (request.kind == .asset and std.mem.eql(u8, request.artifact_name, "document_units_v1")) saw_document_asset = true;
+        if (request.kind == .dense_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_dense_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_dense = true;
+        }
+        if (request.kind == .sparse_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_sparse_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_sparse = true;
+        }
+    }
+    try std.testing.expect(saw_document_asset);
+    try std.testing.expect(saw_document_chunk_dense);
+    try std.testing.expect(saw_document_chunk_sparse);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(state_key);
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+
+    const chunk_payload = try db.core.store.get(alloc, chunk_key);
+    defer alloc.free(chunk_payload);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_doc_key\":\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_artifact_name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_source_artifact_name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"text\":\"alpha beta gamma\"") != null);
+
+    const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_chunk_dense_v1");
+    defer alloc.free(dense_artifact_key);
+    const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(dense_artifact_payload);
+    const sparse_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_chunk_sparse_v1");
+    defer alloc.free(sparse_artifact_key);
+    const sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(sparse_artifact_payload);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"fingerprint\"") != null);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"manifest_version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"child_ranges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"unit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"merge_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+
+    var result = try db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    var parent_with_chunks = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .parent_with_chunks,
+        .include_stored = false,
+    });
+    defer parent_with_chunks.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
+    var chunk_public_id_for_rollup = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, chunk_key);
+    defer chunk_public_id_for_rollup.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_public_id_for_rollup.id, parent_with_chunks.hits[0].chunk_hits[0].id);
+    const rollup_chunk_ref = parent_with_chunks.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", rollup_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", rollup_chunk_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, rollup_chunk_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), rollup_chunk_ref.chunk_id);
+    try std.testing.expectEqualStrings("document:000001", rollup_chunk_ref.unit_id.?);
+
+    const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
+    defer alloc.free(query_vec);
+    const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
+    var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
+    defer direct.deinit();
+    const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
+        metadata
+    else blk: {
+        const hit = direct.getHits()[0];
+        break :blk (try dense_index.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
+    };
+    defer alloc.free(dense_internal_id);
+    try std.testing.expectEqualStrings(chunk_key, dense_internal_id);
+
+    var sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta gamma");
+    defer sparse_query.deinit(alloc);
+    var sparse_result = try db.search(alloc, .{
+        .index_name = "document_chunk_sparse_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = sparse_query.indices,
+            .values = sparse_query.values,
+            .k = 3,
+        } },
+        .return_mode = .chunk,
+        .limit = 1,
+    });
+    defer sparse_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
+    var chunk_public_id = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, chunk_key);
+    defer chunk_public_id.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_public_id.id, sparse_result.hits[0].id);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    const updated_manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(updated_manifest);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"from_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"to_generation\":2") != null);
+    const updated_chunk_payload = try db.core.store.get(alloc, chunk_key);
+    defer alloc.free(updated_chunk_payload);
+    try std.testing.expect(std.mem.indexOf(u8, updated_chunk_payload, "\"text\":\"alpha beta delta\"") != null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, chunk_key));
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {
@@ -28840,7 +30901,7 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.enrichment_runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
-    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    const query_vec = try deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
     const req: types.SearchRequest = .{
@@ -29523,21 +31584,23 @@ test "db dense index can reference existing chunk embedding enrichment" {
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
     const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, slow_test_wait_attempts);
+    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 2, slow_test_wait_attempts);
     defer direct.deinit();
 
-    const internal_id = if (direct.takeMetadata(0)) |metadata|
-        metadata
-    else blk: {
-        const hit = direct.getHits()[0];
-        break :blk (try dv_ref.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
-    };
-    defer alloc.free(internal_id);
-    var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
-    defer identity.deinit(alloc);
     const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, identity.id);
+    var found_chunk_zero = false;
+    for (direct.getHits(), 0..) |hit, idx| {
+        const internal_id = if (direct.takeMetadata(idx)) |metadata|
+            metadata
+        else
+            (try dv_ref.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(internal_id);
+        var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
+        defer identity.deinit(alloc);
+        if (std.mem.eql(u8, identity.id, chunk_zero)) found_chunk_zero = true;
+    }
+    try std.testing.expect(found_chunk_zero);
 }
 
 test "db persists shorthand chunk enrichment catalog across reopen" {

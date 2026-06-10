@@ -86,6 +86,9 @@ pub const Routes = struct {
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
+    pub const documents_marker = "/documents/";
+    pub const artifacts_marker = "/artifacts/";
+    pub const reprocess_suffix = ":reprocess";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -131,6 +134,12 @@ pub const Routes = struct {
     pub const TableIndex = struct {
         table_name: []const u8,
         index_name: []const u8,
+    };
+
+    pub const TableDocumentArtifact = struct {
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
     };
 
     pub const SecretPath = struct {
@@ -394,6 +403,40 @@ pub const Routes = struct {
         return .{
             .table_name = table_name,
             .index_name = index_name,
+        };
+    }
+
+    pub fn matchTableDocumentArtifact(path: []const u8) ?TableDocumentArtifact {
+        return matchTableDocumentArtifactWithReprocess(path, false);
+    }
+
+    pub fn matchTableDocumentArtifactReprocess(path: []const u8) ?TableDocumentArtifact {
+        return matchTableDocumentArtifactWithReprocess(path, true);
+    }
+
+    fn matchTableDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?TableDocumentArtifact {
+        const effective_path = if (reprocess) blk: {
+            if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+            break :blk path[0 .. path.len - reprocess_suffix.len];
+        } else blk: {
+            if (std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+            break :blk path;
+        };
+        if (!std.mem.startsWith(u8, effective_path, tables_prefix)) return null;
+        const rest = effective_path[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = rest[0..documents_index];
+        const document_rest = rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        return .{
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
         };
     }
 
@@ -841,6 +884,15 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", index.table_name);
     try std.testing.expectEqualStrings("search_idx", index.index_name);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/search_idx/algebraic") == null);
+    const artifact = Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+    try std.testing.expectEqualStrings("docs", artifact.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", artifact.key);
+    try std.testing.expectEqualStrings("document_units_v1", artifact.artifact_name);
+    const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
+    try std.testing.expectEqualStrings("docs", reprocess.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
+    try std.testing.expectEqualStrings("document_units_v1", reprocess.artifact_name);
+    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);

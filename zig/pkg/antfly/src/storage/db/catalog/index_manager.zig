@@ -3051,6 +3051,20 @@ pub const IndexManager = struct {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         errdefer enrichment_types.deinitGeneratedRequests(alloc, requests.items);
 
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            try requests.append(alloc, .{
+                .kind = .asset,
+                .index_name = try alloc.dupe(u8, entry.name),
+                .artifact_name = try alloc.dupe(u8, entry.name),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .source_field = try alloc.dupe(u8, entry.source_field),
+                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+            });
+        }
+
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
@@ -3176,21 +3190,50 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                 });
+            } else if (entry.embedding_name) |embedding_name| {
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
+                if (embedding_cfg.expected_dims != 0) continue;
+                if (embedding_cfg.source_artifact_name.len > 0) {
+                    const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                        try requests.append(alloc, .{
+                            .kind = .chunk_text,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                            .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                    if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
+                        try requests.append(alloc, .{
+                            .kind = .sparse_embedding,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .embedding_name = try alloc.dupe(u8, embedding_name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                    try requests.append(alloc, .{
+                        .kind = .sparse_embedding,
+                        .index_name = try alloc.dupe(u8, entry.config.name),
+                        .artifact_name = "",
+                        .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .doc_key = try alloc.dupe(u8, doc_key),
+                        .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                        .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                    });
+                }
             }
-        }
-
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-            });
         }
 
         return try requests.toOwnedSlice(alloc);
@@ -6042,6 +6085,7 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.chunk, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
                 !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
@@ -6092,9 +6136,11 @@ pub const IndexManager = struct {
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+                if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.asset, cfg.source_artifact_name) == null) {
+                    return error.InvalidEnrichmentConfig;
+                }
             },
             .embedding => {
-                if (cfg.expected_dims == 0) return error.InvalidEnrichmentConfig;
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
@@ -11938,6 +11984,26 @@ fn hasGeneratedDenseEmbeddingRequest(
 ) bool {
     for (requests) |request| {
         if (request.kind != .dense_embedding) continue;
+        if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
+        if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
+        if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
+        if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn hasGeneratedSparseEmbeddingRequest(
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    doc_key: []const u8,
+    source_field: []const u8,
+    source_template: []const u8,
+    artifact_name: []const u8,
+    embedding_name: []const u8,
+) bool {
+    for (requests) |request| {
+        if (request.kind != .sparse_embedding) continue;
         if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
         if (!std.mem.eql(u8, request.source_field, source_field)) continue;
         if (!std.mem.eql(u8, request.source_template, source_template)) continue;

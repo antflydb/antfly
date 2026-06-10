@@ -191,17 +191,20 @@ pub const ArtifactSourceRef = struct {
     kind: ArtifactKind,
     name: []u8,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
         return .{
             .kind = self.kind,
             .name = try alloc.dupe(u8, self.name),
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
     }
 
     pub fn deinit(self: *ArtifactSourceRef, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;
     }
 };
@@ -211,6 +214,7 @@ pub const ArtifactRef = struct {
     name: []u8,
     kind: ArtifactKind,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
@@ -219,6 +223,7 @@ pub const ArtifactRef = struct {
             .name = try alloc.dupe(u8, self.name),
             .kind = self.kind,
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -226,6 +231,7 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
     }
@@ -392,6 +398,34 @@ pub const ArtifactWrite = struct {
 };
 
 pub const ArtifactRecord = ArtifactWrite;
+
+pub const DocumentArtifactManifest = struct {
+    document_id: []u8,
+    artifact_name: []u8,
+    artifact_id: []u8,
+    manifest_json: []u8,
+    state_json: ?[]u8 = null,
+    generation: u64 = 0,
+    route_type: []u8 = "",
+    unsupported_reason: ?[]u8 = null,
+    unit_count: usize = 0,
+    chunk_count: usize = 0,
+    child_range_count: usize = 0,
+    merge_status: []u8 = "",
+    merge_operation_count: usize = 0,
+
+    pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        alloc.free(self.artifact_name);
+        alloc.free(self.artifact_id);
+        alloc.free(self.manifest_json);
+        if (self.state_json) |state_json| alloc.free(state_json);
+        if (self.route_type.len > 0) alloc.free(self.route_type);
+        if (self.unsupported_reason) |unsupported_reason| alloc.free(unsupported_reason);
+        if (self.merge_status.len > 0) alloc.free(self.merge_status);
+        self.* = undefined;
+    }
+};
 
 pub const TextBoolQuery = struct {
     must: []const TextQuery = &.{},

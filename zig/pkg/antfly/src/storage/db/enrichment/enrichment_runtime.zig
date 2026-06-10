@@ -32,6 +32,7 @@ const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
+const document_extraction_mod = @import("document_extraction.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -622,6 +623,19 @@ const ChunkedDenseWindowItem = struct {
     chunk_key: []u8,
     source_hash: u64,
 };
+
+const ChunkEmbeddingSource = struct {
+    key: []u8,
+    text: []u8,
+};
+
+fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
+    for (sources) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    if (sources.len > 0) alloc.free(sources);
+}
 
 const PlainDenseBatchItem = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1593,8 +1607,12 @@ fn processAsset(
     const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
-        try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        if (producer_cfg.type == .document_extraction) {
+            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+        } else {
+            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     };
@@ -1602,9 +1620,18 @@ fn processAsset(
     if (source_text.len == 0) {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
-        try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        if (producer_cfg.type == .document_extraction) {
+            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+        } else {
+            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        return;
+    }
+
+    if (producer_cfg.type == .document_extraction) {
+        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, window);
         return;
     }
 
@@ -1660,6 +1687,317 @@ fn processAsset(
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
     try materializeGraphAssetForRuntime(runtime, request, produced, raw, window);
     recordArtifactBytes(runtime, .asset, produced.len);
+}
+
+fn processDocumentExtractionAsset(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    raw_doc: []const u8,
+    source_url: []const u8,
+    config_json: []const u8,
+    manifest_key: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var config = try document_extraction_mod.parseConfig(runtime.alloc, config_json);
+    defer config.deinit(runtime.alloc);
+    try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
+
+    const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+        runtime.alloc,
+        runtime.config.remote_content,
+        runtime.config.secret_store,
+        source_url,
+        if (config.credentials.len > 0) config.credentials else null,
+    );
+    const downloaded = switch (fetched) {
+        .ok => |content| content,
+        .http_error => return error.RemoteDocumentFetchFailed,
+    };
+    var downloaded_mut = downloaded;
+    defer downloaded_mut.deinit(runtime.alloc);
+
+    var extraction = try document_extraction_mod.extractDownloadedAlloc(runtime.alloc, downloaded_mut, source_url, config);
+    defer extraction.deinit(runtime.alloc);
+
+    const source_fingerprint = try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
+    defer runtime.alloc.free(source_fingerprint);
+
+    var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_keys.items) |key| runtime.alloc.free(@constCast(key));
+        desired_unit_keys.deinit(runtime.alloc);
+    }
+    var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(runtime.alloc);
+    }
+    try collectRuntimeDocumentExtractionDesiredKeys(runtime, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_chunk_keys);
+
+    const new_state = try documentExtractionStateValueAlloc(runtime.alloc, source_fingerprint, desired_unit_keys.items, desired_chunk_keys.items);
+    defer runtime.alloc.free(new_state);
+
+    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_state) |value| runtime.alloc.free(value);
+
+    if (existing_state) |state| {
+        if (std.mem.eql(u8, state, new_state)) {
+            const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
+                std.mem.Allocator.Error.OutOfMemory => return err,
+                else => null,
+            };
+            if (existing_manifest) |value| {
+                runtime.alloc.free(value);
+                runtime.skip_by_hash_count += 1;
+                return;
+            }
+        }
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            runtime.alloc.free(@constCast(write.key));
+            runtime.alloc.free(@constCast(write.value));
+        }
+        writes.deinit(runtime.alloc);
+    }
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+
+    if (existing_state) |state| {
+        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+    }
+
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, false);
+    defer {
+        for (text_indexes) |name| runtime.alloc.free(name);
+        runtime.alloc.free(text_indexes);
+    }
+
+    for (extraction.units) |unit| {
+        const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, unit.unit_id);
+        defer runtime.alloc.free(unit_key);
+        const payload = try documentUnitPayloadAlloc(runtime.alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type);
+        errdefer runtime.alloc.free(payload);
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, unit_key),
+            .value = payload,
+        });
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, unit_key);
+
+        if (text_indexes.len > 0) {
+            var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+            errdefer {
+                for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+                runtime.alloc.free(targets);
+            }
+            for (text_indexes, 0..) |index_name, i| {
+                targets[i] = .{
+                    .kind = .full_text,
+                    .index_name = try runtime.alloc.dupe(u8, index_name),
+                };
+            }
+            try window.documents.append(runtime.alloc, .{
+                .key = try runtime.alloc.dupe(u8, unit_key),
+                .action = .upsert,
+                .cleaned_value = try runtime.alloc.dupe(u8, payload),
+                .targets = targets,
+            });
+        }
+
+        try appendRuntimeDocumentUnitChunkWrites(runtime, request.doc_key, artifact_name, unit_key, unit, &writes, window);
+    }
+
+    const manifest = try documentExtractionManifestPayloadAlloc(runtime.alloc, request.doc_key, artifact_name, source_url, source_fingerprint, extraction);
+    errdefer runtime.alloc.free(manifest);
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, manifest_key),
+        .value = manifest,
+    });
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, state_key),
+        .value = try runtime.alloc.dupe(u8, new_state),
+    });
+
+    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    recordArtifactBytes(runtime, .asset, manifest.len);
+}
+
+fn deleteDocumentExtractionForRuntime(
+    runtime: *EnrichmentRuntime,
+    manifest_key: []const u8,
+    state_key: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+
+    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, manifest_key));
+    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+
+    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_state) |value| runtime.alloc.free(value);
+    if (existing_state) |state| {
+        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+    }
+
+    try storePutBatchWithRetry(runtime, &.{}, deletes.items);
+}
+
+fn collectRuntimeDocumentExtractionDesiredKeys(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    units: []const document_extraction_mod.Unit,
+    desired_unit_keys: *std.ArrayListUnmanaged([]const u8),
+    desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (units) |unit| {
+        try desired_unit_keys.append(runtime.alloc, try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, doc_key, artifact_name, unit.unit_id));
+        for (runtime.index_manager.enrichments.items) |entry| {
+            if (entry.kind != .chunk) continue;
+            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+            const chunks = if (entry.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            else
+                try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+            defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            for (chunks) |chunk| {
+                try desired_chunk_keys.append(runtime.alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            }
+        }
+    }
+}
+
+fn appendRuntimeDocumentUnitChunkWrites(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    window: *GeneratedReplayWindow,
+) !void {
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+        if (chunks.len == 0) continue;
+
+        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, false);
+        defer {
+            for (text_indexes) |name| runtime.alloc.free(name);
+            runtime.alloc.free(text_indexes);
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(runtime.alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer runtime.alloc.free(chunk_key);
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit.unit_id, chunk, true);
+            try writes.append(runtime.alloc, .{
+                .key = try runtime.alloc.dupe(u8, chunk_key),
+                .value = try runtime.alloc.dupe(u8, payload),
+            });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, chunk_key);
+
+            if (text_indexes.len > 0) {
+                var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                errdefer {
+                    for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+                    runtime.alloc.free(targets);
+                }
+                for (text_indexes, 0..) |index_name, i| {
+                    targets[i] = .{
+                        .kind = .full_text,
+                        .index_name = try runtime.alloc.dupe(u8, index_name),
+                    };
+                }
+                try window.documents.append(runtime.alloc, .{
+                    .key = try runtime.alloc.dupe(u8, chunk_key),
+                    .action = .upsert,
+                    .cleaned_value = try runtime.alloc.dupe(u8, payload),
+                    .targets = targets,
+                });
+            }
+
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+}
+
+fn buildDocumentUnitChunkPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    unit_key: []const u8,
+    artifact_name: []const u8,
+    source_artifact_name: []const u8,
+    source_field: []const u8,
+    unit_id: []const u8,
+    chunk: chunker_mod.Chunk,
+    include_payload: bool,
+) ![]u8 {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
+    try chunk_artifact_mod.appendArtifactFields(alloc, &obj, source_field, chunk, include_payload);
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
 
 fn materializeGraphAssetForRuntime(
@@ -2463,35 +2801,32 @@ fn processChunkedDenseWindow(
                 try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, key);
             }
 
-            const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-            for (chunks) |chunk| {
-                const source = chunk.text orelse continue;
-                const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, chunk_artifact_name, @intCast(chunk.chunk_id));
-                errdefer runtime.alloc.free(chunk_key);
-                const source_hash = enrichment_artifact_codec.hashSource(source);
-                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, embedding_artifact_name);
+            const sources = try chunkEmbeddingSourcesForRequest(runtime, request, chunk_artifact_name, chunk_cache);
+            defer freeChunkEmbeddingSources(runtime.alloc, sources);
+            for (sources) |source| {
+                const source_hash = enrichment_artifact_codec.hashSource(source.text);
+                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
                     if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
-                        runtime.alloc.free(chunk_key);
                         continue;
                     }
                     try cached_embeddings.append(runtime.alloc, .{
                         .index_name = try runtime.alloc.dupe(u8, seed.index_name),
                         .parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key),
-                        .doc_key = chunk_key,
+                        .doc_key = try runtime.alloc.dupe(u8, source.key),
                         .artifact_key = try runtime.alloc.dupe(u8, embedding_key),
                         .vector = &.{},
                     });
                     continue;
                 }
-                try chunk_texts.append(runtime.alloc, source);
+                try chunk_texts.append(runtime.alloc, source.text);
                 try chunk_items.append(runtime.alloc, .{
                     .request = request,
                     .parent_doc_key = request.doc_key,
                     .source_field = request.source_field,
                     .artifact_name = embedding_artifact_name,
-                    .chunk_key = chunk_key,
+                    .chunk_key = try runtime.alloc.dupe(u8, source.key),
                     .source_hash = source_hash,
                 });
             }
@@ -3037,8 +3372,9 @@ fn buildChunkDenseEmbeddings(
     artifact_name: []const u8,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![]derived_types.DerivedDenseEmbeddingWrite {
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
+    const sources = try chunkEmbeddingSourcesForRequest(runtime, request, artifact_name, chunk_cache);
+    defer freeChunkEmbeddingSources(runtime.alloc, sources);
+    if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
 
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
@@ -3053,11 +3389,10 @@ fn buildChunkDenseEmbeddings(
         chunk_keys.deinit(runtime.alloc);
     }
 
-    for (chunks) |chunk| {
-        const source = chunk.text orelse continue;
-        const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-        const source_hash = enrichment_artifact_codec.hashSource(source);
-        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, requestEmbeddingName(request));
+    for (sources) |source| {
+        const chunk_key = try runtime.alloc.dupe(u8, source.key);
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
             if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
@@ -3073,7 +3408,7 @@ fn buildChunkDenseEmbeddings(
             });
             continue;
         }
-        try chunk_texts.append(runtime.alloc, source);
+        try chunk_texts.append(runtime.alloc, source.text);
         try chunk_keys.append(runtime.alloc, chunk_key);
     }
 
@@ -3113,8 +3448,9 @@ fn buildChunkSparseEmbeddings(
     artifact_name: []const u8,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![]derived_types.DerivedSparseEmbeddingWrite {
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
+    const sources = try chunkEmbeddingSourcesForRequest(runtime, request, artifact_name, chunk_cache);
+    defer freeChunkEmbeddingSources(runtime.alloc, sources);
+    if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
 
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
@@ -3137,11 +3473,10 @@ fn buildChunkSparseEmbeddings(
         chunk_keys.deinit(runtime.alloc);
     }
 
-    for (chunks) |chunk| {
-        const source = chunk.text orelse continue;
-        const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-        const source_hash = enrichment_artifact_codec.hashSource(source);
-        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, requestEmbeddingName(request));
+    for (sources) |source| {
+        const chunk_key = try runtime.alloc.dupe(u8, source.key);
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
             if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
@@ -3157,7 +3492,7 @@ fn buildChunkSparseEmbeddings(
             });
             continue;
         }
-        try chunk_texts.append(runtime.alloc, source);
+        try chunk_texts.append(runtime.alloc, source.text);
         try chunk_keys.append(runtime.alloc, chunk_key);
         try chunk_hashes.append(runtime.alloc, source_hash);
     }
@@ -3439,6 +3774,140 @@ fn assetStateValueAlloc(
     return try alloc.dupe(u8, &digest);
 }
 
+fn documentExtractionFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_url);
+    hasher.update(config_json);
+    hasher.update(configured_content_type);
+    hasher.update(configured_filename);
+    hasher.update(downloaded_content_type);
+    hasher.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn documentExtractionStateValueAlloc(
+    alloc: Allocator,
+    fingerprint: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_extraction_state_v1",
+        .fingerprint = fingerprint,
+        .unit_keys = unit_keys,
+        .chunk_keys = chunk_keys,
+    }, .{});
+}
+
+fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "unit_keys");
+}
+
+fn documentExtractionStateChunkKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "chunk_keys");
+}
+
+fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_name: []const u8) ![]const []const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc([]const u8, 0);
+    const keys_value = parsed.value.object.get(field_name) orelse return try alloc.alloc([]const u8, 0);
+    if (keys_value != .array) return try alloc.alloc([]const u8, 0);
+    const out = try alloc.alloc([]const u8, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionUnitKeyStillPresent(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_key: []const u8,
+    units: []const document_extraction_mod.Unit,
+) !bool {
+    for (units) |unit| {
+        const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(key);
+        if (std.mem.eql(u8, previous_key, key)) return true;
+    }
+    return false;
+}
+
+fn documentUnitPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    source_url: []const u8,
+    content_type: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .text = unit.text,
+        .content_type = "text/plain",
+        .language = "",
+        .provenance = .{
+            .source_url = source_url,
+            .method = unit.method,
+            .ocr_used = false,
+            .page_number = unit.page_number,
+            .source_content_type = content_type,
+        },
+    }, .{});
+}
+
+fn documentExtractionManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    fingerprint: []const u8,
+    extraction: document_extraction_mod.Result,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        .artifact_type = "document_units",
+        .manifest_version = 1,
+        .source_url = source_url,
+        .source_fingerprint = fingerprint,
+        .content_type = extraction.content_type,
+        .route_type = extraction.route_type,
+        .unit_count = extraction.units.len,
+    }, .{});
+}
+
 fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, artifact_name: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -3660,6 +4129,77 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     return enrichment_artifact_codec.hashSource(source.string);
 }
 
+fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(source_field) orelse return null;
+    if (source != .string or source.string.len == 0) return null;
+    return try alloc.dupe(u8, source.string);
+}
+
+fn storedChunkEmbeddingSourcesForRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+) ![]ChunkEmbeddingSource {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", artifact_name);
+    defer runtime.alloc.free(prefix);
+    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, existing);
+
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            runtime.alloc.free(source.key);
+            runtime.alloc.free(source.text);
+        }
+        sources.deinit(runtime.alloc);
+    }
+
+    for (existing) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        const text = (try chunkPayloadTextAlloc(runtime.alloc, entry.value, request.source_field)) orelse continue;
+        errdefer runtime.alloc.free(text);
+        try sources.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, entry.key),
+            .text = text,
+        });
+    }
+    return try sources.toOwnedSlice(runtime.alloc);
+}
+
+fn chunkEmbeddingSourcesForRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+) ![]ChunkEmbeddingSource {
+    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            runtime.alloc.free(source.key);
+            runtime.alloc.free(source.text);
+        }
+        sources.deinit(runtime.alloc);
+    }
+    for (chunks) |chunk| {
+        const source = chunk.text orelse continue;
+        if (source.len == 0) continue;
+        try sources.append(runtime.alloc, .{
+            .key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
+            .text = try runtime.alloc.dupe(u8, source),
+        });
+    }
+    if (sources.items.len > 0) return try sources.toOwnedSlice(runtime.alloc);
+
+    const stored = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
+    if (stored.len > 0) return stored;
+    runtime.alloc.free(stored);
+    return try sources.toOwnedSlice(runtime.alloc);
+}
+
 fn chunkKeysForDenseRequest(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -3667,6 +4207,24 @@ fn chunkKeysForDenseRequest(
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![][]u8 {
     const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    if (chunks.len > 0) return try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
+
+    const stored = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
+    defer freeChunkEmbeddingSources(runtime.alloc, stored);
+    if (stored.len > 0) {
+        const keys = try runtime.alloc.alloc([]u8, stored.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| runtime.alloc.free(key);
+            runtime.alloc.free(keys);
+        }
+        for (stored, 0..) |source, i| {
+            keys[i] = try runtime.alloc.dupe(u8, source.key);
+            initialized += 1;
+        }
+        return keys;
+    }
+
     return try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
 }
 

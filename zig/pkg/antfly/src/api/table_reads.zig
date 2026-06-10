@@ -1309,6 +1309,14 @@ pub const TableReadSource = struct {
             ptr: *anyopaque,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
+        document_artifact_manifest: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
     };
 
     pub fn lookup(
@@ -1332,6 +1340,18 @@ pub const TableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    pub fn documentArtifactManifest(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const fn_ptr = self.vtable.document_artifact_manifest orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, consistency);
     }
 
     pub fn query(
@@ -1797,8 +1817,22 @@ pub const BoundTableReadSource = struct {
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
+                .document_artifact_manifest = documentArtifactManifest,
             },
         };
+    }
+
+    fn documentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.reads.documentArtifactManifestWithConsistency(alloc, self.db, doc_key, artifact_name, consistency);
     }
 
     fn lsmStorageStats(
@@ -5537,7 +5571,7 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy;
+    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
 }
 
 fn loadTableIdentityNamespaceForGroup(

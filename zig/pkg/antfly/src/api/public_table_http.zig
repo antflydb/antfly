@@ -89,6 +89,20 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteDocumentArtifactManifestError = error{
+        NotFound,
+        MethodNotAllowed,
+        DocIdentityUnavailable,
+        InternalFailure,
+    };
+
+    pub const ExecuteReprocessDocumentArtifactError = error{
+        NotFound,
+        MethodNotAllowed,
+        DocIdentityUnavailable,
+        InternalFailure,
+    };
+
     pub const TableQueryView = enum {
         default_view,
         published,
@@ -154,6 +168,20 @@ pub const TableApi = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) ExecuteDeleteIndexError!void,
+        execute_document_artifact_manifest: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest = null,
+        execute_reprocess_document_artifact: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) ExecuteReprocessDocumentArtifactError!void = null,
     };
 
     pub fn executeTableBatch(
@@ -239,6 +267,28 @@ pub const TableApi = struct {
         index_name: []const u8,
     ) ExecuteDeleteIndexError!void {
         return try self.vtable.execute_table_delete_index(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn executeDocumentArtifactManifest(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+        const fn_ptr = self.vtable.execute_document_artifact_manifest orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
+    pub fn executeReprocessDocumentArtifact(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) ExecuteReprocessDocumentArtifactError!void {
+        const fn_ptr = self.vtable.execute_reprocess_document_artifact orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
     }
 };
 
@@ -493,6 +543,75 @@ pub fn handleTableDeleteIndex(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleDocumentArtifactManifest(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    var manifest = api.executeDocumentArtifactManifest(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
+    };
+    defer manifest.deinit(alloc);
+
+    const Response = struct {
+        document_id: []const u8,
+        artifact_name: []const u8,
+        artifact_id: []const u8,
+        generation: u64,
+        route_type: []const u8,
+        unsupported_reason: ?[]const u8,
+        unit_count: usize,
+        chunk_count: usize,
+        child_range_count: usize,
+        merge_status: []const u8,
+        merge_operation_count: usize,
+        manifest_json: []const u8,
+        state_json: ?[]const u8,
+    };
+    return .{
+        .status = 200,
+        .body = try std.json.Stringify.valueAlloc(alloc, Response{
+            .document_id = manifest.document_id,
+            .artifact_name = manifest.artifact_name,
+            .artifact_id = manifest.artifact_id,
+            .generation = manifest.generation,
+            .route_type = manifest.route_type,
+            .unsupported_reason = manifest.unsupported_reason,
+            .unit_count = manifest.unit_count,
+            .chunk_count = manifest.chunk_count,
+            .child_range_count = manifest.child_range_count,
+            .merge_status = manifest.merge_status,
+            .merge_operation_count = manifest.merge_operation_count,
+            .manifest_json = manifest.manifest_json,
+            .state_json = manifest.state_json,
+        }, .{}),
+    };
+}
+
+pub fn handleReprocessDocumentArtifact(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    api.executeReprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
+    };
+    return .{
+        .status = 202,
+        .body = try alloc.dupe(u8, "{\"reprocess\":\"triggered\"}"),
+    };
 }
 
 fn unsupportedBatch(
@@ -1098,4 +1217,128 @@ test "public table restore handler maps target already exists" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("restore target already exists", resp.body);
+}
+
+test "public document artifact manifest handler returns summary and raw state" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_document_artifact_manifest = executeDocumentArtifactManifest,
+                },
+            };
+        }
+
+        fn executeDocumentArtifactManifest(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+            return .{
+                .document_id = alloc.dupe(u8, doc_key) catch return error.InternalFailure,
+                .artifact_name = alloc.dupe(u8, artifact_name) catch return error.InternalFailure,
+                .artifact_id = alloc.dupe(u8, "af1:asset:doc:a:document_units_v1") catch return error.InternalFailure,
+                .manifest_json = alloc.dupe(u8, "{\"manifest_version\":2}") catch return error.InternalFailure,
+                .state_json = alloc.dupe(u8, "{\"kind\":\"document_extraction_state_v1\"}") catch return error.InternalFailure,
+                .generation = 7,
+                .route_type = alloc.dupe(u8, "text") catch return error.InternalFailure,
+                .unit_count = 2,
+                .chunk_count = 3,
+                .child_range_count = 1,
+                .merge_status = alloc.dupe(u8, "converged") catch return error.InternalFailure,
+                .merge_operation_count = 4,
+            };
+        }
+    };
+
+    var resp = try handleDocumentArtifactManifest(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        Backend.iface(),
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    const Parsed = struct {
+        document_id: []const u8,
+        generation: u64,
+        route_type: []const u8,
+        unit_count: usize,
+        manifest_json: []const u8,
+        state_json: ?[]const u8,
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, resp.body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("doc:a", parsed.value.document_id);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.generation);
+    try std.testing.expectEqualStrings("text", parsed.value.route_type);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.unit_count);
+    try std.testing.expectEqualStrings("{\"manifest_version\":2}", parsed.value.manifest_json);
+    try std.testing.expectEqualStrings("{\"kind\":\"document_extraction_state_v1\"}", parsed.value.state_json.?);
+}
+
+test "public document artifact reprocess handler returns accepted" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_reprocess_document_artifact = executeReprocessDocumentArtifact,
+                },
+            };
+        }
+
+        fn executeReprocessDocumentArtifact(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) TableApi.ExecuteReprocessDocumentArtifactError!void {
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
+        }
+    };
+
+    var resp = try handleReprocessDocumentArtifact(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        Backend.iface(),
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\"}", resp.body);
 }

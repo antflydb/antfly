@@ -327,6 +327,7 @@ pub fn reshapeChunkBackedResult(
                 .id = try alloc.dupe(u8, chunk_hit.id),
                 .score = chunk_hit.score,
                 .stored_data = if (chunk_hit.stored_data) |stored| try alloc.dupe(u8, stored) else null,
+                .artifact_ref = if (chunk_hit.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             });
             parent_hit.chunk_hits = try chunks.toOwnedSlice(alloc);
         }
@@ -1330,6 +1331,47 @@ test "reshapeChunkBackedResult preserves parent ordinal from chunk hits" {
     try std.testing.expectEqual(@as(?f32, 0.6), result.hits[0].score);
 }
 
+test "reshapeChunkBackedResult preserves nested chunk artifact refs" {
+    const alloc = std.testing.allocator;
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 1);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a#0"),
+        .score = 0.4,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_chunks_v1"),
+            .kind = .chunk,
+            .chunk_id = 0,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .parent_with_chunks,
+        .limit = 1,
+        .include_stored = false,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 1,
+    }, .{
+        .ctx = null,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    const artifact_ref = result.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", artifact_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
+    try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
 test "externalizeSearchResultArtifactIds preserves hit ordinals" {
     const alloc = std.testing.allocator;
 
@@ -1376,4 +1418,46 @@ test "externalizeSearchResultArtifactIds preserves hit ordinals" {
     try std.testing.expectEqualStrings("af1:chunk:ZG9jOmE:Ym9keV9jaHVua3NfdjE:0", result.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 23), result.graph_results[0].hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("af1:chunk:ZG9jOmI:Ym9keV9jaHVua3NfdjE:1", result.graph_results[0].hits[0].id);
+}
+
+test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
+    const alloc = std.testing.allocator;
+
+    const unit_chunk_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("document_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 0,
+        .unit_id = @constCast("page:000001"),
+    };
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .chunk_hits = try alloc.alloc(types.ChunkHit, 1),
+    };
+    result.hits[0].chunk_hits[0] = .{
+        .id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, unit_chunk_ref),
+    };
+
+    try externalizeSearchResultArtifactIds(alloc, &result);
+
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings(
+        "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:0:unit:cGFnZTowMDAwMDE",
+        result.hits[0].chunk_hits[0].id,
+    );
+    const artifact_ref = result.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", artifact_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
+    try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
 }

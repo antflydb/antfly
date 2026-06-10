@@ -1900,6 +1900,13 @@ pub const TableWriteSource = struct {
             doc_key: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        reprocess_document_artifact: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
         local_runtime_statuses: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2102,6 +2109,17 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, index_name);
     }
 
+    pub fn reprocessDocumentArtifact(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name);
+    }
+
     pub fn localRuntimeStatuses(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -2187,6 +2205,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
+                .reprocess_document_artifact = reprocessDocumentArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
@@ -2217,6 +2236,18 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         if (!try corruptEmbeddingArtifactInDb(alloc, self.db, doc_key, index_name)) return error.NotFound;
+    }
+
+    fn reprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
     }
 
     fn createTable(
@@ -8396,7 +8427,7 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy;
+    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
 }
 
 test "provisioning detects model backed graph shorthand assets inside config_json strings" {
@@ -9852,6 +9883,94 @@ test "bound table write source applies batch writes" {
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "bound table sources inspect and reprocess document artifact manifests" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-table-document-artifact-manifest", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    var write_source = BoundTableWriteSource.init("docs", &db);
+    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    _ = try write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var manifest = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.TestUnexpectedResult;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqual(@as(u64, 1), manifest.generation);
+    try std.testing.expectEqualStrings("text", manifest.route_type);
+
+    try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
+        alloc,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+    ));
+
+    var after = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), after.generation);
+
+    try std.testing.expectEqual(@as(?bool, false), try write_source.source().reprocessDocumentArtifact(
+        alloc,
+        "docs",
+        "doc:missing",
+        "document_units_v1",
+    ));
+    try std.testing.expect((try read_source.source().documentArtifactManifest(
+        alloc,
+        "docs",
+        "doc:missing",
+        "document_units_v1",
+        .read_index,
+    )) == null);
+    try std.testing.expectEqual(@as(?bool, null), try write_source.source().reprocessDocumentArtifact(
+        alloc,
+        "wrong",
+        "doc:a",
+        "document_units_v1",
+    ));
+    try std.testing.expect((try read_source.source().documentArtifactManifest(
+        alloc,
+        "wrong",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) == null);
 }
 
 test "bound table write source resolves internal group transactions into visible documents" {

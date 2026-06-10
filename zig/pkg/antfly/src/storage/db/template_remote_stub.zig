@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const template_mod = @import("template_stub.zig");
+const scraping = @import("antfly_scraping");
+const common_secrets = @import("../../common/secrets.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,6 +25,11 @@ pub const RenderError = error{
 };
 
 pub const RenderConfig = struct {};
+
+const remote_fetch_security = scraping.ContentSecurityConfig{
+    .block_private_ips = true,
+    .max_download_size_bytes = 4 << 20,
+};
 
 pub const RenderJsonToTextFn = *const fn (
     ctx: ?*anyopaque,
@@ -126,6 +133,25 @@ pub fn renderJsonToPartsWithConfig(
     const rendered = try template_mod.renderDocument(alloc, template_source, json_doc);
     defer alloc.free(@constCast(rendered));
     return try template_mod.textToParts(alloc, rendered);
+}
+
+pub fn downloadRemoteContentOutcomeAllocWithConfig(
+    alloc: Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    _ = remote_content;
+    _ = secret_store;
+    _ = credential_name;
+    return try scraping.downloadContentOutcomeAllocWithHeaders(
+        alloc,
+        url,
+        &remote_fetch_security,
+        null,
+        null,
+    );
 }
 
 test "template remote stub renders local template parts" {

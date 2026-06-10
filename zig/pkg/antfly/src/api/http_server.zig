@@ -3123,6 +3123,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
             }
@@ -3338,6 +3343,11 @@ pub const ApiHttpServer = struct {
                         .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
                     },
                 });
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name);
             }
         }
         if (req.method == .GET) {
@@ -4462,6 +4472,8 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
+                .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
             },
         };
     }
@@ -5267,6 +5279,46 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicDocumentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
+    fn executePublicReprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact reprocess failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
+        if (handled == null) return error.MethodNotAllowed;
+        if (!handled.?) return error.NotFound;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5659,6 +5711,34 @@ pub const ApiHttpServer = struct {
                 const parsed = try parseJsonResponseBody(struct {}, arena_impl.allocator(), resp.body);
                 break :blk try jsonResponseWithStatus(self.alloc, 201, parsed);
             },
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }

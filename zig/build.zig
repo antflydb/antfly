@@ -3554,6 +3554,8 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps doc identity unavailable errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public document artifact manifest handler returns summary and raw state",
+            "public document artifact reprocess handler returns accepted",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

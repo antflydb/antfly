@@ -1787,9 +1787,11 @@ pub fn parseQueryRequest(
 
     const has_internal_shard_fields = try queryBodyHasInternalShardFields(alloc, body);
     const has_public_doc_filter_bindings = try queryBodyHasPublicDocFilterBindings(alloc, body);
+    const has_public_hierarchy_controls = try queryBodyHasPublicHierarchyControls(alloc, body);
     const contract_body = try queryBodyForGeneratedContractAlloc(alloc, body, .{
         .strip_internal_shard_fields = has_internal_shard_fields,
         .strip_public_doc_filter_bindings = has_public_doc_filter_bindings,
+        .strip_public_hierarchy_controls = has_public_hierarchy_controls,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     const body_for_contract = contract_body orelse body;
@@ -1810,6 +1812,7 @@ pub fn parseQueryRequest(
     errdefer freeSearchRequest(alloc, &req);
 
     try applyCommonSearchRequestOptions(alloc, request, &req);
+    try applyPublicHierarchyControls(alloc, body, &req);
     req.distributed_text_stats = try parseDistributedTextStatsAlloc(alloc, body);
     try parseInternalDocIdConstraintsAlloc(alloc, body, &req);
 
@@ -2062,6 +2065,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"graph\"",
         "\"join\"",
         "\"with\"",
+        "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
         db_mod.doc_filter_wire.field_name,
@@ -4585,6 +4589,7 @@ fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !
 const QueryContractStripOptions = struct {
     strip_internal_shard_fields: bool = false,
     strip_public_doc_filter_bindings: bool = false,
+    strip_public_hierarchy_controls: bool = false,
 };
 
 fn queryBodyForGeneratedContractAlloc(
@@ -4592,7 +4597,7 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings) return null;
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -4600,6 +4605,9 @@ fn queryBodyForGeneratedContractAlloc(
 
     if (options.strip_public_doc_filter_bindings) {
         _ = parsed.value.object.orderedRemove("with");
+    }
+    if (options.strip_public_hierarchy_controls) {
+        _ = parsed.value.object.orderedRemove("hierarchy");
     }
     if (options.strip_internal_shard_fields) {
         removeInternalShardFields(&parsed.value.object);
@@ -4624,6 +4632,103 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         if (object.get(field) != null) return true;
     }
     return false;
+}
+
+fn queryBodyHasPublicHierarchyControls(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    return parsed.value.object.get("hierarchy") != null;
+}
+
+fn applyPublicHierarchyControls(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    req: *db_mod.types.SearchRequest,
+) !void {
+    if (!(try queryBodyHasPublicHierarchyControls(alloc, body))) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const hierarchy = parsed.value.object.get("hierarchy") orelse return;
+    if (hierarchy != .object) return error.InvalidQueryRequest;
+
+    var return_level: ?[]const u8 = null;
+    var rollup: ?[]const u8 = null;
+    var include_chunk = false;
+    var max_children_set = false;
+
+    var it = hierarchy.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "return_level")) {
+            if (value != .string) return error.InvalidQueryRequest;
+            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "chunk")) {
+                return_level = value.string;
+            } else if (std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "mention")) {
+                return error.UnsupportedQueryRequest;
+            } else {
+                return error.InvalidQueryRequest;
+            }
+        } else if (std.mem.eql(u8, key, "rollup")) {
+            if (value != .string) return error.InvalidQueryRequest;
+            if (std.mem.eql(u8, value.string, "source") or std.mem.eql(u8, value.string, "none")) {
+                rollup = value.string;
+            } else if (std.mem.eql(u8, value.string, "unit") or std.mem.eql(u8, value.string, "mention")) {
+                return error.UnsupportedQueryRequest;
+            } else {
+                return error.InvalidQueryRequest;
+            }
+        } else if (std.mem.eql(u8, key, "include")) {
+            if (value != .array) return error.InvalidQueryRequest;
+            for (value.array.items) |item| {
+                if (item != .string) return error.InvalidQueryRequest;
+                if (std.mem.eql(u8, item.string, "chunk") or std.mem.eql(u8, item.string, "chunks")) {
+                    include_chunk = true;
+                } else if (std.mem.eql(u8, item.string, "source") or std.mem.eql(u8, item.string, "unit")) {
+                    continue;
+                } else if (std.mem.eql(u8, item.string, "mention") or std.mem.eql(u8, item.string, "mentions")) {
+                    return error.UnsupportedQueryRequest;
+                } else {
+                    return error.InvalidQueryRequest;
+                }
+            }
+        } else if (std.mem.eql(u8, key, "max_children_per_parent")) {
+            req.max_chunks_per_parent = try parseOptionalU32Json(value, req.max_chunks_per_parent);
+            max_children_set = true;
+        } else {
+            return error.InvalidQueryRequest;
+        }
+    }
+
+    const has_child_limit = max_children_set and req.max_chunks_per_parent > 0;
+    const wants_source_rollup = if (rollup) |value| std.mem.eql(u8, value, "source") else false;
+    const wants_no_rollup = if (rollup) |value| std.mem.eql(u8, value, "none") else false;
+
+    if (return_level) |level| {
+        if (std.mem.eql(u8, level, "chunk")) {
+            req.return_mode = if (wants_source_rollup or include_chunk or has_child_limit)
+                .parent_with_chunks
+            else
+                .chunk;
+        } else {
+            req.return_mode = if (include_chunk or has_child_limit)
+                .parent_with_chunks
+            else
+                .parent;
+        }
+    } else if (wants_source_rollup) {
+        req.return_mode = if (include_chunk or has_child_limit)
+            .parent_with_chunks
+        else
+            .parent;
+    } else if (wants_no_rollup) {
+        req.return_mode = .chunk;
+    } else if (include_chunk or has_child_limit) {
+        req.return_mode = .parent_with_chunks;
+    }
 }
 
 fn removeInternalShardFields(object: *std.json.ObjectMap) void {
@@ -5214,6 +5319,47 @@ test "api query contract parses public with document filter bindings" {
     try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+}
+
+test "api query contract parses public hierarchy controls" {
+    const alloc = std.testing.allocator;
+    const chunk_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"return_level":"chunk"}
+        \\}
+    ;
+    var chunk = try parseQueryRequest(alloc, null, "docs", chunk_body);
+    defer chunk.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, chunk.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 0), chunk.req.max_chunks_per_parent);
+
+    const grouped_body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {
+        \\    "return_level": "source",
+        \\    "rollup": "source",
+        \\    "include": ["unit", "chunk"],
+        \\    "max_children_per_parent": 2
+        \\  }
+        \\}
+    ;
+    var grouped = try parseQueryRequest(alloc, null, "docs", grouped_body);
+    defer grouped.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, grouped.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 2), grouped.req.max_chunks_per_parent);
+}
+
+test "api query contract rejects unsupported hierarchy levels" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "full_text_search": {"match":"needle","field":"content"},
+        \\  "hierarchy": {"return_level":"mention"}
+        \\}
+    ;
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
 }
 
 test "api query contract keeps generated schema strict when with is present" {
