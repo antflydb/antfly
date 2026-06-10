@@ -2387,6 +2387,30 @@ pub const RaftBatcher = struct {
     }
 };
 
+const DocumentChildRangeDispatchContext = struct {
+    source: TableWriteSource,
+    table_name: []const u8,
+
+    fn dispatcher(self: *DocumentChildRangeDispatchContext) db_mod.DocumentArtifactChildRangeDispatcher {
+        return .{
+            .ptr = self,
+            .apply = apply,
+        };
+    }
+
+    fn apply(ptr: *anyopaque, alloc: std.mem.Allocator, dispatch: db_mod.DocumentArtifactChildRangeDispatch) !void {
+        const self: *DocumentChildRangeDispatchContext = @ptrCast(@alignCast(ptr));
+        _ = (try self.source.applyDocumentArtifactChildRangeBatch(
+            alloc,
+            dispatch.owner_group_id,
+            self.table_name,
+            dispatch.doc_key,
+            dispatch.artifact_name,
+            dispatch.child_batch,
+        )) orelse return error.NotFound;
+    }
+};
+
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
     db: *db_mod.DB,
@@ -7326,7 +7350,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                         defer cached.deinit(hosted_cache.write_cache.alloc);
                         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-                        try cached.db.batch(.{
+                        var dispatch_ctx = DocumentChildRangeDispatchContext{
+                            .source = self.source(),
+                            .table_name = table_name,
+                        };
+                        try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
                             .transforms = group.transforms.items,
@@ -7335,7 +7363,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .predicates = req.predicates,
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
-                        });
+                        }, dispatch_ctx.dispatcher());
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
@@ -7368,7 +7396,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                 var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                 defer cached.deinit(hosted_cache.write_cache.alloc);
                 try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-                try cached.db.batch(.{
+                var dispatch_ctx = DocumentChildRangeDispatchContext{
+                    .source = self.source(),
+                    .table_name = table_name,
+                };
+                try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
@@ -7377,7 +7409,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .predicates = req.predicates,
                     .timestamp_ns = req.timestamp_ns,
                     .sync_level = req.sync_level,
-                });
+                }, dispatch_ctx.dispatcher());
                 if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
             }
         }

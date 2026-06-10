@@ -213,6 +213,22 @@ pub const DocumentArtifactChildRangeApplyBatch = struct {
     sync_level: types.SyncLevel = .full_index,
 };
 
+pub const DocumentArtifactChildRangeDispatch = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const DocumentArtifactChildRangeDispatcher = struct {
+    ptr: *anyopaque,
+    apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
+
+    fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+        return try self.apply(self.ptr, alloc, dispatch);
+    }
+};
+
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
 
 pub const QueryVisibilityChange = enum {
@@ -956,6 +972,7 @@ const BatchExecutionOptions = struct {
     store_batch_options: backend_types.BatchOptions = .{},
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
+    document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
 };
 
 pub const OpenProfile = struct {
@@ -3494,6 +3511,20 @@ pub const DB = struct {
         try self.batchInternal(req, profile, .{});
     }
 
+    pub fn batchWithDocumentArtifactChildRangeDispatcher(
+        self: *DB,
+        req: types.BatchRequest,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+    ) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .document_child_range_dispatcher = dispatcher });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .document_child_range_dispatcher = dispatcher });
+        }
+    }
+
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
     }
@@ -4013,6 +4044,11 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(self.alloc);
+        var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
+        defer {
+            for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
+            remote_child_range_dispatches.deinit(self.alloc);
+        }
         var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
         defer {
             for (materialized_graph_artifact_writes.items) |write| {
@@ -4030,6 +4066,10 @@ pub const DB = struct {
                 generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
                 opts.force_generated_artifact_names,
             );
+
+            if (opts.document_child_range_dispatcher != null) {
+                try partitionRemoteDocumentChildRangeGeneratedBatch(self, &precomputed_generated, &remote_child_range_dispatches);
+            }
 
             for (precomputed_generated.artifact_writes) |write| {
                 try store_writes.append(self.alloc, .{
@@ -4189,6 +4229,11 @@ pub const DB = struct {
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
         self.core.unlockApply();
         apply_mutex_held = false;
+        if (opts.document_child_range_dispatcher) |dispatcher| {
+            for (remote_child_range_dispatches.items) |dispatch_group| {
+                try dispatcher.applyDispatch(self.alloc, dispatch_group.dispatch(effective_req.sync_level));
+            }
+        }
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
         try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
@@ -15554,6 +15599,328 @@ const PrecomputedGeneratedBatch = struct {
         self.* = undefined;
     }
 };
+
+const DocumentChildRangeRoutingSnapshot = struct {
+    doc_key: []u8,
+    manifest_artifact_name: []u8,
+    child_ranges: []types.DocumentArtifactChildRange,
+
+    fn deinit(self: *DocumentChildRangeRoutingSnapshot, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.manifest_artifact_name);
+        freeDocumentArtifactChildRanges(alloc, self.child_ranges);
+        self.* = undefined;
+    }
+};
+
+const DocumentChildRangeDispatchGroup = struct {
+    owner_group_id: u64,
+    doc_key: []u8,
+    artifact_name: []u8,
+    artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    artifact_delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
+    dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
+    sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
+    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+
+    fn deinit(self: *DocumentChildRangeDispatchGroup, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        for (self.artifact_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        self.artifact_writes.deinit(alloc);
+        for (self.artifact_delete_keys.items) |key| alloc.free(@constCast(key));
+        self.artifact_delete_keys.deinit(alloc);
+        var derived_batch = derived_types.DerivedBatch{
+            .documents = self.documents.items,
+            .dense_embeddings = self.dense_embeddings.items,
+            .sparse_embeddings = self.sparse_embeddings.items,
+            .generated_enrichment_refs = self.generated_enrichment_refs.items,
+        };
+        derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        self.documents = .empty;
+        self.dense_embeddings = .empty;
+        self.sparse_embeddings = .empty;
+        self.generated_enrichment_refs = .empty;
+        self.* = undefined;
+    }
+
+    fn dispatch(self: DocumentChildRangeDispatchGroup, sync_level: types.SyncLevel) DocumentArtifactChildRangeDispatch {
+        return .{
+            .owner_group_id = self.owner_group_id,
+            .doc_key = self.doc_key,
+            .artifact_name = self.artifact_name,
+            .child_batch = .{
+                .artifact_writes = self.artifact_writes.items,
+                .artifact_delete_keys = self.artifact_delete_keys.items,
+                .documents = self.documents.items,
+                .dense_embeddings = self.dense_embeddings.items,
+                .sparse_embeddings = self.sparse_embeddings.items,
+                .generated_enrichment_refs = self.generated_enrichment_refs.items,
+                .sync_level = sync_level,
+            },
+        };
+    }
+};
+
+const DocumentChildRangeRoute = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+};
+
+fn partitionRemoteDocumentChildRangeGeneratedBatch(
+    self: *DB,
+    generated: *PrecomputedGeneratedBatch,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var snapshots = std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot).empty;
+    defer {
+        for (snapshots.items) |*snapshot| snapshot.deinit(self.alloc);
+        snapshots.deinit(self.alloc);
+    }
+    try collectDocumentChildRangeRoutingSnapshots(self, generated.*, &snapshots);
+    if (snapshots.items.len == 0) return;
+
+    var local_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    errdefer {
+        for (local_writes.items) |write| {
+            self.alloc.free(@constCast(write.key));
+            self.alloc.free(@constCast(write.value));
+        }
+        local_writes.deinit(self.alloc);
+    }
+    for (generated.artifact_writes) |write| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, write.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_writes.append(self.alloc, write);
+        } else {
+            try local_writes.append(self.alloc, write);
+        }
+    }
+    if (generated.artifact_writes.len > 0) self.alloc.free(generated.artifact_writes);
+    generated.artifact_writes = try local_writes.toOwnedSlice(self.alloc);
+
+    var local_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (local_deletes.items) |key| self.alloc.free(@constCast(key));
+        local_deletes.deinit(self.alloc);
+    }
+    for (generated.artifact_delete_keys) |key| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_delete_keys.append(self.alloc, key);
+        } else {
+            try local_deletes.append(self.alloc, key);
+        }
+    }
+    if (generated.artifact_delete_keys.len > 0) self.alloc.free(generated.artifact_delete_keys);
+    generated.artifact_delete_keys = try local_deletes.toOwnedSlice(self.alloc);
+
+    try partitionRemoteDerivedDocuments(self.alloc, snapshots.items, &generated.documents, out);
+    try partitionRemoteDenseEmbeddings(self.alloc, snapshots.items, &generated.dense_embeddings, out);
+    try partitionRemoteSparseEmbeddings(self.alloc, snapshots.items, &generated.sparse_embeddings, out);
+}
+
+fn collectDocumentChildRangeRoutingSnapshots(
+    self: *DB,
+    generated: PrecomputedGeneratedBatch,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
+) !void {
+    for (generated.artifact_writes) |write| {
+        try appendDocumentChildRangeRoutingSnapshotFromValue(self, write.key, write.value, out);
+    }
+    for (generated.artifact_delete_keys) |key| {
+        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, key)) orelse continue;
+        defer artifact_ref.deinit(self.alloc);
+        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+        const existing = self.core.getStoreValue(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        defer if (existing) |value| self.alloc.free(value);
+        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(self, key, value, out);
+    }
+}
+
+fn appendDocumentChildRangeRoutingSnapshotFromValue(
+    self: *DB,
+    key: []const u8,
+    value: []const u8,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
+) !void {
+    if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, key)) orelse return;
+    defer artifact_ref.deinit(self.alloc);
+    if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
+
+    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(self.alloc, value) catch |err| switch (err) {
+        error.InvalidDocumentExtractionManifest => return,
+        else => return err,
+    };
+    errdefer freeDocumentArtifactChildRanges(self.alloc, ranges);
+    if (ranges.len == 0) {
+        freeDocumentArtifactChildRanges(self.alloc, ranges);
+        return;
+    }
+    const doc_key = try self.alloc.dupe(u8, artifact_ref.document_id);
+    errdefer self.alloc.free(doc_key);
+    const manifest_artifact_name = try self.alloc.dupe(u8, artifact_ref.name);
+    errdefer self.alloc.free(manifest_artifact_name);
+    try out.append(self.alloc, .{
+        .doc_key = doc_key,
+        .manifest_artifact_name = manifest_artifact_name,
+        .child_ranges = ranges,
+    });
+}
+
+fn documentChildRangeRouteForKey(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    key: []const u8,
+) !?DocumentChildRangeRoute {
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+
+    const route_kind, const route_artifact_name = switch (artifact_ref.kind) {
+        .asset => blk: {
+            if (artifact_ref.unit_id == null) return null;
+            break :blk .{ "unit", artifact_ref.name };
+        },
+        .chunk => .{ "chunk", artifact_ref.name },
+        .embedding => blk: {
+            const source = artifact_ref.source orelse return null;
+            break :blk .{
+                if (source.kind == .chunk) "chunk" else "unit",
+                source.name,
+            };
+        },
+    };
+
+    for (snapshots) |snapshot| {
+        if (!std.mem.eql(u8, snapshot.doc_key, artifact_ref.document_id)) continue;
+        for (snapshot.child_ranges) |range| {
+            if (!std.mem.eql(u8, range.range_kind, route_kind)) continue;
+            if (!std.mem.eql(u8, range.artifact_name, route_artifact_name)) continue;
+            const owner_group_id = range.owner_group_id orelse 0;
+            if (owner_group_id == 0) continue;
+            const route_status = range.route_status orelse "local_committed";
+            if (!std.mem.eql(u8, route_status, "remote_committed")) continue;
+            if (!keyWithinDocumentChildRange(key, range)) continue;
+            return .{
+                .owner_group_id = owner_group_id,
+                .doc_key = snapshot.doc_key,
+                .artifact_name = range.artifact_name,
+            };
+        }
+    }
+    return null;
+}
+
+fn keyWithinDocumentChildRange(key: []const u8, range: types.DocumentArtifactChildRange) bool {
+    if (std.mem.order(u8, key, range.start_key) == .lt) return false;
+    if (range.end_key_exclusive.len == 0) return true;
+    return std.mem.order(u8, key, range.end_key_exclusive) == .lt;
+}
+
+fn ensureDocumentChildRangeDispatchGroup(
+    alloc: Allocator,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+    route: DocumentChildRangeRoute,
+) !*DocumentChildRangeDispatchGroup {
+    for (groups.items) |*group| {
+        if (group.owner_group_id == route.owner_group_id and
+            std.mem.eql(u8, group.doc_key, route.doc_key) and
+            std.mem.eql(u8, group.artifact_name, route.artifact_name))
+        {
+            return group;
+        }
+    }
+    const doc_key = try alloc.dupe(u8, route.doc_key);
+    errdefer alloc.free(doc_key);
+    const artifact_name = try alloc.dupe(u8, route.artifact_name);
+    errdefer alloc.free(artifact_name);
+    try groups.append(alloc, .{
+        .owner_group_id = route.owner_group_id,
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+    });
+    return &groups.items[groups.items.len - 1];
+}
+
+fn partitionRemoteDerivedDocuments(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    documents: *[]const derived_types.DerivedDocument,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .documents = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (documents.*) |doc| {
+        if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.documents.append(alloc, doc);
+        } else {
+            try local.append(alloc, doc);
+        }
+    }
+    if (documents.*.len > 0) alloc.free(documents.*);
+    documents.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteDenseEmbeddings(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .dense_embeddings = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.dense_embeddings.append(alloc, embedding);
+        } else {
+            try local.append(alloc, embedding);
+        }
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteSparseEmbeddings(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .sparse_embeddings = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.sparse_embeddings.append(alloc, embedding);
+        } else {
+            try local.append(alloc, embedding);
+        }
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
+}
 
 fn appendPrecomputedGraphSourceArtifacts(
     self: *DB,
@@ -29819,6 +30186,118 @@ test "db applies document artifact child range batch without source row write" {
     });
     try std.testing.expect(delete_sequence > sequence);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+}
+
+test "db dispatches generated document child range artifacts to remote owner" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), moved.child_ranges.len);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const Capture = struct {
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        artifact_delete_keys: usize = 0,
+        documents: usize = 0,
+        dense_embeddings: usize = 0,
+        sparse_embeddings: usize = 0,
+        first_key: ?[]u8 = null,
+        first_value: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+            if (self.first_value) |value| allocator.free(value);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            self.artifact_delete_keys += dispatch.child_batch.artifact_delete_keys.len;
+            self.documents += dispatch.child_batch.documents.len;
+            self.dense_embeddings += dispatch.child_batch.dense_embeddings.len;
+            self.sparse_embeddings += dispatch.child_batch.sparse_embeddings.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+                errdefer {
+                    allocator.free(self.first_key.?);
+                    self.first_key = null;
+                }
+                self.first_value = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].value);
+            }
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.deinit(alloc);
+
+    try db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqual(@as(usize, 0), capture.artifact_delete_keys);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_owner_group_id\":7002") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
 }
 
 test "db document extraction manifest inspection and reprocess API" {
