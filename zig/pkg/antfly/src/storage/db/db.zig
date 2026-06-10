@@ -13884,6 +13884,11 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .extraction_method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .ocr_used = unit.ocr_used,
+        .ocr_confidence = unit.ocr_confidence,
+        .transcript_used = unit.transcript_used,
+        .transcript_confidence = unit.transcript_confidence,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -13916,6 +13921,23 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     hasher.update(unit.text);
     hasher.update(unit.method);
     if (unit.source_path) |source_path| hasher.update(source_path);
+    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
+    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
+    if (unit.byte_length) |byte_length| {
+        var buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &buf, byte_length, .big);
+        hasher.update(&buf);
+    }
+    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    if (unit.ocr_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
+    if (unit.transcript_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -14093,11 +14115,20 @@ fn documentUnitPayloadAlloc(
         .content_type = "text/plain",
         .language = "",
         .source_path = unit.source_path,
+        .extraction_status = unit.extraction_status,
+        .source_sha256 = unit.source_sha256,
+        .byte_length = unit.byte_length,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
             .method = unit.method,
-            .ocr_used = false,
+            .extraction_status = unit.extraction_status,
+            .source_sha256 = unit.source_sha256,
+            .byte_length = unit.byte_length,
+            .ocr_used = unit.ocr_used,
+            .ocr_confidence = unit.ocr_confidence,
+            .transcript_used = unit.transcript_used,
+            .transcript_confidence = unit.transcript_confidence,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
@@ -14111,7 +14142,13 @@ fn documentUnitPayloadAlloc(
                 .source_path = unit.source_path,
                 .coordinate_system = "source_page_points",
                 .extraction_method = unit.method,
-                .ocr_used = false,
+                .extraction_status = unit.extraction_status,
+                .source_sha256 = unit.source_sha256,
+                .byte_length = unit.byte_length,
+                .ocr_used = unit.ocr_used,
+                .ocr_confidence = unit.ocr_confidence,
+                .transcript_used = unit.transcript_used,
+                .transcript_confidence = unit.transcript_confidence,
                 .page_number = unit.page_number,
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,
@@ -30278,6 +30315,57 @@ test "db document extraction stores zip archive entry units" {
     try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_path\":\"docs/readme.txt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"text\":\"Archive DB text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_content_type\":\"application/zip\"") != null);
+}
+
+test "db document extraction stores image pending OCR unit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:image", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"pending_ocr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"byte_length\":19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_sha256\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_content_type\":\"image/png\"") != null);
 }
 
 test "db document extraction stores rfc822 email units" {

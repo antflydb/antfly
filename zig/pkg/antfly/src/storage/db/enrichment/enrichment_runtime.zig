@@ -2092,6 +2092,11 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .extraction_method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .ocr_used = unit.ocr_used,
+        .ocr_confidence = unit.ocr_confidence,
+        .transcript_used = unit.transcript_used,
+        .transcript_confidence = unit.transcript_confidence,
     });
     return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
 }
@@ -3918,6 +3923,23 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     hasher.update(unit.text);
     hasher.update(unit.method);
     if (unit.source_path) |source_path| hasher.update(source_path);
+    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
+    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
+    if (unit.byte_length) |byte_length| {
+        var buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &buf, byte_length, .big);
+        hasher.update(&buf);
+    }
+    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    if (unit.ocr_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
+    if (unit.transcript_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -4108,11 +4130,20 @@ fn documentUnitPayloadAlloc(
         .content_type = "text/plain",
         .language = "",
         .source_path = unit.source_path,
+        .extraction_status = unit.extraction_status,
+        .source_sha256 = unit.source_sha256,
+        .byte_length = unit.byte_length,
         .provenance = .{
             .source_url = source_url,
             .source_path = unit.source_path,
             .method = unit.method,
-            .ocr_used = false,
+            .extraction_status = unit.extraction_status,
+            .source_sha256 = unit.source_sha256,
+            .byte_length = unit.byte_length,
+            .ocr_used = unit.ocr_used,
+            .ocr_confidence = unit.ocr_confidence,
+            .transcript_used = unit.transcript_used,
+            .transcript_confidence = unit.transcript_confidence,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
@@ -4126,7 +4157,13 @@ fn documentUnitPayloadAlloc(
                 .source_path = unit.source_path,
                 .coordinate_system = "source_page_points",
                 .extraction_method = unit.method,
-                .ocr_used = false,
+                .extraction_status = unit.extraction_status,
+                .source_sha256 = unit.source_sha256,
+                .byte_length = unit.byte_length,
+                .ocr_used = unit.ocr_used,
+                .ocr_confidence = unit.ocr_confidence,
+                .transcript_used = unit.transcript_used,
+                .transcript_confidence = unit.transcript_confidence,
                 .page_number = unit.page_number,
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,

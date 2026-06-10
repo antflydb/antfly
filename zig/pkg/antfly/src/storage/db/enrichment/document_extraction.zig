@@ -49,6 +49,13 @@ pub const Unit = struct {
     text: []u8,
     method: []u8,
     source_path: ?[]u8 = null,
+    extraction_status: ?[]u8 = null,
+    source_sha256: ?[]u8 = null,
+    byte_length: ?u64 = null,
+    ocr_used: bool = false,
+    ocr_confidence: ?f64 = null,
+    transcript_used: bool = false,
+    transcript_confidence: ?f64 = null,
     page_number: ?u32 = null,
     page_label: ?[]u8 = null,
     page_bbox: ?[4]f64 = null,
@@ -62,6 +69,8 @@ pub const Unit = struct {
         alloc.free(self.text);
         alloc.free(self.method);
         if (self.source_path) |value| alloc.free(value);
+        if (self.extraction_status) |value| alloc.free(value);
+        if (self.source_sha256) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -113,6 +122,8 @@ const ExtractorType = enum {
     pptx,
     xlsx,
     archive,
+    ocr,
+    audio,
     unsupported,
 
     fn parse(value: []const u8) ?ExtractorType {
@@ -124,6 +135,8 @@ const ExtractorType = enum {
         if (std.mem.eql(u8, value, "pptx")) return .pptx;
         if (std.mem.eql(u8, value, "xlsx")) return .xlsx;
         if (std.mem.eql(u8, value, "archive")) return .archive;
+        if (std.mem.eql(u8, value, "ocr") or std.mem.eql(u8, value, "image")) return .ocr;
+        if (std.mem.eql(u8, value, "audio") or std.mem.eql(u8, value, "transcript")) return .audio;
         if (std.mem.eql(u8, value, "unsupported")) return .unsupported;
         return null;
     }
@@ -334,6 +347,12 @@ pub fn extractDownloadedAlloc(
     if (isZipArchiveContent(content_type, config.filename, source_url)) {
         return try extractZipArchiveAlloc(alloc, downloaded.data, content_type);
     }
+    if (isImageContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "image", "image", "image", "ocr_pending", "pending_ocr", false, false);
+    }
+    if (isAudioContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "audio", "audio", "audio", "transcript_pending", "pending_transcription", false, false);
+    }
     if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);
     }
@@ -369,6 +388,8 @@ fn extractWithRouteAlloc(
         .pptx => try extractPptxAlloc(alloc, bytes, content_type),
         .xlsx => try extractXlsxAlloc(alloc, bytes, content_type),
         .archive => try extractZipArchiveAlloc(alloc, bytes, content_type),
+        .ocr => try extractConfiguredMediaPlaceholderAlloc(alloc, bytes, content_type, "image", route.unit, "image", "ocr_pending", "pending_ocr"),
+        .audio => try extractConfiguredMediaPlaceholderAlloc(alloc, bytes, content_type, "audio", route.unit, "audio", "transcript_pending", "pending_transcription"),
         .unsupported => try unsupportedResultAlloc(alloc, content_type, "matched_unsupported_route"),
     };
 }
@@ -395,6 +416,17 @@ fn unsupportedResultAlloc(alloc: Allocator, content_type: []const u8, reason: []
         .unsupported_reason = try alloc.dupe(u8, reason),
         .units = try alloc.alloc(Unit, 0),
     };
+}
+
+fn sha256HexAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const out = try alloc.alloc(u8, digest.len * 2);
+    for (digest, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
 }
 
 fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
@@ -697,6 +729,58 @@ fn extractZipArchiveAlloc(alloc: Allocator, bytes: []const u8, content_type: []c
         .content_type = try alloc.dupe(u8, content_type),
         .route_type = try alloc.dupe(u8, "archive"),
         .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+fn extractConfiguredMediaPlaceholderAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    route_type: []const u8,
+    configured_unit: []const u8,
+    default_unit: []const u8,
+    method: []const u8,
+    extraction_status: []const u8,
+) !Result {
+    const unit_type = if (configured_unit.len > 0) configured_unit else default_unit;
+    const unit_id = try std.fmt.allocPrint(alloc, "{s}:000001", .{unit_type});
+    defer alloc.free(unit_id);
+    return try extractMediaPlaceholderAlloc(alloc, bytes, content_type, route_type, unit_id, unit_type, method, extraction_status, false, false);
+}
+
+fn extractMediaPlaceholderAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    route_type: []const u8,
+    unit_id: []const u8,
+    unit_type: []const u8,
+    method: []const u8,
+    extraction_status: []const u8,
+    ocr_used: bool,
+    transcript_used: bool,
+) !Result {
+    var units = try alloc.alloc(Unit, 1);
+    errdefer alloc.free(units);
+    const sha256 = try sha256HexAlloc(alloc, bytes);
+    errdefer alloc.free(sha256);
+    units[0] = .{
+        .unit_id = try alloc.dupe(u8, unit_id),
+        .unit_type = try alloc.dupe(u8, unit_type),
+        .text = try alloc.alloc(u8, 0),
+        .method = try alloc.dupe(u8, method),
+        .extraction_status = try alloc.dupe(u8, extraction_status),
+        .source_sha256 = sha256,
+        .byte_length = bytes.len,
+        .ocr_used = ocr_used,
+        .transcript_used = transcript_used,
+        .char_start = 0,
+        .char_end = 0,
+    };
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, route_type),
+        .units = units,
     };
 }
 
@@ -1516,6 +1600,44 @@ fn isEmailContent(content_type: []const u8, filename: []const u8, source_url: []
     return contentTypeAllowsTextSniff(content_type) and emailHeaderBodySplit(bytes) != null;
 }
 
+fn isImageContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
+    if (contentTypeStartsWith(content_type, "image/")) return true;
+    if (hasExtension(filename, ".png") or hasExtension(source_url, ".png") or
+        hasExtension(filename, ".jpg") or hasExtension(source_url, ".jpg") or
+        hasExtension(filename, ".jpeg") or hasExtension(source_url, ".jpeg") or
+        hasExtension(filename, ".gif") or hasExtension(source_url, ".gif") or
+        hasExtension(filename, ".webp") or hasExtension(source_url, ".webp") or
+        hasExtension(filename, ".tif") or hasExtension(source_url, ".tif") or
+        hasExtension(filename, ".tiff") or hasExtension(source_url, ".tiff") or
+        hasExtension(filename, ".bmp") or hasExtension(source_url, ".bmp"))
+    {
+        return true;
+    }
+    return std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n") or
+        std.mem.startsWith(u8, bytes, "\xff\xd8\xff") or
+        std.mem.startsWith(u8, bytes, "GIF87a") or
+        std.mem.startsWith(u8, bytes, "GIF89a") or
+        (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WEBP"));
+}
+
+fn isAudioContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
+    if (contentTypeStartsWith(content_type, "audio/")) return true;
+    if (hasExtension(filename, ".mp3") or hasExtension(source_url, ".mp3") or
+        hasExtension(filename, ".wav") or hasExtension(source_url, ".wav") or
+        hasExtension(filename, ".m4a") or hasExtension(source_url, ".m4a") or
+        hasExtension(filename, ".aac") or hasExtension(source_url, ".aac") or
+        hasExtension(filename, ".ogg") or hasExtension(source_url, ".ogg") or
+        hasExtension(filename, ".opus") or hasExtension(source_url, ".opus") or
+        hasExtension(filename, ".flac") or hasExtension(source_url, ".flac"))
+    {
+        return true;
+    }
+    return std.mem.startsWith(u8, bytes, "ID3") or
+        std.mem.startsWith(u8, bytes, "OggS") or
+        std.mem.startsWith(u8, bytes, "fLaC") or
+        (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WAVE"));
+}
+
 fn isDocxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
     if (contentTypeEquals(content_type, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")) return true;
     return hasExtension(filename, ".docx") or hasExtension(source_url, ".docx");
@@ -2014,6 +2136,56 @@ test "document extraction extracts zip archive text entries with source paths" {
     try std.testing.expectEqualStrings("zip_text", result.units[1].method);
     try std.testing.expectEqualStrings("z-last.txt", result.units[1].source_path.?);
     try std.testing.expectEqualStrings("Last text", result.units[1].text);
+}
+
+test "document extraction routes image content to pending OCR unit" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "image/png"),
+        .data = try alloc.dupe(u8, "\x89PNG\r\n\x1a\nimage bytes"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/image.png", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("image", result.route_type);
+    try std.testing.expectEqual(@as(usize, 1), result.units.len);
+    try std.testing.expectEqualStrings("image:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("image", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("ocr_pending", result.units[0].method);
+    try std.testing.expectEqualStrings("pending_ocr", result.units[0].extraction_status.?);
+    try std.testing.expectEqual(@as(usize, 0), result.units[0].text.len);
+    try std.testing.expectEqual(@as(u64, 19), result.units[0].byte_length.?);
+    try std.testing.expectEqual(@as(usize, 64), result.units[0].source_sha256.?.len);
+    try std.testing.expect(!result.units[0].ocr_used);
+    try std.testing.expect(!result.units[0].transcript_used);
+}
+
+test "document extraction applies configured audio transcript route" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"routes":[{"match":{"content_type_prefix":"audio/"},"extractor":{"type":"transcript","unit":"transcript_segment"}}]}
+    );
+    defer config.deinit(alloc);
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "audio/mpeg"),
+        .data = try alloc.dupe(u8, "ID3audio bytes"),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/audio.mp3", config);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("audio", result.route_type);
+    try std.testing.expectEqual(@as(usize, 1), result.units.len);
+    try std.testing.expectEqualStrings("transcript_segment:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("transcript_segment", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("transcript_pending", result.units[0].method);
+    try std.testing.expectEqualStrings("pending_transcription", result.units[0].extraction_status.?);
+    try std.testing.expectEqual(@as(usize, 0), result.units[0].text.len);
+    try std.testing.expectEqual(@as(u64, 14), result.units[0].byte_length.?);
+    try std.testing.expectEqual(@as(usize, 64), result.units[0].source_sha256.?.len);
+    try std.testing.expect(!result.units[0].ocr_used);
+    try std.testing.expect(!result.units[0].transcript_used);
 }
 
 test "document extraction applies source metadata fields from row json" {
