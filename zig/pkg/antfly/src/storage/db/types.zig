@@ -960,6 +960,8 @@ pub const SearchRequest = struct {
     expand_strategy: ?graph_query_mod.ExpandStrategy = null,
     return_mode: ReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    hierarchy_include_source: bool = false,
+    hierarchy_include_unit: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
@@ -1046,6 +1048,8 @@ pub const SearchHit = struct {
     score: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
 
@@ -1056,6 +1060,8 @@ pub const SearchHit = struct {
             .score = self.score,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
         };
@@ -1063,6 +1069,8 @@ pub const SearchHit = struct {
             alloc.free(cloned.id);
             freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.ancestor_source_data) |data| alloc.free(data);
+            if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
 
@@ -1085,6 +1093,8 @@ pub const SearchHit = struct {
         alloc.free(self.id);
         freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
         if (self.chunk_hits.len > 0) alloc.free(self.chunk_hits);
@@ -1119,6 +1129,8 @@ pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
@@ -1126,6 +1138,8 @@ pub const ChunkHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
         };
     }
@@ -1133,6 +1147,8 @@ pub const ChunkHit = struct {
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         self.* = undefined;
     }

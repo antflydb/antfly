@@ -9813,7 +9813,7 @@ components:
 
             `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
 
-            `ancestors` with response-local source/unit context when available.
+            `ancestors` with response-local or requested DB-backed source/unit context when available.
           properties:
             level:
               type: string
@@ -9837,9 +9837,9 @@ components:
             ancestors:
               type: object
               additionalProperties: true
-              description: Response-local ancestor context. Includes `source.id` for derived hits, `source.document`
-                for materialized source rollups, and `unit.document` for direct unit hits when the unit
-                payload is present.
+              description: Ancestor context. Includes `source.id` for derived hits, `source.document`
+                for materialized source rollups or requested source hydration, and `unit.document` for
+                direct unit hits or requested unit hydration when the unit payload is present.
             chunks:
               type: array
               description: Child chunk hits included for source-level rollups.

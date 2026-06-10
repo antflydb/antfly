@@ -15313,6 +15313,9 @@ fn reshapeChunkBackedResult(self: *DB, alloc: Allocator, req: types.SearchReques
         .ctx = self,
         .resolve_parent_id = resolveChunkParentIdCallback,
         .load_parent_stored = loadParentStoredForSearchCallback,
+        .load_parent_stored_many = loadParentStoredForSearchManyCallback,
+        .load_stored = loadStoredForHitCallback,
+        .load_many_stored = loadStoredSearchDocumentManyCallback,
     });
 }
 
@@ -28984,12 +28987,21 @@ test "db document extraction chunks units through source artifact enrichment" {
         } },
         .return_mode = .chunk,
         .limit = 1,
+        .include_stored = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
     });
     defer sparse_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
     var chunk_public_id = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, chunk_key);
     defer chunk_public_id.deinit(alloc);
     try std.testing.expectEqualStrings(chunk_public_id.id, sparse_result.hits[0].id);
+    try std.testing.expect(sparse_result.hits[0].stored_data == null);
+    try std.testing.expect(sparse_result.hits[0].ancestor_source_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_source_data.?, "\"url\"") != null);
+    try std.testing.expect(sparse_result.hits[0].ancestor_unit_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"text\":\"alpha beta gamma\"") != null);
 
     try db.batch(.{
         .writes = &.{.{
