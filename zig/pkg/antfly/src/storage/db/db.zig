@@ -30235,6 +30235,59 @@ test "db document extraction stores rfc822 email units" {
     try std.testing.expect(std.mem.indexOf(u8, body_payload, "\"source_content_type\":\"message/rfc822\"") != null);
 }
 
+test "db document extraction stores multipart rfc822 text parts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:multipart-email",
+            .value = "{\"filename\":\"message.eml\",\"mime_type\":\"message/rfc822\",\"url\":\"data:message/rfc822;base64,U3ViamVjdDogQWxwaGENCkNvbnRlbnQtVHlwZTogbXVsdGlwYXJ0L2FsdGVybmF0aXZlOyBib3VuZGFyeT0iYjEiDQoNCi0tYjENCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbg0KDQpQbGFpbiBib2R5DQotLWIxDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQo8cD5IVE1MIGJvZHk8L3A+DQotLWIxLS0NCg==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:multipart-email", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const plain_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:multipart-email", "document_units_v1", "email:part:000001");
+    defer alloc.free(plain_key);
+    const html_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:multipart-email", "document_units_v1", "email:part:000002");
+    defer alloc.free(html_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":3") != null);
+
+    const plain_payload = try db.core.store.get(alloc, plain_key);
+    defer alloc.free(plain_payload);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "\"unit_type\":\"email_part\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "\"method\":\"email_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "Plain body") != null);
+
+    const html_payload = try db.core.store.get(alloc, html_key);
+    defer alloc.free(html_payload);
+    try std.testing.expect(std.mem.indexOf(u8, html_payload, "\"method\":\"email_html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_payload, "\"text\":\"HTML body\"") != null);
+}
+
 test "db document extraction stores unsupported file manifest without searchable units" {
     const alloc = std.testing.allocator;
 

@@ -517,7 +517,7 @@ Still remaining in Phase 4:
 
 Current implementation status:
 
-- RFC 822 email extraction now routes `message/rfc822` and `.eml` content into the canonical `document_units_v1` artifact, emitting deterministic `email_headers` and `email_body` units with `email_rfc822` provenance. The email body extractor decodes common `base64` and `quoted-printable` transfer encodings while keeping multipart/deeper MIME expansion as future work.
+- RFC 822 email extraction now routes `message/rfc822` and `.eml` content into the canonical `document_units_v1` artifact, emitting deterministic `email_headers`, `email_body`, and multipart `email_part` units with email provenance. The email body extractor decodes common `base64` and `quoted-printable` transfer encodings, extracts `text/plain` parts directly, strips simple `text/html` parts, and skips non-text parts such as attachments.
 
 ## Open Questions And Proposed Direction
 

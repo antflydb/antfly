@@ -491,22 +491,7 @@ fn extractEmailAlloc(
         }
     }
 
-    const body_text = try emailBodyTextAlloc(alloc, headers, body);
-    errdefer alloc.free(body_text);
-    if (body_text.len > 0) {
-        const unit_id = try std.fmt.allocPrint(alloc, "{s}:body", .{unit_prefix});
-        errdefer alloc.free(unit_id);
-        try units.append(alloc, .{
-            .unit_id = unit_id,
-            .unit_type = try alloc.dupe(u8, "email_body"),
-            .text = body_text,
-            .method = try alloc.dupe(u8, "email_rfc822"),
-            .char_start = std.math.cast(u32, split.body_start),
-            .char_end = std.math.cast(u32, bytes.len),
-        });
-    } else {
-        alloc.free(body_text);
-    }
+    try appendEmailBodyUnits(alloc, &units, headers, body, unit_prefix, split.body_start, bytes.len);
 
     return .{
         .content_type = try alloc.dupe(u8, content_type),
@@ -563,15 +548,150 @@ fn normalizeEmailHeaderTextAlloc(alloc: Allocator, headers: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn emailBodyTextAlloc(alloc: Allocator, headers: []const u8, body: []const u8) ![]u8 {
+fn appendEmailBodyUnits(
+    alloc: Allocator,
+    units: *std.ArrayListUnmanaged(Unit),
+    headers: []const u8,
+    body: []const u8,
+    unit_prefix: []const u8,
+    body_start: usize,
+    message_len: usize,
+) !void {
+    if (try emailMultipartBoundaryAlloc(alloc, headers)) |boundary| {
+        defer alloc.free(boundary);
+        const appended = try appendEmailMultipartTextUnits(alloc, units, body, unit_prefix, body_start, boundary);
+        if (appended > 0) return;
+    }
+
+    const body_text = try emailBodyTextAlloc(alloc, headers, body, false);
+    errdefer alloc.free(body_text);
+    if (body_text.len > 0) {
+        const unit_id = try std.fmt.allocPrint(alloc, "{s}:body", .{unit_prefix});
+        errdefer alloc.free(unit_id);
+        try units.append(alloc, .{
+            .unit_id = unit_id,
+            .unit_type = try alloc.dupe(u8, "email_body"),
+            .text = body_text,
+            .method = try alloc.dupe(u8, "email_rfc822"),
+            .char_start = std.math.cast(u32, body_start),
+            .char_end = std.math.cast(u32, message_len),
+        });
+    } else {
+        alloc.free(body_text);
+    }
+}
+
+fn appendEmailMultipartTextUnits(
+    alloc: Allocator,
+    units: *std.ArrayListUnmanaged(Unit),
+    body: []const u8,
+    unit_prefix: []const u8,
+    body_start: usize,
+    boundary: []const u8,
+) !usize {
+    if (boundary.len == 0) return 0;
+    var appended: usize = 0;
+    var in_part = false;
+    var part_start: usize = 0;
+    var cursor: usize = 0;
+    while (nextEmailLine(body, cursor)) |line| {
+        if (emailBoundaryLineKind(line.text, boundary)) |kind| {
+            if (in_part and line.start >= part_start) {
+                if (try appendEmailMultipartTextPartUnit(alloc, units, body[part_start..line.start], unit_prefix, body_start + part_start, appended + 1)) {
+                    appended += 1;
+                }
+            }
+            if (kind == .closing) break;
+            in_part = true;
+            part_start = line.next;
+        }
+        cursor = line.next;
+    }
+    return appended;
+}
+
+const EmailLine = struct {
+    start: usize,
+    next: usize,
+    text: []const u8,
+};
+
+fn nextEmailLine(bytes: []const u8, start: usize) ?EmailLine {
+    if (start >= bytes.len) return null;
+    const newline_offset = std.mem.indexOfScalar(u8, bytes[start..], '\n');
+    const raw_end = if (newline_offset) |offset| start + offset else bytes.len;
+    const next = if (newline_offset != null) raw_end + 1 else bytes.len;
+    return .{
+        .start = start,
+        .next = next,
+        .text = trimTrailingCarriageReturn(bytes[start..raw_end]),
+    };
+}
+
+const EmailBoundaryLineKind = enum {
+    part,
+    closing,
+};
+
+fn emailBoundaryLineKind(line: []const u8, boundary: []const u8) ?EmailBoundaryLineKind {
+    if (line.len < boundary.len + 2) return null;
+    if (line[0] != '-' or line[1] != '-') return null;
+    if (!std.mem.eql(u8, line[2 .. 2 + boundary.len], boundary)) return null;
+    const suffix = line[2 + boundary.len ..];
+    if (suffix.len == 0) return .part;
+    if (std.mem.eql(u8, suffix, "--")) return .closing;
+    return null;
+}
+
+fn appendEmailMultipartTextPartUnit(
+    alloc: Allocator,
+    units: *std.ArrayListUnmanaged(Unit),
+    part: []const u8,
+    unit_prefix: []const u8,
+    part_message_start: usize,
+    part_index: usize,
+) !bool {
+    const split = emailHeaderBodySplit(part) orelse return false;
+    const part_headers = part[0..split.header_end];
+    const part_body = part[split.body_start..];
+    const part_content_type = emailHeaderValue(part_headers, "content-type") orelse "text/plain";
+    const part_content_base = contentTypeBase(part_content_type);
+    const strip_html = std.ascii.eqlIgnoreCase(part_content_base, "text/html");
+    if (!strip_html and !std.ascii.eqlIgnoreCase(part_content_base, "text/plain")) return false;
+
+    const part_text = try emailBodyTextAlloc(alloc, part_headers, part_body, strip_html);
+    errdefer alloc.free(part_text);
+    if (part_text.len == 0) {
+        alloc.free(part_text);
+        return false;
+    }
+
+    const unit_id = try std.fmt.allocPrint(alloc, "{s}:part:{d:0>6}", .{ unit_prefix, part_index });
+    errdefer alloc.free(unit_id);
+    try units.append(alloc, .{
+        .unit_id = unit_id,
+        .unit_type = try alloc.dupe(u8, "email_part"),
+        .text = part_text,
+        .method = try alloc.dupe(u8, if (strip_html) "email_html" else "email_text"),
+        .char_start = std.math.cast(u32, part_message_start + split.body_start),
+        .char_end = std.math.cast(u32, part_message_start + part.len),
+    });
+    return true;
+}
+
+fn emailBodyTextAlloc(alloc: Allocator, headers: []const u8, body: []const u8, strip_html: bool) ![]u8 {
     const encoding = emailHeaderValue(headers, "content-transfer-encoding") orelse "";
-    if (std.ascii.eqlIgnoreCase(encoding, "base64")) {
-        return decodeBase64BodyAlloc(alloc, body) catch try alloc.dupe(u8, body);
-    }
-    if (std.ascii.eqlIgnoreCase(encoding, "quoted-printable")) {
-        return try decodeQuotedPrintableAlloc(alloc, body);
-    }
-    return try alloc.dupe(u8, body);
+    const decoded = if (std.ascii.eqlIgnoreCase(encoding, "base64"))
+        decodeBase64BodyAlloc(alloc, body) catch try alloc.dupe(u8, body)
+    else if (std.ascii.eqlIgnoreCase(encoding, "quoted-printable"))
+        try decodeQuotedPrintableAlloc(alloc, body)
+    else
+        try alloc.dupe(u8, body);
+    errdefer alloc.free(decoded);
+    if (!strip_html) return decoded;
+    const text = try htmlToTextAlloc(alloc, decoded);
+    alloc.free(decoded);
+    return text;
 }
 
 fn emailHeaderValue(headers: []const u8, name_lower: []const u8) ?[]const u8 {
@@ -582,6 +702,30 @@ fn emailHeaderValue(headers: []const u8, name_lower: []const u8) ?[]const u8 {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, name_lower)) continue;
         return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn emailMultipartBoundaryAlloc(alloc: Allocator, headers: []const u8) !?[]u8 {
+    const content_type = emailHeaderValue(headers, "content-type") orelse return null;
+    if (!contentTypeStartsWith(content_type, "multipart/")) return null;
+    const boundary = contentTypeParameter(content_type, "boundary") orelse return null;
+    return try alloc.dupe(u8, boundary);
+}
+
+fn contentTypeParameter(content_type: []const u8, name_lower: []const u8) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, content_type, ';');
+    _ = parts.next();
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const name = std.mem.trim(u8, trimmed[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, name_lower)) continue;
+        var value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
+        return value;
     }
     return null;
 }
@@ -924,6 +1068,35 @@ test "document extraction routes configured email extractor with unit prefix" {
     try std.testing.expectEqualStrings("message:headers", result.units[0].unit_id);
     try std.testing.expectEqualStrings("message:body", result.units[1].unit_id);
     try std.testing.expectEqualStrings("Body", result.units[1].text);
+}
+
+test "document extraction extracts multipart rfc822 text parts" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "message/rfc822"),
+        .data = try alloc.dupe(
+            u8,
+            "Subject: Alpha\r\nContent-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n" ++
+                "--b1\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n" ++
+                "--b1\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>HTML=20body</p>\r\n" ++
+                "--b1\r\nContent-Type: application/octet-stream\r\n\r\nopaque\r\n" ++
+                "--b1--\r\n",
+        ),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/message.eml", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("email", result.route_type);
+    try std.testing.expectEqual(@as(usize, 3), result.units.len);
+    try std.testing.expectEqualStrings("email:headers", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("email:part:000001", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("email_part", result.units[1].unit_type);
+    try std.testing.expectEqualStrings("email_text", result.units[1].method);
+    try std.testing.expectEqualStrings("Plain body\r\n", result.units[1].text);
+    try std.testing.expectEqualStrings("email:part:000002", result.units[2].unit_id);
+    try std.testing.expectEqualStrings("email_html", result.units[2].method);
+    try std.testing.expectEqualStrings("HTML body", result.units[2].text);
 }
 
 test "document extraction applies source metadata fields from row json" {
