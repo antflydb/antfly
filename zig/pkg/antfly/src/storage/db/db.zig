@@ -13915,6 +13915,7 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     hasher.update(unit.unit_type);
     hasher.update(unit.text);
     hasher.update(unit.method);
+    if (unit.source_path) |source_path| hasher.update(source_path);
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -14091,8 +14092,10 @@ fn documentUnitPayloadAlloc(
         .text = unit.text,
         .content_type = "text/plain",
         .language = "",
+        .source_path = unit.source_path,
         .provenance = .{
             .source_url = source_url,
+            .source_path = unit.source_path,
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
@@ -14105,6 +14108,7 @@ fn documentUnitPayloadAlloc(
             .format_provenance = .{
                 .schema = "antfly.document_format_provenance.v1",
                 .source_content_type = content_type,
+                .source_path = unit.source_path,
                 .coordinate_system = "source_page_points",
                 .extraction_method = unit.method,
                 .ocr_used = false,
@@ -30226,6 +30230,54 @@ test "db document extraction stores docx section units" {
     try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"method\":\"docx_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"text\":\"Alpha DB\\nBeta DB\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"source_content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"") != null);
+}
+
+test "db document extraction stores zip archive entry units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:archive",
+            .value = "{\"filename\":\"bundle.zip\",\"mime_type\":\"application/zip\",\"url\":\"data:application/zip;base64,UEsDBBQAAAAAAAAAAADxLiMkDwAAAA8AAAAPAAAAZG9jcy9yZWFkbWUudHh0QXJjaGl2ZSBEQiB0ZXh0UEsBAhQAFAAAAAAAAAAAAPEuIyQPAAAADwAAAA8AAAAAAAAAAAAAAAAAAAAAAGRvY3MvcmVhZG1lLnR4dFBLBQYAAAAAAQABAD0AAAA8AAAAAAA=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:archive", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const entry_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:archive", "document_units_v1", "archive:entry:000001");
+    defer alloc.free(entry_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"archive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const entry_payload = try db.core.store.get(alloc, entry_key);
+    defer alloc.free(entry_payload);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"unit_type\":\"archive_entry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"method\":\"zip_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_path\":\"docs/readme.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"text\":\"Archive DB text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_content_type\":\"application/zip\"") != null);
 }
 
 test "db document extraction stores rfc822 email units" {

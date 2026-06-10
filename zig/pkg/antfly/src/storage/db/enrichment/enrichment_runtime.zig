@@ -3917,6 +3917,7 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     hasher.update(unit.unit_type);
     hasher.update(unit.text);
     hasher.update(unit.method);
+    if (unit.source_path) |source_path| hasher.update(source_path);
     if (unit.page_number) |page_number| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, page_number, .big);
@@ -4106,8 +4107,10 @@ fn documentUnitPayloadAlloc(
         .text = unit.text,
         .content_type = "text/plain",
         .language = "",
+        .source_path = unit.source_path,
         .provenance = .{
             .source_url = source_url,
+            .source_path = unit.source_path,
             .method = unit.method,
             .ocr_used = false,
             .page_number = unit.page_number,
@@ -4120,6 +4123,7 @@ fn documentUnitPayloadAlloc(
             .format_provenance = .{
                 .schema = "antfly.document_format_provenance.v1",
                 .source_content_type = content_type,
+                .source_path = unit.source_path,
                 .coordinate_system = "source_page_points",
                 .extraction_method = unit.method,
                 .ocr_used = false,

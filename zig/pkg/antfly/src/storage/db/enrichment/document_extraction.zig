@@ -48,6 +48,7 @@ pub const Unit = struct {
     unit_type: []u8,
     text: []u8,
     method: []u8,
+    source_path: ?[]u8 = null,
     page_number: ?u32 = null,
     page_label: ?[]u8 = null,
     page_bbox: ?[4]f64 = null,
@@ -60,6 +61,7 @@ pub const Unit = struct {
         alloc.free(self.unit_type);
         alloc.free(self.text);
         alloc.free(self.method);
+        if (self.source_path) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -110,6 +112,7 @@ const ExtractorType = enum {
     docx,
     pptx,
     xlsx,
+    archive,
     unsupported,
 
     fn parse(value: []const u8) ?ExtractorType {
@@ -120,6 +123,7 @@ const ExtractorType = enum {
         if (std.mem.eql(u8, value, "docx")) return .docx;
         if (std.mem.eql(u8, value, "pptx")) return .pptx;
         if (std.mem.eql(u8, value, "xlsx")) return .xlsx;
+        if (std.mem.eql(u8, value, "archive")) return .archive;
         if (std.mem.eql(u8, value, "unsupported")) return .unsupported;
         return null;
     }
@@ -327,6 +331,9 @@ pub fn extractDownloadedAlloc(
     if (isXlsxContent(content_type, config.filename, source_url)) {
         return try extractXlsxAlloc(alloc, downloaded.data, content_type);
     }
+    if (isZipArchiveContent(content_type, config.filename, source_url)) {
+        return try extractZipArchiveAlloc(alloc, downloaded.data, content_type);
+    }
     if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);
     }
@@ -361,6 +368,7 @@ fn extractWithRouteAlloc(
         .docx => try extractDocxAlloc(alloc, bytes, content_type),
         .pptx => try extractPptxAlloc(alloc, bytes, content_type),
         .xlsx => try extractXlsxAlloc(alloc, bytes, content_type),
+        .archive => try extractZipArchiveAlloc(alloc, bytes, content_type),
         .unsupported => try unsupportedResultAlloc(alloc, content_type, "matched_unsupported_route"),
     };
 }
@@ -535,7 +543,7 @@ fn extractDocxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u
         const section_text = try ooxmlXmlTextAlloc(alloc, document_xml[segment_start..tag_start], .word);
         errdefer alloc.free(section_text);
         if (section_text.len > 0) {
-            try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text);
+            try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text, null);
             section_index += 1;
         } else {
             alloc.free(section_text);
@@ -553,7 +561,7 @@ fn extractDocxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u
     const section_text = try ooxmlXmlTextAlloc(alloc, document_xml[segment_start..], .word);
     errdefer alloc.free(section_text);
     if (section_text.len > 0) {
-        try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text);
+        try appendOwnedUnit(alloc, &units, "section:{d:0>6}", .{section_index}, "section", "docx_text", section_text, null);
     } else {
         alloc.free(section_text);
     }
@@ -596,7 +604,7 @@ fn extractPptxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u
     for (parts.items, 1..) |*part, ordinal| {
         const text = part.text;
         part.text = &.{};
-        try appendOwnedUnit(alloc, &units, "slide:{d:0>6}", .{ordinal}, "slide", "pptx_text", text);
+        try appendOwnedUnit(alloc, &units, "slide:{d:0>6}", .{ordinal}, "slide", "pptx_text", text, null);
     }
 
     return .{
@@ -644,12 +652,50 @@ fn extractXlsxAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u
     for (parts.items, 1..) |*part, ordinal| {
         const text = part.text;
         part.text = &.{};
-        try appendOwnedUnit(alloc, &units, "sheet:{d:0>6}", .{ordinal}, "sheet", "xlsx_text", text);
+        try appendOwnedUnit(alloc, &units, "sheet:{d:0>6}", .{ordinal}, "sheet", "xlsx_text", text, null);
     }
 
     return .{
         .content_type = try alloc.dupe(u8, content_type),
         .route_type = try alloc.dupe(u8, "xlsx"),
+        .units = try units.toOwnedSlice(alloc),
+    };
+}
+
+fn extractZipArchiveAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8) !Result {
+    const entries = try zipEntriesAlloc(alloc, bytes);
+    defer alloc.free(entries);
+    std.mem.sort(ZipEntry, entries, {}, zipEntryLessThanName);
+
+    var units = std.ArrayListUnmanaged(Unit).empty;
+    errdefer {
+        for (units.items) |*unit| unit.deinit(alloc);
+        units.deinit(alloc);
+    }
+    var unit_index: usize = 1;
+    for (entries) |entry| {
+        if (entry.name.len == 0 or std.mem.endsWith(u8, entry.name, "/")) continue;
+        if (!zipEntryNameIsSafe(entry.name)) continue;
+        const extracted = zipEntryDataFromEntryAlloc(alloc, bytes, entry) catch |err| switch (err) {
+            error.UnsupportedCompressionMethod, error.ZipDecompressSizeMismatch => continue,
+            else => return err,
+        };
+        defer alloc.free(extracted);
+
+        const entry_text = try archiveEntryTextAlloc(alloc, entry.name, extracted);
+        errdefer alloc.free(entry_text);
+        if (entry_text.len == 0) {
+            alloc.free(entry_text);
+            continue;
+        }
+        const method: []const u8 = if (archiveEntryLooksHtml(entry.name, extracted)) "zip_html" else "zip_text";
+        try appendOwnedUnit(alloc, &units, "archive:entry:{d:0>6}", .{unit_index}, "archive_entry", method, entry_text, entry.name);
+        unit_index += 1;
+    }
+
+    return .{
+        .content_type = try alloc.dupe(u8, content_type),
+        .route_type = try alloc.dupe(u8, "archive"),
         .units = try units.toOwnedSlice(alloc),
     };
 }
@@ -662,6 +708,7 @@ fn appendOwnedUnit(
     unit_type: []const u8,
     method: []const u8,
     text: []u8,
+    source_path: ?[]const u8,
 ) !void {
     errdefer alloc.free(text);
     const unit_id = try std.fmt.allocPrint(alloc, unit_id_fmt, unit_id_args);
@@ -670,11 +717,14 @@ fn appendOwnedUnit(
     errdefer alloc.free(owned_type);
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
+    const owned_source_path = if (source_path) |path| try alloc.dupe(u8, path) else null;
+    errdefer if (owned_source_path) |path| alloc.free(path);
     try units.append(alloc, .{
         .unit_id = unit_id,
         .unit_type = owned_type,
         .text = text,
         .method = owned_method,
+        .source_path = owned_source_path,
     });
 }
 
@@ -685,6 +735,20 @@ const ZipEntry = struct {
     uncompressed_size: usize,
     local_file_header_offset: usize,
 };
+
+fn zipEntryLessThanName(_: void, lhs: ZipEntry, rhs: ZipEntry) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
+}
+
+fn zipEntryNameIsSafe(name: []const u8) bool {
+    if (name.len == 0 or name[0] == '/' or name[0] == '\\') return false;
+    var parts = std.mem.splitAny(u8, name, "/\\");
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
 
 fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
     const end_pos = std.mem.lastIndexOf(u8, bytes, &std.zip.end_record_sig) orelse return error.ZipNoEndRecord;
@@ -712,10 +776,6 @@ fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
         const flags = std.mem.readInt(u16, bytes[cursor + 8 ..][0..2], .little);
         if ((flags & 0x0001) != 0) return error.ZipEncryptionUnsupported;
         const compression_method: std.zip.CompressionMethod = @enumFromInt(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little));
-        switch (compression_method) {
-            .store, .deflate => {},
-            else => return error.UnsupportedCompressionMethod,
-        }
         const compressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 20 ..][0..4], .little);
         const uncompressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 24 ..][0..4], .little);
         const name_len = std.mem.readInt(u16, bytes[cursor + 28 ..][0..2], .little);
@@ -780,6 +840,31 @@ fn inflateRawAlloc(alloc: Allocator, compressed: []const u8, expected_size: usiz
     errdefer alloc.free(inflated);
     if (inflated.len != expected_size) return error.ZipDecompressSizeMismatch;
     return inflated;
+}
+
+fn archiveEntryTextAlloc(alloc: Allocator, name: []const u8, bytes: []const u8) ![]u8 {
+    if (archiveEntryLooksHtml(name, bytes)) return try htmlToTextAlloc(alloc, bytes);
+    if (!archiveEntryLooksText(name, bytes)) return try alloc.alloc(u8, 0);
+    return try alloc.dupe(u8, bytes);
+}
+
+fn archiveEntryLooksHtml(name: []const u8, bytes: []const u8) bool {
+    return hasExtension(name, ".html") or hasExtension(name, ".htm") or looksLikeHtml(bytes);
+}
+
+fn archiveEntryLooksText(name: []const u8, bytes: []const u8) bool {
+    if (hasExtension(name, ".txt") or
+        hasExtension(name, ".md") or
+        hasExtension(name, ".markdown") or
+        hasExtension(name, ".csv") or
+        hasExtension(name, ".json") or
+        hasExtension(name, ".jsonl") or
+        hasExtension(name, ".xml") or
+        hasExtension(name, ".log"))
+    {
+        return looksLikePlainText(bytes);
+    }
+    return looksLikePlainText(bytes);
 }
 
 const OoxmlTextMode = enum {
@@ -1446,6 +1531,13 @@ fn isXlsxContent(content_type: []const u8, filename: []const u8, source_url: []c
     return hasExtension(filename, ".xlsx") or hasExtension(source_url, ".xlsx");
 }
 
+fn isZipArchiveContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
+    if (contentTypeEquals(content_type, "application/zip")) return true;
+    if (contentTypeEquals(content_type, "application/x-zip-compressed")) return true;
+    if (contentTypeEquals(content_type, "multipart/x-zip")) return true;
+    return hasExtension(filename, ".zip") or hasExtension(source_url, ".zip");
+}
+
 fn isTextContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeStartsWith(content_type, "text/")) return true;
     if (contentTypeEquals(content_type, "application/json")) return true;
@@ -1880,6 +1972,48 @@ test "document extraction extracts xlsx sheets with shared strings" {
     try std.testing.expectEqualStrings("sheet", result.units[0].unit_type);
     try std.testing.expectEqualStrings("xlsx_text", result.units[0].method);
     try std.testing.expectEqualStrings("Name\tScore\nAda & Bob\t42", result.units[0].text);
+}
+
+test "document extraction extracts zip archive text entries with source paths" {
+    const alloc = std.testing.allocator;
+    const zip = try buildStoredZipAlloc(alloc, &.{
+        .{
+            .name = "z-last.txt",
+            .data = "Last text",
+        },
+        .{
+            .name = "a/page.html",
+            .data = "<h1>Heading</h1><p>Body &amp; more</p>",
+        },
+        .{
+            .name = "../escape.txt",
+            .data = "skip me",
+        },
+        .{
+            .name = "bin/data.bin",
+            .data = "abc\x00def",
+        },
+    });
+    defer alloc.free(zip);
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "application/zip"),
+        .data = try alloc.dupe(u8, zip),
+    };
+    defer downloaded.deinit(alloc);
+
+    var result = try extractDownloadedAlloc(alloc, downloaded, "https://example.test/archive.zip", .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("archive", result.route_type);
+    try std.testing.expectEqual(@as(usize, 2), result.units.len);
+    try std.testing.expectEqualStrings("archive:entry:000001", result.units[0].unit_id);
+    try std.testing.expectEqualStrings("archive_entry", result.units[0].unit_type);
+    try std.testing.expectEqualStrings("zip_html", result.units[0].method);
+    try std.testing.expectEqualStrings("a/page.html", result.units[0].source_path.?);
+    try std.testing.expectEqualStrings("Heading Body &amp; more", result.units[0].text);
+    try std.testing.expectEqualStrings("archive:entry:000002", result.units[1].unit_id);
+    try std.testing.expectEqualStrings("zip_text", result.units[1].method);
+    try std.testing.expectEqualStrings("z-last.txt", result.units[1].source_path.?);
+    try std.testing.expectEqualStrings("Last text", result.units[1].text);
 }
 
 test "document extraction applies source metadata fields from row json" {

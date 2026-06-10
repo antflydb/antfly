@@ -392,8 +392,8 @@ Current implementation status:
 - `asset` enrichments can now use producer type `document_extraction`.
 - The producer is handled internally rather than by the external model-backed asset producer runtime.
 - The source field resolves to a URL, including `data:` URLs through the existing remote-content downloader path.
-- Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, simple HTML, RFC 822 email, and OOXML Office packages into canonical units.
-- The initial route config now supports ordered built-in routes for `pdf`, `html`, `text`, and `unsupported` extractors, matched by exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
+- Extraction currently routes PDF mechanical text, text, JSON/CSV-like text, simple HTML, RFC 822 email, OOXML Office packages, and ZIP archives into canonical units.
+- The route config supports ordered built-in routes for `pdf`, `html`, `text`, `email`, `docx`, `pptx`, `xlsx`, `archive`, and `unsupported` extractors, matched by exact content type, content-type prefix, filename/URL extension, or configured magic-byte prefix.
 - The default detector now sniffs PDF magic, common HTML prefixes, and valid UTF-8 plain text for missing or generic content-type metadata, so mixed-file tables can still produce canonical units when upstream file metadata is incomplete.
 - Route matching can hydrate effective filename and content type from per-row source metadata fields such as `source.filename_field` and `source.content_type_field`, so one mixed-file table can route documents without one enrichment per MIME type.
 - Unsupported content types now produce a structured `route_type: "unsupported"` manifest with `unsupported_reason`, zero units, and no searchable child documents instead of failing the enrichment.
@@ -519,6 +519,7 @@ Current implementation status:
 
 - RFC 822 email extraction now routes `message/rfc822` and `.eml` content into the canonical `document_units_v1` artifact, emitting deterministic `email_headers`, `email_body`, and multipart `email_part` units with email provenance. The email body extractor decodes common `base64` and `quoted-printable` transfer encodings, extracts `text/plain` parts directly, strips simple `text/html` parts, and skips non-text parts such as attachments.
 - OOXML Office extraction now routes DOCX, PPTX, and XLSX content by official MIME type, extension, or explicit route config into the same canonical artifact. DOCX emits deterministic `section` units from `word/document.xml`, PPTX emits numerically ordered `slide` units from `ppt/slides/slide*.xml`, and XLSX emits `sheet` units from worksheet XML with shared-string and inline-string support. The implementation uses an in-memory ZIP central-directory reader with stored and raw-deflate entry support, XML entity decoding, and no temp-file dependency.
+- ZIP archive extraction now routes `application/zip`, common ZIP aliases, `.zip` filenames, and explicit `archive` route configs into deterministic `archive_entry` units for text and simple HTML entries. Entries are sorted by path, unsafe path traversal names are skipped, unsupported/binary entries are skipped without failing the whole archive, and each unit carries `source_path` in the payload, provenance, format provenance, and unit fingerprint so archive entry renames are visible to incremental cleanup/replay.
 
 ## Open Questions And Proposed Direction
 
