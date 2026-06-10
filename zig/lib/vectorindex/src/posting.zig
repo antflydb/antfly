@@ -267,13 +267,9 @@ pub const PostingFormat = struct {
     pub const base_magic = [_]u8{ 'A', 'F', 'P', 'B' };
     pub const delta_magic = [_]u8{ 'A', 'F', 'P', 'D' };
     pub const version: u8 = 1;
-    pub const delta_compact_version: u8 = 2;
 
     const base_header_size: usize = 4 + 1 + 8 + 8 + 4;
-    const delta_header_size: usize = 4 + 1 + 4;
-    const delta_record_size: usize = 8 + 1 + 8;
-    const delta_compact_header_size: usize = 4 + 1 + 4 + 8;
-    const delta_compact_record_size: usize = 4 + 1 + 8;
+    const delta_header_size: usize = 4 + 1 + 4 + 8;
 
     pub fn encodedBaseSize(base: PostingBase) !usize {
         if (base.members.len > std.math.maxInt(u32)) return error.TooLarge;
@@ -348,104 +344,39 @@ pub const PostingFormat = struct {
 
     pub fn encodeDeltaTail(alloc: std.mem.Allocator, records: []const PostingDeltaRecord) ![]u8 {
         if (records.len > std.math.maxInt(u32)) return error.TooLarge;
-        const compact = deltaTailCanUseCompactEncoding(records);
-        const encoded_len = if (compact)
-            delta_compact_header_size + records.len * delta_compact_record_size
-        else
-            delta_header_size + records.len * delta_record_size;
+        const encoded_len = try encodedDeltaTailSize(records);
         var out = try alloc.alloc(u8, encoded_len);
         errdefer alloc.free(out);
 
         @memcpy(out[0..4], &delta_magic);
-        out[4] = if (compact) delta_compact_version else version;
+        out[4] = version;
         std.mem.writeInt(u32, out[5..9], @intCast(records.len), .little);
 
-        if (compact) {
-            const base_sequence = records[0].sequence;
-            std.mem.writeInt(u64, out[9..17], base_sequence, .little);
-            var pos: usize = delta_compact_header_size;
-            for (records) |record| {
-                std.mem.writeInt(u32, out[pos..][0..4], @intCast(record.sequence - base_sequence), .little);
-                pos += 4;
-                out[pos] = @intFromEnum(record.op);
-                pos += 1;
-                std.mem.writeInt(u64, out[pos..][0..8], record.vector_id, .little);
-                pos += 8;
-            }
-        } else {
-            var pos: usize = delta_header_size;
-            for (records) |record| {
-                std.mem.writeInt(u64, out[pos..][0..8], record.sequence, .little);
-                pos += 8;
-                out[pos] = @intFromEnum(record.op);
-                pos += 1;
-                std.mem.writeInt(u64, out[pos..][0..8], record.vector_id, .little);
-                pos += 8;
-            }
+        const base_sequence = baseSequenceForDeltaTail(records);
+        std.mem.writeInt(u64, out[9..17], base_sequence, .little);
+        var pos: usize = delta_header_size;
+        for (records) |record| {
+            writeVarint(out, &pos, record.sequence - base_sequence);
+            out[pos] = @intFromEnum(record.op);
+            pos += 1;
+            writeVarint(out, &pos, record.vector_id);
         }
         return out;
     }
 
     pub fn decodeDeltaTail(alloc: std.mem.Allocator, data: []const u8) ![]PostingDeltaRecord {
-        if (data.len < delta_header_size) return error.Corrupted;
-        if (!std.mem.eql(u8, data[0..4], &delta_magic)) return error.BadPostingDeltaMagic;
-        if (data[4] == delta_compact_version) return try decodeCompactDeltaTail(alloc, data);
-        if (data[4] != version) return error.UnsupportedPostingDeltaVersion;
-        const record_count = std.mem.readInt(u32, data[5..9], .little);
-        const expected_len = delta_header_size + @as(usize, record_count) * delta_record_size;
-        if (data.len != expected_len) return error.Corrupted;
-
-        const records = try alloc.alloc(PostingDeltaRecord, record_count);
+        const header = try decodeDeltaTailHeader(data);
+        const records = try alloc.alloc(PostingDeltaRecord, header.record_count);
         errdefer alloc.free(records);
-        var pos: usize = delta_header_size;
+        var pos = header.records_offset;
         for (records) |*record| {
-            record.sequence = std.mem.readInt(u64, data[pos..][0..8], .little);
-            pos += 8;
-            const op_pos = pos;
-            record.op = switch (data[op_pos]) {
-                @intFromEnum(PostingDeltaOp.insert) => .insert,
-                @intFromEnum(PostingDeltaOp.tombstone) => .tombstone,
-                @intFromEnum(PostingDeltaOp.replace) => .replace,
-                else => return error.UnsupportedPostingDeltaOp,
-            };
-            pos += 1;
-            record.vector_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-            pos += 8;
-        }
-        return records;
-    }
-
-    fn decodeCompactDeltaTail(alloc: std.mem.Allocator, data: []const u8) ![]PostingDeltaRecord {
-        if (data.len < delta_compact_header_size) return error.Corrupted;
-        const record_count = std.mem.readInt(u32, data[5..9], .little);
-        const expected_len = delta_compact_header_size + @as(usize, record_count) * delta_compact_record_size;
-        if (data.len != expected_len) return error.Corrupted;
-        const base_sequence = std.mem.readInt(u64, data[9..17], .little);
-
-        const records = try alloc.alloc(PostingDeltaRecord, record_count);
-        errdefer alloc.free(records);
-        var pos: usize = delta_compact_header_size;
-        for (records) |*record| {
-            const offset = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4;
-            const op_pos = pos;
-            record.op = switch (data[op_pos]) {
-                @intFromEnum(PostingDeltaOp.insert) => .insert,
-                @intFromEnum(PostingDeltaOp.tombstone) => .tombstone,
-                @intFromEnum(PostingDeltaOp.replace) => .replace,
-                else => return error.UnsupportedPostingDeltaOp,
-            };
-            pos += 1;
-            record.vector_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-            pos += 8;
-            record.sequence = std.math.add(u64, base_sequence, @as(u64, offset)) catch return error.Corrupted;
+            record.* = try readDeltaRecord(data, header, &pos);
         }
         return records;
     }
 
     const DeltaTailHeader = struct {
         record_count: usize,
-        compact: bool,
         base_sequence: u64 = 0,
         records_offset: usize,
     };
@@ -453,26 +384,25 @@ pub const PostingFormat = struct {
     fn decodeDeltaTailHeader(data: []const u8) !DeltaTailHeader {
         if (data.len < delta_header_size) return error.Corrupted;
         if (!std.mem.eql(u8, data[0..4], &delta_magic)) return error.BadPostingDeltaMagic;
-        const record_count = std.mem.readInt(u32, data[5..9], .little);
-        if (data[4] == delta_compact_version) {
-            if (data.len < delta_compact_header_size) return error.Corrupted;
-            const expected_len = delta_compact_header_size + @as(usize, record_count) * delta_compact_record_size;
-            if (data.len != expected_len) return error.Corrupted;
-            return .{
-                .record_count = record_count,
-                .compact = true,
-                .base_sequence = std.mem.readInt(u64, data[9..17], .little),
-                .records_offset = delta_compact_header_size,
-            };
-        }
         if (data[4] != version) return error.UnsupportedPostingDeltaVersion;
-        const expected_len = delta_header_size + @as(usize, record_count) * delta_record_size;
-        if (data.len != expected_len) return error.Corrupted;
-        return .{
+        const record_count = std.mem.readInt(u32, data[5..9], .little);
+        const header = DeltaTailHeader{
             .record_count = record_count,
-            .compact = false,
+            .base_sequence = std.mem.readInt(u64, data[9..17], .little),
             .records_offset = delta_header_size,
         };
+        var pos = header.records_offset;
+        var i: usize = 0;
+        while (i < record_count) : (i += 1) {
+            const sequence_offset = try readVarint(data, &pos);
+            _ = std.math.add(u64, header.base_sequence, sequence_offset) catch return error.Corrupted;
+            if (pos >= data.len) return error.Corrupted;
+            _ = try decodeDeltaOp(data[pos]);
+            pos += 1;
+            _ = try readVarint(data, &pos);
+        }
+        if (pos != data.len) return error.Corrupted;
+        return header;
     }
 
     pub fn deltaTailRecordCount(data: []const u8) !usize {
@@ -489,26 +419,15 @@ pub const PostingFormat = struct {
     }
 
     fn readDeltaRecord(data: []const u8, header: DeltaTailHeader, pos: *usize) !PostingDeltaRecord {
-        if (header.compact) {
-            const offset = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            const op = try decodeDeltaOp(data[pos.*]);
-            pos.* += 1;
-            const vector_id = std.mem.readInt(u64, data[pos.*..][0..8], .little);
-            pos.* += 8;
-            return .{
-                .sequence = std.math.add(u64, header.base_sequence, @as(u64, offset)) catch return error.Corrupted,
-                .op = op,
-                .vector_id = vector_id,
-            };
-        }
-        const sequence = std.mem.readInt(u64, data[pos.*..][0..8], .little);
-        pos.* += 8;
+        const sequence_offset = try readVarint(data, pos);
         const op = try decodeDeltaOp(data[pos.*]);
         pos.* += 1;
-        const vector_id = std.mem.readInt(u64, data[pos.*..][0..8], .little);
-        pos.* += 8;
-        return .{ .sequence = sequence, .op = op, .vector_id = vector_id };
+        const vector_id = try readVarint(data, pos);
+        return .{
+            .sequence = std.math.add(u64, header.base_sequence, sequence_offset) catch return error.Corrupted,
+            .op = op,
+            .vector_id = vector_id,
+        };
     }
 
     pub fn deltaTailStatsAfterGeneration(data: []const u8, base_generation: u64) !PostingDeltaTailStats {
@@ -546,14 +465,60 @@ pub const PostingFormat = struct {
         return applied;
     }
 
-    fn deltaTailCanUseCompactEncoding(records: []const PostingDeltaRecord) bool {
-        if (records.len < 3) return false;
-        const base_sequence = records[0].sequence;
+    fn baseSequenceForDeltaTail(records: []const PostingDeltaRecord) u64 {
+        if (records.len == 0) return 0;
+        var base_sequence = records[0].sequence;
         for (records) |record| {
-            if (record.sequence < base_sequence) return false;
-            if (record.sequence - base_sequence > std.math.maxInt(u32)) return false;
+            base_sequence = @min(base_sequence, record.sequence);
         }
-        return true;
+        return base_sequence;
+    }
+
+    fn encodedDeltaTailSize(records: []const PostingDeltaRecord) !usize {
+        var total: usize = delta_header_size;
+        const base_sequence = baseSequenceForDeltaTail(records);
+        for (records) |record| {
+            total = try std.math.add(usize, total, varintSize(record.sequence - base_sequence));
+            total = try std.math.add(usize, total, 1);
+            total = try std.math.add(usize, total, varintSize(record.vector_id));
+        }
+        return total;
+    }
+
+    fn varintSize(value: u64) usize {
+        var remaining = value;
+        var bytes: usize = 1;
+        while (remaining >= 0x80) : (bytes += 1) {
+            remaining >>= 7;
+        }
+        return bytes;
+    }
+
+    fn writeVarint(out: []u8, pos: *usize, value: u64) void {
+        var remaining = value;
+        while (remaining >= 0x80) {
+            out[pos.*] = @as(u8, @intCast(remaining & 0x7f)) | 0x80;
+            pos.* += 1;
+            remaining >>= 7;
+        }
+        out[pos.*] = @intCast(remaining);
+        pos.* += 1;
+    }
+
+    fn readVarint(data: []const u8, pos: *usize) !u64 {
+        var out: u64 = 0;
+        var shift: u6 = 0;
+        var i: usize = 0;
+        while (i < 10) : (i += 1) {
+            if (pos.* >= data.len) return error.Corrupted;
+            const byte = data[pos.*];
+            pos.* += 1;
+            if (i == 9 and byte > 1) return error.Corrupted;
+            out |= (@as(u64, byte & 0x7f) << shift);
+            if ((byte & 0x80) == 0) return out;
+            shift += 7;
+        }
+        return error.Corrupted;
     }
 
     pub fn materializeMembers(
@@ -2054,8 +2019,8 @@ test "posting delta tail round trips and overlays base members" {
     const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
     defer alloc.free(encoded);
 
-    try std.testing.expectEqual(PostingFormat.delta_compact_version, encoded[4]);
-    try std.testing.expectEqual(@as(usize, 17 + records.len * 13), encoded.len);
+    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
+    try std.testing.expectEqual(@as(usize, 17 + records.len * 3), encoded.len);
 
     const decoded = try PostingFormat.decodeDeltaTail(alloc, encoded);
     defer alloc.free(decoded);
@@ -2075,7 +2040,7 @@ test "posting delta tail round trips and overlays base members" {
     try std.testing.expectError(error.UnsupportedPostingDeltaVersion, PostingFormat.decodeDeltaTail(alloc, encoded));
 }
 
-test "posting delta tail keeps single-record values in legacy format" {
+test "posting delta tail uses varint encoding for small single-record values" {
     const alloc = std.testing.allocator;
     const records = [_]PostingDeltaRecord{
         .{ .sequence = 7, .op = .insert, .vector_id = 10 },
@@ -2085,7 +2050,7 @@ test "posting delta tail keeps single-record values in legacy format" {
     defer alloc.free(encoded);
 
     try std.testing.expectEqual(PostingFormat.version, encoded[4]);
-    try std.testing.expectEqual(@as(usize, 9 + records.len * 17), encoded.len);
+    try std.testing.expectEqual(@as(usize, 17 + 3), encoded.len);
 
     const decoded = try PostingFormat.decodeDeltaTail(alloc, encoded);
     defer alloc.free(decoded);
@@ -2095,17 +2060,17 @@ test "posting delta tail keeps single-record values in legacy format" {
     try std.testing.expectEqual(records[0].vector_id, decoded[0].vector_id);
 }
 
-test "posting delta tail rejects compact sequence overflow" {
+test "posting delta tail rejects sequence offset overflow" {
     const alloc = std.testing.allocator;
-    var encoded = try alloc.alloc(u8, 17 + 13);
+    var encoded = try alloc.alloc(u8, 20);
     defer alloc.free(encoded);
     @memcpy(encoded[0..4], &PostingFormat.delta_magic);
-    encoded[4] = PostingFormat.delta_compact_version;
+    encoded[4] = PostingFormat.version;
     std.mem.writeInt(u32, encoded[5..9], 1, .little);
     std.mem.writeInt(u64, encoded[9..17], std.math.maxInt(u64), .little);
-    std.mem.writeInt(u32, encoded[17..21], 1, .little);
-    encoded[21] = @intFromEnum(PostingDeltaOp.insert);
-    std.mem.writeInt(u64, encoded[22..30], 10, .little);
+    encoded[17] = 1;
+    encoded[18] = @intFromEnum(PostingDeltaOp.insert);
+    encoded[19] = 10;
 
     try std.testing.expectError(error.Corrupted, PostingFormat.decodeDeltaTail(alloc, encoded));
 }
@@ -2113,14 +2078,27 @@ test "posting delta tail rejects compact sequence overflow" {
 test "posting delta tail rejects unsupported op" {
     const alloc = std.testing.allocator;
     const records = [_]PostingDeltaRecord{
-        .{ .sequence = 1, .op = .insert, .vector_id = 10 },
+        .{ .sequence = 1, .op = .insert, .vector_id = std.math.maxInt(u64) },
     };
 
     const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
     defer alloc.free(encoded);
 
-    encoded[PostingFormat.delta_header_size + 8] = 99;
+    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
+    encoded[PostingFormat.delta_header_size + 1] = 99;
     try std.testing.expectError(error.UnsupportedPostingDeltaOp, PostingFormat.decodeDeltaTail(alloc, encoded));
+}
+
+test "posting delta tail rejects truncated varint encoding" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = 1, .op = .insert, .vector_id = 10 },
+    };
+
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
+    try std.testing.expectError(error.Corrupted, PostingFormat.decodeDeltaTail(alloc, encoded[0 .. encoded.len - 1]));
 }
 
 test "centroid directory format round trips centroid and stats" {

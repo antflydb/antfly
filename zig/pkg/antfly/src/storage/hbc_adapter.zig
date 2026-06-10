@@ -9288,7 +9288,7 @@ test "base delta lazy overwrite does not reroute into full target posting" {
     try std.testing.expectEqual(@as(u64, 0), stats.max_over_capacity_members);
 }
 
-test "base delta batched reroutes write ordered compact posting delta values" {
+test "base delta batched reroutes write ordered varint posting delta values" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -10165,7 +10165,7 @@ test "base delta multi-posting batch survives modeled lsm crash" {
     }
 }
 
-test "base delta compact grouped tail survives modeled lsm crash and folds" {
+test "base delta varint grouped tail survives modeled lsm crash and folds" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -10228,8 +10228,8 @@ test "base delta compact grouped tail survives modeled lsm crash and folds" {
 
         var delta_key_buf: [18]u8 = undefined;
         const raw_delta = try idx.getNamespaced(&txn, .nodes, vectorindex_hbc.encodePostingDeltaKey(&delta_key_buf, posting_id, deltas[0].sequence));
-        try std.testing.expectEqual(vectorindex_posting.PostingFormat.delta_compact_version, raw_delta[4]);
-        try std.testing.expectEqual(@as(usize, 17 + deltas.len * 13), raw_delta.len);
+        try std.testing.expectEqual(vectorindex_posting.PostingFormat.version, raw_delta[4]);
+        try std.testing.expectEqual(@as(usize, 17 + deltas.len * 3), raw_delta.len);
 
         const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &txn, posting_id, isNotFound);
         defer alloc.free(materialized);
