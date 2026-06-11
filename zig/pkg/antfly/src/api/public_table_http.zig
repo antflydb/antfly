@@ -901,6 +901,7 @@ pub fn handleReprocessDocumentArtifactRange(
     };
     const Response = struct {
         reprocess: []const u8,
+        reprocess_status: []const u8,
         artifact_name: []const u8,
         scanned: usize,
         reprocessed: usize,
@@ -908,6 +909,7 @@ pub fn handleReprocessDocumentArtifactRange(
         failed: usize,
         limit: u32,
         next_key: ?[]const u8,
+        pending_shards: usize,
         failures: []const FailureResponse,
         shard_cursors: []const ShardCursorResponse,
     };
@@ -952,11 +954,18 @@ pub fn handleReprocessDocumentArtifactRange(
             .limit = cursor.limit,
         };
     }
+    const pending_shards = if (result.shard_cursors.len > 0)
+        result.shard_cursors.len
+    else if (result.next_key != null)
+        @as(usize, 1)
+    else
+        @as(usize, 0);
 
     return .{
         .status = 202,
         .body = try std.json.Stringify.valueAlloc(alloc, Response{
             .reprocess = "triggered",
+            .reprocess_status = if (pending_shards == 0) "complete" else "in_progress",
             .artifact_name = artifact_name,
             .scanned = result.scanned,
             .reprocessed = result.reprocessed,
@@ -964,6 +973,7 @@ pub fn handleReprocessDocumentArtifactRange(
             .failed = result.failed,
             .limit = result.limit,
             .next_key = result.next_key,
+            .pending_shards = pending_shards,
             .failures = failures,
             .shard_cursors = shard_cursors,
         }, .{}),
@@ -1839,11 +1849,13 @@ test "public document artifact range reprocess handler returns bounded summary" 
 
     const Parsed = struct {
         reprocess: []const u8,
+        reprocess_status: []const u8,
         artifact_name: []const u8,
         scanned: usize,
         reprocessed: usize,
         failed: usize,
         next_key: ?[]const u8,
+        pending_shards: usize,
         failures: []const struct {
             key: []const u8,
             error_code: []const u8,
@@ -1864,11 +1876,13 @@ test "public document artifact range reprocess handler returns bounded summary" 
 
     try std.testing.expectEqual(@as(u16, 202), resp.status);
     try std.testing.expectEqualStrings("triggered", parsed.value.reprocess);
+    try std.testing.expectEqualStrings("in_progress", parsed.value.reprocess_status);
     try std.testing.expectEqualStrings("document_units_v1", parsed.value.artifact_name);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.scanned);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.reprocessed);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.failed);
     try std.testing.expectEqualStrings("doc:b", parsed.value.next_key.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.pending_shards);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.failures.len);
     try std.testing.expectEqualStrings("doc:b", parsed.value.failures[0].key);
     try std.testing.expectEqualStrings("InvalidDataUri", parsed.value.failures[0].error_code);

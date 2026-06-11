@@ -270,6 +270,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         };
         const Response = struct {
             reprocess: []const u8,
+            reprocess_status: []const u8,
             artifact_name: []const u8,
             scanned: usize,
             reprocessed: usize,
@@ -277,6 +278,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             failed: usize,
             limit: u32,
             next_key: ?[]const u8,
+            pending_shards: usize,
             failures: []const FailureResponse,
             shard_cursors: []const ShardCursorResponse,
         };
@@ -323,8 +325,15 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 .limit = cursor.limit,
             };
         }
+        const pending_shards = if (result.shard_cursors.len > 0)
+            result.shard_cursors.len
+        else if (result.next_key != null)
+            @as(usize, 1)
+        else
+            @as(usize, 0);
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, Response{
             .reprocess = "triggered",
+            .reprocess_status = if (pending_shards == 0) "complete" else "in_progress",
             .artifact_name = decoded_artifact_name,
             .scanned = result.scanned,
             .reprocessed = result.reprocessed,
@@ -332,6 +341,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .failed = result.failed,
             .limit = result.limit,
             .next_key = result.next_key,
+            .pending_shards = pending_shards,
             .failures = failures,
             .shard_cursors = shard_cursors,
         });

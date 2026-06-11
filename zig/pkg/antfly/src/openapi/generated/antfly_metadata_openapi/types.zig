@@ -1406,6 +1406,8 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 pub const DocumentArtifactTableReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,
+    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+    reprocess_status: []const u8,
     /// Name of the derived artifact that was reprocessed.
     artifact_name: []const u8,
     /// Number of source rows scanned by this bounded pass.
@@ -1420,6 +1422,8 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     limit: i64,
     /// Source key cursor for the next bounded pass, when more rows may remain.
     next_key: ?[]const u8 = null,
+    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
+    pending_shards: i64,
     failures: []const DocumentArtifactReprocessFailure,
     /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
     shard_cursors: []const DocumentArtifactReprocessShardCursor,

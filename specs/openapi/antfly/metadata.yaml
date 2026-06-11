@@ -1779,12 +1779,14 @@ components:
       type: object
       required:
         - reprocess
+        - reprocess_status
         - artifact_name
         - scanned
         - reprocessed
         - skipped
         - failed
         - limit
+        - pending_shards
         - failures
         - shard_cursors
       properties:
@@ -1793,6 +1795,12 @@ components:
           enum:
             - triggered
           description: Indicates that reprocessing was accepted.
+        reprocess_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+          description: Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
         artifact_name:
           type: string
           description: Name of the derived artifact that was reprocessed.
@@ -1816,6 +1824,9 @@ components:
           type: string
           nullable: true
           description: Source key cursor for the next bounded pass, when more rows may remain.
+        pending_shards:
+          type: integer
+          description: Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
         failures:
           type: array
           items:
