@@ -31,7 +31,7 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.17.0-dev.607+456b2ec07
+  ZIG_VERSION: 0.17.0-dev.813+2153f8143
 
 jobs:
   build-artifact:

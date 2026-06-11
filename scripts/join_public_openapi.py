@@ -30,6 +30,20 @@ INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
+def resolve_arg_path(arg: str) -> Path:
+    """Resolve a CLI path argument.
+
+    Absolute and explicitly-relative (./ or ../) paths resolve against the
+    caller's working directory — the Zig build system passes cache output
+    paths like ./.zig-cache/o/<hash>/file.yaml. Bare names stay
+    repo-root-relative for Makefile callers (e.g. `openapi.yaml`).
+    """
+    path = Path(arg)
+    if path.is_absolute() or arg.startswith(("./", "../")):
+        return path
+    return ROOT / path
+
+
 class Dumper(yaml.SafeDumper):
     def increase_indent(self, flow=False, indentless=False):
         return super().increase_indent(flow, False)
@@ -275,7 +289,7 @@ def dump_yaml(data: dict, output: Path) -> None:
 def main(argv: list[str]) -> int:
     spec = join_specs()
     if argv and argv[0] == "--compare":
-        target = ROOT / (argv[1] if len(argv) > 1 else "openapi.yaml")
+        target = resolve_arg_path(argv[1]) if len(argv) > 1 else ROOT / "openapi.yaml"
         current = load_yaml(target)
         if current != spec:
             print(f"{target} differs from joined public OpenAPI contract")
@@ -283,7 +297,7 @@ def main(argv: list[str]) -> int:
         print(f"{target} is current")
         return 0
 
-    output = ROOT / argv[0] if argv else OUTPUT
+    output = resolve_arg_path(argv[0]) if argv else OUTPUT
     dump_yaml(spec, output)
     validate_spec(spec, base_uri=output.resolve().as_uri())
     print(f"wrote {output}")

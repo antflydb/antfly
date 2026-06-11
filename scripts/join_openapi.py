@@ -26,6 +26,22 @@ from openapi_spec_validator import validate_spec
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_arg_path(arg: str) -> Path:
+    """Resolve a CLI path argument.
+
+    Absolute and explicitly-relative (./ or ../) paths resolve against the
+    caller's working directory — the Zig build system passes cache output
+    paths like ./.zig-cache/o/<hash>/file.yaml. Bare names stay
+    repo-root-relative for Makefile callers (e.g. `openapi.yaml`).
+    """
+    path = Path(arg)
+    if path.is_absolute() or arg.startswith(("./", "../")):
+        return path
+    return ROOT / path
+
+
 SHARED_JOINER = ROOT / "scripts/openapi_joiner.py"
 HTTP_METHODS = {
     "delete",
@@ -275,14 +291,14 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "--joined-only":
         joined_modular = joiner.rewrite_external_refs(joiner.join_specs(metadata, usermgr))
         add_redocly_tag_groups(joined_modular)
-        output = ROOT / (argv[1] if len(argv) > 1 else "openapi.joined.yaml")
+        output = resolve_arg_path(argv[1]) if len(argv) > 1 else ROOT / "openapi.joined.yaml"
         dump_yaml(joined_modular, output)
         print(f"wrote {output}")
         return 0
 
     if argv and argv[0] == "--compare":
         target = argv[1] if len(argv) > 1 else "openapi.yaml"
-        current = joiner.load_yaml(ROOT / target)
+        current = joiner.load_yaml(resolve_arg_path(target))
         joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr), current)
         joined.pop("security", None)
         add_redocly_tag_groups(joined)
@@ -290,13 +306,13 @@ def main(argv: list[str]) -> int:
         return 1 if has_drift else 0
 
     if argv and argv[0] == "--validate":
-        target = ROOT / (argv[1] if len(argv) > 1 else "openapi.yaml")
+        target = resolve_arg_path(argv[1]) if len(argv) > 1 else ROOT / "openapi.yaml"
         validate_openapi_spec(joiner.load_yaml(target), target)
         return 0
 
     joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr))
     add_redocly_tag_groups(joined)
-    output = ROOT / (argv[0] if argv else "openapi.joined.yaml")
+    output = resolve_arg_path(argv[0]) if argv else ROOT / "openapi.joined.yaml"
     order_openapi_like_reference(joined, output)
     dump_yaml(joined, output)
     print(f"wrote {output}")

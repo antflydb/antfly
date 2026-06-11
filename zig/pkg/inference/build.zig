@@ -604,6 +604,7 @@ pub fn build(b: *std.Build) void {
     configureMetal(b, tests.root_module, target, enable_metal);
     configureMlx(b, tests.root_module, target, enable_mlx, effective_mlx_root);
     configureOnnxRuntime(b, tests.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCImportBindings(tests.root_module, runtime_graph.c_bindings);
     tests.root_module.link_libc = link_libc;
 
     const finetune_ctx = finetune_common.Context{

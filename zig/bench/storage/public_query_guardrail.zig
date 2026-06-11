@@ -3658,7 +3658,7 @@ fn parseNextU64(args: *std.process.Args.Iterator, flag: []const u8) !u64 {
 }
 
 fn tempPath(buf: []u8) [:0]u8 {
-    return std.fmt.bufPrintZ(buf, "/tmp/antfly-public-query-{d}", .{platform_time.monotonicNs()}) catch unreachable;
+    return std.fmt.bufPrintSentinel(buf, "/tmp/antfly-public-query-{d}", .{platform_time.monotonicNs()}, 0) catch unreachable;
 }
 
 fn reserveEphemeralPort(_: std.Io) !u16 {

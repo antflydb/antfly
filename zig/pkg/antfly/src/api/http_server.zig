@@ -13669,6 +13669,7 @@ test "api http server serves table create and drop" {
         projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8,
         owns_indexes_json: bool = false,
+        owns_schema_json: bool = false,
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 1,
             .name = "docs",
@@ -13699,6 +13700,7 @@ test "api http server serves table create and drop" {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.owns_indexes_json) alloc.free(self.indexes_json);
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
         }
 
         fn replaceIndexesJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
@@ -13706,6 +13708,12 @@ test "api http server serves table create and drop" {
             self.indexes_json = next;
             self.owns_indexes_json = owns_next;
             self.table_record.indexes_json = self.indexes_json;
+        }
+
+        fn replaceSchemaJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
+            if (self.owns_schema_json) alloc.free(self.table_record.schema_json);
+            self.table_record.schema_json = next;
+            self.owns_schema_json = owns_next;
         }
 
         fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
@@ -13778,12 +13786,13 @@ test "api http server serves table create and drop" {
             self.created = false;
         }
 
-        fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        fn updateSchema(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"document_schemas\"") != null);
             self.created = true;
-            self.table_record.schema_json = schema_json;
+            // The caller frees schema_json after this returns; keep an owned copy.
+            self.replaceSchemaJson(inner_alloc, try inner_alloc.dupe(u8, schema_json), true);
         }
 
         fn createIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

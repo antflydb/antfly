@@ -3,14 +3,14 @@
 ## 2026-05-30: Zig 0.17.0 nightly bring-up (full build GREEN)
 
 Summary: the whole repo builds and the full `antfly` binary runs on the official
-nightly `0.17.0-dev.607`. This covers the devlog's build-system split plus several
+nightly `0.17.0-dev.813`. This covers the devlog's build-system split plus several
 undocumented 0.17 removals — the `**` repeat operator, `@cImport`/`@cInclude`,
 `Allocator.dupeZ`, `std.heap.stackFallback`, `std.ascii.indexOfIgnoreCase`,
 `std.meta.Int`, and the `std.bit_set` static-init methods. Details below.
 
 Tracking the 0.17.0 pre-release announced in the
 [2026-05-26 devlog](https://ziglang.org/devlog/2026/#2026-05-26). 0.17.0 is not
-released yet; this is against the official nightly `0.17.0-dev.607+456b2ec07`.
+released yet; this is against the official nightly `0.17.0-dev.813+2153f8143`.
 
 ### Installing the nightly via pip
 
@@ -26,7 +26,7 @@ cd zig-pypi
 # builder's strict license allowlist rejects. Add it to required_license_paths.
 uv run --with wheel python make_wheels.py --version master --platform x86_64-linux --outdir dist
 pip install --force-reinstall dist/ziglang-0.17.0.dev*.whl
-python3 -m ziglang version   # -> 0.17.0-dev.607+456b2ec07
+python3 -m ziglang version   # -> 0.17.0-dev.813+2153f8143
 ```
 
 The wheel exposes the compiler as `python3 -m ziglang`; wrap it in a `zig` shim on
@@ -169,7 +169,7 @@ codebase. Two shapes were used:
    - `cache.zig` `time.h` clock_gettime → `std.time.nanoTimestamp`.
    - `http_server.zig` test setenv/unsetenv → inline `extern "c"`.
 
-### Full build status on nightly 0.17.0-dev.607 — GREEN
+### Full build status on nightly 0.17.0-dev.813 — GREEN
 
 All of the following pass with the pip-installed nightly (`python3 -m ziglang`,
 via a `zig` PATH shim):

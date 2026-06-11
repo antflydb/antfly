@@ -14,7 +14,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.17.0-dev.607+456b2ec07
+  ZIG_VERSION: 0.17.0-dev.813+2153f8143
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}

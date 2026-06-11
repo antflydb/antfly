@@ -891,7 +891,7 @@ fn runSwarmWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: SwarmWikiC
     if (cfg.health_port == 0) cfg.health_port = port_base + 1;
 
     var root_buf: [256]u8 = undefined;
-    const root_path = std.fmt.bufPrintZ(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}) catch unreachable;
+    const root_path = std.fmt.bufPrintSentinel(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}, 0) catch unreachable;
     defer cleanupTempDir(root_path);
 
     const cwd = try std.process.currentPathAlloc(io, alloc);
