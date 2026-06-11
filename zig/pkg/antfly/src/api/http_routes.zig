@@ -58,19 +58,12 @@ pub const Routes = struct {
     pub const batch_suffix = "/batch";
     pub const rows_batch_suffix = "/rows:batch";
     pub const rows_get_suffix = "/rows:get";
-    pub const rows_plan_suffix = "/rows:plan";
     pub const rows_query_suffix = "/rows:query";
     pub const rows_aggregate_suffix = "/rows:aggregate";
     pub const rows_window_suffix = "/rows:window";
     pub const rows_join_suffix = "/rows:join";
     pub const rows_lateral_suffix = "/rows:lateral";
-    pub const rows_source_suffix = "/rows:source";
     pub const rows_mutation_source_suffix = "/rows:mutation-source";
-    pub const rows_mutation_source_collect_suffix = "/rows:mutation-source-collect";
-    pub const rows_mutation_source_stage_suffix = "/rows:mutation-source-stage";
-    pub const rows_joined_mutation_source_collect_suffix = "/rows:joined-mutation-source-collect";
-    pub const rows_joined_mutation_source_inputs_suffix = "/rows:joined-mutation-source-inputs";
-    pub const rows_joined_mutation_source_stage_suffix = "/rows:joined-mutation-source-stage";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -94,7 +87,6 @@ pub const Routes = struct {
     pub const graph_expand_suffix = "/graph-expand";
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
-    pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";
@@ -106,20 +98,11 @@ pub const Routes = struct {
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
     pub const lookup_suffix = "/lookup";
+    pub const lookup_marker = "/lookup/";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
     pub const graph_metrics_marker = "/graph-metrics/";
-    pub const artifacts_suffix = "/artifacts";
-    pub const documents_marker = "/documents/";
-    pub const artifacts_marker = "/artifacts/";
-    pub const reprocess_suffix = ":reprocess";
-    pub const reprocess_jobs_suffix = "/reprocess-jobs";
-    pub const reprocess_jobs_marker = "/reprocess-jobs/";
-    pub const advance_suffix = ":advance";
-    pub const cancel_suffix = ":cancel";
-    pub const placement_update_suffix = ":placement";
-    pub const child_range_batch_suffix = ":child-range-batch";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -188,22 +171,6 @@ pub const Routes = struct {
         index_name: []const u8,
         metric_name: []const u8,
         action: []const u8,
-    };
-
-    pub const TableArtifact = struct {
-        table_name: []const u8,
-        artifact_name: []const u8,
-    };
-
-    pub const TableDocumentArtifact = struct {
-        table_name: []const u8,
-        key: []const u8,
-        artifact_name: []const u8,
-    };
-
-    pub const TableDocumentArtifacts = struct {
-        table_name: []const u8,
-        key: []const u8,
     };
 
     pub const SecretPath = struct {
@@ -314,11 +281,6 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
-    pub const GroupRowsMutationSource = struct {
-        group_id: u64,
-        table_name: []const u8,
-    };
-
     pub const GroupForeignKeyIntegrity = struct {
         group_id: u64,
         table_name: []const u8,
@@ -332,23 +294,6 @@ pub const Routes = struct {
     pub const GroupSecondaryIndexRebuild = struct {
         group_id: u64,
         table_name: []const u8,
-    pub const GroupDocumentArtifact = struct {
-        group_id: u64,
-        table_name: []const u8,
-        key: []const u8,
-        artifact_name: []const u8,
-    };
-
-    pub const GroupTableArtifact = struct {
-        group_id: u64,
-        table_name: []const u8,
-        artifact_name: []const u8,
-    };
-
-    pub const GroupDocumentArtifacts = struct {
-        group_id: u64,
-        table_name: []const u8,
-        key: []const u8,
     };
 
     pub const GroupGraphExpand = struct {
@@ -362,11 +307,6 @@ pub const Routes = struct {
     };
 
     pub const GroupGraphEdges = struct {
-        group_id: u64,
-        table_name: []const u8,
-    };
-
-    pub const GroupGraphMetricMaintenance = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -429,17 +369,6 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
-    pub const TableArtifactReprocessJobs = struct {
-        table_name: []const u8,
-        artifact_name: []const u8,
-    };
-
-    pub const TableArtifactReprocessJob = struct {
-        table_name: []const u8,
-        artifact_name: []const u8,
-        job_id: []const u8,
-    };
-
     pub const TransactionSession = struct {
         txn_id: []const u8,
     };
@@ -452,11 +381,11 @@ pub const Routes = struct {
     pub fn matchTableLookup(path: []const u8) ?TableLookup {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         const rest = path[tables_prefix.len..];
-        const marker_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
+        const marker_index = std.mem.indexOf(u8, rest, lookup_marker) orelse return null;
         if (marker_index == 0) return null;
         const table_name = rest[0..marker_index];
-        const key = rest[marker_index + documents_marker.len ..];
-        if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+        const key = rest[marker_index + lookup_marker.len ..];
+        if (key.len == 0) return null;
         return .{
             .table_name = table_name,
             .key = key,
@@ -501,10 +430,6 @@ pub const Routes = struct {
         const table_name = path[tables_prefix.len .. path.len - rows_get_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
-    }
-
-    pub fn matchTableRowsPlan(path: []const u8) ?TableRows {
-        return matchTableRowsAction(path, rows_plan_suffix);
     }
 
     pub fn matchTableRowsQuery(path: []const u8) ?TableRows {
@@ -652,126 +577,6 @@ pub const Routes = struct {
         };
     }
 
-    pub fn matchTableDocumentArtifact(path: []const u8) ?TableDocumentArtifact {
-        return matchTableDocumentArtifactWithReprocess(path, false);
-    }
-
-    pub fn matchTableDocumentArtifactReprocess(path: []const u8) ?TableDocumentArtifact {
-        return matchTableDocumentArtifactWithReprocess(path, true);
-    }
-
-    pub fn matchTableArtifactReprocess(path: []const u8) ?TableArtifact {
-        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
-        const effective_path = path[0 .. path.len - reprocess_suffix.len];
-        const rest = effective_path[tables_prefix.len..];
-        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const table_name = rest[0..artifacts_index];
-        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
-        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
-        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
-        return .{
-            .table_name = table_name,
-            .artifact_name = artifact_name,
-        };
-    }
-
-    pub fn matchTableArtifactReprocessJobs(path: []const u8) ?TableArtifactReprocessJobs {
-        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, path, reprocess_jobs_suffix)) return null;
-        const effective_path = path[0 .. path.len - reprocess_jobs_suffix.len];
-        const rest = effective_path[tables_prefix.len..];
-        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const table_name = rest[0..artifacts_index];
-        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
-        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
-        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
-        return .{
-            .table_name = table_name,
-            .artifact_name = artifact_name,
-        };
-    }
-
-    pub fn matchTableArtifactReprocessJob(path: []const u8) ?TableArtifactReprocessJob {
-        return matchTableArtifactReprocessJobWithSuffix(path, "");
-    }
-
-    pub fn matchTableArtifactReprocessJobAdvance(path: []const u8) ?TableArtifactReprocessJob {
-        return matchTableArtifactReprocessJobWithSuffix(path, advance_suffix);
-    }
-
-    pub fn matchTableArtifactReprocessJobCancel(path: []const u8) ?TableArtifactReprocessJob {
-        return matchTableArtifactReprocessJobWithSuffix(path, cancel_suffix);
-    }
-
-    fn matchTableArtifactReprocessJobWithSuffix(path: []const u8, suffix: []const u8) ?TableArtifactReprocessJob {
-        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (suffix.len > 0 and !std.mem.endsWith(u8, path, suffix)) return null;
-        const effective_path = if (suffix.len > 0) path[0 .. path.len - suffix.len] else path;
-        const rest = effective_path[tables_prefix.len..];
-        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const table_name = rest[0..artifacts_index];
-        const artifact_rest = rest[artifacts_index + artifacts_marker.len ..];
-        const jobs_index = std.mem.indexOf(u8, artifact_rest, reprocess_jobs_marker) orelse return null;
-        const artifact_name = artifact_rest[0..jobs_index];
-        const job_id = artifact_rest[jobs_index + reprocess_jobs_marker.len ..];
-        if (artifact_name.len == 0 or job_id.len == 0) return null;
-        if (std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
-        if (std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
-        if (suffix.len == 0 and (std.mem.endsWith(u8, job_id, advance_suffix) or std.mem.endsWith(u8, job_id, cancel_suffix))) return null;
-        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
-        return .{
-            .table_name = table_name,
-            .artifact_name = artifact_name,
-            .job_id = job_id,
-        };
-    }
-
-    pub fn matchTableDocumentArtifacts(path: []const u8) ?TableDocumentArtifacts {
-        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, path, artifacts_suffix)) return null;
-        const rest = path[tables_prefix.len .. path.len - artifacts_suffix.len];
-        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
-        if (documents_index == 0) return null;
-        const table_name = rest[0..documents_index];
-        const key = rest[documents_index + documents_marker.len ..];
-        if (key.len == 0) return null;
-        return .{
-            .table_name = table_name,
-            .key = key,
-        };
-    }
-
-    fn matchTableDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?TableDocumentArtifact {
-        const effective_path = if (reprocess) blk: {
-            if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
-            break :blk path[0 .. path.len - reprocess_suffix.len];
-        } else blk: {
-            if (std.mem.endsWith(u8, path, reprocess_suffix)) return null;
-            break :blk path;
-        };
-        if (!std.mem.startsWith(u8, effective_path, tables_prefix)) return null;
-        const rest = effective_path[tables_prefix.len..];
-        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
-        if (documents_index == 0) return null;
-        const table_name = rest[0..documents_index];
-        const document_rest = rest[documents_index + documents_marker.len ..];
-        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const key = document_rest[0..artifacts_index];
-        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
-        if (std.mem.endsWith(u8, artifact_name, placement_update_suffix)) return null;
-        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
-        return .{
-            .table_name = table_name,
-            .key = key,
-            .artifact_name = artifact_name,
-        };
-    }
-
     pub fn matchSecretPath(path: []const u8) ?SecretPath {
         if (!std.mem.startsWith(u8, path, secrets_prefix)) return null;
         const key = path[secrets_prefix.len..];
@@ -881,11 +686,11 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         const table_rest = rest[tables_prefix.len..];
-        const marker_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        const marker_index = std.mem.indexOf(u8, table_rest, lookup_marker) orelse return null;
         if (marker_index == 0) return null;
         const table_name = table_rest[0..marker_index];
-        const key = table_rest[marker_index + documents_marker.len ..];
-        if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+        const key = table_rest[marker_index + lookup_marker.len ..];
+        if (key.len == 0) return null;
         return .{ .group_id = group.group_id, .table_name = table_name, .key = key };
     }
 
@@ -915,16 +720,6 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, query_preflight_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - query_preflight_suffix.len];
-        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
-        return .{ .group_id = group.group_id, .table_name = table_name };
-    }
-
-    pub fn matchGroupRowsSource(path: []const u8) ?GroupQuery {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, rows_source_suffix)) return null;
-        const table_name = rest[tables_prefix.len .. rest.len - rows_source_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1009,36 +804,6 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
-    pub fn matchGroupRowsMutationSourceCollect(path: []const u8) ?GroupRowsMutationSource {
-        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_collect_suffix);
-    }
-
-    pub fn matchGroupRowsMutationSourceStage(path: []const u8) ?GroupRowsMutationSource {
-        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_stage_suffix);
-    }
-
-    pub fn matchGroupRowsJoinedMutationSourceCollect(path: []const u8) ?GroupRowsMutationSource {
-        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_collect_suffix);
-    }
-
-    pub fn matchGroupRowsJoinedMutationSourceInputs(path: []const u8) ?GroupRowsMutationSource {
-        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_inputs_suffix);
-    }
-
-    pub fn matchGroupRowsJoinedMutationSourceStage(path: []const u8) ?GroupRowsMutationSource {
-        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_stage_suffix);
-    }
-
-    fn matchGroupRowsMutationSourceAction(path: []const u8, suffix: []const u8) ?GroupRowsMutationSource {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, suffix)) return null;
-        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
-        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
-        return .{ .group_id = group.group_id, .table_name = table_name };
-    }
-
     pub fn matchGroupForeignKeyIntegrity(path: []const u8) ?GroupForeignKeyIntegrity {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1119,113 +884,6 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
-    pub fn matchGroupDocumentArtifact(path: []const u8) ?GroupDocumentArtifact {
-        return matchGroupDocumentArtifactWithReprocess(path, false);
-    }
-
-    pub fn matchGroupDocumentArtifactReprocess(path: []const u8) ?GroupDocumentArtifact {
-        return matchGroupDocumentArtifactWithReprocess(path, true);
-    }
-
-    pub fn matchGroupDocumentArtifactPlacementUpdate(path: []const u8) ?GroupDocumentArtifact {
-        return matchGroupDocumentArtifactWithControlSuffix(path, placement_update_suffix);
-    }
-
-    pub fn matchGroupDocumentArtifactChildRangeBatch(path: []const u8) ?GroupDocumentArtifact {
-        return matchGroupDocumentArtifactWithControlSuffix(path, child_range_batch_suffix);
-    }
-
-    pub fn matchGroupTableArtifactReprocess(path: []const u8) ?GroupTableArtifact {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, reprocess_suffix)) return null;
-        const effective_rest = rest[0 .. rest.len - reprocess_suffix.len];
-        const table_rest = effective_rest[tables_prefix.len..];
-        const artifacts_index = std.mem.indexOf(u8, table_rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const table_name = table_rest[0..artifacts_index];
-        const artifact_name = table_rest[artifacts_index + artifacts_marker.len ..];
-        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
-        if (std.mem.indexOf(u8, table_rest, documents_marker) != null) return null;
-        return .{
-            .group_id = group.group_id,
-            .table_name = table_name,
-            .artifact_name = artifact_name,
-        };
-    }
-
-    pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, artifacts_suffix)) return null;
-        const table_rest = rest[tables_prefix.len .. rest.len - artifacts_suffix.len];
-        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
-        if (documents_index == 0) return null;
-        const table_name = table_rest[0..documents_index];
-        const key = table_rest[documents_index + documents_marker.len ..];
-        if (key.len == 0) return null;
-        return .{
-            .group_id = group.group_id,
-            .table_name = table_name,
-            .key = key,
-        };
-    }
-
-    fn matchGroupDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?GroupDocumentArtifact {
-        if (reprocess) return matchGroupDocumentArtifactWithControlSuffix(path, reprocess_suffix);
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        const table_rest = rest[tables_prefix.len..];
-        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
-        if (documents_index == 0) return null;
-        const table_name = table_rest[0..documents_index];
-        const document_rest = table_rest[documents_index + documents_marker.len ..];
-        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const key = document_rest[0..artifacts_index];
-        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
-        if (std.mem.endsWith(u8, artifact_name, reprocess_suffix) or
-            std.mem.endsWith(u8, artifact_name, placement_update_suffix) or
-            std.mem.endsWith(u8, artifact_name, child_range_batch_suffix))
-        {
-            return null;
-        }
-        if (key.len == 0 or artifact_name.len == 0) return null;
-        return .{
-            .group_id = group.group_id,
-            .table_name = table_name,
-            .key = key,
-            .artifact_name = artifact_name,
-        };
-    }
-
-    fn matchGroupDocumentArtifactWithControlSuffix(path: []const u8, suffix: []const u8) ?GroupDocumentArtifact {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        const table_rest = rest[tables_prefix.len..];
-        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
-        if (documents_index == 0) return null;
-        const table_name = table_rest[0..documents_index];
-        const document_rest = table_rest[documents_index + documents_marker.len ..];
-        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
-        if (artifacts_index == 0) return null;
-        const key = document_rest[0..artifacts_index];
-        var artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
-        if (!std.mem.endsWith(u8, artifact_name, suffix)) return null;
-        artifact_name = artifact_name[0 .. artifact_name.len - suffix.len];
-        if (key.len == 0 or artifact_name.len == 0) return null;
-        return .{
-            .group_id = group.group_id,
-            .table_name = table_name,
-            .key = key,
-            .artifact_name = artifact_name,
-        };
-    }
-
     pub fn matchInternalTableCorruptEmbeddingArtifact(path: []const u8) ?InternalTableCorruptEmbeddingArtifact {
         if (!std.mem.startsWith(u8, path, internal_tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, corrupt_embedding_artifact_suffix)) return null;
@@ -1260,16 +918,6 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_edges_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_edges_suffix.len];
-        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
-        return .{ .group_id = group.group_id, .table_name = table_name };
-    }
-
-    pub fn matchGroupGraphMetricMaintenance(path: []const u8) ?GroupGraphMetricMaintenance {
-        const group = parseGroupPrefix(path) orelse return null;
-        const rest = group.rest;
-        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, graph_metric_maintenance_suffix)) return null;
-        const table_name = rest[tables_prefix.len .. rest.len - graph_metric_maintenance_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1432,11 +1080,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("/backup", Routes.backup);
     try std.testing.expectEqualStrings("/restore", Routes.restore);
     try std.testing.expectEqualStrings("/backups", Routes.backups);
-    const lookup = Routes.matchTableLookup("/tables/docs/documents/doc:a").?;
+    const lookup = Routes.matchTableLookup("/tables/docs/lookup/doc:a").?;
     try std.testing.expectEqualStrings("docs", lookup.table_name);
     try std.testing.expectEqualStrings("doc:a", lookup.key);
-    try std.testing.expect(Routes.matchTableLookup("/tables/docs/lookup/doc:a") == null);
-    try std.testing.expect(Routes.matchTableLookup("/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
     const scan = Routes.matchTableScan("/tables/docs/lookup").?;
     try std.testing.expectEqualStrings("docs", scan.table_name);
     const query = Routes.matchTableQuery("/tables/docs/query").?;
@@ -1467,32 +1113,6 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("pagerank", graph_metric.metric_name);
     try std.testing.expectEqualStrings("refresh", graph_metric.action);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh") == null);
-    const artifact = Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
-    try std.testing.expectEqualStrings("docs", artifact.table_name);
-    try std.testing.expectEqualStrings("doc%2Fa", artifact.key);
-    try std.testing.expectEqualStrings("document_units_v1", artifact.artifact_name);
-    const artifacts = Routes.matchTableDocumentArtifacts("/tables/docs/documents/doc%2Fa/artifacts").?;
-    try std.testing.expectEqualStrings("docs", artifacts.table_name);
-    try std.testing.expectEqualStrings("doc%2Fa", artifacts.key);
-    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts") == null);
-    const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
-    try std.testing.expectEqualStrings("docs", reprocess.table_name);
-    try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
-    try std.testing.expectEqualStrings("document_units_v1", reprocess.artifact_name);
-    const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1:reprocess").?;
-    try std.testing.expectEqualStrings("docs", table_reprocess.table_name);
-    try std.testing.expectEqualStrings("document_units_v1", table_reprocess.artifact_name);
-    const table_reprocess_jobs = Routes.matchTableArtifactReprocessJobs("/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
-    try std.testing.expectEqualStrings("docs", table_reprocess_jobs.table_name);
-    try std.testing.expectEqualStrings("document_units_v1", table_reprocess_jobs.artifact_name);
-    const table_reprocess_job = Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
-    try std.testing.expectEqualStrings("42", table_reprocess_job.job_id);
-    const table_reprocess_job_advance = Routes.matchTableArtifactReprocessJobAdvance("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance").?;
-    try std.testing.expectEqualStrings("42", table_reprocess_job_advance.job_id);
-    const table_reprocess_job_cancel = Routes.matchTableArtifactReprocessJobCancel("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:cancel").?;
-    try std.testing.expectEqualStrings("42", table_reprocess_job_cancel.job_id);
-    try std.testing.expect(Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance") == null);
-    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);
@@ -1521,18 +1141,13 @@ test "public api routes compile" {
     const subject_row_filter = Routes.matchSubjectRowFilter("/auth/v1/subjects/group:eng/row-filters/docs").?;
     try std.testing.expectEqualStrings("group:eng", subject_row_filter.subject);
     try std.testing.expectEqualStrings("docs", subject_row_filter.table);
-    const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a").?;
+    const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a").?;
     try std.testing.expectEqual(@as(u64, 7), group_lookup.group_id);
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);
-    try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a") == null);
-    try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
     const group_query = Routes.matchGroupQuery("/internal/v1/groups/7/tables/docs/query").?;
     try std.testing.expectEqual(@as(u64, 7), group_query.group_id);
     const group_query_preflight = Routes.matchGroupQueryPreflight("/internal/v1/groups/7/tables/docs/query-preflight").?;
     try std.testing.expectEqual(@as(u64, 7), group_query_preflight.group_id);
-    const group_rows_source = Routes.matchGroupRowsSource("/internal/v1/groups/7/tables/docs/rows:source").?;
-    try std.testing.expectEqual(@as(u64, 7), group_rows_source.group_id);
-    try std.testing.expectEqualStrings("docs", group_rows_source.table_name);
     const group_batch = Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch").?;
     try std.testing.expectEqual(@as(u64, 7), group_batch.group_id);
     const group_fk_integrity = Routes.matchGroupForeignKeyIntegrity("/internal/v1/groups/7/tables/docs/foreign-key-integrity").?;
@@ -1556,39 +1171,12 @@ test "public api routes compile" {
     const group_fk_action_schedule_progress = Routes.matchGroupForeignKeyActionScheduleProgress("/internal/v1/groups/7/tables/docs/foreign-key-action-schedule-progress").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_action_schedule_progress.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_action_schedule_progress.table_name);
-    const group_artifact = Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
-    try std.testing.expectEqual(@as(u64, 7), group_artifact.group_id);
-    try std.testing.expectEqualStrings("docs", group_artifact.table_name);
-    try std.testing.expectEqualStrings("doc%2Fa", group_artifact.key);
-    try std.testing.expectEqualStrings("document_units_v1", group_artifact.artifact_name);
-    const group_artifacts = Routes.matchGroupDocumentArtifacts("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts").?;
-    try std.testing.expectEqual(@as(u64, 7), group_artifacts.group_id);
-    try std.testing.expectEqualStrings("docs", group_artifacts.table_name);
-    try std.testing.expectEqualStrings("doc%2Fa", group_artifacts.key);
-    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts") == null);
-    const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
-    try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
-    try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
-    const group_placement_update = Routes.matchGroupDocumentArtifactPlacementUpdate("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement").?;
-    try std.testing.expectEqual(@as(u64, 7), group_placement_update.group_id);
-    try std.testing.expectEqualStrings("document_units_v1", group_placement_update.artifact_name);
-    const group_child_range_batch = Routes.matchGroupDocumentArtifactChildRangeBatch("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch").?;
-    try std.testing.expectEqual(@as(u64, 7), group_child_range_batch.group_id);
-    try std.testing.expectEqualStrings("document_units_v1", group_child_range_batch.artifact_name);
-    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement") == null);
-    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch") == null);
-    const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1:reprocess").?;
-    try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
-    try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);
-    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_hydrate.group_id);
     const group_graph_edges = Routes.matchGroupGraphEdges("/internal/v1/groups/7/tables/docs/graph-edges").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_edges.group_id);
-    const group_graph_metric_maintenance = Routes.matchGroupGraphMetricMaintenance("/internal/v1/groups/7/tables/docs/graph-metric-maintenance").?;
-    try std.testing.expectEqual(@as(u64, 7), group_graph_metric_maintenance.group_id);
     const group_vector_worker = Routes.matchGroupVectorWorker("/internal/v1/groups/7/tables/docs/vector-worker").?;
     try std.testing.expectEqual(@as(u64, 7), group_vector_worker.group_id);
     const group_txn_begin = Routes.matchGroupTxnBegin("/internal/v1/groups/7/tables/docs/txn-begin").?;

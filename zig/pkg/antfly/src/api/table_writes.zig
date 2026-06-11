@@ -26,7 +26,6 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_mod = @import("../raft/mod.zig");
-const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -39,7 +38,6 @@ const schema_mod = @import("../schema/mod.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
-const relational_rows_api = @import("relational_rows.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
@@ -68,98 +66,15 @@ const auto_bulk_ingest_max_window_ops: usize = 25_000;
 const auto_bulk_ingest_max_hbc_leaf_splits_per_publish: usize = 256;
 const provisioned_write_coalesce_max_waiters: usize = 64;
 const provisioned_write_coalesce_max_ops: usize = 10_000;
-const startup_obsolete_reclaim_max_steps: usize = 64;
-// Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
-// API uploads no longer start these windows automatically; DB/storage owns
-// online write batching and L0 maintenance for ordinary write traffic.
+// Client-side bulk loads often arrive as serial HTTP chunks. Finish implicit
+// dense bulk ingest windows on max ops or idle, not elapsed open time, so an
+// active upload does not start HBC replay/publish work mid-stream.
 const auto_bulk_ingest_max_idle_ns: u64 = 2 * std.time.ns_per_s;
 const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .{
     .compact = false,
     .flush = true,
     .max_deferred_l0_runs = 64,
     .max_deferred_hbc_leaf_splits_per_publish = auto_bulk_ingest_max_hbc_leaf_splits_per_publish,
-};
-
-pub const GraphMetricMaintenanceRole = db_mod.graph_metric_runtime.Role;
-
-pub const GraphMetricMaintenanceAction = enum {
-    tick,
-    status,
-    release,
-};
-
-pub const GraphMetricMaintenanceGroupLocalOptions = struct {
-    action: GraphMetricMaintenanceAction = .tick,
-    role: GraphMetricMaintenanceRole = .combined,
-    runtime_id: []const u8 = "graph-metric-service-runtime",
-    owner_id: []const u8 = "",
-    lease_owned: bool = false,
-    lease_ttl_ms: u64 = 30_000,
-    worker_id: []const u8 = "graph-metric-service-worker",
-    worker_ids: []const []const u8 = &.{},
-    start_background_builds: bool = true,
-    max_rounds: usize = 1,
-    max_metrics_per_round: usize = 8,
-    max_pages_per_round: usize = 1,
-    now_ms: ?u64 = null,
-};
-
-pub const GraphMetricMaintenanceGroupLocalResult = struct {
-    result: db_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = .{},
-    stats: db_mod.graph_metric_runtime.Stats = .{},
-    released: bool = false,
-    lease_owner_id_hash: u64 = 0,
-    lease_expires_at_ms: u64 = 0,
-};
-
-pub const RelationalRowsMutationSourceGroupCollectRequest = struct {
-    schema_json: []const u8,
-    topology_epoch: u64 = 0,
-    req: db_mod.types.RelationalRowsMutationSourceRequest,
-    doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-};
-
-pub const RelationalRowsMutationSourceGroupStageRequest = struct {
-    schema_json: []const u8,
-    topology_epoch: u64 = 0,
-    req: db_mod.types.RelationalRowsMutationSourceRequest,
-    matched: u32 = 0,
-    candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate = &.{},
-};
-
-pub const RelationalRowsJoinedMutationSourceGroupCollectRequest = struct {
-    schema_json: []const u8,
-    topology_epoch: u64 = 0,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-};
-
-pub const RelationalRowsJoinedMutationSourceGroupInputsRequest = struct {
-    schema_json: []const u8,
-    topology_epoch: u64 = 0,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-};
-
-pub const RelationalRowsJoinedMutationSourceGroupInputsResult = struct {
-    target_candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate = &.{},
-    source_rows: []const []const u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        freeRelationalRowsMutationSourceCandidates(alloc, self.target_candidates);
-        for (self.source_rows) |row| alloc.free(@constCast(row));
-        if (self.source_rows.len > 0) alloc.free(self.source_rows);
-        self.* = undefined;
-    }
-};
-
-pub const RelationalRowsJoinedMutationSourceGroupStageRequest = struct {
-    schema_json: []const u8,
-    source_schema_json: []const u8 = "",
-    topology_epoch: u64 = 0,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    matched: u32 = 0,
-    candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate = &.{},
 };
 
 fn isTransientReplayVisibilityError(err: anyerror) bool {
@@ -171,116 +86,6 @@ fn normalizeRelationalConstraintError(err: anyerror) anyerror {
         error.ForeignKeyViolation, error.UniqueConstraintViolation => error.InvalidBatchRequest,
         else => err,
     };
-}
-
-fn joinedMutationSourceUsesDifferentSourceTable(
-    table_name: []const u8,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-) bool {
-    return req.source_table.len > 0 and !std.mem.eql(u8, req.source_table, table_name);
-}
-
-fn joinedMutationSourceEffectiveSourceTable(
-    table_name: []const u8,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-) []const u8 {
-    return if (req.source_table.len > 0) req.source_table else table_name;
-}
-
-fn insertSourceEffectiveSourceTable(
-    table_name: []const u8,
-    req: db_mod.types.RelationalRowsInsertSourceRequest,
-) []const u8 {
-    return if (req.source_table.len > 0) req.source_table else table_name;
-}
-
-fn relationalRowsInsertSourceFullSourceQuery(
-    req: db_mod.types.RelationalRowsInsertSourceRequest,
-    doc_key_range: ?db_mod.types.RelationalRowsDocKeyRange,
-    preserve_order_and_pagination: bool,
-) db_mod.types.RelationalRowsQueryRequest {
-    var source = req.source;
-    source.select = &.{};
-    source.json_extract = &.{};
-    source.array_length = &.{};
-    source.coalesce = &.{};
-    source.field_aliases = &.{};
-    source.expressions = &.{};
-    source.select_all = true;
-    source.row_claim = null;
-    source.doc_key_range = doc_key_range;
-    if (!preserve_order_and_pagination) {
-        source.distinct_on = &.{};
-        source.order_by = &.{};
-        source.limit = null;
-        source.offset = 0;
-    }
-    return source;
-}
-
-const RoutedRowsConflictResolver = struct {
-    read_source: table_reads.TableReadSource,
-
-    fn resolver(self: *@This()) relational_rows_api.UniqueSelectorResolver {
-        return .{
-            .ptr = self,
-            .resolve = resolveUnique,
-            .resolve_primary = primaryExists,
-            .lookup_primary = lookupPrimary,
-        };
-    }
-
-    fn resolveUnique(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        constraint_name: []const u8,
-        encoded_value: []const u8,
-    ) !?[]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.read_source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index);
-    }
-
-    fn primaryExists(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        physical_key: []const u8,
-    ) !bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var row = (try self.read_source.lookup(alloc, table_name, physical_key, .{}, .read_index)) orelse return false;
-        row.deinit(alloc);
-        return true;
-    }
-
-    fn lookupPrimary(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        physical_key: []const u8,
-    ) !?relational_rows_api.ResolvedPrimaryRow {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const row = (try self.read_source.lookup(alloc, table_name, physical_key, .{}, .read_index)) orelse return null;
-        return .{
-            .json = row.json,
-            .version = row.version,
-        };
-    }
-};
-
-fn relationalRowsJoinedMutationSourceOnlyRequest(
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-) db_mod.types.RelationalRowsQueryRequest {
-    var source = switch (req.target_side) {
-        .left => req.join.right,
-        .right => req.join.left,
-    };
-    source.select = &.{};
-    source.select_all = true;
-    source.row_claim = null;
-    source.doc_key_range = doc_key_range;
-    return source;
 }
 
 const TestExecutionHook = struct {
@@ -366,146 +171,6 @@ fn runTestBeforeRestoreWorkHook() void {
     if (comptime builtin.is_test) {
         if (test_before_restore_work_hook) |hook| hook.run(hook.ptr);
     }
-}
-
-fn mergeDocumentArtifactTableReprocessResult(
-    alloc: std.mem.Allocator,
-    dst: *db_mod.types.DocumentArtifactTableReprocessResult,
-    dst_failures: *std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure),
-    dst_shard_cursors: *std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor),
-    group_id: ?u64,
-    src: db_mod.types.DocumentArtifactTableReprocessResult,
-) !void {
-    dst.scanned += src.scanned;
-    dst.reprocessed += src.reprocessed;
-    dst.skipped += src.skipped;
-    dst.failed += src.failed;
-    dst.limit += src.limit;
-    if (dst.next_key == null) {
-        if (src.next_key) |next_key| dst.next_key = try alloc.dupe(u8, next_key);
-    }
-    if (src.shard_cursors.len > 0) {
-        for (src.shard_cursors) |cursor| {
-            const next_key_copy = try alloc.dupe(u8, cursor.next_key);
-            errdefer alloc.free(next_key_copy);
-            try dst_shard_cursors.append(alloc, .{
-                .group_id = cursor.group_id orelse group_id,
-                .next_key = next_key_copy,
-                .scanned = cursor.scanned,
-                .reprocessed = cursor.reprocessed,
-                .skipped = cursor.skipped,
-                .failed = cursor.failed,
-                .limit = cursor.limit,
-            });
-        }
-    } else if (src.next_key) |next_key| {
-        const next_key_copy = try alloc.dupe(u8, next_key);
-        errdefer alloc.free(next_key_copy);
-        try dst_shard_cursors.append(alloc, .{
-            .group_id = group_id,
-            .next_key = next_key_copy,
-            .scanned = src.scanned,
-            .reprocessed = src.reprocessed,
-            .skipped = src.skipped,
-            .failed = src.failed,
-            .limit = src.limit,
-        });
-    }
-    for (src.failures) |failure| {
-        {
-            const key = try alloc.dupe(u8, failure.key);
-            errdefer alloc.free(key);
-            const error_code = try alloc.dupe(u8, failure.error_code);
-            errdefer alloc.free(error_code);
-            try dst_failures.append(alloc, .{
-                .key = key,
-                .error_code = error_code,
-            });
-        }
-    }
-}
-
-fn documentArtifactReprocessRequestForCursor(
-    req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    cursor: db_mod.types.DocumentArtifactReprocessShardResume,
-) db_mod.types.DocumentArtifactTableReprocessRequest {
-    return .{
-        .from_key = cursor.next_key,
-        .to_key = req.to_key,
-        .limit = if (cursor.limit != 0) cursor.limit else req.limit,
-    };
-}
-
-fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactTableReprocessResult {
-    const RemoteFailure = struct {
-        key: []const u8,
-        error_code: []const u8,
-    };
-    const RemoteShardCursor = struct {
-        group_id: ?u64 = null,
-        next_key: []const u8,
-        scanned: usize = 0,
-        reprocessed: usize = 0,
-        skipped: usize = 0,
-        failed: usize = 0,
-        limit: u32 = 0,
-    };
-    const RemoteResult = struct {
-        scanned: usize = 0,
-        reprocessed: usize = 0,
-        skipped: usize = 0,
-        failed: usize = 0,
-        limit: u32 = 0,
-        next_key: ?[]const u8 = null,
-        failures: []const RemoteFailure = &.{},
-        shard_cursors: []const RemoteShardCursor = &.{},
-    };
-
-    var parsed = try std.json.parseFromSlice(RemoteResult, alloc, body, .{});
-    defer parsed.deinit();
-
-    var failures = try alloc.alloc(db_mod.types.DocumentArtifactReprocessFailure, parsed.value.failures.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (failures[0..initialized]) |*failure| failure.deinit(alloc);
-        if (failures.len > 0) alloc.free(failures);
-    }
-    for (parsed.value.failures, failures) |remote, *out| {
-        out.* = .{
-            .key = try alloc.dupe(u8, remote.key),
-            .error_code = try alloc.dupe(u8, remote.error_code),
-        };
-        initialized += 1;
-    }
-    var shard_cursors = try alloc.alloc(db_mod.types.DocumentArtifactReprocessShardCursor, parsed.value.shard_cursors.len);
-    var initialized_cursors: usize = 0;
-    errdefer {
-        for (shard_cursors[0..initialized_cursors]) |*cursor| cursor.deinit(alloc);
-        if (shard_cursors.len > 0) alloc.free(shard_cursors);
-    }
-    for (parsed.value.shard_cursors, shard_cursors) |remote, *out| {
-        out.* = .{
-            .group_id = remote.group_id,
-            .next_key = try alloc.dupe(u8, remote.next_key),
-            .scanned = remote.scanned,
-            .reprocessed = remote.reprocessed,
-            .skipped = remote.skipped,
-            .failed = remote.failed,
-            .limit = remote.limit,
-        };
-        initialized_cursors += 1;
-    }
-
-    return .{
-        .scanned = parsed.value.scanned,
-        .reprocessed = parsed.value.reprocessed,
-        .skipped = parsed.value.skipped,
-        .failed = parsed.value.failed,
-        .limit = parsed.value.limit,
-        .next_key = if (parsed.value.next_key) |value| try alloc.dupe(u8, value) else null,
-        .failures = failures,
-        .shard_cursors = shard_cursors,
-    };
 }
 
 const DroppedTableDeleteWork = struct {
@@ -707,12 +372,12 @@ pub const ProvisionedTableWriteCache = struct {
         fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             if (self.bulk_ingest_session_open) {
                 if (self.auto_bulk_ingest_session_open) {
-                    self.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                    self.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                         std.log.warn("auto bulk ingest finish failed before cached db close table={s} err={s}", .{
                             self.table_name,
                             @errorName(err),
                         });
-                        self.db.abortPrimaryStoreAutoBulkIngestSession();
+                        self.db.abortDenseAutoBulkIngestSession();
                     };
                 } else {
                     self.db.abortBulkIngestSession();
@@ -1055,10 +720,9 @@ pub const ProvisionedTableWriteCache = struct {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
                             .startup_catch_up, .restore_repair => .writer_no_replay,
-                            .query_readonly => .query_readonly,
                             .status_only => .status_only,
                         },
-                        .start_optional_runtimes = open_mode != .startup_catch_up and open_mode != .query_readonly,
+                        .start_optional_runtimes = open_mode != .startup_catch_up,
                         .index_open_parallelism = if (open_mode == .default_async or open_mode == .writer_no_replay) 1 else null,
                     });
                 errdefer db.close();
@@ -1067,7 +731,7 @@ pub const ProvisionedTableWriteCache = struct {
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
                         .default, .default_async, .writer_no_replay => true,
-                        .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
+                        .startup_catch_up, .restore_repair, .status_only => false,
                     },
                 };
             }
@@ -1295,7 +959,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const start_bulk_session = switch (mode) {
             .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
-            .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
+            .startup_catch_up, .restore_repair, .status_only => false,
         };
         if (start_bulk_session) {
             try db.beginBulkIngestSession();
@@ -1567,7 +1231,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
+                try entry.db.finishDenseAutoBulkIngestSessionWithOptions(options);
             } else {
                 try entry.db.finishBulkIngestSessionWithOptions(options);
             }
@@ -1587,7 +1251,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name) or !entry.bulk_ingest_session_open) continue;
             if (entry.auto_bulk_ingest_session_open) {
-                entry.db.abortPrimaryStoreAutoBulkIngestSession();
+                entry.db.abortDenseAutoBulkIngestSession();
             } else {
                 entry.db.abortBulkIngestSession();
             }
@@ -1607,7 +1271,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!entry.bulk_ingest_session_open) {
-                try entry.db.beginPrimaryStoreAutoBulkIngestSession();
+                try entry.db.beginDenseAutoBulkIngestSession();
                 entry.bulk_ingest_session_open = true;
             }
             entry.auto_bulk_ingest_session_open = true;
@@ -1634,7 +1298,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (entry.active_leases > 1) return false;
-            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.rollDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.auto_bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_ops = 0;
             entry.auto_bulk_ingest_started_ns = now_ns;
@@ -1648,7 +1312,7 @@ pub const ProvisionedTableWriteCache = struct {
     pub fn finishAutoBulkIngestLocked(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8) !void {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or !entry.auto_bulk_ingest_session_open) continue;
-            try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
             entry.bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_session_open = false;
             entry.auto_bulk_ingest_ops = 0;
@@ -1679,7 +1343,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!idle_expired and entry.auto_bulk_ingest_finish_requested) {
                 continue;
             } else {
-                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                entry.db.finishDenseAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -1728,8 +1392,7 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.bulk_ingest_session_open) continue;
             if (entry.db.hasActiveDenseBulkWork()) continue;
-            const raw_score = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
-            const score = if (raw_score != 0) raw_score else versionPinnedObsoleteScore(entry);
+            const score = if (best_effort) entry.db.lsmMaintenanceDebtHint() else entry.db.lsmMaintenanceScore();
             if (score > best_score) {
                 best_score = score;
                 best_entry = entry;
@@ -1737,32 +1400,6 @@ pub const ProvisionedTableWriteCache = struct {
         }
         if (best_score == 0) return null;
         return self.leaseEntryLocked(best_entry.?);
-    }
-
-    fn versionPinnedObsoleteScore(entry: *Entry) u64 {
-        const stats = entry.db.trySnapshotLsmMaintenanceStats() orelse return 0;
-        return if (stats.obsolete_paths_pinned_by_versions != 0) 1 else 0;
-    }
-
-    fn leaseLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
-            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) return self.leaseEntryLocked(entry);
-            }
-        }
-        return null;
-    }
-
-    fn leasePrimaryLsmObsoleteReclaimDueLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) return self.leaseEntryLocked(entry);
-            }
-        }
-        return null;
     }
 
     pub fn leaseLsmMaintenanceRoundLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
@@ -1778,64 +1415,9 @@ pub const ProvisionedTableWriteCache = struct {
         for (self.entries.items) |entry| {
             if (entry.bulk_ingest_session_open) continue;
             if (entry.db.hasActiveDenseBulkWork()) continue;
-            const raw_score = entry.db.lsmMaintenanceDebtHint();
-            score = @max(score, if (raw_score != 0) raw_score else versionPinnedObsoleteScore(entry));
+            score = @max(score, entry.db.lsmMaintenanceDebtHint());
         }
         return score;
-    }
-
-    pub fn maxPrimaryLsmMaintenanceScoreLocked(self: *const ProvisionedTableWriteCache) u64 {
-        var score: u64 = 0;
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            const raw_score = entry.db.primaryLsmMaintenanceDebtHint();
-            const reclaim_score: u64 = if (raw_score == 0) blk: {
-                if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                    break :blk if (delay_ns == 0) @as(u64, 1) else @as(u64, 0);
-                }
-                break :blk 0;
-            } else 0;
-            score = @max(score, @max(raw_score, reclaim_score));
-        }
-        return score;
-    }
-
-    pub fn nextLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
-        var delay_ns: ?u64 = null;
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.hasActiveDenseBulkWork()) continue;
-            if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
-                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
-            }
-        }
-        return delay_ns;
-    }
-
-    pub fn nextPrimaryLsmMaintenanceWakeDelayNsLocked(self: *const ProvisionedTableWriteCache) ?u64 {
-        var delay_ns: ?u64 = null;
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            if (entry.db.nextPrimaryLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
-                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
-            }
-        }
-        return delay_ns;
-    }
-
-    pub fn leasePrimaryLsmMaintenanceRoundBestEffortLocked(self: *ProvisionedTableWriteCache) ?CachedDb {
-        var best_entry: ?*Entry = null;
-        var best_score: u64 = 0;
-        for (self.entries.items) |entry| {
-            if (entry.bulk_ingest_session_open) continue;
-            const score = entry.db.primaryLsmMaintenanceDebtHint();
-            if (score > best_score) {
-                best_score = score;
-                best_entry = entry;
-            }
-        }
-        if (best_score == 0) return null;
-        return self.leaseEntryLocked(best_entry.?);
     }
 
     fn bulkIngestSessionActiveForTable(self: *const ProvisionedTableWriteCache, table_name: []const u8) bool {
@@ -2211,205 +1793,6 @@ pub const UniqueConstraintIntegrityAction = enum {
     repair,
     progress,
 };
-    pub const VTable = struct {
-        create_table: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: tables_api.CreateTableRequest,
-        ) anyerror!?void = null,
-        update_schema: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            schema_json: []const u8,
-        ) anyerror!?void = null,
-        create_index: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            index_name: []const u8,
-            index_json: []const u8,
-        ) anyerror!?void = null,
-        drop_index: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            index_name: []const u8,
-        ) anyerror!?void = null,
-        drop_table: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            group_ids: []const u64,
-        ) anyerror!?void = null,
-        backup_table: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            plan: backups_api.TableBackupPlan,
-        ) anyerror!?[]backups_api.ShardSnapshot = null,
-        restore_table: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            plan: backups_api.TableRestorePlan,
-        ) anyerror!?void = null,
-        commit_transaction: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            tables: []const distributed_txn.TableCommitRequest,
-            sync_level: db_mod.types.SyncLevel,
-        ) anyerror!?distributed_txn.CommitOutcome = null,
-        commit_transaction_with_id: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            txn_id: db_mod.types.TxnId,
-            begin_timestamp: u64,
-            tables: []const distributed_txn.TableCommitRequest,
-            sync_level: db_mod.types.SyncLevel,
-        ) anyerror!?distributed_txn.CommitOutcome = null,
-        batch: *const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: db_mod.types.BatchRequest,
-        ) anyerror!?void,
-        begin_bulk_ingest: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-        ) anyerror!?void = null,
-        finish_bulk_ingest: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            options: backend_types.BulkIngestFinishOptions,
-        ) anyerror!?void = null,
-        abort_bulk_ingest: ?*const fn (
-            ptr: *anyopaque,
-            table_name: []const u8,
-        ) void = null,
-        batch_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            req: db_mod.types.BatchRequest,
-        ) anyerror!?void = null,
-        txn_begin_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            txn_id: db_mod.types.TxnId,
-            begin_timestamp: u64,
-            topology_epoch: u64,
-            participants: []const []const u8,
-        ) anyerror!?void = null,
-        txn_prepare_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            txn_id: db_mod.types.TxnId,
-            topology_epoch: u64,
-            req: db_mod.types.TransactionIntentRequest,
-        ) anyerror!?void = null,
-        txn_resolve_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            txn_id: db_mod.types.TxnId,
-            status: db_mod.types.TxnStatus,
-            commit_version: u64,
-        ) anyerror!?void = null,
-        txn_status_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            txn_id: db_mod.types.TxnId,
-        ) anyerror!?db_mod.types.TxnStatus = null,
-        corrupt_embedding_artifact: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            doc_key: []const u8,
-            index_name: []const u8,
-        ) anyerror!?void = null,
-        reprocess_document_artifact: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-        ) anyerror!?bool = null,
-        reprocess_document_artifact_range: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            artifact_name: []const u8,
-            req: db_mod.types.DocumentArtifactTableReprocessRequest,
-        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
-        update_document_artifact_child_range_placement: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-        ) anyerror!?bool = null,
-        apply_document_artifact_child_range_batch: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-        ) anyerror!?u64 = null,
-        reprocess_document_artifact_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-        ) anyerror!?bool = null,
-        reprocess_document_artifact_range_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            artifact_name: []const u8,
-            req: db_mod.types.DocumentArtifactTableReprocessRequest,
-        ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
-        update_document_artifact_child_range_placement_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-        ) anyerror!?bool = null,
-        apply_document_artifact_child_range_batch_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            doc_key: []const u8,
-            artifact_name: []const u8,
-            child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-        ) anyerror!?u64 = null,
-        local_runtime_statuses: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-        ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
-    };
 
 pub const SecondaryIndexRebuildWorkerResult = struct {
     group_id: u64,
@@ -2578,12 +1961,11 @@ fn promoteReadySecondaryIndexesForCatalog(
         if (!column.indexed) continue;
         if (column.index_lifecycle != .building) continue;
         if (column.index_generation == 0) continue;
-        const index_name = column.index_name orelse column.name;
-        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, index_name, column.index_generation)) continue;
+        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, column.name, column.index_generation)) continue;
         const did_promote = catalog.promoteSecondaryIndexReady(
             alloc,
             table_name,
-            index_name,
+            column.name,
             column.index_generation,
         ) catch |err| switch (err) {
             error.UnsupportedOperation => false,
@@ -2891,29 +2273,6 @@ fn freeForeignKeyIntegrityTupleValues(alloc: std.mem.Allocator, values: []Foreig
     for (values) |*value| value.deinit(alloc);
     if (values.len > 0) alloc.free(values);
 }
-const DocumentChildRangeDispatchContext = struct {
-    source: TableWriteSource,
-    table_name: []const u8,
-
-    fn dispatcher(self: *DocumentChildRangeDispatchContext) db_mod.DocumentArtifactChildRangeDispatcher {
-        return .{
-            .ptr = self,
-            .apply = apply,
-        };
-    }
-
-    fn apply(ptr: *anyopaque, alloc: std.mem.Allocator, dispatch: db_mod.DocumentArtifactChildRangeDispatch) !void {
-        const self: *DocumentChildRangeDispatchContext = @ptrCast(@alignCast(ptr));
-        _ = (try self.source.applyDocumentArtifactChildRangeBatch(
-            alloc,
-            dispatch.owner_group_id,
-            self.table_name,
-            dispatch.doc_key,
-            dispatch.artifact_name,
-            dispatch.child_batch,
-        )) orelse return error.NotFound;
-    }
-};
 
 fn cloneOptionalString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |text| try alloc.dupe(u8, text) else null;
@@ -3103,89 +2462,6 @@ fn appendForeignKeyActionJobProgressFromDb(
         out.appendAssumeCapacity(try foreignKeyActionJobStatusFromDbRecord(alloc, group_id, record));
     }
 }
-    fn reprocessDocumentArtifact(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-    ) !?bool {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
-    }
-
-    fn reprocessDocumentArtifactRange(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
-    }
-
-    fn updateDocumentArtifactChildRangePlacement(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-    ) !?bool {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
-    }
-
-    fn applyDocumentArtifactChildRangeBatch(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
-    }
-
-    fn applyDocumentArtifactChildRangeBatchGroupLocal(
-        ptr: *anyopaque,
-        _: std.mem.Allocator,
-        _: u64,
-        table_name: []const u8,
-        _: []const u8,
-        _: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
-        return try self.db.applyDocumentArtifactChildRangeBatch(child_batch);
-    }
-
-    fn createTable(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        req: tables_api.CreateTableRequest,
-    ) !?void {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-
-        const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
-        const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
-        defer alloc.free(expanded_indexes_json);
-        const indexes_json = expanded_indexes_json;
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => return error.InvalidCreateTableRequest,
-        };
 
 pub const ForeignKeyIntegrityJobStatus = struct {
     group_id: u64,
@@ -3519,13 +2795,6 @@ pub const TableWriteSource = struct {
             metric_name: []const u8,
             action: []const u8,
         ) anyerror!?db_mod.types.GraphMetricStatus = null,
-        graph_metric_maintenance_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            options: GraphMetricMaintenanceGroupLocalOptions,
-        ) anyerror!?GraphMetricMaintenanceGroupLocalResult = null,
         drop_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3570,74 +2839,6 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             schema: storage_schema.TableSchema,
             req: db_mod.types.RelationalRowsMutationSourceRequest,
-        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
-        insert_rows_from_source: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            schema: storage_schema.TableSchema,
-            source_schema: storage_schema.TableSchema,
-            req: db_mod.types.RelationalRowsInsertSourceRequest,
-        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
-        mutate_rows_from_joined_source: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            table_name: []const u8,
-            schema: storage_schema.TableSchema,
-            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
-        mutate_rows_from_source_collect_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            topology_epoch: u64,
-            schema_json: []const u8,
-            req: db_mod.types.RelationalRowsMutationSourceRequest,
-            doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        ) anyerror!?[]db_mod.DB.RelationalRowsMutationSourceCandidate = null,
-        mutate_rows_from_source_stage_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            topology_epoch: u64,
-            schema_json: []const u8,
-            req: db_mod.types.RelationalRowsMutationSourceRequest,
-            matched: u32,
-            candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
-        mutate_rows_from_joined_source_collect_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            topology_epoch: u64,
-            schema_json: []const u8,
-            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-            doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        ) anyerror!?[]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate = null,
-        mutate_rows_from_joined_source_inputs_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            topology_epoch: u64,
-            schema_json: []const u8,
-            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-            doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        ) anyerror!?RelationalRowsJoinedMutationSourceGroupInputsResult = null,
-        mutate_rows_from_joined_source_stage_group_local: ?*const fn (
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            group_id: u64,
-            table_name: []const u8,
-            topology_epoch: u64,
-            schema_json: []const u8,
-            source_schema_json: []const u8,
-            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-            matched: u32,
-            candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         begin_bulk_ingest: ?*const fn (
             ptr: *anyopaque,
@@ -4016,102 +3217,6 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, schema, req);
     }
 
-    pub fn insertRowsFromSource(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const fn_ptr = self.vtable.insert_rows_from_source orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, schema, source_schema, req);
-    }
-
-    pub fn mutateRowsFromJoinedSource(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const fn_ptr = self.vtable.mutate_rows_from_joined_source orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, schema, req);
-    }
-
-    pub fn collectRowsMutationSourceCandidatesGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsMutationSourceCandidate {
-        const fn_ptr = self.vtable.mutate_rows_from_source_collect_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema_json, req, doc_key_range);
-    }
-
-    pub fn stageRowsMutationSourceGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const fn_ptr = self.vtable.mutate_rows_from_source_stage_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema_json, req, matched, candidates);
-    }
-
-    pub fn collectRowsJoinedMutationSourceCandidatesGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate {
-        const fn_ptr = self.vtable.mutate_rows_from_joined_source_collect_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema_json, req, doc_key_range);
-    }
-
-    pub fn collectRowsJoinedMutationSourceInputsGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?RelationalRowsJoinedMutationSourceGroupInputsResult {
-        const fn_ptr = self.vtable.mutate_rows_from_joined_source_inputs_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema_json, req, doc_key_range);
-    }
-
-    pub fn stageRowsJoinedMutationSourceGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        source_schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const fn_ptr = self.vtable.mutate_rows_from_joined_source_stage_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, topology_epoch, schema_json, source_schema_json, req, matched, candidates);
-    }
-
     pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
         const fn_ptr = self.vtable.begin_bulk_ingest orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
@@ -4183,17 +3288,6 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.GraphMetricStatus {
         const fn_ptr = self.vtable.graph_metric_action orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
-    }
-
-    pub fn graphMetricMaintenanceGroupLocal(
-        self: TableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        options: GraphMetricMaintenanceGroupLocalOptions,
-    ) !?GraphMetricMaintenanceGroupLocalResult {
-        const fn_ptr = self.vtable.graph_metric_maintenance_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, options);
     }
 
     pub fn dropTable(
@@ -4732,236 +3826,6 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, group_id, table_name, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
     }
 };
-
-fn runGraphMetricMaintenanceGroupLocalInDb(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-) !GraphMetricMaintenanceGroupLocalResult {
-    var stats = try graphMetricServiceRuntimeInitialStats(db.alloc, options);
-    switch (options.action) {
-        .status => return try graphMetricServiceRuntimeStatus(db, options, stats),
-        .release => return try graphMetricServiceRuntimeRelease(db, options, stats),
-        .tick => {},
-    }
-    if (!try graphMetricServiceRuntimeEnsureLease(db, options, &stats)) {
-        return .{ .stats = stats };
-    }
-
-    stats.ticks_started += 1;
-    const result = runGraphMetricMaintenanceGroupLocalSweepInDb(db, options) catch |err| {
-        stats.error_ticks += 1;
-        stats.last_error_name = @errorName(err);
-        return err;
-    };
-    stats.ticks_completed += 1;
-    if (result.durableProgressed()) {
-        stats.durable_progress_ticks += 1;
-    } else {
-        stats.idle_ticks += 1;
-    }
-    stats.last_error_name = null;
-    stats.last_result = result;
-    stats.total_result.add(result);
-    return .{ .result = result, .stats = stats };
-}
-
-fn runGraphMetricMaintenanceGroupLocalSweepInDb(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-) !db_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-    switch (options.role) {
-        .combined => return try db.runGraphMetricPlannedMaintenanceForIdle(.{
-            .worker_id = options.worker_id,
-            .worker_ids = options.worker_ids,
-            .max_rounds = options.max_rounds,
-            .max_metrics_per_round = options.max_metrics_per_round,
-            .max_pages_per_round = options.max_pages_per_round,
-            .now_ms = options.now_ms,
-        }),
-        .coordinator => return try db.runGraphMetricPlannedCoordinatorSweep(.{
-            .max_metrics = options.max_metrics_per_round,
-            .start_background_builds = options.start_background_builds,
-            .now_ms = options.now_ms,
-        }),
-        .worker => return try db.runGraphMetricPlannedWorkerSweep(.{
-            .worker_id = options.worker_id,
-            .max_pages = options.max_pages_per_round,
-            .now_ms = options.now_ms,
-        }),
-        .worker_pool => {
-            if (options.worker_ids.len == 0) {
-                return try db.runGraphMetricPlannedWorkerSweep(.{
-                    .worker_id = options.worker_id,
-                    .max_pages = options.max_pages_per_round,
-                    .now_ms = options.now_ms,
-                });
-            }
-            var total = db_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
-            var pages_remaining = options.max_pages_per_round;
-            while (pages_remaining > 0) {
-                var worker_progressed = false;
-                for (options.worker_ids) |worker_id| {
-                    if (pages_remaining == 0) break;
-                    const one = try db.runGraphMetricPlannedWorkerSweep(.{
-                        .worker_id = worker_id,
-                        .max_pages = 1,
-                        .now_ms = options.now_ms,
-                    });
-                    total.add(one);
-                    pages_remaining -= @min(pages_remaining, one.worker_steps);
-                    worker_progressed = worker_progressed or one.durableProgressed();
-                }
-                if (!worker_progressed) break;
-            }
-            return total;
-        },
-    }
-}
-
-fn graphMetricServiceRuntimeConfig(options: GraphMetricMaintenanceGroupLocalOptions) db_mod.graph_metric_runtime.Config {
-    return .{
-        .enabled = true,
-        .start_background_loop = false,
-        .role = options.role,
-        .runtime_id = options.runtime_id,
-        .owner_id = options.owner_id,
-        .lease_owned = options.lease_owned,
-        .lease_ttl_ms = options.lease_ttl_ms,
-        .coordinator_start_background_builds = options.start_background_builds,
-        .planned_options = .{
-            .worker_id = options.worker_id,
-            .worker_ids = options.worker_ids,
-            .max_rounds = options.max_rounds,
-            .max_metrics_per_round = options.max_metrics_per_round,
-            .max_pages_per_round = options.max_pages_per_round,
-            .now_ms = options.now_ms,
-        },
-    };
-}
-
-fn graphMetricServiceRuntimeInitialStats(
-    alloc: std.mem.Allocator,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-) !db_mod.graph_metric_runtime.Stats {
-    const cfg = graphMetricServiceRuntimeConfig(options);
-    if (cfg.lease_ttl_ms == 0 or
-        cfg.planned_options.max_rounds == 0 or
-        cfg.planned_options.max_metrics_per_round == 0 or
-        cfg.planned_options.max_pages_per_round == 0)
-    {
-        return error.InvalidGraphMetricRuntimeConfig;
-    }
-    const lease_key = try db_mod.graph_metric_runtime.runtimeLeaseKeyAlloc(alloc, cfg);
-    defer alloc.free(lease_key);
-    return db_mod.graph_metric_runtime.initialStatsWithLeaseKey(cfg, lease_key);
-}
-
-fn graphMetricServiceRuntimeEnsureLease(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-    stats: *db_mod.graph_metric_runtime.Stats,
-) !bool {
-    if (!options.lease_owned) {
-        stats.has_lease = true;
-        return true;
-    }
-
-    const cfg = graphMetricServiceRuntimeConfig(options);
-    const now_ms = options.now_ms orelse platform_clock.Clock.real().nowRealtimeMs();
-    const owner_id = db_mod.graph_metric_runtime.runtimeOwnerId(cfg);
-    const lease_key = try db_mod.graph_metric_runtime.runtimeLeaseKeyAlloc(db.alloc, cfg);
-    defer db.alloc.free(lease_key);
-    var lease = try db_mod.lease.Lease.init(db.alloc, db.core.store, lease_key);
-    defer lease.deinit();
-
-    const acquired = lease.tryAcquireDetailed(owner_id, now_ms, options.lease_ttl_ms) catch |err| {
-        stats.lease_acquire_failures += 1;
-        stats.last_error_name = @errorName(err);
-        return false;
-    };
-    if (!acquired.acquiredLease()) {
-        stats.lease_acquire_failures += 1;
-        stats.has_lease = false;
-        return false;
-    }
-    stats.has_lease = true;
-    stats.acquisition_count = 1;
-    if (acquired == .takeover) stats.takeover_count = 1;
-    stats.last_acquired_ms = now_ms;
-    return true;
-}
-
-fn graphMetricServiceRuntimeStatus(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-    stats: db_mod.graph_metric_runtime.Stats,
-) !GraphMetricMaintenanceGroupLocalResult {
-    var out = GraphMetricMaintenanceGroupLocalResult{ .stats = stats };
-    try graphMetricServiceRuntimeLoadLease(db, options, &out);
-    return out;
-}
-
-fn graphMetricServiceRuntimeRelease(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-    stats: db_mod.graph_metric_runtime.Stats,
-) !GraphMetricMaintenanceGroupLocalResult {
-    var out = GraphMetricMaintenanceGroupLocalResult{ .stats = stats };
-    if (!options.lease_owned) {
-        out.stats.has_lease = true;
-        return out;
-    }
-
-    const cfg = graphMetricServiceRuntimeConfig(options);
-    const owner_id = db_mod.graph_metric_runtime.runtimeOwnerId(cfg);
-    const lease_key = try db_mod.graph_metric_runtime.runtimeLeaseKeyAlloc(db.alloc, cfg);
-    defer db.alloc.free(lease_key);
-    var lease = try db_mod.lease.Lease.init(db.alloc, db.core.store, lease_key);
-    defer lease.deinit();
-
-    out.released = try lease.release(owner_id);
-    if (out.released) {
-        out.stats.has_lease = false;
-        return out;
-    }
-    try graphMetricServiceRuntimeLoadLeaseWithLease(db, options, &lease, &out);
-    return out;
-}
-
-fn graphMetricServiceRuntimeLoadLease(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-    out: *GraphMetricMaintenanceGroupLocalResult,
-) !void {
-    if (!options.lease_owned) {
-        out.stats.has_lease = true;
-        return;
-    }
-    const cfg = graphMetricServiceRuntimeConfig(options);
-    const lease_key = try db_mod.graph_metric_runtime.runtimeLeaseKeyAlloc(db.alloc, cfg);
-    defer db.alloc.free(lease_key);
-    var lease = try db_mod.lease.Lease.init(db.alloc, db.core.store, lease_key);
-    defer lease.deinit();
-    try graphMetricServiceRuntimeLoadLeaseWithLease(db, options, &lease, out);
-}
-
-fn graphMetricServiceRuntimeLoadLeaseWithLease(
-    db: *db_mod.DB,
-    options: GraphMetricMaintenanceGroupLocalOptions,
-    lease: *db_mod.lease.Lease,
-    out: *GraphMetricMaintenanceGroupLocalResult,
-) !void {
-    const record = try lease.load(db.alloc) orelse {
-        out.stats.has_lease = false;
-        return;
-    };
-    defer db.alloc.free(@constCast(record.owner_id));
-    const cfg = graphMetricServiceRuntimeConfig(options);
-    const owner_id = db_mod.graph_metric_runtime.runtimeOwnerId(cfg);
-    out.lease_owner_id_hash = db_mod.graph_metric_runtime.identityHash(record.owner_id);
-    out.lease_expires_at_ms = record.expires_at_ms;
-    out.stats.has_lease = std.mem.eql(u8, record.owner_id, owner_id);
-}
 
 pub fn freeForeignKeyRefChildrenPage(alloc: std.mem.Allocator, page: *db_mod.types.ForeignKeyRefChildrenPage) void {
     for (page.children) |child| {
@@ -7922,15 +6786,12 @@ pub const BoundTableWriteSource = struct {
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .graph_metric_action = graphMetricAction,
-                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .batch = batch,
                 .mutate_rows_from_source = mutateRowsFromSource,
-                .insert_rows_from_source = insertRowsFromSource,
-                .mutate_rows_from_joined_source = mutateRowsFromJoinedSource,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -8807,115 +7668,6 @@ pub const BoundTableWriteSource = struct {
         return try self.db.mutateRelationalRowsFromSource(alloc, schema, req);
     }
 
-    fn insertRowsFromSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        if (req.source_table.len > 0 and !std.mem.eql(u8, req.source_table, table_name)) return error.UnsupportedQueryRequest;
-
-        const source_req = relationalRowsInsertSourceFullSourceQuery(req, null, true);
-
-        var source_rows = try self.db.queryRelationalRows(alloc, schema, source_req);
-        defer source_rows.deinit(alloc);
-
-        var resolver_ctx = LocalRowsConflictResolver{ .db = self.db };
-        const resolver = if (req.on_conflict != null) resolver_ctx.resolver() else null;
-        var batch_req = try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(alloc, table_name, schema, source_schema, req, source_rows.rows, resolver);
-        defer batch_req.deinit(alloc);
-
-        if (batch_req.writes.len == 0 and batch_req.transforms.len == 0) {
-            return .{
-                .matched = source_rows.total,
-                .staged = 0,
-                .returning_rows = &.{},
-            };
-        }
-
-        try validateTableBatchAgainstLocalSchema(alloc, self.db, batch_req.writes, batch_req.deletes, batch_req.transforms);
-        self.db.batch(batch_req.req) catch |err| return normalizeRelationalConstraintError(err);
-
-        const returning_rows = batch_req.returning_rows;
-        batch_req.returning_rows = &.{};
-        return .{
-            .matched = source_rows.total,
-            .staged = @intCast(batch_req.writes.len + batch_req.transforms.len),
-            .returning_rows = returning_rows,
-        };
-    }
-
-    const LocalRowsConflictResolver = struct {
-        db: *db_mod.DB,
-
-        fn resolver(self: *@This()) relational_rows_api.UniqueSelectorResolver {
-            return .{
-                .ptr = self,
-                .resolve = resolveUnique,
-                .resolve_primary = primaryExists,
-                .lookup_primary = lookupPrimary,
-            };
-        }
-
-        fn resolveUnique(
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            _: []const u8,
-            constraint_name: []const u8,
-            encoded_value: []const u8,
-        ) !?[]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const key = try db_mod.internal_keys.relationalUniqueKeyAlloc(alloc, constraint_name, encoded_value);
-            defer alloc.free(key);
-            return try self.db.getRawStoreValue(alloc, key);
-        }
-
-        fn primaryExists(
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            _: []const u8,
-            physical_key: []const u8,
-        ) !bool {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const row = try self.db.get(alloc, physical_key) orelse return false;
-            alloc.free(row);
-            return true;
-        }
-
-        fn lookupPrimary(
-            ptr: *anyopaque,
-            alloc: std.mem.Allocator,
-            _: []const u8,
-            physical_key: []const u8,
-        ) !?relational_rows_api.ResolvedPrimaryRow {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const row = try self.db.get(alloc, physical_key) orelse return null;
-            errdefer alloc.free(row);
-            const version = try self.db.getTimestamp(alloc, physical_key);
-            return .{
-                .json = row,
-                .version = version,
-            };
-        }
-    };
-
-    fn mutateRowsFromJoinedSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        if (joinedMutationSourceUsesDifferentSourceTable(table_name, req)) return error.UnsupportedQueryRequest;
-        return try self.db.mutateRelationalRowsJoinedSourceAlloc(alloc, schema, req);
-    }
-
     fn beginBulkIngest(
         ptr: *anyopaque,
         _: std.mem.Allocator,
@@ -9116,18 +7868,6 @@ pub const BoundTableWriteSource = struct {
             return try self.db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
         }
         return error.InvalidGraphMetricAction;
-    }
-
-    fn graphMetricMaintenanceGroupLocal(
-        ptr: *anyopaque,
-        _: std.mem.Allocator,
-        _: u64,
-        table_name: []const u8,
-        options: GraphMetricMaintenanceGroupLocalOptions,
-    ) !?GraphMetricMaintenanceGroupLocalResult {
-        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        return try runGraphMetricMaintenanceGroupLocalInDb(self.db, options);
     }
 
     fn batchGroupLocal(
@@ -11730,14 +10470,6 @@ pub const ProvisionedTableWriteSource = struct {
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .batch = batch,
-                .mutate_rows_from_source = mutateRowsFromSource,
-                .insert_rows_from_source = insertRowsFromSource,
-                .mutate_rows_from_joined_source = mutateRowsFromJoinedSource,
-                .mutate_rows_from_source_collect_group_local = collectRowsMutationSourceCandidatesGroupLocal,
-                .mutate_rows_from_source_stage_group_local = stageRowsMutationSourceGroupLocal,
-                .mutate_rows_from_joined_source_collect_group_local = collectRowsJoinedMutationSourceCandidatesGroupLocal,
-                .mutate_rows_from_joined_source_inputs_group_local = collectRowsJoinedMutationSourceInputsGroupLocal,
-                .mutate_rows_from_joined_source_stage_group_local = stageRowsJoinedMutationSourceGroupLocal,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -11747,7 +10479,6 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
-                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .foreign_key_integrity = foreignKeyIntegrity,
                 .foreign_key_integrity_worker_pass = foreignKeyIntegrityWorkerPass,
@@ -12435,898 +11166,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .data);
     }
 
-    fn insertRowsFromSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        source_schema_arg: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-
-        const source_table_name = insertSourceEffectiveSourceTable(table_name, req);
-        const different_source_table = !std.mem.eql(u8, source_table_name, table_name);
-        const loaded_source_schema_json = if (different_source_table) (try loadTableSchemaJson(alloc, self.catalog, source_table_name)) orelse return null else null;
-        defer if (loaded_source_schema_json) |value| alloc.free(value);
-        const loaded_source_schema = if (different_source_table) try runtimeTableSchemaFromJsonAlloc(alloc, loaded_source_schema_json.?) else null;
-        defer if (loaded_source_schema) |value| storage_schema.freeSchema(alloc, value);
-        const source_schema = loaded_source_schema orelse source_schema_arg;
-
-        const source_ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, source_table_name, "", "");
-        defer freeTableDocKeyRangePlansForWrites(alloc, source_ranges);
-        if (source_ranges.len == 0) return null;
-
-        var collected_source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (collected_source_rows.items) |row| alloc.free(@constCast(row));
-            collected_source_rows.deinit(alloc);
-        }
-        for (source_ranges) |range| {
-            self.beginGroupOperation(source_table_name, range.group_id);
-            defer self.endGroupOperation(source_table_name, range.group_id);
-            try self.appendProvisionedRelationalRowsInsertSourceRowsForRange(alloc, source_table_name, source_schema, req, range, &collected_source_rows);
-        }
-
-        const final_source_req = relationalRowsInsertSourceFullSourceQuery(req, null, true);
-        var source_rows = try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "insert_source", collected_source_rows.items, final_source_req);
-        defer source_rows.deinit(alloc);
-
-        var read_source_impl = table_reads.ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, raft_mod.read_gate.noopReadableLeaseRequester());
-        read_source_impl.cache = self.read_cache;
-        read_source_impl.backend_runtime = self.backend_runtime;
-        read_source_impl.group_visible_root_generation = self.group_visible_root_generation;
-        read_source_impl.primary_lookup_db = self.primaryLookupDbSource();
-        read_source_impl.secret_store = self.secret_store;
-        read_source_impl.remote_content = self.remote_content;
-        var resolver_ctx = RoutedRowsConflictResolver{ .read_source = read_source_impl.source() };
-        const resolver = if (req.on_conflict != null) resolver_ctx.resolver() else null;
-
-        var batch_req = try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(alloc, table_name, schema, source_schema, req, source_rows.rows, resolver);
-        defer batch_req.deinit(alloc);
-
-        if (batch_req.writes.len == 0 and batch_req.transforms.len == 0) {
-            return .{
-                .matched = source_rows.total,
-                .staged = 0,
-                .returning_rows = &.{},
-            };
-        }
-
-        _ = try self.source().batch(alloc, table_name, batch_req.req);
-        const returning_rows = batch_req.returning_rows;
-        batch_req.returning_rows = &.{};
-        return .{
-            .matched = source_rows.total,
-            .staged = @intCast(batch_req.writes.len + batch_req.transforms.len),
-            .returning_rows = returning_rows,
-        };
-    }
-
-    fn mutateRowsFromSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, table_name, "", "");
-        defer freeTableDocKeyRangePlansForWrites(alloc, ranges);
-        if (ranges.len == 0) return null;
-        const topology_epoch = ranges[0].topology_epoch;
-
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-        errdefer {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
-        }
-
-        var all_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        defer {
-            for (all_candidates.items) |*candidate| candidate.deinit(alloc);
-            all_candidates.deinit(alloc);
-        }
-        for (ranges) |range| {
-            self.beginGroupOperation(table_name, range.group_id);
-            defer self.endGroupOperation(table_name, range.group_id);
-            try self.appendProvisionedRelationalRowsMutationCandidatesForRange(alloc, table_name, schema, req, range, &all_candidates);
-        }
-
-        var candidate_slice = try all_candidates.toOwnedSlice(alloc);
-        all_candidates = .empty;
-        var candidate_slice_transferred = false;
-        errdefer if (!candidate_slice_transferred) {
-            for (candidate_slice) |*candidate| candidate.deinit(alloc);
-            if (candidate_slice.len > 0) alloc.free(candidate_slice);
-        };
-        var plan = try db_mod.DB.selectPlannedRelationalRowsMutationSourceCandidatesAlloc(alloc, req, &candidate_slice);
-        candidate_slice_transferred = true;
-        defer plan.deinit(alloc);
-
-        var segments = try provisionedMutationSourceCandidateSegmentsAlloc(alloc, plan.candidates);
-        defer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-
-        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (returning_rows.items) |row| alloc.free(@constCast(row));
-            returning_rows.deinit(alloc);
-        }
-        var staged: u32 = 0;
-        for (segments.items) |segment| {
-            self.beginGroupOperation(table_name, segment.group_id);
-            defer self.endGroupOperation(table_name, segment.group_id);
-            var result = try self.stageProvisionedRelationalRowsMutationCandidateSegment(alloc, table_name, topology_epoch, schema, req, segment);
-            staged += result.staged;
-            for (result.returning_rows) |row| {
-                var row_transferred = false;
-                errdefer if (!row_transferred) alloc.free(@constCast(row));
-                try returning_rows.append(alloc, row);
-                row_transferred = true;
-            }
-            if (result.returning_rows.len > 0) alloc.free(result.returning_rows);
-            result.returning_rows = &.{};
-        }
-
-        lockAtomic(&self.local_db_mutex);
-        self.markWriteCacheDirty(table_name);
-        self.invalidateReadCache(table_name);
-        self.local_db_mutex.unlock();
-        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-        self.notifyLocalChange(table_name, .data);
-        return .{
-            .matched = plan.matched,
-            .staged = staged,
-            .returning_rows = try returning_rows.toOwnedSlice(alloc),
-        };
-    }
-
-    fn mutateRowsFromJoinedSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const source_table_name = joinedMutationSourceEffectiveSourceTable(table_name, req);
-        const different_source_table = !std.mem.eql(u8, source_table_name, table_name);
-        const loaded_source_schema_json = if (different_source_table) (try loadTableSchemaJson(alloc, self.catalog, source_table_name)) orelse return null else null;
-        defer if (loaded_source_schema_json) |value| alloc.free(value);
-        const loaded_source_schema = if (different_source_table) try runtimeTableSchemaFromJsonAlloc(alloc, loaded_source_schema_json.?) else null;
-        defer if (loaded_source_schema) |value| storage_schema.freeSchema(alloc, value);
-        const source_schema = loaded_source_schema orelse schema;
-        const ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, table_name, "", "");
-        defer freeTableDocKeyRangePlansForWrites(alloc, ranges);
-        if (ranges.len == 0) return null;
-        const topology_epoch = ranges[0].topology_epoch;
-        var source_ranges: []table_catalog.TableDocKeyRangePlan = &.{};
-        if (different_source_table) source_ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, source_table_name, "", "");
-        defer if (different_source_table) freeTableDocKeyRangePlansForWrites(alloc, source_ranges);
-        if (different_source_table and source_ranges.len == 0) return null;
-
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-        errdefer {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
-        }
-
-        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        defer {
-            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
-            target_candidates.deinit(alloc);
-        }
-        var source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (source_rows.items) |row| alloc.free(@constCast(row));
-            source_rows.deinit(alloc);
-        }
-        for (ranges) |range| {
-            self.beginGroupOperation(table_name, range.group_id);
-            defer self.endGroupOperation(table_name, range.group_id);
-            try self.appendProvisionedRelationalRowsJoinedMutationInputsForRange(alloc, table_name, schema, req, range, &target_candidates, &source_rows);
-        }
-        if (different_source_table) {
-            for (source_ranges) |range| {
-                self.beginGroupOperation(source_table_name, range.group_id);
-                defer self.endGroupOperation(source_table_name, range.group_id);
-                try self.appendProvisionedRelationalRowsJoinedMutationSourceRowsForRange(alloc, source_table_name, source_schema, req, range, &source_rows);
-            }
-        }
-
-        var target_slice = try target_candidates.toOwnedSlice(alloc);
-        target_candidates = .empty;
-        var target_slice_transferred = false;
-        errdefer if (!target_slice_transferred) freeRelationalRowsMutationSourceCandidates(alloc, target_slice);
-        var candidate_slice = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_slice, source_rows.items);
-        target_slice_transferred = true;
-        var candidate_slice_transferred = false;
-        errdefer if (!candidate_slice_transferred) freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidate_slice);
-        var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidate_slice);
-        candidate_slice_transferred = true;
-        defer plan.deinit(alloc);
-
-        var segments = try provisionedJoinedMutationSourceCandidateSegmentsAlloc(alloc, plan.candidates);
-        defer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-
-        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (returning_rows.items) |row| alloc.free(@constCast(row));
-            returning_rows.deinit(alloc);
-        }
-        var staged: u32 = 0;
-        for (segments.items) |segment| {
-            self.beginGroupOperation(table_name, segment.group_id);
-            defer self.endGroupOperation(table_name, segment.group_id);
-            var result = try self.stageProvisionedRelationalRowsJoinedMutationCandidateSegment(alloc, table_name, topology_epoch, schema, source_schema, req, segment);
-            staged += result.staged;
-            for (result.returning_rows) |row| {
-                var row_transferred = false;
-                errdefer if (!row_transferred) alloc.free(@constCast(row));
-                try returning_rows.append(alloc, row);
-                row_transferred = true;
-            }
-            if (result.returning_rows.len > 0) alloc.free(result.returning_rows);
-            result.returning_rows = &.{};
-        }
-
-        lockAtomic(&self.local_db_mutex);
-        self.markWriteCacheDirty(table_name);
-        self.invalidateReadCache(table_name);
-        self.local_db_mutex.unlock();
-        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-        self.notifyLocalChange(table_name, .data);
-        return .{
-            .matched = plan.matched,
-            .staged = staged,
-            .returning_rows = try returning_rows.toOwnedSlice(alloc),
-        };
-    }
-
-    fn runProvisionedRelationalRowsJoinedMutationForGroup(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        group_id: u64,
-    ) !db_mod.types.RelationalRowsMutationSourceResult {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-            return cached.db.mutateRelationalRowsJoinedSourceAlloc(alloc, schema, req) catch |err| return normalizeRelationalConstraintError(err);
-        }
-
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-        defer db.close();
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-        const result = db.mutateRelationalRowsJoinedSourceAlloc(alloc, schema, req) catch |err| return normalizeRelationalConstraintError(err);
-        self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-        return result;
-    }
-
-    const ProvisionedJoinedMutationSourceCandidateSegment = struct {
-        group_id: u64,
-        candidates: std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            self.candidates.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    fn appendProvisionedRelationalRowsInsertSourceRowsForRange(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        source_table_name: []const u8,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, source_table_name, range.group_id, range.topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        const source_req = relationalRowsInsertSourceFullSourceQuery(req, doc_key_range, false);
-        var source_rows: db_mod.types.RelationalRowsQueryResult = .{};
-        var have_source_rows = false;
-        defer if (have_source_rows) source_rows.deinit(alloc);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                range.group_id,
-                source_table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, range.group_id, cached.db);
-            source_rows = cached.db.queryRelationalRows(alloc, source_schema, source_req) catch |err| return normalizeRelationalConstraintError(err);
-            have_source_rows = true;
-        } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, source_table_name, range.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, range.group_id, &db);
-            source_rows = db.queryRelationalRows(alloc, source_schema, source_req) catch |err| return normalizeRelationalConstraintError(err);
-            have_source_rows = true;
-        }
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendProvisionedRelationalRowsJoinedMutationInputsForRange(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        target_out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, range.group_id, range.topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var target_candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate = &.{};
-        var source_rows: db_mod.types.RelationalRowsQueryResult = .{};
-        var have_targets = false;
-        var have_source_rows = false;
-        defer {
-            if (have_targets) freeRelationalRowsMutationSourceCandidates(alloc, target_candidates);
-            if (have_source_rows) source_rows.deinit(alloc);
-        }
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                range.group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, cached.db);
-            target_candidates = cached.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            have_targets = true;
-            if (!joinedMutationSourceUsesDifferentSourceTable(table_name, req)) {
-                source_rows = cached.db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-                have_source_rows = true;
-            }
-        } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, range.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, &db);
-            target_candidates = db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            have_targets = true;
-            if (!joinedMutationSourceUsesDifferentSourceTable(table_name, req)) {
-                source_rows = db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-                have_source_rows = true;
-            }
-        }
-
-        try target_out.ensureUnusedCapacity(alloc, target_candidates.len);
-        for (target_candidates) |*candidate| {
-            candidate.group_id = range.group_id;
-            candidate.ordinal = target_out.items.len;
-            target_out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 };
-        }
-
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendProvisionedRelationalRowsJoinedMutationSourceRowsForRange(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        source_table_name: []const u8,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, source_table_name, range.group_id, range.topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var source_rows: db_mod.types.RelationalRowsQueryResult = .{};
-        var have_source_rows = false;
-        defer if (have_source_rows) source_rows.deinit(alloc);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                range.group_id,
-                source_table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, range.group_id, cached.db);
-            source_rows = cached.db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, source_schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            have_source_rows = true;
-        } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, source_table_name, range.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, range.group_id, &db);
-            source_rows = db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, source_schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            have_source_rows = true;
-        }
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendProvisionedRelationalRowsJoinedMutationCandidatesForRange(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, range.group_id, range.topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        const candidates = blk: {
-            if (self.write_cache) |cache| {
-                var cached = try self.getOrOpenCachedDbMode(
-                    alloc,
-                    cache,
-                    path,
-                    range.group_id,
-                    table_name,
-                    .default_async,
-                    null,
-                    null,
-                );
-                defer cached.deinit(alloc);
-                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, cached.db);
-                break :blk cached.db.collectRelationalRowsJoinedMutationSourceCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            }
-
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, range.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, &db);
-            break :blk db.collectRelationalRowsJoinedMutationSourceCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-        };
-        defer freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidates);
-        try out.ensureUnusedCapacity(alloc, candidates.len);
-        for (candidates) |*candidate| {
-            candidate.target.group_id = range.group_id;
-            candidate.target.ordinal = out.items.len;
-            out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{};
-        }
-    }
-
-    fn stageProvisionedRelationalRowsJoinedMutationCandidateSegment(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        segment: ProvisionedJoinedMutationSourceCandidateSegment,
-    ) !db_mod.types.RelationalRowsMutationSourceResult {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, segment.group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, segment.group_id);
-        defer alloc.free(path);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                segment.group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, segment.group_id, cached.db);
-            return cached.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, schema, source_schema, req, 0, segment.candidates.items) catch |err| return normalizeRelationalConstraintError(err);
-        }
-
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, segment.group_id, self.backend_runtime);
-        defer db.close();
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, segment.group_id, &db);
-        const result = db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, schema, source_schema, req, 0, segment.candidates.items) catch |err| return normalizeRelationalConstraintError(err);
-        self.finishTransientManagedDbWriteBeforeClose(table_name, segment.group_id, &db);
-        return result;
-    }
-
-    const ProvisionedMutationSourceCandidateSegment = struct {
-        group_id: u64,
-        candidates: std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            self.candidates.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    fn appendProvisionedRelationalRowsMutationCandidatesForRange(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, range.group_id, range.topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        const candidates = blk: {
-            if (self.write_cache) |cache| {
-                var cached = try self.getOrOpenCachedDbMode(
-                    alloc,
-                    cache,
-                    path,
-                    range.group_id,
-                    table_name,
-                    .default_async,
-                    null,
-                    null,
-                );
-                defer cached.deinit(alloc);
-                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, cached.db);
-                break :blk cached.db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-            }
-
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, range.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, range.group_id, &db);
-            break :blk db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, doc_key_range) catch |err| return normalizeRelationalConstraintError(err);
-        };
-        defer {
-            for (candidates) |*candidate| candidate.deinit(alloc);
-            if (candidates.len > 0) alloc.free(candidates);
-        }
-        try out.ensureUnusedCapacity(alloc, candidates.len);
-        for (candidates) |*candidate| {
-            candidate.group_id = range.group_id;
-            candidate.ordinal = out.items.len;
-            out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 };
-        }
-    }
-
-    fn stageProvisionedRelationalRowsMutationCandidateSegment(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        segment: ProvisionedMutationSourceCandidateSegment,
-    ) !db_mod.types.RelationalRowsMutationSourceResult {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, segment.group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, segment.group_id);
-        defer alloc.free(path);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                segment.group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, segment.group_id, cached.db);
-            return cached.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, 0, segment.candidates.items) catch |err| return normalizeRelationalConstraintError(err);
-        }
-
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, segment.group_id, self.backend_runtime);
-        defer db.close();
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, segment.group_id, &db);
-        const result = db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, 0, segment.candidates.items) catch |err| return normalizeRelationalConstraintError(err);
-        self.finishTransientManagedDbWriteBeforeClose(table_name, segment.group_id, &db);
-        return result;
-    }
-
-    fn collectRowsMutationSourceCandidatesGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsMutationSourceCandidate {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-
-        var out = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        errdefer {
-            for (out.items) |*candidate| candidate.deinit(alloc);
-            out.deinit(alloc);
-        }
-        try self.appendProvisionedRelationalRowsMutationCandidatesForRange(
-            alloc,
-            table_name,
-            schema,
-            req,
-            .{ .group_id = group_id, .start_key = @constCast(doc_key_range.start), .end_key = @constCast(doc_key_range.end), .topology_epoch = topology_epoch },
-            &out,
-        );
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn stageRowsMutationSourceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        _ = matched;
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        return try self.stageProvisionedRelationalRowsMutationCandidateSegment(
-            alloc,
-            table_name,
-            topology_epoch,
-            schema,
-            req,
-            .{
-                .group_id = group_id,
-                .candidates = .{ .items = @constCast(candidates), .capacity = candidates.len },
-            },
-        );
-    fn beginLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        self.beginStructuralTableActivity(table_name);
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateWriteCache(table_name);
-        self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-    }
-
-    fn finishLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateWriteCache(table_name);
-        self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-        self.endStructuralTableActivity(table_name);
-    }
-
-    fn abortLocalRestoreMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.invalidateWriteCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-        self.endStructuralTableActivity(table_name);
-    }
-
-    fn abortLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        self.invalidateReadCache(table_name);
-        self.invalidateWriteCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
-        self.local_db_mutex.unlock();
-        self.endStructuralTableActivity(table_name);
-    }
-
-    fn collectRowsJoinedMutationSourceCandidatesGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (joinedMutationSourceUsesDifferentSourceTable(table_name, req)) return error.UnsupportedQueryRequest;
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-
-        var out = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate).empty;
-        errdefer {
-            for (out.items) |*candidate| candidate.deinit(alloc);
-            out.deinit(alloc);
-        }
-        try self.appendProvisionedRelationalRowsJoinedMutationCandidatesForRange(
-            alloc,
-            table_name,
-            schema,
-            req,
-            .{ .group_id = group_id, .start_key = @constCast(doc_key_range.start), .end_key = @constCast(doc_key_range.end), .topology_epoch = topology_epoch },
-            &out,
-        );
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn collectRowsJoinedMutationSourceInputsGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?RelationalRowsJoinedMutationSourceGroupInputsResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-
-        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        errdefer {
-            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
-            target_candidates.deinit(alloc);
-        }
-        var source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (source_rows.items) |row| alloc.free(@constCast(row));
-            source_rows.deinit(alloc);
-        }
-        try self.appendProvisionedRelationalRowsJoinedMutationInputsForRange(
-            alloc,
-            table_name,
-            schema,
-            req,
-            .{ .group_id = group_id, .start_key = @constCast(doc_key_range.start), .end_key = @constCast(doc_key_range.end), .topology_epoch = topology_epoch },
-            &target_candidates,
-            &source_rows,
-        );
-        const owned_targets = try target_candidates.toOwnedSlice(alloc);
-        var targets_transferred = false;
-        errdefer if (!targets_transferred) freeRelationalRowsMutationSourceCandidates(alloc, owned_targets);
-        const owned_source_rows = try source_rows.toOwnedSlice(alloc);
-        targets_transferred = true;
-        return .{
-            .target_candidates = owned_targets,
-            .source_rows = owned_source_rows,
-        };
-    }
-
-    fn stageRowsJoinedMutationSourceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        source_schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        _ = matched;
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        const effective_source_schema_json = if (source_schema_json.len > 0) source_schema_json else schema_json;
-        const source_schema = try runtimeTableSchemaFromJsonAlloc(alloc, effective_source_schema_json);
-        defer storage_schema.freeSchema(alloc, source_schema);
-        return try self.stageProvisionedRelationalRowsJoinedMutationCandidateSegment(
-            alloc,
-            table_name,
-            topology_epoch,
-            schema,
-            source_schema,
-            req,
-            .{
-                .group_id = group_id,
-                .candidates = .{ .items = @constCast(candidates), .capacity = candidates.len },
-            },
-        );
-    }
-
-    fn provisionedJoinedMutationSourceCandidateSegmentsAlloc(
-        alloc: std.mem.Allocator,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !std.ArrayListUnmanaged(ProvisionedJoinedMutationSourceCandidateSegment) {
-        var segments = std.ArrayListUnmanaged(ProvisionedJoinedMutationSourceCandidateSegment).empty;
-        errdefer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-        for (candidates) |candidate| {
-            if (segments.items.len == 0 or segments.items[segments.items.len - 1].group_id != candidate.target.group_id) {
-                try segments.append(alloc, .{ .group_id = candidate.target.group_id });
-            }
-            try segments.items[segments.items.len - 1].candidates.append(alloc, candidate);
-        }
-        return segments;
-    }
-
-    fn provisionedMutationSourceCandidateSegmentsAlloc(
-        alloc: std.mem.Allocator,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !std.ArrayListUnmanaged(ProvisionedMutationSourceCandidateSegment) {
-        var segments = std.ArrayListUnmanaged(ProvisionedMutationSourceCandidateSegment).empty;
-        errdefer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-        for (candidates) |candidate| {
-            if (segments.items.len == 0 or segments.items[segments.items.len - 1].group_id != candidate.group_id) {
-                try segments.append(alloc, .{ .group_id = candidate.group_id });
-            }
-            try segments.items[segments.items.len - 1].candidates.append(alloc, candidate);
-        }
-        return segments;
-    }
-
-    fn freeTableDocKeyRangePlansForWrites(alloc: std.mem.Allocator, ranges: []table_catalog.TableDocKeyRangePlan) void {
-        for (ranges) |*range| range.deinit(alloc);
-        if (ranges.len > 0) alloc.free(ranges);
-    }
-
     fn backupTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -13350,48 +11189,6 @@ pub const ProvisionedTableWriteSource = struct {
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ plan.backup_id, group_id });
         defer alloc.free(snapshot_token);
         _ = try db.snapshot(snapshot_token);
-        var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-                cache.alloc,
-                path,
-                value,
-                cache.lsm_cache,
-                cache.hbc_cache,
-                lsm_root_generation,
-                cache.resource_manager,
-                mode,
-                cache.backend_runtime,
-                self.antfly_provider,
-                self.secret_store,
-                cache.remote_content,
-                identity_namespace,
-                .{ .drain_resolver_backfill = false },
-            )
-        else
-            try db_mod.DB.open(cache.alloc, path, .{
-                .lsm_cache = cache.lsm_cache,
-                .hbc_cache = cache.hbc_cache,
-                .lsm_root_generation = lsm_root_generation,
-                .resource_manager = cache.resource_manager,
-                .backend_runtime = cache.backend_runtime,
-                .identity_namespace = identity_namespace,
-                .prefer_existing_identity_namespace = identity_namespace != null,
-                .open_mode = switch (mode) {
-                    .default => .writer,
-                    .default_async, .writer_no_replay => .writer_no_replay,
-                    .startup_catch_up, .restore_repair => .writer_no_replay,
-                    .query_readonly => .query_readonly,
-                    .status_only => .status_only,
-                },
-                .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
-                .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
-                .start_optional_runtimes = mode != .startup_catch_up and mode != .query_readonly,
-                .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-            });
-        defer if (opened) |*db| db.close();
-        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ path, snapshot_token });
         defer alloc.free(snapshot_root);
@@ -13582,49 +11379,10 @@ pub const ProvisionedTableWriteSource = struct {
                         self.local_db_mutex.unlock();
                         publishRuntimeStatusSnapshot(self, alloc, table_name, group_id, cached.db) catch |err| {
                             std.log.warn("auto bulk roll runtime status publish failed table={s} group_id={} err={s}", .{
-                self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
-            },
-            .publish_consistent => {
-                if (db) |managed_db| {
-                    if (self.runtime_status_cache) |snapshot_cache| {
-                        publishRuntimeStatusSnapshotConsistentIfAvailable(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
-                            if (err != error.WriterLocked) {
-                                std.log.warn("managed runtime status publish failed table={s} group_id={} err={s}", .{
-                                    table_name,
-                                    group_id,
-                                    @errorName(err),
-                                });
-                            }
-                        };
-                        self.invalidateReadCache(table_name);
-                        lockAtomic(&self.local_db_mutex);
-                        self.markWriteCacheDirty(table_name);
-                        self.local_db_mutex.unlock();
-                        self.notifyLocalChange(table_name, .data);
-                        return;
-                    }
-                }
-                lockAtomic(&self.local_db_mutex);
-                self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
-            },
-            .publish_blocking => {
-                if (db) |managed_db| {
-                    if (self.runtime_status_cache) |snapshot_cache| {
-                        publishRuntimeStatusSnapshotConsistent(self, snapshot_cache.alloc, table_name, group_id, managed_db) catch |err| {
-                            std.log.warn("managed runtime status blocking publish failed table={s} group_id={} err={s}", .{
                                 table_name,
                                 group_id,
                                 @errorName(err),
                             });
-                            self.invalidateRuntimeStatusCache(table_name);
-                            lockAtomic(&self.local_db_mutex);
-                            self.markWriteCacheDirty(table_name);
-                            self.local_db_mutex.unlock();
-                            self.invalidateReadCache(table_name);
-                            self.notifyLocalChange(table_name, .data);
-                            return;
                         };
                         lockAtomic(&self.local_db_mutex);
                     }
@@ -13646,36 +11404,6 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             self.notifyLocalChange(table_name, .data);
         }
-                self.invalidateRuntimeStatusCache(table_name);
-                lockAtomic(&self.local_db_mutex);
-                self.markWriteCacheDirty(table_name);
-                self.local_db_mutex.unlock();
-            },
-            .invalidate => {},
-        }
-        self.invalidateReadCache(table_name);
-        self.notifyLocalChange(table_name, .data);
-    }
-
-    fn invalidateWriteCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        _ = self.publishWriteCacheStatusBeforeInvalidate(table_name);
-        self.detachWriteCacheVisibilityHooksBeforeInvalidate(table_name);
-        if (self.write_cache) |cache| cache.invalidateTable(table_name);
-        if (self.startup_write_cache) |cache| cache.invalidateTable(table_name);
-        self.clearDirtyWriteTable(table_name);
-    }
-
-    fn publishWriteCacheStatusBeforeInvalidate(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        if (self.runtime_status_cache == null) return true;
-        var published = true;
-        published = self.publishCacheStatusBeforeInvalidate(table_name, self.write_cache) and published;
-        published = self.publishCacheStatusBeforeInvalidate(table_name, self.startup_write_cache) and published;
-        return published;
-    }
-
-    fn detachWriteCacheVisibilityHooksBeforeInvalidate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        self.detachCacheVisibilityHooksBeforeInvalidate(table_name, self.write_cache);
-        self.detachCacheVisibilityHooksBeforeInvalidate(table_name, self.startup_write_cache);
     }
 
     pub fn syncReplicatedBatchGroupLocal(
@@ -13759,21 +11487,6 @@ pub const ProvisionedTableWriteSource = struct {
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
         _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, participants);
-    fn finishEntryAutoBulkIngestForForegroundVisibility(
-        self: *ProvisionedTableWriteSource,
-        cache: *ProvisionedTableWriteCache,
-        entry: *ProvisionedTableWriteCache.Entry,
-    ) !void {
-        if (!entry.auto_bulk_ingest_session_open) return;
-        try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
-        entry.bulk_ingest_session_open = false;
-        entry.auto_bulk_ingest_session_open = false;
-        entry.auto_bulk_ingest_ops = 0;
-        entry.auto_bulk_ingest_started_ns = 0;
-        entry.auto_bulk_ingest_last_ns = 0;
-        entry.auto_bulk_ingest_finish_requested = false;
-        cache.removeInactiveBulkIngestSessionLocked(entry.table_name);
-        _ = self;
     }
 
     fn txnPrepareGroupLocal(
@@ -14160,17 +11873,6 @@ pub const ProvisionedTableWriteSource = struct {
         return try runProvisionedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
     }
 
-    fn graphMetricMaintenanceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        options: GraphMetricMaintenanceGroupLocalOptions,
-    ) !?GraphMetricMaintenanceGroupLocalResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        return try runProvisionedGraphMetricMaintenanceGroupLocal(self, alloc, group_id, table_name, options);
-    }
-
     fn uniqueConstraintIntegrity(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14326,50 +12028,6 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?ForeignKeyActionJobResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const owner_parent_table = try foreignKeyActionOwnerParentTableNameAlloc(
-            const identity_namespace = if (cached_indexes_json == null)
-                try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id)
-            else
-                null;
-            uncached_db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-                    alloc,
-                    path,
-                    value,
-                    null,
-                    null,
-                    lsm_root_generation,
-                    null,
-                    startup_open_mode,
-                    self.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    self.remote_content,
-                    identity_namespace,
-                    .{ .drain_resolver_backfill = false },
-                )
-            else
-                try db_mod.DB.open(alloc, path, .{
-                    .open_mode = .writer_no_replay,
-                    .lsm_root_generation = lsm_root_generation,
-                    .backend_runtime = self.backend_runtime,
-                    .start_index_workers = false,
-                    .start_optional_runtimes = false,
-                    .ttl_cleanup = .{ .enabled = false },
-                    .transaction_recovery = .{ .enabled = false },
-                    .text_merge = .{ .enabled = false },
-                    .identity_namespace = identity_namespace,
-                    .prefer_existing_identity_namespace = identity_namespace != null,
-                });
-            errdefer if (uncached_db) |*owned| owned.close();
-            try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
-            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, group_id, &uncached_promotion_owner_state);
-            try uncached_db.?.drainResolverBackfill();
-            break :db_blk &uncached_db.?;
-        };
-        defer if (uncached_db) |*owned| owned.close();
-        _ = try db.runDueLsmObsoleteReclaimUntilIdle(startup_obsolete_reclaim_max_steps);
-        try publishStartupCatchUpRuntimeStatusSnapshot(
-            self,
             alloc,
             self.catalog,
             table_name,
@@ -14420,102 +12078,6 @@ pub const ProvisionedTableWriteSource = struct {
             .complete = complete,
             .groups = try groups.toOwnedSlice(alloc),
         };
-    pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
-        var primary_only = false;
-        var leased = blk: {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
-            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
-                primary_only = true;
-                break :blk lease;
-            }
-            if (cache.maxLsmMaintenanceScoreLocked() == 0) return false;
-            break :blk cache.leaseLsmMaintenanceRoundLocked() orelse return false;
-        };
-        defer {
-            const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
-            leased.deinit(release_alloc);
-        }
-        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
-        const progressed = if (primary_only)
-            try leased.db.runPrimaryLsmMaintenanceStep()
-        else
-            try leased.db.runLsmMaintenanceStep();
-        if (maintenance_table_name) |table_name| {
-            const should_invalidate_read_cache = progressed or blk: {
-                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
-                break :blk stats.obsolete_paths_pinned_by_versions != 0;
-            };
-            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
-        }
-        return progressed;
-    }
-
-    pub fn runLsmMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !bool {
-        if (!self.local_db_mutex.tryLock()) return false;
-        var primary_only = false;
-        var leased = blk: {
-            defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return false;
-            if (cache.leaseLsmObsoleteReclaimDueLocked()) |lease| break :blk lease;
-            if (cache.leasePrimaryLsmObsoleteReclaimDueLocked()) |lease| {
-                primary_only = true;
-                break :blk lease;
-            }
-            if (cache.maxLsmMaintenanceScoreLocked() != 0) {
-                if (cache.leaseLsmMaintenanceRoundBestEffortLocked()) |lease| break :blk lease;
-            }
-            if (cache.maxPrimaryLsmMaintenanceScoreLocked() == 0) return false;
-            primary_only = true;
-            break :blk cache.leasePrimaryLsmMaintenanceRoundBestEffortLocked() orelse return false;
-        };
-        defer {
-            const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
-            leased.deinit(release_alloc);
-        }
-        const maintenance_table_name = if (leased.entry) |entry| entry.table_name else null;
-        const progressed = if (primary_only)
-            try leased.db.runPrimaryLsmMaintenanceStepBestEffort()
-        else
-            try leased.db.runLsmMaintenanceStepBestEffort();
-        if (maintenance_table_name) |table_name| {
-            const should_invalidate_read_cache = progressed or blk: {
-                const stats = leased.db.trySnapshotLsmMaintenanceStats() orelse break :blk false;
-                break :blk stats.obsolete_paths_pinned_by_versions != 0;
-            };
-            if (should_invalidate_read_cache) self.invalidateReadCache(table_name);
-        }
-        return progressed;
-    }
-
-    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
-        if (!self.local_db_mutex.tryLock()) return 0;
-        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
-        var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
-        {
-            defer self.local_db_mutex.unlock();
-            const cache = self.write_cache orelse return 0;
-            lease_alloc = cache.alloc;
-            for (cache.entries.items) |entry| {
-                if (entry.bulk_ingest_session_open) continue;
-                if (entry.db.hasActiveDenseBulkWork()) continue;
-                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
-            }
-        }
-        defer {
-            for (leases.items) |*lease| lease.deinit(lease_alloc);
-            leases.deinit(lease_alloc);
-        }
-        var total_steps: usize = 0;
-        for (leases.items) |lease| {
-            total_steps += lease.db.runDensePostingMaintenanceForIdle() catch |err| blk: {
-                std.log.warn("dense posting maintenance round failed: {}", .{err});
-                break :blk 0;
-            };
-        }
-        return total_steps;
     }
 
     fn foreignKeyActionJobGroupLocal(
@@ -14959,46 +12521,6 @@ pub const ProvisionedTableWriteSource = struct {
 
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        maybe_cache: ?*ProvisionedTableWriteCache,
-        out: *std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb),
-    ) !void {
-        const cache = maybe_cache orelse return;
-        for (cache.entries.items) |entry| {
-            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
-            if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) continue;
-            try cache.appendRuntimeStatusLeaseForEntryLocked(alloc, entry, out);
-        }
-    }
-
-    pub fn lsmMaintenanceScore(self: *ProvisionedTableWriteSource) u64 {
-        lockAtomic(&self.local_db_mutex);
-        defer self.local_db_mutex.unlock();
-        return if (self.write_cache) |cache| @max(
-            cache.maxLsmMaintenanceScoreLocked(),
-            cache.maxPrimaryLsmMaintenanceScoreLocked(),
-        ) else 0;
-    }
-
-    pub fn lsmMaintenanceScoreBestEffort(self: *ProvisionedTableWriteSource) u64 {
-        if (!self.local_db_mutex.tryLock()) return 0;
-        defer self.local_db_mutex.unlock();
-        return if (self.write_cache) |cache| @max(
-            cache.maxLsmMaintenanceScoreLocked(),
-            cache.maxPrimaryLsmMaintenanceScoreLocked(),
-        ) else 0;
-    }
-
-    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *ProvisionedTableWriteSource) ?u64 {
-        if (!self.local_db_mutex.tryLock()) return null;
-        defer self.local_db_mutex.unlock();
-        const cache = self.write_cache orelse return null;
-
-        var delay_ns = cache.nextLsmMaintenanceWakeDelayNsLocked();
-        if (cache.nextPrimaryLsmMaintenanceWakeDelayNsLocked()) |candidate| {
-            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
-        }
-        return delay_ns;
-    }
 
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
@@ -15258,36 +12780,6 @@ pub const ProvisionedTableWriteSource = struct {
         var status = try foreignKeyActionJobStatusFromDbRecord(alloc, group_id, record);
         errdefer status.deinit(alloc);
         return status;
-    ) !?runtime_status.LocalTableRuntimeStatus {
-        return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
-            .absent, .unknown => null,
-            .leased => |cached| blk: {
-                var owned = cached;
-                const release_alloc = if (owned.cache) |cache| cache.alloc else std.heap.page_allocator;
-                defer owned.deinit(release_alloc);
-                if (self.runtime_status_cache) |snapshot_cache| {
-                    if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
-                        var status = cached_status;
-                        errdefer status.deinit(alloc);
-                        owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-                        self.markManagedWriterRuntimeStatus(&status);
-                        status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
-                        if (status.created_at_millis == 0) {
-                            status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
-                        }
-                        break :blk status;
-                    }
-                }
-                var status = runtime_status.LocalTableRuntimeStatus{
-                    .group_id = group_id,
-                    .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
-                    .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
-                    .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
-                };
-                self.markManagedWriterRuntimeStatus(&status);
-                break :blk status;
-            },
-        };
     }
 
     fn runProvisionedForeignKeyActionJobGroupLocal(
@@ -15309,23 +12801,6 @@ pub const ProvisionedTableWriteSource = struct {
     ) !ForeignKeyActionJobStatus {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        status: *runtime_status.LocalTableRuntimeStatus,
-    ) void {
-        switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
-            .absent, .unknown => {},
-            .leased => |cached| {
-                var owned = cached;
-                const release_alloc = if (owned.cache) |cache| cache.alloc else std.heap.page_allocator;
-                defer owned.deinit(release_alloc);
-                owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
-                self.markManagedWriterRuntimeStatus(status);
-                status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
-                if (status.created_at_millis == 0) {
-                    status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
-                }
-            },
-        }
-    }
 
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
@@ -15362,24 +12837,6 @@ pub const ProvisionedTableWriteSource = struct {
             self.notifyLocalChange(table_name, .data);
             cached.deinit(alloc);
             return status;
-    fn lsmStorageStatsFromDb(db: *db_mod.DB) runtime_status.LsmStorageStats {
-        return .{
-            .maintenance = db.snapshotLsmMaintenanceStats(),
-            .write = db.snapshotLsmWriteStats(),
-            .maintenance_score = db.lsmMaintenanceScore(),
-            .maintenance_debt_hint = db.lsmMaintenanceDebtHint(),
-        };
-    }
-
-    pub fn hasGroupActivityBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
-        self.table_activity_mutex.lockUncancelable(io);
-        defer self.table_activity_mutex.unlock(io);
-        if (self.findTableActivityLocked(table_name, null)) |index| {
-            if (self.active_table_activities.items[index].structural_active) return true;
-        }
-        if (self.findTableActivityLocked(table_name, group_id)) |index| {
-            if (self.active_table_activities.items[index].operation_active) return true;
         }
 
         var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
@@ -15768,63 +13225,6 @@ pub const ProvisionedTableWriteSource = struct {
                 null,
             );
         }
-    fn indexHasVisibilityFactsForStatus(item: db_mod.types.DBIndexStats) bool {
-        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
-    }
-
-    fn runtimeStatusNeedsColdVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
-        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
-        for (status.stats.indexes) |item| {
-            if (item.kind != .dense_vector) continue;
-            if (indexHasVisibilityFactsForStatus(item)) continue;
-            if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
-            if (has_primary_facts) return true;
-            return status.metadata.source == .live_writer_publish;
-        }
-        return false;
-    }
-
-    fn runtimeStatusesNeedColdVisibilityRefresh(statuses: *const runtime_status.LocalTableRuntimeStatuses) bool {
-        if (statuses.items.len == 0) return true;
-        for (statuses.items) |status| {
-            if (runtimeStatusNeedsColdVisibilityRefresh(status)) return true;
-        }
-        return false;
-    }
-
-    fn markRecoveredRuntimeStatuses(statuses: *runtime_status.LocalTableRuntimeStatuses) void {
-        const now_ns = platform_time.monotonicNs();
-        for (statuses.items) |*item| {
-            item.metadata = item.metadata.withDefaults(.cached_snapshot, now_ns);
-            item.metadata.source = .cached_snapshot;
-        }
-    }
-
-    pub fn snapshotRuntimeStatusesBestEffort(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-    ) !?runtime_status.LocalTableRuntimeStatuses {
-        // Keep the hot HTTP status path on the cached status plane. After a
-        // process restart the cache is empty, or can contain only a synthetic
-        // dense placeholder; recover once from durable status snapshots, and
-        // only load query-visible index state when the cheap snapshot is
-        // clearly missing dense visibility for existing primary documents.
-        const snapshot_cache = self.runtime_status_cache orelse return null;
-        const cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
-        if (!runtimeStatusesNeedColdVisibilityRefresh(&cached)) return cached;
-        var owned_cached = cached;
-        owned_cached.deinit(alloc);
-
-        var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .status_only)) orelse return null;
-        errdefer recovered.deinit(alloc);
-        if (runtimeStatusesNeedColdVisibilityRefresh(&recovered)) {
-            recovered.deinit(alloc);
-            recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .query_readonly)) orelse return null;
-        }
-        markRecoveredRuntimeStatuses(&recovered);
-        for (recovered.items) |item| try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, item);
-        return recovered;
     }
 
     fn recordProvisionedForeignKeyIntegrityJobFinish(
@@ -16073,46 +13473,6 @@ pub const ProvisionedTableWriteSource = struct {
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         const result = try runSecondaryIndexRebuildRangeGroupLocal(&db, self.catalog, record, worker_id, now_ms, lease_ms);
         if (result.claimed) {
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            self.notifyLocalChange(table_name, .data);
-        }
-        return result;
-    }
-
-    fn runProvisionedGraphMetricMaintenanceGroupLocal(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        options: GraphMetricMaintenanceGroupLocalOptions,
-    ) !?GraphMetricMaintenanceGroupLocalResult {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
-            defer cached.deinit(alloc);
-            const result = try runGraphMetricMaintenanceGroupLocalInDb(cached.db, options);
-            if (result.result.durableProgressed()) {
-                try drainManagedDbBeforeClose(cached.db);
-                lockAtomic(&self.local_db_mutex);
-                self.markWriteCacheDirty(table_name);
-                self.invalidateReadCache(table_name);
-                self.local_db_mutex.unlock();
-                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-                self.notifyLocalChange(table_name, .data);
-            }
-            return result;
-        }
-
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-        defer db.close();
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-        const result = try runGraphMetricMaintenanceGroupLocalInDb(&db, options);
-        if (result.result.durableProgressed()) {
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             self.notifyLocalChange(table_name, .data);
         }
@@ -16457,50 +13817,6 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         var prepared_open: ?ProvisionedTableWriteCache.PreparedOpen = null;
         defer if (prepared_open) |*prepared| prepared.deinit(cache.write_cache.alloc);
-    fn repairRestoredTableRuntimeStateBlocking(
-        self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        path: []const u8,
-        group_id: u64,
-        table_name: []const u8,
-    ) !void {
-        if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) return;
-
-        const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout;
-        defer alloc.free(indexes_json);
-
-        var db = try self.openRestoreRepairDbForGroup(
-            alloc,
-            path,
-            group_id,
-            table_name,
-            indexes_json,
-        );
-        defer db.close();
-
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const start_ns = platform_time.monotonicNs();
-        var attempts: usize = 0;
-        std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
-        while (try db.restoreRuntimeRepairNeeded()) {
-            attempts += 1;
-            if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
-                db.clearDenseHbcCaches();
-            }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-        }
-        std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d}", .{
-            table_name,
-            group_id,
-            attempts,
-        });
-    }
-
-    const RestoreRepairCatchUpWork = struct {
-        alloc: std.mem.Allocator,
-        source: *ProvisionedTableWriteSource,
-        group_id: u64,
-        table_name: []u8,
 
         {
             lockAtomic(&cache.mutex);
@@ -16653,28 +13969,12 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .batch = batch,
-                .mutate_rows_from_source = mutateRowsFromSource,
-                .insert_rows_from_source = insertRowsFromSource,
-                .mutate_rows_from_joined_source = mutateRowsFromJoinedSource,
-                .mutate_rows_from_source_collect_group_local = collectRowsMutationSourceCandidatesGroupLocal,
-                .mutate_rows_from_source_stage_group_local = stageRowsMutationSourceGroupLocal,
-                .mutate_rows_from_joined_source_collect_group_local = collectRowsJoinedMutationSourceCandidatesGroupLocal,
-                .mutate_rows_from_joined_source_inputs_group_local = collectRowsJoinedMutationSourceInputsGroupLocal,
-                .mutate_rows_from_joined_source_stage_group_local = stageRowsJoinedMutationSourceGroupLocal,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
-                .reprocess_document_artifact = reprocessDocumentArtifact,
-                .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
-                .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
-                .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
-                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
-                .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
-                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
-                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .foreign_key_integrity = foreignKeyIntegrity,
                 .foreign_key_integrity_worker_pass = foreignKeyIntegrityWorkerPass,
@@ -16698,7 +13998,6 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .unique_constraint_integrity_schema_controller_maintenance_pass = uniqueConstraintIntegritySchemaControllerMaintenancePass,
                 .secondary_index_rebuild_worker_pass = secondaryIndexRebuildWorkerPass,
                 .secondary_index_rebuild_group_local = secondaryIndexRebuildGroupLocal,
-                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .foreign_key_integrity_group_local = foreignKeyIntegrityGroupLocal,
                 .foreign_key_integrity_work_unit_group_local = foreignKeyIntegrityWorkUnitGroupLocal,
                 .unique_constraint_integrity_group_local = uniqueConstraintIntegrityGroupLocal,
@@ -16763,24 +14062,6 @@ pub const HostedProvisionedTableWriteSource = struct {
             else => return err,
         };
         return try runHostedSecondaryIndexRebuildGroupLocal(self, alloc, group_id, table_name, record, worker_id, lease_ms);
-    }
-
-    fn graphMetricMaintenanceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        options: GraphMetricMaintenanceGroupLocalOptions,
-    ) !?GraphMetricMaintenanceGroupLocalResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        const result = try runGraphMetricMaintenanceGroupLocalInDb(cached.db, options);
-        if (result.result.durableProgressed()) try drainManagedDbBeforeClose(cached.db);
-        return result;
     }
 
     fn foreignKeyIntegrityWorkerPass(
@@ -16993,897 +14274,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     }
 
-    fn insertRowsFromSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        source_schema_arg: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-
-        const target_schema_json = (try loadTableSchemaJson(alloc, self.catalog, table_name)) orelse return null;
-        defer alloc.free(target_schema_json);
-        if (target_schema_json.len == 0) return error.InvalidArgument;
-
-        const source_table_name = insertSourceEffectiveSourceTable(table_name, req);
-        const different_source_table = !std.mem.eql(u8, source_table_name, table_name);
-        const loaded_source_schema_json = if (different_source_table) (try loadTableSchemaJson(alloc, self.catalog, source_table_name)) orelse return null else null;
-        defer if (loaded_source_schema_json) |value| alloc.free(value);
-        const source_schema_json = loaded_source_schema_json orelse target_schema_json;
-        const loaded_source_schema = if (different_source_table) try runtimeTableSchemaFromJsonAlloc(alloc, source_schema_json) else null;
-        defer if (loaded_source_schema) |value| storage_schema.freeSchema(alloc, value);
-        const source_schema = loaded_source_schema orelse source_schema_arg;
-
-        const source_ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, source_table_name, "", "");
-        defer freeTableDocKeyRangePlans(alloc, source_ranges);
-        if (source_ranges.len == 0) return null;
-
-        var collected_source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (collected_source_rows.items) |row| alloc.free(@constCast(row));
-            collected_source_rows.deinit(alloc);
-        }
-        for (source_ranges) |range| {
-            try self.appendHostedRelationalRowsInsertSourceRowsForRange(alloc, source_table_name, source_schema_json, source_schema, req, range, &collected_source_rows);
-        }
-
-        const final_source_req = relationalRowsInsertSourceFullSourceQuery(req, null, true);
-        var source_rows = try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "insert_source", collected_source_rows.items, final_source_req);
-        defer source_rows.deinit(alloc);
-
-        var read_source_impl = table_reads.HostedProvisionedTableReadSource.init(
-            self.replica_root_dir,
-            self.catalog,
-            raft_mod.read_gate.noopReadableLeaseRequester(),
-            self.router,
-            self.executor,
-        );
-        read_source_impl.backend_runtime = self.backend_runtime;
-        read_source_impl.group_visible_root_generation = self.group_visible_root_generation;
-        var resolver_ctx = RoutedRowsConflictResolver{ .read_source = read_source_impl.source() };
-        const resolver = if (req.on_conflict != null) resolver_ctx.resolver() else null;
-
-        var batch_req = try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(alloc, table_name, schema, source_schema, req, source_rows.rows, resolver);
-        defer batch_req.deinit(alloc);
-
-        if (batch_req.writes.len == 0 and batch_req.transforms.len == 0) {
-            return .{
-                .matched = source_rows.total,
-                .staged = 0,
-                .returning_rows = &.{},
-            };
-        }
-
-        _ = try self.source().batch(alloc, table_name, batch_req.req);
-        const returning_rows = batch_req.returning_rows;
-        batch_req.returning_rows = &.{};
-        return .{
-            .matched = source_rows.total,
-            .staged = @intCast(batch_req.writes.len + batch_req.transforms.len),
-            .returning_rows = returning_rows,
-        };
-    }
-
-    fn mutateRowsFromSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema_json = (try loadTableSchemaJson(alloc, self.catalog, table_name)) orelse return null;
-        defer alloc.free(schema_json);
-        if (schema_json.len == 0) return error.InvalidArgument;
-
-        const ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, table_name, "", "");
-        defer freeTableDocKeyRangePlans(alloc, ranges);
-        if (ranges.len == 0) return null;
-        const topology_epoch = ranges[0].topology_epoch;
-
-        var all_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        defer {
-            for (all_candidates.items) |*candidate| candidate.deinit(alloc);
-            all_candidates.deinit(alloc);
-        }
-        for (ranges) |range| {
-            try self.appendHostedRelationalRowsMutationCandidatesForRange(alloc, table_name, schema_json, schema, req, range, &all_candidates);
-        }
-
-        var candidate_slice = try all_candidates.toOwnedSlice(alloc);
-        all_candidates = .empty;
-        var candidate_slice_transferred = false;
-        errdefer if (!candidate_slice_transferred) freeRelationalRowsMutationSourceCandidates(alloc, candidate_slice);
-        var plan = try db_mod.DB.selectPlannedRelationalRowsMutationSourceCandidatesAlloc(alloc, req, &candidate_slice);
-        candidate_slice_transferred = true;
-        defer plan.deinit(alloc);
-
-        var segments = try hostedMutationSourceCandidateSegmentsAlloc(alloc, plan.candidates);
-        defer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-
-        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (returning_rows.items) |row| alloc.free(@constCast(row));
-            returning_rows.deinit(alloc);
-        }
-        var staged: u32 = 0;
-        for (segments.items) |segment| {
-            var result = try self.stageHostedRelationalRowsMutationCandidateSegment(alloc, table_name, topology_epoch, schema_json, schema, req, plan.matched, segment);
-            staged += result.staged;
-            for (result.returning_rows) |row| {
-                try returning_rows.append(alloc, row);
-            }
-            if (result.returning_rows.len > 0) alloc.free(result.returning_rows);
-            result.returning_rows = &.{};
-        }
-
-        return .{
-            .matched = plan.matched,
-            .staged = staged,
-            .returning_rows = try returning_rows.toOwnedSlice(alloc),
-        };
-    }
-
-    fn mutateRowsFromJoinedSource(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema_json = (try loadTableSchemaJson(alloc, self.catalog, table_name)) orelse return null;
-        defer alloc.free(schema_json);
-        if (schema_json.len == 0) return error.InvalidArgument;
-        const source_table_name = joinedMutationSourceEffectiveSourceTable(table_name, req);
-        const different_source_table = !std.mem.eql(u8, source_table_name, table_name);
-        const loaded_source_schema_json = if (different_source_table) (try loadTableSchemaJson(alloc, self.catalog, source_table_name)) orelse return null else null;
-        defer if (loaded_source_schema_json) |value| alloc.free(value);
-        const source_schema_json = loaded_source_schema_json orelse schema_json;
-        const loaded_source_schema = if (different_source_table) try runtimeTableSchemaFromJsonAlloc(alloc, source_schema_json) else null;
-        defer if (loaded_source_schema) |value| storage_schema.freeSchema(alloc, value);
-        const source_schema = loaded_source_schema orelse schema;
-
-        const ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, table_name, "", "");
-        defer freeTableDocKeyRangePlans(alloc, ranges);
-        if (ranges.len == 0) return null;
-        const topology_epoch = ranges[0].topology_epoch;
-        var source_ranges: []table_catalog.TableDocKeyRangePlan = &.{};
-        if (different_source_table) source_ranges = try table_catalog.resolveTableDocKeyRanges(alloc, self.catalog, source_table_name, "", "");
-        defer if (different_source_table) freeTableDocKeyRangePlans(alloc, source_ranges);
-        if (different_source_table and source_ranges.len == 0) return null;
-
-        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        defer {
-            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
-            target_candidates.deinit(alloc);
-        }
-        var source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (source_rows.items) |row| alloc.free(@constCast(row));
-            source_rows.deinit(alloc);
-        }
-        for (ranges) |range| {
-            try self.appendHostedRelationalRowsJoinedMutationInputsForRange(alloc, table_name, schema_json, schema, req, range, &target_candidates, &source_rows);
-        }
-        if (different_source_table) {
-            for (source_ranges) |range| {
-                try self.appendHostedRelationalRowsJoinedMutationSourceRowsForRange(alloc, source_table_name, source_schema_json, source_schema, req, range, &source_rows);
-            }
-        }
-
-        var target_slice = try target_candidates.toOwnedSlice(alloc);
-        target_candidates = .empty;
-        var target_slice_transferred = false;
-        errdefer if (!target_slice_transferred) freeRelationalRowsMutationSourceCandidates(alloc, target_slice);
-        var candidate_slice = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_slice, source_rows.items);
-        target_slice_transferred = true;
-        var candidate_slice_transferred = false;
-        errdefer if (!candidate_slice_transferred) freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidate_slice);
-        var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidate_slice);
-        candidate_slice_transferred = true;
-        defer plan.deinit(alloc);
-
-        var segments = try hostedJoinedMutationSourceCandidateSegmentsAlloc(alloc, plan.candidates);
-        defer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-
-        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (returning_rows.items) |row| alloc.free(@constCast(row));
-            returning_rows.deinit(alloc);
-        }
-        var staged: u32 = 0;
-        for (segments.items) |segment| {
-            var result = try self.stageHostedRelationalRowsJoinedMutationCandidateSegment(alloc, table_name, topology_epoch, schema_json, source_schema_json, schema, source_schema, req, plan.matched, segment);
-            staged += result.staged;
-            for (result.returning_rows) |row| {
-                try returning_rows.append(alloc, row);
-            }
-            if (result.returning_rows.len > 0) alloc.free(result.returning_rows);
-            result.returning_rows = &.{};
-        }
-
-        return .{
-            .matched = plan.matched,
-            .staged = staged,
-            .returning_rows = try returning_rows.toOwnedSlice(alloc),
-        };
-    }
-
-    fn runHostedRowsJoinedMutationSourceGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        if (joinedMutationSourceUsesDifferentSourceTable(table_name, req)) return error.UnsupportedQueryRequest;
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => {},
-                .remote => return error.UnsupportedQueryRequest,
-            }
-        }
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        var result = try cached.db.mutateRelationalRowsJoinedSourceAlloc(alloc, schema, req);
-        errdefer result.deinit(alloc);
-        return result;
-    }
-
-    const HostedJoinedMutationSourceCandidateSegment = struct {
-        group_id: u64,
-        candidates: std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            self.candidates.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    const HostedMutationSourceCandidateSegment = struct {
-        group_id: u64,
-        candidates: std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            self.candidates.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    fn appendHostedRelationalRowsJoinedMutationInputsForRange(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema_json: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        target_out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => return try self.appendHostedRelationalRowsJoinedMutationInputsGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range, target_out, source_rows_out),
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalRowsJoinedMutationSourceGroupInputsRequest{
-                        .schema_json = schema_json,
-                        .topology_epoch = range.topology_epoch,
-                        .req = req,
-                        .doc_key_range = doc_key_range,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsJoinedMutationSourceInputs(remote.base_uri, range.group_id, table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice(RelationalRowsJoinedMutationSourceGroupInputsResult, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    try appendHostedRelationalRowsJoinedMutationInputs(alloc, target_out, source_rows_out, range.group_id, parsed.value);
-                    return;
-                },
-            }
-        }
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.UnknownGroup,
-            else => return err,
-        };
-        return try self.appendHostedRelationalRowsJoinedMutationInputsGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range, target_out, source_rows_out);
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationInputs(
-        alloc: std.mem.Allocator,
-        target_out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-        group_id: u64,
-        inputs: RelationalRowsJoinedMutationSourceGroupInputsResult,
-    ) !void {
-        try target_out.ensureUnusedCapacity(alloc, inputs.target_candidates.len);
-        for (inputs.target_candidates) |candidate| {
-            var cloned = try db_mod.DB.cloneRelationalRowsMutationSourceCandidateAlloc(alloc, candidate);
-            errdefer cloned.deinit(alloc);
-            cloned.group_id = group_id;
-            cloned.ordinal = target_out.items.len;
-            target_out.appendAssumeCapacity(cloned);
-        }
-
-        try source_rows_out.ensureUnusedCapacity(alloc, inputs.source_rows.len);
-        for (inputs.source_rows) |row| {
-            source_rows_out.appendAssumeCapacity(try alloc.dupe(u8, row));
-        }
-    }
-
-    fn appendHostedRelationalRowsInsertSourceRowsForRange(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        source_table_name: []const u8,
-        source_schema_json: []const u8,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => return try self.appendHostedRelationalRowsInsertSourceRowsGroupLocal(alloc, range.group_id, source_table_name, range.topology_epoch, source_schema, req, doc_key_range, source_rows_out),
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const source_req = relationalRowsInsertSourceFullSourceQuery(req, doc_key_range, false);
-                    const body = try std.json.Stringify.valueAlloc(alloc, table_reads.RelationalRowsSourceGroupRequest{
-                        .schema_json = source_schema_json,
-                        .topology_epoch = range.topology_epoch,
-                        .req = source_req,
-                        .doc_key_range = doc_key_range,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsSource(remote.base_uri, range.group_id, source_table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsQueryResult, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    try source_rows_out.ensureUnusedCapacity(alloc, parsed.value.rows.len);
-                    for (parsed.value.rows) |row| {
-                        source_rows_out.appendAssumeCapacity(try alloc.dupe(u8, row));
-                    }
-                    return;
-                },
-            }
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
-        defer alloc.free(path);
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                group.group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req);
-        } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
-            try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
-        }
-        return try self.appendHostedRelationalRowsInsertSourceRowsGroupLocal(alloc, range.group_id, source_table_name, range.topology_epoch, source_schema, req, doc_key_range, source_rows_out);
-    }
-
-    fn appendHostedRelationalRowsInsertSourceRowsGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        source_table_name: []const u8,
-        topology_epoch: u64,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsInsertSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, source_table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, source_table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, group_id, cached.db);
-        const source_req = relationalRowsInsertSourceFullSourceQuery(req, doc_key_range, false);
-        var source_rows = try cached.db.queryRelationalRows(alloc, source_schema, source_req);
-        defer source_rows.deinit(alloc);
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationInputsGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        target_out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        var target_candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate = &.{};
-        var source_rows: db_mod.types.RelationalRowsQueryResult = .{};
-        var have_targets = false;
-        var have_source_rows = false;
-        defer {
-            if (have_targets) freeRelationalRowsMutationSourceCandidates(alloc, target_candidates);
-            if (have_source_rows) source_rows.deinit(alloc);
-        }
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        target_candidates = try cached.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range);
-        have_targets = true;
-        if (!joinedMutationSourceUsesDifferentSourceTable(table_name, req)) {
-            source_rows = try cached.db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, schema, req, doc_key_range);
-            have_source_rows = true;
-        }
-
-        try target_out.ensureUnusedCapacity(alloc, target_candidates.len);
-        for (target_candidates) |*candidate| {
-            candidate.group_id = group_id;
-            candidate.ordinal = target_out.items.len;
-            target_out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 };
-        }
-
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationSourceRowsForRange(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        source_table_name: []const u8,
-        source_schema_json: []const u8,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => return try self.appendHostedRelationalRowsJoinedMutationSourceRowsGroupLocal(alloc, range.group_id, source_table_name, range.topology_epoch, source_schema, req, doc_key_range, source_rows_out),
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const source_req = relationalRowsJoinedMutationSourceOnlyRequest(req, doc_key_range);
-                    const body = try std.json.Stringify.valueAlloc(alloc, table_reads.RelationalRowsSourceGroupRequest{
-                        .schema_json = source_schema_json,
-                        .topology_epoch = range.topology_epoch,
-                        .req = source_req,
-                        .doc_key_range = doc_key_range,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsSource(remote.base_uri, range.group_id, source_table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsQueryResult, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    try source_rows_out.ensureUnusedCapacity(alloc, parsed.value.rows.len);
-                    for (parsed.value.rows) |row| {
-                        source_rows_out.appendAssumeCapacity(try alloc.dupe(u8, row));
-                    }
-                    return;
-                },
-            }
-        }
-        return try self.appendHostedRelationalRowsJoinedMutationSourceRowsGroupLocal(alloc, range.group_id, source_table_name, range.topology_epoch, source_schema, req, doc_key_range, source_rows_out);
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationSourceRowsGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        source_table_name: []const u8,
-        topology_epoch: u64,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-        source_rows_out: *std.ArrayListUnmanaged([]const u8),
-    ) !void {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, source_table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, source_table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, source_table_name, group_id, cached.db);
-        var source_rows = try cached.db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, source_schema, req, doc_key_range);
-        defer source_rows.deinit(alloc);
-        try source_rows_out.ensureUnusedCapacity(alloc, source_rows.rows.len);
-        for (source_rows.rows) |*row| {
-            source_rows_out.appendAssumeCapacity(row.*);
-            row.* = &.{};
-        }
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationCandidatesForRange(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema_json: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate),
-    ) !void {
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => {
-                    const candidates = (try self.runHostedRowsJoinedMutationSourceCollectGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range)) orelse return;
-                    defer freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidates);
-                    try appendHostedRelationalRowsJoinedMutationCandidates(alloc, out, range.group_id, candidates);
-                    return;
-                },
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalRowsJoinedMutationSourceGroupCollectRequest{
-                        .schema_json = schema_json,
-                        .topology_epoch = range.topology_epoch,
-                        .req = req,
-                        .doc_key_range = doc_key_range,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsJoinedMutationSourceCollect(remote.base_uri, range.group_id, table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice([]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    for (parsed.value) |candidate| {
-                        var cloned = try cloneRelationalRowsJoinedMutationSourceCandidateAlloc(alloc, candidate);
-                        errdefer cloned.deinit(alloc);
-                        cloned.target.group_id = range.group_id;
-                        cloned.target.ordinal = out.items.len;
-                        try out.append(alloc, cloned);
-                    }
-                    return;
-                },
-            }
-        }
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.UnknownGroup,
-            else => return err,
-        };
-        const candidates = (try self.runHostedRowsJoinedMutationSourceCollectGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range)) orelse return;
-        defer freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidates);
-        try appendHostedRelationalRowsJoinedMutationCandidates(alloc, out, range.group_id, candidates);
-    }
-
-    fn appendHostedRelationalRowsJoinedMutationCandidates(
-        alloc: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsJoinedMutationSourceCandidate),
-        group_id: u64,
-        candidates: []db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !void {
-        try out.ensureUnusedCapacity(alloc, candidates.len);
-        for (candidates) |*candidate| {
-            candidate.target.group_id = group_id;
-            candidate.target.ordinal = out.items.len;
-            out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{};
-        }
-    }
-
-    fn stageHostedRelationalRowsJoinedMutationCandidateSegment(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        source_schema_json: []const u8,
-        schema: storage_schema.TableSchema,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        matched: u32,
-        segment: HostedJoinedMutationSourceCandidateSegment,
-    ) !db_mod.types.RelationalRowsMutationSourceResult {
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, segment.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => return (try self.runHostedRowsJoinedMutationSourceStageGroupLocal(alloc, segment.group_id, table_name, topology_epoch, schema, source_schema, req, matched, segment.candidates.items)) orelse error.UnknownGroup,
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalRowsJoinedMutationSourceGroupStageRequest{
-                        .schema_json = schema_json,
-                        .source_schema_json = source_schema_json,
-                        .topology_epoch = topology_epoch,
-                        .req = req,
-                        .matched = matched,
-                        .candidates = segment.candidates.items,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsJoinedMutationSourceStage(remote.base_uri, segment.group_id, table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsMutationSourceResult, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    return try cloneRelationalRowsMutationSourceResultAlloc(alloc, parsed.value);
-                },
-            }
-        }
-        return (try self.runHostedRowsJoinedMutationSourceStageGroupLocal(alloc, segment.group_id, table_name, topology_epoch, schema, source_schema, req, matched, segment.candidates.items)) orelse error.UnknownGroup;
-    }
-
-    fn appendHostedRelationalRowsMutationCandidatesForRange(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        schema_json: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        range: table_catalog.TableDocKeyRangePlan,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-    ) !void {
-        const doc_key_range = db_mod.types.RelationalRowsDocKeyRange{ .start = range.start_key, .end = range.end_key };
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => {
-                    const candidates = (try self.runHostedRowsMutationSourceCollectGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range)) orelse return;
-                    defer freeRelationalRowsMutationSourceCandidates(alloc, candidates);
-                    try appendHostedRelationalRowsMutationCandidates(alloc, out, range.group_id, candidates);
-                    return;
-                },
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalRowsMutationSourceGroupCollectRequest{
-                        .schema_json = schema_json,
-                        .topology_epoch = range.topology_epoch,
-                        .req = req,
-                        .doc_key_range = doc_key_range,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsMutationSourceCollect(remote.base_uri, range.group_id, table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice([]db_mod.DB.RelationalRowsMutationSourceCandidate, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    for (parsed.value) |candidate| {
-                        var cloned = try db_mod.DB.cloneRelationalRowsMutationSourceCandidateAlloc(alloc, candidate);
-                        errdefer cloned.deinit(alloc);
-                        cloned.group_id = range.group_id;
-                        cloned.ordinal = out.items.len;
-                        try out.append(alloc, cloned);
-                    }
-                    return;
-                },
-            }
-        }
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, range.group_id);
-        defer alloc.free(path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return error.UnknownGroup,
-            else => return err,
-        };
-        const candidates = (try self.runHostedRowsMutationSourceCollectGroupLocal(alloc, range.group_id, table_name, range.topology_epoch, schema, req, doc_key_range)) orelse return;
-        defer freeRelationalRowsMutationSourceCandidates(alloc, candidates);
-        try appendHostedRelationalRowsMutationCandidates(alloc, out, range.group_id, candidates);
-    }
-
-    fn appendHostedRelationalRowsMutationCandidates(
-        alloc: std.mem.Allocator,
-        out: *std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate),
-        group_id: u64,
-        candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !void {
-        try out.ensureUnusedCapacity(alloc, candidates.len);
-        for (candidates) |*candidate| {
-            candidate.group_id = group_id;
-            candidate.ordinal = out.items.len;
-            out.appendAssumeCapacity(candidate.*);
-            candidate.* = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 };
-        }
-    }
-
-    fn stageHostedRelationalRowsMutationCandidateSegment(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        matched: u32,
-        segment: HostedMutationSourceCandidateSegment,
-    ) !db_mod.types.RelationalRowsMutationSourceResult {
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, segment.group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            switch (route.*) {
-                .local => return (try self.runHostedRowsMutationSourceStageGroupLocal(alloc, segment.group_id, table_name, topology_epoch, schema, req, matched, segment.candidates.items)) orelse error.UnknownGroup,
-                .remote => |remote| {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    const body = try std.json.Stringify.valueAlloc(alloc, RelationalRowsMutationSourceGroupStageRequest{
-                        .schema_json = schema_json,
-                        .topology_epoch = topology_epoch,
-                        .req = req,
-                        .matched = matched,
-                        .candidates = segment.candidates.items,
-                    }, .{});
-                    defer alloc.free(body);
-                    var response = try client.fetchGroupRowsMutationSourceStage(remote.base_uri, segment.group_id, table_name, body);
-                    defer response.deinit(alloc);
-                    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsMutationSourceResult, alloc, response.body, .{
-                        .allocate = .alloc_always,
-                        .ignore_unknown_fields = true,
-                    });
-                    defer parsed.deinit();
-                    return try cloneRelationalRowsMutationSourceResultAlloc(alloc, parsed.value);
-                },
-            }
-        }
-        return (try self.runHostedRowsMutationSourceStageGroupLocal(alloc, segment.group_id, table_name, topology_epoch, schema, req, matched, segment.candidates.items)) orelse error.UnknownGroup;
-    }
-
-    fn hostedMutationSourceCandidateSegmentsAlloc(
-        alloc: std.mem.Allocator,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !std.ArrayListUnmanaged(HostedMutationSourceCandidateSegment) {
-        var segments = std.ArrayListUnmanaged(HostedMutationSourceCandidateSegment).empty;
-        errdefer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-        for (candidates) |candidate| {
-            if (segments.items.len == 0 or segments.items[segments.items.len - 1].group_id != candidate.group_id) {
-                try segments.append(alloc, .{ .group_id = candidate.group_id });
-            }
-            try segments.items[segments.items.len - 1].candidates.append(alloc, candidate);
-        }
-        return segments;
-    }
-
-    fn hostedJoinedMutationSourceCandidateSegmentsAlloc(
-        alloc: std.mem.Allocator,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !std.ArrayListUnmanaged(HostedJoinedMutationSourceCandidateSegment) {
-        var segments = std.ArrayListUnmanaged(HostedJoinedMutationSourceCandidateSegment).empty;
-        errdefer {
-            for (segments.items) |*segment| segment.deinit(alloc);
-            segments.deinit(alloc);
-        }
-        for (candidates) |candidate| {
-            if (segments.items.len == 0 or segments.items[segments.items.len - 1].group_id != candidate.target.group_id) {
-                try segments.append(alloc, .{ .group_id = candidate.target.group_id });
-            }
-            try segments.items[segments.items.len - 1].candidates.append(alloc, candidate);
-        }
-        return segments;
-        plan: backups_api.TableRestorePlan,
-    ) !?void {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
-
-        const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
-        defer alloc.free(local_location);
-
-        self.beginLocalRestoreMutation(table_name);
-        errdefer self.abortLocalRestoreMutation(table_name);
-        var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer restore_io_impl.deinit();
-
-        for (plan.manifest.shards) |shard| {
-            const group_id = shard.group_id;
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-
-            const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-            while (true) {
-                if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
-                if (platform_time.monotonicNs() >= ready_deadline_ns) break;
-                sleepNs(50 * std.time.ns_per_ms);
-            }
-
-            runTestBeforeRestoreWorkHook();
-            backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
-                .backup_id = plan.manifest.backup_id,
-                .location = local_location,
-                .snapshot_path = shard.snapshot_path,
-            }, .{
-                .expected_table_name = table_name,
-                .expected_identity_namespace = identity_namespace,
-            }) catch |err| {
-                switch (err) {
-                    error.IdentityNamespaceMismatch => std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        shard.snapshot_path,
-                        err,
-                    }),
-                    else => std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
-                        table_name,
-                        group_id,
-                        path,
-                        shard.snapshot_path,
-                        err,
-                    }),
-                }
-                return err;
-            };
-            self.requestRestoreRepairCatchUp(table_name, group_id);
-        }
-
-        self.finishLocalRestoreMutation(table_name);
-        self.notifyLocalChange(table_name, .structural);
-        self.notifyLocalChange(table_name, .data);
-    }
-
     fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -17942,58 +14332,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: backups_api.TableRestorePlan,
     ) !?void {
         return error.UnsupportedOperation;
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const apply_req = req;
-        self.beginGroupOperation(table_name, group_id);
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-        defer {
-            self.endGroupOperation(table_name, group_id);
-        }
-        errdefer {
-            lockAtomic(&self.local_db_mutex);
-            defer self.local_db_mutex.unlock();
-            self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
-        }
-        if (self.write_cache) |cache| {
-            var cached = try self.getOrOpenCachedDbMode(
-                alloc,
-                cache,
-                path,
-                group_id,
-                table_name,
-                .default_async,
-                null,
-                null,
-            );
-            defer cached.deinit(alloc);
-            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try cached.db.batchReplicatedApply(apply_req);
-            {
-                lockAtomic(&self.local_db_mutex);
-                defer self.local_db_mutex.unlock();
-                self.markWriteCacheDirty(table_name);
-            }
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
-        } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try db.batchReplicatedApply(apply_req);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            lockAtomic(&self.local_db_mutex);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
-        }
     }
 
     fn batchGroupLocal(
@@ -19288,429 +15626,6 @@ pub const HostedProvisionedTableWriteSource = struct {
             try appendForeignKeyActionScheduleStatuses(alloc, &schedules, progress.schedules);
         }
         return .{ .schedules = try schedules.toOwnedSlice(alloc) };
-
-    fn reprocessDocumentArtifact(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-    ) !?bool {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
-    }
-
-    fn reprocessDocumentArtifactRange(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        var result = db_mod.types.DocumentArtifactTableReprocessResult{};
-        errdefer result.deinit(alloc);
-        var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
-        var shard_cursors = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor).empty;
-        errdefer {
-            for (failures.items) |*failure| failure.deinit(alloc);
-            failures.deinit(alloc);
-            for (shard_cursors.items) |*cursor| cursor.deinit(alloc);
-            shard_cursors.deinit(alloc);
-        }
-
-        var handled_any = false;
-        if (req.shard_cursors.len > 0) {
-            for (req.shard_cursors) |cursor| {
-                const group_id = cursor.group_id orelse return error.InvalidArgument;
-                const group_req = documentArtifactReprocessRequestForCursor(req, cursor);
-                var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue;
-                defer group_result.deinit(alloc);
-                handled_any = true;
-                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
-            }
-        } else {
-            const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-                alloc,
-                self.catalog,
-                table_name,
-                req.from_key,
-                req.to_key,
-                5 * std.time.ns_per_s,
-                10,
-            );
-            defer alloc.free(group_ids);
-            if (group_ids.len == 0) return null;
-
-            for (group_ids) |group_id| {
-                var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
-                defer group_result.deinit(alloc);
-                handled_any = true;
-                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
-            }
-        }
-        if (!handled_any) return null;
-        result.failures = try failures.toOwnedSlice(alloc);
-        result.shard_cursors = try shard_cursors.toOwnedSlice(alloc);
-        return result;
-    }
-
-    fn updateDocumentArtifactChildRangePlacement(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-    ) !?bool {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
-    }
-
-    fn applyDocumentArtifactChildRangeBatch(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
-    }
-
-    fn reprocessDocumentArtifactGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-    ) !?bool {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const handled = if (self.write_cache) |cache| blk: {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
-            defer cached.deinit(alloc);
-            break :blk try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
-        } else blk: {
-            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
-            defer if (indexes_json) |value| alloc.free(value);
-            var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-                    alloc,
-                    path,
-                    value,
-                    null,
-                    null,
-                    self.visibleRootGeneration(group_id),
-                    null,
-                    .default,
-                    self.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    self.remote_content,
-                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
-                )
-            else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            break :blk result;
-        };
-        if (handled) {
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
-        }
-        return handled;
-    }
-
-    fn updateDocumentArtifactChildRangePlacementGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-    ) !?bool {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const handled = if (self.write_cache) |cache| blk: {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
-            defer cached.deinit(alloc);
-            break :blk try cached.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
-        } else blk: {
-            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
-            defer if (indexes_json) |value| alloc.free(value);
-            var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-                    alloc,
-                    path,
-                    value,
-                    null,
-                    null,
-                    self.visibleRootGeneration(group_id),
-                    null,
-                    .default,
-                    self.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    self.remote_content,
-                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
-                )
-            else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const result = try db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            break :blk result;
-        };
-        if (handled) {
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
-        }
-        return handled;
-    }
-
-    fn applyDocumentArtifactChildRangeBatchGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        _: []const u8,
-        _: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const sequence = if (self.write_cache) |cache| blk: {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
-            defer cached.deinit(alloc);
-            break :blk try cached.db.applyDocumentArtifactChildRangeBatch(child_batch);
-        } else blk: {
-            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
-            defer if (indexes_json) |value| alloc.free(value);
-            var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-                    alloc,
-                    path,
-                    value,
-                    null,
-                    null,
-                    self.visibleRootGeneration(group_id),
-                    null,
-                    .default_async,
-                    self.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    self.remote_content,
-                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
-                )
-            else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const result = try db.applyDocumentArtifactChildRangeBatch(child_batch);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            break :blk result;
-        };
-        if (sequence > 0) {
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
-        }
-        return sequence;
-    }
-
-    fn reprocessDocumentArtifactRangeGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.beginTableRequest(table_name);
-        defer self.endTableRequest(table_name);
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-
-        lockAtomic(&self.local_db_mutex);
-        self.invalidateReadCache(table_name);
-        self.markWriteCacheDirty(table_name);
-        self.local_db_mutex.unlock();
-
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        var result = if (self.write_cache) |cache| blk: {
-            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
-            defer cached.deinit(alloc);
-            break :blk try cached.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
-        } else blk: {
-            const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
-            defer if (indexes_json) |value| alloc.free(value);
-            var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-                    alloc,
-                    path,
-                    value,
-                    null,
-                    null,
-                    self.visibleRootGeneration(group_id),
-                    null,
-                    .default,
-                    self.backend_runtime,
-                    self.antfly_provider,
-                    self.secret_store,
-                    self.remote_content,
-                    try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
-                )
-            else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
-            defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const range_result = try db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
-            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
-            break :blk range_result;
-        };
-        errdefer result.deinit(alloc);
-        if (result.reprocessed > 0 or result.failed > 0) {
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
-        }
-        return result;
-    }
-};
-
-pub const HostedProvisionedTableWriteSource = struct {
-    replica_root_dir: []const u8,
-    catalog: table_catalog.CatalogSource,
-    router: table_router.HostedGroupRouter,
-    executor: http_common.RequestExecutor,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
-    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
-    secret_store: ?*common_secrets.FileStore = null,
-    remote_content: ?*const scraping.RemoteContentConfig = null,
-    foreground_derived_progress: bool = false,
-
-    pub fn init(
-        replica_root_dir: []const u8,
-        catalog: table_catalog.CatalogSource,
-        router: table_router.HostedGroupRouter,
-        executor: http_common.RequestExecutor,
-    ) HostedProvisionedTableWriteSource {
-        return .{
-            .replica_root_dir = replica_root_dir,
-            .catalog = catalog,
-            .router = router,
-            .executor = executor,
-        };
-    }
-
-    pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
-        self.backend_runtime = backend_runtime;
-        return self;
-    }
-
-    pub fn withGroupVisibleRootGeneration(
-        self: *HostedProvisionedTableWriteSource,
-        generation_source: ?table_reads.GroupVisibleRootGenerationSource,
-    ) *HostedProvisionedTableWriteSource {
-        self.group_visible_root_generation = generation_source;
-        return self;
-    }
-
-    pub fn withSecretStore(
-        self: *HostedProvisionedTableWriteSource,
-        secret_store: ?*common_secrets.FileStore,
-    ) *HostedProvisionedTableWriteSource {
-        self.secret_store = secret_store;
-        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
-            cache.write_cache.secret_store = secret_store;
-        }
-        return self;
-    }
-
-    pub fn withRemoteContent(
-        self: *HostedProvisionedTableWriteSource,
-        remote_content: ?*const scraping.RemoteContentConfig,
-    ) *HostedProvisionedTableWriteSource {
-        self.remote_content = remote_content;
-        if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
-            cache.write_cache.remote_content = remote_content;
-        }
-        return self;
-    }
-
-    pub fn withForegroundDerivedProgress(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
-        self.foreground_derived_progress = true;
-        return self;
-    }
-
-    fn shouldDrainAfterBatch(self: *const HostedProvisionedTableWriteSource, sync_level: db_mod.types.SyncLevel) bool {
-        return self.foreground_derived_progress or shouldDrainCachedManagedDbAfterBatch(sync_level);
-    }
-
-    fn visibleRootGeneration(self: *const HostedProvisionedTableWriteSource, group_id: u64) u64 {
-        return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
-    }
-
-    fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
-        const hosted_cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
-        lockAtomic(&hosted_cache.mutex);
-        defer hosted_cache.mutex.unlock();
-        hosted_cache.write_cache.invalidateTable(table_name);
     }
 
     fn foreignKeyActionScheduleGroupLocalProgress(
@@ -19860,47 +15775,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try self.requeueHostedForeignKeyActionScheduleGroupLocal(alloc, group_id, table_name, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
-        var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
-            try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
-                cache.write_cache.alloc,
-                path,
-                value,
-                cache.write_cache.lsm_cache,
-                cache.write_cache.hbc_cache,
-                lsm_root_generation,
-                cache.write_cache.resource_manager,
-                mode,
-                cache.write_cache.backend_runtime,
-                cache.write_cache.antfly_provider,
-                cache.write_cache.secret_store,
-                cache.write_cache.remote_content,
-                identity_namespace,
-                .{ .drain_resolver_backfill = false },
-            )
-        else
-            try db_mod.DB.open(cache.write_cache.alloc, path, .{
-                .lsm_cache = cache.write_cache.lsm_cache,
-                .hbc_cache = cache.write_cache.hbc_cache,
-                .lsm_root_generation = lsm_root_generation,
-                .resource_manager = cache.write_cache.resource_manager,
-                .backend_runtime = cache.write_cache.backend_runtime,
-                .identity_namespace = identity_namespace,
-                .prefer_existing_identity_namespace = identity_namespace != null,
-                .open_mode = switch (mode) {
-                    .default => .writer,
-                    .default_async, .writer_no_replay => .writer_no_replay,
-                    .startup_catch_up, .restore_repair => .writer_no_replay,
-                    .query_readonly => .query_readonly,
-                    .status_only => .status_only,
-                },
-                .start_index_workers = if (mode == .startup_catch_up or mode == .query_readonly) false else true,
-                .start_optional_runtimes = mode != .startup_catch_up and mode != .query_readonly,
-                .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-            });
-        defer if (opened) |*db| db.close();
-        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &opened.?);
 
     fn runHostedForeignKeyActionJobGroupLocalProgress(
         self: *HostedProvisionedTableWriteSource,
@@ -20058,33 +15932,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         ) catch |err| switch (err) {
             error.ForeignKeyActionScheduleNotFound => return null,
             else => return err,
-    pub fn source(self: *HostedProvisionedTableWriteSource) TableWriteSource {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .create_index = createIndex,
-                .drop_index = dropIndex,
-                .commit_transaction = commitTransaction,
-                .commit_transaction_with_id = commitTransactionWithId,
-                .backup_table = backupTable,
-                .restore_table = restoreTable,
-                .batch = batch,
-                .batch_group_local = batchGroupLocal,
-                .txn_begin_group_local = txnBeginGroupLocal,
-                .txn_prepare_group_local = txnPrepareGroupLocal,
-                .txn_resolve_group_local = txnResolveGroupLocal,
-                .txn_status_group_local = txnStatusGroupLocal,
-                .corrupt_embedding_artifact = corruptEmbeddingArtifact,
-                .reprocess_document_artifact = reprocessDocumentArtifact,
-                .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
-                .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
-                .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
-                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
-                .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
-                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
-                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
-                .local_runtime_statuses = localRuntimeStatuses,
-            },
         };
         defer cached.db.freeForeignKeyActionScheduleRecord(record);
         var status = try foreignKeyActionScheduleStatusFromDbRecord(alloc, group_id, record);
@@ -20374,81 +16221,6 @@ pub const HostedProvisionedTableWriteSource = struct {
             final_progress.deinit(alloc);
             for (final_claims.items) |*claim| claim.deinit(alloc);
             final_claims.deinit(alloc);
-        for (grouped.items) |group| {
-            var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group.group_id, .prefer_leader);
-            if (resolved_route) |*route| {
-                defer route.deinit(alloc);
-
-                switch (route.*) {
-                    .local => {
-                        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
-                        defer alloc.free(path);
-                        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-                        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
-                        defer cached.deinit(hosted_cache.write_cache.alloc);
-                        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-                        var dispatch_ctx = DocumentChildRangeDispatchContext{
-                            .source = self.source(),
-                            .table_name = table_name,
-                        };
-                        try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
-                            .writes = group.writes.items,
-                            .deletes = group.deletes.items,
-                            .transforms = group.transforms.items,
-                            .graph_writes = req.graph_writes,
-                            .graph_deletes = req.graph_deletes,
-                            .predicates = req.predicates,
-                            .timestamp_ns = req.timestamp_ns,
-                            .sync_level = req.sync_level,
-                        }, dispatch_ctx.dispatcher());
-                        if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
-                    },
-                    .remote => |remote| {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                        const body = try encodeRemoteBatchRequest(alloc, .{
-                            .writes = group.writes.items,
-                            .deletes = group.deletes.items,
-                            .transforms = group.transforms.items,
-                            .graph_writes = req.graph_writes,
-                            .graph_deletes = req.graph_deletes,
-                            .predicates = req.predicates,
-                            .timestamp_ns = req.timestamp_ns,
-                            .sync_level = req.sync_level,
-                        });
-                        defer alloc.free(body);
-                        var response = try client.fetchGroupBatch(remote.base_uri, group.group_id, table_name, body);
-                        response.deinit(alloc);
-                    },
-                }
-            } else {
-                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
-                defer alloc.free(path);
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-                defer io_impl.deinit();
-                std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-                    error.FileNotFound => return null,
-                    else => return err,
-                };
-                const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-                var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
-                defer cached.deinit(hosted_cache.write_cache.alloc);
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, group.writes.items, group.deletes.items, group.transforms.items);
-                var dispatch_ctx = DocumentChildRangeDispatchContext{
-                    .source = self.source(),
-                    .table_name = table_name,
-                };
-                try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
-                    .writes = group.writes.items,
-                    .deletes = group.deletes.items,
-                    .transforms = group.transforms.items,
-                    .graph_writes = req.graph_writes,
-                    .graph_deletes = req.graph_deletes,
-                    .predicates = req.predicates,
-                    .timestamp_ns = req.timestamp_ns,
-                    .sync_level = req.sync_level,
-                }, dispatch_ctx.dispatcher());
-                if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
-            }
         }
         try collectHostedForeignKeyIntegrityStatusSnapshot(self, alloc, table_name, planned_units, &final_progress, &final_claims);
         const work_statuses = try buildForeignKeyIntegrityWorkStatuses(alloc, planned_units, final_progress.items, final_claims.items, .pending);
@@ -20597,216 +16369,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 
-    fn collectRowsMutationSourceCandidatesGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsMutationSourceCandidate {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        return try self.runHostedRowsMutationSourceCollectGroupLocal(alloc, group_id, table_name, topology_epoch, schema, req, doc_key_range);
-    }
-
-    fn stageRowsMutationSourceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        return try self.runHostedRowsMutationSourceStageGroupLocal(alloc, group_id, table_name, topology_epoch, schema, req, matched, candidates);
-    }
-
-    fn collectRowsJoinedMutationSourceCandidatesGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (joinedMutationSourceUsesDifferentSourceTable(table_name, req)) return error.UnsupportedQueryRequest;
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        return try self.runHostedRowsJoinedMutationSourceCollectGroupLocal(alloc, group_id, table_name, topology_epoch, schema, req, doc_key_range);
-    }
-
-    fn collectRowsJoinedMutationSourceInputsGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?RelationalRowsJoinedMutationSourceGroupInputsResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-
-        var target_candidates = std.ArrayListUnmanaged(db_mod.DB.RelationalRowsMutationSourceCandidate).empty;
-        errdefer {
-            for (target_candidates.items) |*candidate| candidate.deinit(alloc);
-            target_candidates.deinit(alloc);
-        }
-        var source_rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (source_rows.items) |row| alloc.free(@constCast(row));
-            source_rows.deinit(alloc);
-        }
-        try self.appendHostedRelationalRowsJoinedMutationInputsGroupLocal(
-            alloc,
-            group_id,
-            table_name,
-            topology_epoch,
-            schema,
-            req,
-            doc_key_range,
-            &target_candidates,
-            &source_rows,
-        );
-        const owned_targets = try target_candidates.toOwnedSlice(alloc);
-        var targets_transferred = false;
-        errdefer if (!targets_transferred) freeRelationalRowsMutationSourceCandidates(alloc, owned_targets);
-        const owned_source_rows = try source_rows.toOwnedSlice(alloc);
-        targets_transferred = true;
-        return .{
-            .target_candidates = owned_targets,
-            .source_rows = owned_source_rows,
-        };
-    }
-
-    fn stageRowsJoinedMutationSourceGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema_json: []const u8,
-        source_schema_json: []const u8,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const schema = try runtimeTableSchemaFromJsonAlloc(alloc, schema_json);
-        defer storage_schema.freeSchema(alloc, schema);
-        const effective_source_schema_json = if (source_schema_json.len > 0) source_schema_json else schema_json;
-        const source_schema = try runtimeTableSchemaFromJsonAlloc(alloc, effective_source_schema_json);
-        defer storage_schema.freeSchema(alloc, source_schema);
-        return try self.runHostedRowsJoinedMutationSourceStageGroupLocal(alloc, group_id, table_name, topology_epoch, schema, source_schema, req, matched, candidates);
-    }
-
-    fn runHostedRowsMutationSourceCollectGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsMutationSourceCandidate {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        const candidates = try cached.db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, doc_key_range);
-        errdefer freeRelationalRowsMutationSourceCandidates(alloc, candidates);
-        for (candidates) |*candidate| candidate.group_id = group_id;
-        return candidates;
-    }
-
-    fn runHostedRowsMutationSourceStageGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        var result = try cached.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, matched, candidates);
-        errdefer result.deinit(alloc);
-        return result;
-    }
-
-    fn runHostedRowsJoinedMutationSourceCollectGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
-    ) !?[]db_mod.DB.RelationalRowsJoinedMutationSourceCandidate {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        const candidates = try cached.db.collectRelationalRowsJoinedMutationSourceCandidatesForTargetRangeAlloc(alloc, schema, req, doc_key_range);
-        errdefer freeRelationalRowsJoinedMutationSourceCandidates(alloc, candidates);
-        for (candidates) |*candidate| candidate.target.group_id = group_id;
-        return candidates;
-    }
-
-    fn runHostedRowsJoinedMutationSourceStageGroupLocal(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        topology_epoch: u64,
-        schema: storage_schema.TableSchema,
-        source_schema: storage_schema.TableSchema,
-        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-        matched: u32,
-        candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-    ) !?db_mod.types.RelationalRowsMutationSourceResult {
-        try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-        var result = try cached.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, schema, source_schema, req, matched, candidates);
-        errdefer result.deinit(alloc);
-        return result;
-    }
-
     fn corruptEmbeddingArtifact(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -20837,275 +16399,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         return error.NotFound;
-    }
-
-    fn reprocessDocumentArtifact(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-    ) !?bool {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            return switch (route.*) {
-                .local => try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name),
-                .remote => |remote| blk: {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    var response = client.fetchGroupDocumentArtifactReprocess(remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
-                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
-                        else => return err,
-                    };
-                    defer response.deinit(alloc);
-                    break :blk true;
-                },
-            };
-        }
-        return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
-    }
-
-    fn reprocessDocumentArtifactRange(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        var result = db_mod.types.DocumentArtifactTableReprocessResult{};
-        errdefer result.deinit(alloc);
-        var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
-        var shard_cursors = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor).empty;
-        errdefer {
-            for (failures.items) |*failure| failure.deinit(alloc);
-            failures.deinit(alloc);
-            for (shard_cursors.items) |*cursor| cursor.deinit(alloc);
-            shard_cursors.deinit(alloc);
-        }
-
-        var handled_any = false;
-        const group_ids = if (req.shard_cursors.len > 0) blk: {
-            const ids = try alloc.alloc(u64, req.shard_cursors.len);
-            errdefer alloc.free(ids);
-            for (req.shard_cursors, ids) |cursor, *id| id.* = cursor.group_id orelse return error.InvalidArgument;
-            break :blk ids;
-        } else blk: {
-            break :blk try table_catalog.resolveGroupsForSpanEventually(
-                alloc,
-                self.catalog,
-                table_name,
-                req.from_key,
-                req.to_key,
-                5 * std.time.ns_per_s,
-                10,
-            );
-        };
-        defer alloc.free(group_ids);
-        if (group_ids.len == 0) return null;
-
-        for (group_ids, 0..) |group_id, i| {
-            const group_req = if (req.shard_cursors.len > 0)
-                documentArtifactReprocessRequestForCursor(req, req.shard_cursors[i])
-            else
-                req;
-            const body = try std.json.Stringify.valueAlloc(alloc, .{
-                .from_key = group_req.from_key,
-                .to_key = group_req.to_key,
-                .limit = group_req.limit,
-            }, .{});
-            defer alloc.free(body);
-
-            var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-            if (resolved_route) |*route| {
-                defer route.deinit(alloc);
-                var group_result = switch (route.*) {
-                    .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue,
-                    .remote => |remote| blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                        var response = client.fetchGroupDocumentArtifactRangeReprocess(remote.base_uri, group_id, table_name, artifact_name, body) catch |err| switch (err) {
-                            error.NotFound, error.UnexpectedHttpStatus => continue,
-                            else => return err,
-                        };
-                        defer response.deinit(alloc);
-                        break :blk try parseDocumentArtifactTableReprocessResultAlloc(alloc, response.body);
-                    },
-                };
-                defer group_result.deinit(alloc);
-                handled_any = true;
-                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
-                continue;
-            }
-            var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue;
-            defer group_result.deinit(alloc);
-            handled_any = true;
-            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
-        }
-        if (!handled_any) return null;
-        result.failures = try failures.toOwnedSlice(alloc);
-        result.shard_cursors = try shard_cursors.toOwnedSlice(alloc);
-        return result;
-    }
-
-    fn updateDocumentArtifactChildRangePlacement(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-    ) !?bool {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            return switch (route.*) {
-                .local => try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update),
-                .remote => |remote| blk: {
-                    const body = try std.json.Stringify.valueAlloc(alloc, update, .{ .emit_null_optional_fields = false });
-                    defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    var response = client.fetchGroupDocumentArtifactChildRangePlacementUpdate(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
-                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
-                        else => return err,
-                    };
-                    defer response.deinit(alloc);
-                    break :blk true;
-                },
-            };
-        }
-        return try updateDocumentArtifactChildRangePlacementGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, update);
-    }
-
-    fn applyDocumentArtifactChildRangeBatch(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        if (resolved_route) |*route| {
-            defer route.deinit(alloc);
-            return switch (route.*) {
-                .local => try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch),
-                .remote => |remote| blk: {
-                    const body = try encodeRemoteDocumentArtifactChildRangeApplyBatch(alloc, child_batch);
-                    defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
-                    var response = client.fetchGroupDocumentArtifactChildRangeBatchApply(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
-                        error.NotFound, error.UnexpectedHttpStatus => break :blk null,
-                        else => return err,
-                    };
-                    defer response.deinit(alloc);
-                    var parsed = std.json.parseFromSlice(struct { sequence: u64 = 0 }, alloc, response.body, .{}) catch break :blk null;
-                    defer parsed.deinit();
-                    break :blk parsed.value.sequence;
-                },
-            };
-        }
-        return try applyDocumentArtifactChildRangeBatchGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, child_batch);
-    }
-
-    fn reprocessDocumentArtifactGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-    ) !?bool {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        const handled = try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
-        if (handled) {
-            try drainManagedDbBeforeClose(cached.db);
-            self.invalidateManagedCache(table_name);
-        }
-        return handled;
-    }
-
-    fn updateDocumentArtifactChildRangePlacementGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        doc_key: []const u8,
-        artifact_name: []const u8,
-        update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
-    ) !?bool {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        const handled = try cached.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
-        if (handled) {
-            try drainManagedDbBeforeClose(cached.db);
-            self.invalidateManagedCache(table_name);
-        }
-        return handled;
-    }
-
-    fn applyDocumentArtifactChildRangeBatchGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        _: []const u8,
-        _: []const u8,
-        child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-    ) !?u64 {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        const sequence = try cached.db.applyDocumentArtifactChildRangeBatch(child_batch);
-        if (sequence > 0) {
-            if (self.shouldDrainAfterBatch(child_batch.sync_level)) try drainManagedDbBeforeClose(cached.db);
-            self.invalidateManagedCache(table_name);
-        }
-        return sequence;
-    }
-
-    fn reprocessDocumentArtifactRangeGroupLocal(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        group_id: u64,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        req: db_mod.types.DocumentArtifactTableReprocessRequest,
-    ) !?db_mod.types.DocumentArtifactTableReprocessResult {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        self.invalidateManagedCache(table_name);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        var result = try cached.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
-        errdefer result.deinit(alloc);
-        if (result.reprocessed > 0 or result.failed > 0) {
-            try drainManagedDbBeforeClose(cached.db);
-            self.invalidateManagedCache(table_name);
-        }
-        return result;
     }
 };
 
@@ -21835,11 +17128,7 @@ fn catchUpManagedIndexCreate(
 ) !void {
     if (try db.core.indexRequiresEnrichmentReplay(index_name)) {
         if (db.enrichment_runtime != null) {
-            const scheduled = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
-            if (scheduled > 0) {
-                try db.core.index_manager.syncAll(false);
-                return;
-            }
+            _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
         } else {
             _ = try seedManagedIndexReplayFromStoredDocsIfNeeded(alloc, db, index_name);
         }
@@ -21952,17 +17241,6 @@ fn snapshotLocalTableRuntimeStatusesUncached(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     table_name: []const u8,
 ) !?runtime_status.LocalTableRuntimeStatuses {
-    return try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, catalog, replica_root_dir, backend_runtime, table_name, .status_only);
-}
-
-fn snapshotLocalTableRuntimeStatusesUncachedMode(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    replica_root_dir: []const u8,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    mode: ManagedDbOpenMode,
-) !?runtime_status.LocalTableRuntimeStatuses {
     const group_ids = try table_catalog.resolveGroupsForSpanEventually(
         alloc,
         catalog,
@@ -21986,7 +17264,7 @@ fn snapshotLocalTableRuntimeStatusesUncachedMode(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForStatusWithCacheMode(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, mode);
+        var db = try openManagedDbForStatusWithCache(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
         errdefer db.close();
         items[initialized] = .{
             .group_id = group_id,
@@ -22019,22 +17297,6 @@ fn openManagedDbForStatusWithCache(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForStatusWithCacheMode(alloc, path, catalog, table_name, group_id, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime, .status_only);
-}
-
-fn openManagedDbForStatusWithCacheMode(
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    group_id: u64,
-    lsm_cache: ?*lsm_backend.Cache,
-    hbc_cache: ?*hbc_mod.Cache,
-    lsm_root_generation: u64,
-    resource_manager: ?*resource_manager_mod.ResourceManager,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    mode: ManagedDbOpenMode,
-) !db_mod.DB {
     const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
         var db = try db_mod.DB.open(alloc, path, .{
@@ -22043,10 +17305,7 @@ fn openManagedDbForStatusWithCacheMode(
             .lsm_root_generation = lsm_root_generation,
             .resource_manager = resource_manager,
             .backend_runtime = backend_runtime,
-            .open_mode = switch (mode) {
-                .query_readonly => .query_readonly,
-                else => .status_only,
-            },
+            .open_mode = .status_only,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
             .transaction_recovery = .{ .enabled = false },
@@ -22068,7 +17327,7 @@ fn openManagedDbForStatusWithCacheMode(
         hbc_cache,
         lsm_root_generation,
         resource_manager,
-        mode,
+        .status_only,
         backend_runtime,
         identity_namespace,
     );
@@ -22124,7 +17383,6 @@ const ManagedDbOpenMode = enum {
     writer_no_replay,
     startup_catch_up,
     restore_repair,
-    query_readonly,
     status_only,
 };
 
@@ -22458,7 +17716,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
                         .open_mode = .writer_no_replay,
-                        .start_index_workers = false,
+                        .start_index_workers = true,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
@@ -22475,42 +17733,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .open_mode = .writer_no_replay,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    }),
-                .query_readonly => if (enrichment_cfg != null)
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .enrichment = enrichment_cfg,
-                        .open_mode = .query_readonly,
-                        .start_index_workers = false,
-                        .ttl_cleanup = .{ .enabled = false },
-                        .transaction_recovery = .{ .enabled = false },
-                        .text_merge = .{ .enabled = false },
-                    })
-                else
-                    try db_mod.DB.open(allocator, db_path, .{
-                        .lsm_cache = cache,
-                        .hbc_cache = vector_cache,
-                        .lsm_root_generation = root_generation,
-                        .resource_manager = manager,
-                        .backend_runtime = runtime,
-                        .secret_store = store,
-                        .remote_content = remote,
-                        .identity_namespace = namespace,
-                        .prefer_existing_identity_namespace = namespace != null,
-                        .open_mode = .query_readonly,
-                        .start_index_workers = false,
+                        .start_index_workers = true,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
@@ -22566,7 +17789,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     errdefer if (db_open) db.close();
 
     try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
-    if (mode == .status_only or mode == .query_readonly) return db;
+    if (mode == .status_only) return db;
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = options.drain_resolver_backfill,
@@ -22700,7 +17923,7 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
+    return producer_cfg.type != .copy;
 }
 
 test "provisioning detects model backed graph shorthand assets inside config_json strings" {
@@ -22775,24 +17998,6 @@ fn publishRuntimeStatusSnapshotConsistent(
     );
 }
 
-fn publishRuntimeStatusSnapshotConsistentIfAvailable(
-    source: *ProvisionedTableWriteSource,
-    alloc: std.mem.Allocator,
-    table_name: []const u8,
-    group_id: u64,
-    db: *db_mod.DB,
-) !void {
-    try publishRuntimeStatusSnapshotWithStartupPhaseMode(
-        source,
-        alloc,
-        table_name,
-        group_id,
-        if (source.startup_catch_up_active.load(.monotonic)) .startup_catch_up else .idle,
-        .consistent_if_available,
-        db,
-    );
-}
-
 fn publishRuntimeStatusSnapshotWithStartupPhase(
     source: *ProvisionedTableWriteSource,
     alloc: std.mem.Allocator,
@@ -22807,7 +18012,6 @@ fn publishRuntimeStatusSnapshotWithStartupPhase(
 const RuntimeStatusSnapshotMode = enum {
     best_effort,
     consistent,
-    consistent_if_available,
 };
 
 fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
@@ -22833,8 +18037,10 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             owned.deinit(alloc);
         }
     }
+    if (phase != .idle) {
+        cached_startup = try cachedStartupCatchUpStats(snapshot_cache, alloc, table_name, group_id);
+    }
     if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
-        cached_startup = cached_status.stats.async_indexing.startup;
         switch (mode) {
             .best_effort => {
                 status = cached_status;
@@ -22854,20 +18060,6 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
                 };
                 status_initialized = true;
             },
-            .consistent_if_available => {
-                const disk_bytes = cached_status.disk_bytes;
-                const created_at_millis = cached_status.created_at_millis;
-                var discard = cached_status;
-                discard.deinit(alloc);
-                const fresh_stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked;
-                status = .{
-                    .group_id = group_id,
-                    .disk_bytes = disk_bytes,
-                    .created_at_millis = created_at_millis,
-                    .stats = fresh_stats,
-                };
-                status_initialized = true;
-            },
         }
         markRuntimeStatusFromDb(source, &status, phase);
     }
@@ -22877,7 +18069,6 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
             .stats = switch (mode) {
                 .best_effort => try db.stats(alloc),
                 .consistent => try db.runtimeStatusStatsConsistent(alloc),
-                .consistent_if_available => (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
             },
         };
         status_initialized = true;
@@ -23013,7 +18204,6 @@ fn startupCatchUpStatsForPhase(
         .{};
     stats.active = phase != .idle;
     stats.phase = phase;
-    if (phase == .idle) return stats;
     if (db) |managed_db| {
         const maintenance = managed_db.snapshotLsmMaintenanceStats();
         stats.wal_retention_known = true;
@@ -23567,6 +18757,22 @@ fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool
     return false;
 }
 
+fn autoBulkIngestBatchOps(req: db_mod.types.BatchRequest) usize {
+    _ = req;
+    // Weak-sync writes are already durable in the primary store plus replay
+    // journal. Opening a foreground HBC bulk session here suppresses dense
+    // replay notifications for the entire active upload, so indexing only
+    // becomes query-visible after the writer goes idle. Let the background
+    // derived executor own dense bulk sessions and publish bounded windows.
+    return 0;
+}
+
+fn autoBulkIngestGroupBatchOps(group: GroupBatch, sync_level: db_mod.types.SyncLevel) usize {
+    _ = group;
+    _ = sync_level;
+    return 0;
+}
+
 test "weak sync levels do not drain managed db after batch" {
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.propose));
     try std.testing.expect(!shouldDrainManagedDbAfterBatch(.write));
@@ -23639,67 +18845,6 @@ fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
         lmdb.Error.NotFound => null,
         else => return err,
     };
-}
-
-fn runtimeTableSchemaFromJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !storage_schema.TableSchema {
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-}
-
-fn freeRelationalRowsMutationSourceCandidates(
-    alloc: std.mem.Allocator,
-    candidates: []db_mod.DB.RelationalRowsMutationSourceCandidate,
-) void {
-    for (candidates) |*candidate| candidate.deinit(alloc);
-    if (candidates.len > 0) alloc.free(candidates);
-}
-
-fn freeRelationalRowsJoinedMutationSourceCandidates(
-    alloc: std.mem.Allocator,
-    candidates: []db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-) void {
-    for (candidates) |*candidate| candidate.deinit(alloc);
-    if (candidates.len > 0) alloc.free(candidates);
-}
-
-fn cloneRelationalRowsJoinedMutationSourceCandidateAlloc(
-    alloc: std.mem.Allocator,
-    candidate: db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
-) !db_mod.DB.RelationalRowsJoinedMutationSourceCandidate {
-    var target = try db_mod.DB.cloneRelationalRowsMutationSourceCandidateAlloc(alloc, candidate.target);
-    errdefer target.deinit(alloc);
-    const source_json = try alloc.dupe(u8, candidate.source_json);
-    errdefer alloc.free(source_json);
-    return .{
-        .target = target,
-        .source_json = source_json,
-    };
-}
-
-fn cloneRelationalRowsMutationSourceResultAlloc(
-    alloc: std.mem.Allocator,
-    result: db_mod.types.RelationalRowsMutationSourceResult,
-) !db_mod.types.RelationalRowsMutationSourceResult {
-    var returning = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (returning.items) |row| alloc.free(@constCast(row));
-        returning.deinit(alloc);
-    }
-    try returning.ensureUnusedCapacity(alloc, result.returning_rows.len);
-    for (result.returning_rows) |row| {
-        returning.appendAssumeCapacity(try alloc.dupe(u8, row));
-    }
-    return .{
-        .matched = result.matched,
-        .staged = result.staged,
-        .returning_rows = try returning.toOwnedSlice(alloc),
-    };
-}
-
-fn freeTableDocKeyRangePlans(alloc: std.mem.Allocator, ranges: []table_catalog.TableDocKeyRangePlan) void {
-    for (ranges) |*range| range.deinit(alloc);
-    if (ranges.len > 0) alloc.free(ranges);
 }
 
 fn validateTableWritesAgainstLocalSchema(
@@ -24234,13 +19379,6 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
     return try out.toOwnedSlice(alloc);
 }
 
-fn encodeRemoteDocumentArtifactChildRangeApplyBatch(
-    alloc: std.mem.Allocator,
-    child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
-) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, child_batch, .{ .emit_null_optional_fields = false });
-}
-
 test "bound table write source applies batch writes" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-table-batch";
@@ -24557,119 +19695,6 @@ test "secondary index promotion ignores stale ready rebuild generation" {
 
     var catalog = Catalog{};
     try std.testing.expectEqual(@as(u64, 0), try promoteReadySecondaryIndexesForCatalog(alloc, catalog.iface(), "orders"));
-test "bound table sources inspect and reprocess document artifact manifests" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-table-document-artifact-manifest", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-
-    var write_source = BoundTableWriteSource.init("docs", &db);
-    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-
-    _ = try write_source.source().batch(alloc, "docs", .{
-        .writes = &.{.{
-            .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
-        }},
-        .sync_level = .full_index,
-    });
-
-    var manifest = (try read_source.source().documentArtifactManifest(
-        alloc,
-        "docs",
-        "doc:a",
-        "document_units_v1",
-        .read_index,
-    )) orelse return error.TestUnexpectedResult;
-    defer manifest.deinit(alloc);
-    try std.testing.expectEqualStrings("doc:a", manifest.document_id);
-    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
-    try std.testing.expectEqual(@as(u64, 1), manifest.generation);
-    try std.testing.expectEqualStrings("text", manifest.route_type);
-
-    try std.testing.expectEqual(@as(?bool, true), try write_source.source().updateDocumentArtifactChildRangePlacement(
-        alloc,
-        "docs",
-        "doc:a",
-        "document_units_v1",
-        .{
-            .range_id = "range:000000",
-            .placement = "remote",
-            .owner_group_id = 7002,
-            .placement_generation = 3,
-            .route_status = "remote_committed",
-            .split_eligible = true,
-        },
-    ));
-    var moved = (try read_source.source().documentArtifactManifest(
-        alloc,
-        "docs",
-        "doc:a",
-        "document_units_v1",
-        .read_index,
-    )) orelse return error.TestUnexpectedResult;
-    defer moved.deinit(alloc);
-    try std.testing.expectEqualStrings("remote", moved.child_ranges[0].placement);
-    try std.testing.expectEqual(@as(?u64, 7002), moved.child_ranges[0].owner_group_id);
-    try std.testing.expectEqual(@as(?u64, 3), moved.child_ranges[0].placement_generation);
-    try std.testing.expectEqualStrings("remote_committed", moved.child_ranges[0].route_status.?);
-
-    try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
-        alloc,
-        "docs",
-        "doc:a",
-        "document_units_v1",
-    ));
-
-    var after = (try read_source.source().documentArtifactManifest(
-        alloc,
-        "docs",
-        "doc:a",
-        "document_units_v1",
-        .read_index,
-    )) orelse return error.TestUnexpectedResult;
-    defer after.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 2), after.generation);
-
-    try std.testing.expectEqual(@as(?bool, false), try write_source.source().reprocessDocumentArtifact(
-        alloc,
-        "docs",
-        "doc:missing",
-        "document_units_v1",
-    ));
-    try std.testing.expect((try read_source.source().documentArtifactManifest(
-        alloc,
-        "docs",
-        "doc:missing",
-        "document_units_v1",
-        .read_index,
-    )) == null);
-    try std.testing.expectEqual(@as(?bool, null), try write_source.source().reprocessDocumentArtifact(
-        alloc,
-        "wrong",
-        "doc:a",
-        "document_units_v1",
-    ));
-    try std.testing.expect((try read_source.source().documentArtifactManifest(
-        alloc,
-        "wrong",
-        "doc:a",
-        "document_units_v1",
-        .read_index,
-    )) == null);
 }
 
 test "bound table write source resolves internal group transactions into visible documents" {
@@ -25318,231 +20343,6 @@ test "provisioned table write source backs up and restores a local table" {
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned table write source routes cross-table rows insert source through catalog owners" {
-    const alloc = std.testing.allocator;
-    const replica_root_dir = "/tmp/antfly-api-provisioned-cross-table-insert-source";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
-
-    const target_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_ref":{"type":"keyword"},"copied_status":{"type":"keyword"},"copied_amount":{"type":"numeric"}},"required":["id","source_ref"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"target_rows_source_ref_key","columns":["source_ref"]}]}
-    ;
-    const source_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sid":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["sid"],"additionalProperties":false}}},"primary_key":{"columns":["sid"]}}
-    ;
-
-    const target_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
-    defer alloc.free(target_path);
-    const source_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7002);
-    defer alloc.free(source_path);
-    {
-        var target_db = try db_mod.DB.open(alloc, target_path, .{
-            .identity_namespace = .{ .table_id = 101, .shard_id = 7001, .range_id = 7101 },
-        });
-        defer target_db.close();
-        try target_db.applyTableSchemaJson(alloc, target_schema_json, .{});
-    }
-    {
-        var source_db = try db_mod.DB.open(alloc, source_path, .{
-            .identity_namespace = .{ .table_id = 202, .shard_id = 7002, .range_id = 7201 },
-        });
-        defer source_db.close();
-        try source_db.applyTableSchemaJson(alloc, source_schema_json, .{});
-        try source_db.batch(.{
-            .writes = &.{
-                .{ .key = "source:a", .value = "{\"sid\":\"source:a\",\"status\":\"open\",\"amount\":7}" },
-                .{ .key = "source:b", .value = "{\"sid\":\"source:b\",\"status\":\"closed\",\"amount\":9}" },
-            },
-            .sync_level = .write,
-        });
-    }
-
-    var parsed_target = try schema_mod.parseValidatedTableSchema(alloc, target_schema_json);
-    defer parsed_target.deinit(alloc);
-    const target_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_target);
-    defer storage_schema.freeSchema(alloc, target_schema);
-    var parsed_source = try schema_mod.parseValidatedTableSchema(alloc, source_schema_json);
-    defer parsed_source.deinit(alloc);
-    const source_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_source);
-    defer storage_schema.freeSchema(alloc, source_schema);
-
-    const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
-                    .{
-                        .table_id = 101,
-                        .name = "target_rows",
-                        .placement_role = "data",
-                        .schema_json = target_schema_json,
-                    },
-                    .{
-                        .table_id = 202,
-                        .name = "source_rows",
-                        .placement_role = "data",
-                        .schema_json = source_schema_json,
-                    },
-                })[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .range_id = 7101, .table_id = 101, .start_key = "", .end_key = null },
-                    .{ .group_id = 7002, .range_id = 7201, .table_id = 202, .start_key = "", .end_key = null },
-                })[0..]),
-                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
-                    .table_id = 101,
-                    .constraint_name = "target_rows_source_ref_key",
-                    .start_encoded_value = "",
-                    .end_encoded_value = null,
-                    .group_id = 7001,
-                    .topology_epoch = 31,
-                }})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-    defer source.deinit();
-    const req = db_mod.types.RelationalRowsInsertSourceRequest{
-        .source_table = "source_rows",
-        .source = .{
-            .predicates = &.{.{ .name = "source_status_open", .field = "status", .op = .eq, .value_json = "\"open\"" }},
-            .order_by = &.{.{ .field = "sid" }},
-        },
-        .assignments = &.{
-            .{ .field = "id", .expression = .{ .kind = .concat, .operands = &.{ .{ .kind = .value, .value_json = "\"copy:\"" }, .{ .kind = .field, .field = "sid" } } } },
-            .{ .field = "source_ref", .expression = .{ .kind = .field, .field = "sid" } },
-            .{ .field = "copied_status", .expression = .{ .kind = .field, .field = "status" } },
-            .{ .field = "copied_amount", .expression = .{ .kind = .field, .field = "amount" } },
-        },
-        .returning = &.{ "id", "copied_amount" },
-    };
-    var result = (try source.source().insertRowsFromSource(alloc, "target_rows", target_schema, source_schema, req)) orelse return error.TestUnexpectedResult;
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), result.matched);
-    try std.testing.expectEqual(@as(u32, 1), result.staged);
-    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
-    try std.testing.expect(std.mem.indexOf(u8, result.returning_rows[0], "\"id\":\"copy:source:a\"") != null);
-
-    const do_nothing_req = db_mod.types.RelationalRowsInsertSourceRequest{
-        .source_table = "source_rows",
-        .source = req.source,
-        .assignments = req.assignments,
-        .on_conflict = .{
-            .target = .{ .kind = .primary },
-            .action = .nothing,
-        },
-        .returning = &.{ "id", "copied_amount" },
-    };
-    var skipped_result = (try source.source().insertRowsFromSource(alloc, "target_rows", target_schema, source_schema, do_nothing_req)) orelse return error.TestUnexpectedResult;
-    defer skipped_result.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), skipped_result.matched);
-    try std.testing.expectEqual(@as(u32, 0), skipped_result.staged);
-    try std.testing.expectEqual(@as(usize, 0), skipped_result.returning_rows.len);
-
-    const update_req = db_mod.types.RelationalRowsInsertSourceRequest{
-        .source_table = "source_rows",
-        .source = req.source,
-        .assignments = &.{
-            .{ .field = "id", .expression = .{ .kind = .concat, .operands = &.{ .{ .kind = .value, .value_json = "\"copy-retry:\"" }, .{ .kind = .field, .field = "sid" } } } },
-            .{ .field = "source_ref", .expression = .{ .kind = .field, .field = "sid" } },
-            .{ .field = "copied_status", .expression = .{ .kind = .concat, .operands = &.{ .{ .kind = .value, .value_json = "\"updated:\"" }, .{ .kind = .field, .field = "status" } } } },
-            .{ .field = "copied_amount", .expression = .{ .kind = .field, .field = "amount" } },
-        },
-        .on_conflict = .{
-            .target = .{ .kind = .unique, .unique_name = "target_rows_source_ref_key" },
-            .action = .update,
-            .patch_expressions = &.{.{ .field = "copied_status", .expression = .{ .kind = .field, .field = "copied_status", .field_source = .proposed } }},
-        },
-        .returning = &.{ "id", "copied_status" },
-    };
-    var updated_result = (try source.source().insertRowsFromSource(alloc, "target_rows", target_schema, source_schema, update_req)) orelse return error.TestUnexpectedResult;
-    defer updated_result.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), updated_result.matched);
-    try std.testing.expectEqual(@as(u32, 1), updated_result.staged);
-    try std.testing.expectEqual(@as(usize, 1), updated_result.returning_rows.len);
-    try std.testing.expect(std.mem.indexOf(u8, updated_result.returning_rows[0], "\"id\":\"copy:source:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated_result.returning_rows[0], "\"copied_status\":\"updated:open\"") != null);
-
-    var target_db = try db_mod.DB.open(alloc, target_path, .{ .start_index_workers = false });
-    defer target_db.close();
-    const copied_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, "{\"id\":\"copy:source:a\",\"source_ref\":\"source:a\"}");
-    defer alloc.free(copied_key);
-    const copied = (try target_db.get(alloc, copied_key)) orelse return error.TestUnexpectedResult;
-    defer alloc.free(copied);
-    try std.testing.expect(std.mem.indexOf(u8, copied, "\"copied_status\":\"updated:open\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copied, "\"source_ref\":\"source:a\"") != null);
-    const retried_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, "{\"id\":\"copy-retry:source:a\",\"source_ref\":\"source:a\"}");
-    defer alloc.free(retried_key);
-    const retried = try target_db.get(alloc, retried_key);
-    if (retried) |row| alloc.free(row);
-    try std.testing.expect(retried == null);
-    const skipped_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, "{\"id\":\"copy:source:b\",\"source_ref\":\"source:b\"}");
-    defer alloc.free(skipped_key);
-    const skipped = try target_db.get(alloc, skipped_key);
-    if (skipped) |row| alloc.free(row);
-    try std.testing.expect(skipped == null);
-    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
-    _ = try source.source().createTable(alloc, "docs", .{});
-
-    _ = try source.source().batch(alloc, "docs", .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .timestamp_ns = 1,
-    });
-
-    const shards = (try source.source().backupTable(alloc, "docs", .{
-        .backup_root = backup_root,
-        .backup_id = "snap1",
-    })).?;
-    defer freeBackupShards(alloc, shards);
-
-    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
-        .table_id = 7,
-        .name = "docs",
-        .description = "docs table",
-        .schema_json = "",
-        .read_schema_json = "",
-        .indexes_json = tables_api.default_indexes_json,
-        .replication_sources_json = "[]",
-    }, shards);
-    defer manifest.deinit(alloc);
-
-    _ = try source.source().batch(alloc, "docs", .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"beta\"}" }},
-        .timestamp_ns = 2,
-    });
-
-    _ = try source.source().restoreTable(alloc, "docs", .{
-        .backup_root = backup_root,
-        .manifest = &manifest,
-    });
-    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
-
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
-
-    var restored = (try db.lookup(alloc, "doc:a", .{})).?;
-    defer restored.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
-}
-
 test "provisioned table restore rejects mismatched doc identity namespace" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-table-backup-restore-docid-mismatch";
@@ -25597,7 +20397,6 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
         .replication_sources_json = "[]",
     }, shards);
     defer manifest.deinit(alloc);
-    try backups_api.writeManifest(alloc, backup_root, &manifest);
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -25746,7 +20545,6 @@ test "provisioned table write source backs up and restores full_text writes from
         .backup_root = backup_root,
         .manifest = &manifest,
     });
-    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         path,
@@ -28115,426 +22913,6 @@ test "provisioned table write source routes batch writes across ranges" {
     try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
 }
 
-test "provisioned table write source stages relational mutation source on single owner range" {
-    const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-relational-mutation-source";
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = tables_api.default_indexes_json,
-                    .schema_json = schema_json,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
-    var create_req = tables_api.CreateTableRequest{ .schema_json = try alloc.dupe(u8, schema_json) };
-    defer create_req.deinit(alloc);
-    _ = try source.source().createTable(alloc, "docs", create_req);
-    _ = try source.source().batch(alloc, "docs", .{
-        .writes = &.{
-            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\",\"rank\":1}" },
-            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"ready\",\"rank\":2}" },
-        },
-        .timestamp_ns = 1_000,
-    });
-
-    const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
-    _ = try source.source().txnBeginGroupLocal(alloc, 7001, "docs", txn_id, 10_000, 0, &.{"group:7001"});
-
-    const predicates = [_]storage_schema.RelationalCheck{
-        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"ready\"" },
-    };
-    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
-        .field = "rank",
-        .direction = .asc,
-    }};
-    const returning = [_][]const u8{ "id", "status" };
-    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, .{
-        .kind = .update,
-        .source = .{
-            .predicates = predicates[0..],
-            .order_by = order_by[0..],
-            .row_claim = .{
-                .mode = .for_update,
-                .owner_id = "session:mutation",
-                .txn_id = txn_id,
-            },
-            .limit = 1,
-        },
-        .operations = &.{.{
-            .op = .set,
-            .path = "status",
-            .value_json = "\"claimed\"",
-        }},
-        .returning = returning[0..],
-    })).?;
-    defer result.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u32, 2), result.matched);
-    try std.testing.expectEqual(@as(u32, 1), result.staged);
-    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", result.returning_rows[0]);
-
-    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001);
-
-    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
-    defer alloc.free(group_path);
-    var reopened = try db_mod.DB.open(alloc, group_path, .{});
-    defer reopened.close();
-    var row_a = (try reopened.lookup(alloc, "row:a", .{})).?;
-    defer row_a.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_a.json, "\"status\":\"claimed\"") != null);
-    var row_b = (try reopened.lookup(alloc, "row:b", .{})).?;
-    defer row_b.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_b.json, "\"status\":\"ready\"") != null);
-}
-
-test "provisioned table write source globally plans relational mutation source across ranges" {
-    const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-relational-mutation-source-ranges";
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = tables_api.default_indexes_json,
-                    .schema_json = schema_json,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
-                    .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
-                })[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
-    var create_req = tables_api.CreateTableRequest{ .schema_json = try alloc.dupe(u8, schema_json) };
-    defer create_req.deinit(alloc);
-    _ = try source.source().createTable(alloc, "docs", create_req);
-    _ = try source.source().batch(alloc, "docs", .{
-        .writes = &.{
-            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\",\"rank\":2}" },
-            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"ready\",\"rank\":3}" },
-            .{ .key = "row:z", .value = "{\"id\":\"z\",\"status\":\"ready\",\"rank\":1}" },
-        },
-        .timestamp_ns = 1_000,
-    });
-
-    const txn_id = try distributed_txn.parseTxnIdHex("11112222333344445555666677778888");
-    const participants = [_][]const u8{ "group:7001", "group:7002" };
-    _ = try source.source().txnBeginGroupLocal(alloc, 7001, "docs", txn_id, 10_000, 0, participants[0..]);
-    _ = try source.source().txnBeginGroupLocal(alloc, 7002, "docs", txn_id, 10_000, 0, participants[0..]);
-
-    const predicates = [_]storage_schema.RelationalCheck{
-        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"ready\"" },
-    };
-    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
-        .field = "rank",
-        .direction = .asc,
-    }};
-    const returning = [_][]const u8{ "id", "status" };
-    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, .{
-        .kind = .update,
-        .source = .{
-            .predicates = predicates[0..],
-            .order_by = order_by[0..],
-            .row_claim = .{
-                .mode = .for_update,
-                .owner_id = "session:mutation",
-                .txn_id = txn_id,
-            },
-            .limit = 2,
-        },
-        .operations = &.{.{
-            .op = .set,
-            .path = "status",
-            .value_json = "\"claimed\"",
-        }},
-        .returning = returning[0..],
-    })).?;
-    defer result.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u32, 3), result.matched);
-    try std.testing.expectEqual(@as(u32, 2), result.staged);
-    try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", result.returning_rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", result.returning_rows[1]);
-
-    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001);
-    _ = try source.source().txnResolveGroupLocal(alloc, 7002, "docs", txn_id, .committed, 10_001);
-
-    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
-    defer alloc.free(left_path);
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
-    defer left_db.close();
-    var row_a = (try left_db.lookup(alloc, "row:a", .{})).?;
-    defer row_a.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_a.json, "\"status\":\"claimed\"") != null);
-    var row_b = (try left_db.lookup(alloc, "row:b", .{})).?;
-    defer row_b.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_b.json, "\"status\":\"ready\"") != null);
-
-    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
-    defer alloc.free(right_path);
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
-    defer right_db.close();
-    var row_z = (try right_db.lookup(alloc, "row:z", .{})).?;
-    defer row_z.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_z.json, "\"status\":\"claimed\"") != null);
-}
-
-test "hosted provisioned table write source globally plans relational mutation source across local owner ranges" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-relational-mutation-source-ranges", .{tmp.sub_path});
-    defer alloc.free(replica_root_dir);
-
-    const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = tables_api.default_indexes_json,
-                    .schema_json = schema_json,
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
-                    .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
-                })[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    const Router = struct {
-        fn iface() table_router.HostedGroupRouter {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .local_node_id = localNodeId,
-                    .local_status = localStatus,
-                    .group_leader_node_id = groupLeaderNodeId,
-                    .node_status = nodeStatus,
-                    .node_base_uri = nodeBaseUri,
-                },
-            };
-        }
-
-        fn localNodeId(_: *anyopaque) u64 {
-            return 1;
-        }
-
-        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
-            return if (group_id == 7001 or group_id == 7002) .active else .absent;
-        }
-
-        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
-            return if (group_id == 7001 or group_id == 7002) 1 else null;
-        }
-
-        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
-            _ = node_id;
-            return if (group_id == 7001 or group_id == 7002) .active else .absent;
-        }
-
-        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
-            return null;
-        }
-    };
-
-    const Executor = struct {
-        fn iface() http_common.RequestExecutor {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            return error.UnexpectedHttpRequest;
-        }
-    };
-
-    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
-    defer source.invalidateManagedCache("docs");
-    _ = try source.source().batch(alloc, "docs", .{
-        .writes = &.{
-            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\",\"rank\":2}" },
-            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"ready\",\"rank\":3}" },
-            .{ .key = "row:z", .value = "{\"id\":\"z\",\"status\":\"ready\",\"rank\":1}" },
-        },
-        .timestamp_ns = 1_000,
-    });
-
-    const txn_id = try distributed_txn.parseTxnIdHex("22223333444455556666777788889999");
-    const participants = [_][]const u8{ "group:7001", "group:7002" };
-    _ = try source.source().txnBeginGroupLocal(alloc, 7001, "docs", txn_id, 10_000, 0, participants[0..]);
-    _ = try source.source().txnBeginGroupLocal(alloc, 7002, "docs", txn_id, 10_000, 0, participants[0..]);
-
-    const predicates = [_]storage_schema.RelationalCheck{
-        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"ready\"" },
-    };
-    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
-        .field = "rank",
-        .direction = .asc,
-    }};
-    const returning = [_][]const u8{ "id", "status" };
-    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, .{
-        .kind = .update,
-        .source = .{
-            .predicates = predicates[0..],
-            .order_by = order_by[0..],
-            .row_claim = .{
-                .mode = .for_update,
-                .owner_id = "session:mutation",
-                .txn_id = txn_id,
-            },
-            .limit = 2,
-        },
-        .operations = &.{.{
-            .op = .set,
-            .path = "status",
-            .value_json = "\"claimed\"",
-        }},
-        .returning = returning[0..],
-    })).?;
-    defer result.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u32, 3), result.matched);
-    try std.testing.expectEqual(@as(u32, 2), result.staged);
-    try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", result.returning_rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", result.returning_rows[1]);
-
-    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001);
-    _ = try source.source().txnResolveGroupLocal(alloc, 7002, "docs", txn_id, .committed, 10_001);
-
-    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
-    defer alloc.free(left_path);
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
-    defer left_db.close();
-    var row_a = (try left_db.lookup(alloc, "row:a", .{})).?;
-    defer row_a.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_a.json, "\"status\":\"claimed\"") != null);
-    var row_b = (try left_db.lookup(alloc, "row:b", .{})).?;
-    defer row_b.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_b.json, "\"status\":\"ready\"") != null);
-
-    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7002);
-    defer alloc.free(right_path);
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
-    defer right_db.close();
-    var row_z = (try right_db.lookup(alloc, "row:z", .{})).?;
-    defer row_z.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, row_z.json, "\"status\":\"claimed\"") != null);
-}
-
 const ProvisionedWriteCoalesceTestCatalog = struct {
     fn iface() table_catalog.CatalogSource {
         return .{
@@ -29949,102 +24327,6 @@ test "provisioned table write source cached runtime status does not fetch catalo
 }
 
 test "provisioned table write source runtime status does not cold-open uncached db" {
-test "provisioned table write source runtime status repairs cold dense placeholder" {
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-status-cold-reopen", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-
-    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
-    defer alloc.free(group_path);
-
-    const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .placement_role = "data",
-                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":2,\"external\":true}}",
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
-                })[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    {
-        var db = try openManagedDbWithIndexesJson(
-            alloc,
-            group_path,
-            "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":2,\"external\":true}}",
-        );
-        defer db.close();
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,0]}}" },
-            },
-            .sync_level = .full_index,
-        });
-    }
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    var bad_indexes = [_]db_mod.types.DBIndexStats{.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-    }};
-    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", .{
-        .group_id = 7001,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .updated_at_ns = 1 },
-        .stats = .{
-            .doc_count = 0,
-            .index_count = 1,
-            .indexes = bad_indexes[0..],
-            .doc_identity = .{},
-        },
-    });
-
-    var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
-    source.runtime_status_cache = &snapshot_cache;
-
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.cached_snapshot, statuses.items[0].metadata.source);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
-    try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
-    try std.testing.expect(statuses.items[0].stats.indexes[0].doc_count > 0 or statuses.items[0].stats.indexes[0].node_count > 0 or statuses.items[0].stats.indexes[0].root_node > 0);
-}
-
-test "provisioned table write source runtime status stays cache-only without shared snapshot" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -32133,144 +26415,6 @@ test "provisioned table read source survives many external write-sync batches be
         break :blk try out.toOwnedSlice();
     };
     defer alloc.free(dense_doc_json);
-    var hook = Hook{};
-    source.setLocalChangeHook(.{
-        .ptr = &hook,
-        .on_change = Hook.onChange,
-    });
-
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, &db, .publish);
-
-    try std.testing.expectEqual(@as(usize, 1), hook.calls);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
-    try std.testing.expectEqualStrings("docs", hook.table_name);
-    var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
-    defer published.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), published.items.len);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, published.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
-    try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.doc_count);
-    try std.testing.expectEqual(@as(u64, 1), published.items[0].stats.indexes[0].doc_count);
-
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, null, .invalidate);
-
-    try std.testing.expectEqual(@as(usize, 2), hook.calls);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
-    try std.testing.expectEqualStrings("docs", hook.table_name);
-    var retained = (try snapshot_cache.snapshot(alloc, "docs")).?;
-    defer retained.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), retained.items.len);
-    try std.testing.expectEqual(@as(u64, 1), retained.items[0].stats.doc_count);
-}
-
-test "provisioned table write source consistent visibility hook does not block on busy apply lock" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-hook-busy", .{tmp.sub_path});
-    defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
-
-    var db = try openManagedDbWithIndexesJson(
-        alloc,
-        path,
-        "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
-    );
-    defer db.close();
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
-    source.runtime_status_cache = &snapshot_cache;
-
-    db.core.lockApplyExclusive();
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, &db, .publish_consistent);
-    db.core.unlockApplyExclusive();
-
-    const published = try snapshot_cache.snapshot(alloc, "docs");
-    try std.testing.expect(published == null);
-}
-
-test "provisioned table write source consistent visibility refreshes stale dense status" {
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-dense-refresh", .{tmp.sub_path});
-    defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
-
-    var db = try openManagedDbWithIndexesJson(
-        alloc,
-        path,
-        "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
-    );
-    defer db.close();
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
-    source.runtime_status_cache = &snapshot_cache;
-    const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
-
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
-        .sync_level = .full_index,
-    });
-    hook.notify(.publish);
-
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
-        .sync_level = .full_index,
-    });
-    hook.notify(.publish_blocking);
-
-    var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
-    defer published.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), published.items.len);
-    try std.testing.expectEqual(@as(usize, 1), published.items[0].stats.indexes.len);
-    try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.indexes[0].doc_count);
-    try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.doc_count);
-}
-
-test "provisioned table write source promotes synthetic placeholder when publishing live db status" {
-    const alloc = std.testing.allocator;
-
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
 
     const query_json = blk: {
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -34251,30 +28395,6 @@ test "foreign key schema controller maintenance records invalid unvalidated loca
     try db.batch(.{
         .writes = &.{
             .{ .key = "order:1", .value = "{\"customer_id\":\"customer:missing\"}" },
-    const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
-    items[0] = .{
-        .group_id = 7001,
-        .stats = .{
-            .doc_count = 999,
-            .index_count = 1,
-            .indexes = &.{},
-            .async_indexing = .{
-                .startup = .{
-                    .active = true,
-                    .phase = .artifact_rebuild,
-                    .wal_retention_known = true,
-                    .wal_retained_segments = 7,
-                    .wal_retained_bytes = 456,
-                },
-                .dense_catch_up = .{
-                    .active = true,
-                    .current_sequence = 10880,
-                    .current_target_sequence = 1001001,
-                    .current_scanned_entries = 10880,
-                    .current_applied_entries = 10880,
-                    .progress_updates = 91,
-                },
-            },
         },
         .sync_level = .write,
     });
@@ -34538,13 +28658,6 @@ test "foreign key schema controller maintenance reports incomplete when action j
     defer alloc.free(second_child);
     try std.testing.expectEqualStrings("{\"status\":\"open\"}", first_child);
     try std.testing.expectEqualStrings("{\"customer_id\":\"customer:busy\",\"status\":\"open\"}", second_child);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
-    try std.testing.expectEqual(db_mod.types.StartupCatchUpPhase.idle, statuses.items[0].stats.async_indexing.startup.phase);
-    try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
-    try std.testing.expect(statuses.items[0].stats.async_indexing.startup.wal_retention_known);
-    try std.testing.expectEqual(@as(u64, 7), statuses.items[0].stats.async_indexing.startup.wal_retained_segments);
-    try std.testing.expectEqual(@as(u64, 456), statuses.items[0].stats.async_indexing.startup.wal_retained_bytes);
 }
 
 test "foreign key schema controller maintenance seeds durable action schedule" {
@@ -35202,54 +29315,6 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
-}
-
-test "managed startup catch-up reclaims due obsolete primary run files" {
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-obsolete-reclaim", .{tmp.sub_path});
-    defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
-    const indexes_json = "{\"indexes\":[]}";
-
-    var obsolete_path: []u8 = undefined;
-    {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
-        defer seeded.close();
-
-        const primary_backend = seeded.core.primary_store_owner.lsmBackend() orelse return error.SkipZigTest;
-        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
-        obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
-        errdefer alloc.free(obsolete_path);
-        try lsm_backend.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, obsolete_path, "obsolete");
-        {
-            const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, primary_backend);
-            defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, primary_backend, locked);
-            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
-            try primary_backend.persistManifest();
-        }
-    }
-    defer alloc.free(obsolete_path);
-
-    try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
-
-    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
-    defer snapshot_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
-    source.runtime_status_cache = &snapshot_cache;
-
-    const result = try source.catchUpTableGroupBestEffortWithIndexesJson(alloc, 7001, "docs", indexes_json);
-    try std.testing.expect(!result.busy);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
-
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    defer statuses.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.obsolete_paths_reclaimable);
 }
 
 test "managed startup catch-up bypasses shared write cache" {
@@ -36314,7 +30379,6 @@ test "provisioned table write source restore table does not hold local db mutex 
     thread.join();
 
     if (worker.err) |err| return err;
-    try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
     db.close();
     db = try db_mod.DB.open(alloc, db_path, .{});
