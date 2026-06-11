@@ -14,14 +14,14 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <div className="mb-6 border-b border-border pb-4">
           <Link
             href="/foundations"
-            className="block rounded-md px-2 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            className="block rounded-none px-2 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
           >
             Foundations
           </Link>
         </div>
         {(Object.keys(demoCategories) as DemoCategoryKey[]).map((key) => (
           <div key={key} className="mb-6">
-            <h3 className="px-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <h3 className="px-2 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70">
               {demoCategories[key].label}
             </h3>
             <ul className="mt-2 space-y-0.5">
@@ -29,7 +29,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
                 <li key={d.slug}>
                   <Link
                     href={`/components/${d.slug}`}
-                    className="block rounded-md px-2 py-1.5 text-sm text-foreground/80 transition-colors hover:bg-accent hover:text-accent-foreground"
+                    className="block rounded-none px-2 py-1.5 text-sm text-foreground/80 transition-colors hover:bg-accent hover:text-accent-foreground"
                   >
                     {d.name}
                   </Link>
@@ -52,7 +52,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
             <ThemeToggle />
           </div>
         </header>
-        <main className="flex-1 px-6 py-10">{children}</main>
+        <main className="flex-1 px-8 py-12 md:px-12 md:py-16">{children}</main>
       </div>
     </div>
   );

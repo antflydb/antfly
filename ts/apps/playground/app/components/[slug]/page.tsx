@@ -17,7 +17,7 @@ export default async function ComponentPage({ params }: PageProps) {
   const { demo, category } = found;
 
   return (
-    <div className="mx-auto max-w-5xl space-y-10">
+    <div className="mx-auto max-w-5xl space-y-12">
       <div className="space-y-3">
         <Badge variant="outline">{category}</Badge>
         <h1 className="font-display text-4xl tracking-tight text-foreground">{demo.name}</h1>
@@ -26,8 +26,8 @@ export default async function ComponentPage({ params }: PageProps) {
 
       <Separator />
 
-      <section className="rounded-xl border border-border bg-card p-8">
-        <p className="mb-6 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <section className="rounded-none border-(length:--border-width) border-border bg-card p-8">
+        <p className="mb-8 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70">
           Preview
         </p>
         <div className="flex flex-wrap items-start gap-6">{demo.render()}</div>
