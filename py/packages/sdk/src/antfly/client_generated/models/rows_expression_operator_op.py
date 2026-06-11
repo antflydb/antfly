@@ -21,9 +21,11 @@ class RowsExpressionOperatorOp(str, Enum):
     MUL = "mul"
     NOW = "now"
     NULLIF = "nullif"
+    REPLACE = "replace"
     ROUND = "round"
     STRING_TO_ARRAY = "string_to_array"
     SUB = "sub"
+    TRIM = "trim"
     UPPER = "upper"
 
     def __str__(self) -> str:

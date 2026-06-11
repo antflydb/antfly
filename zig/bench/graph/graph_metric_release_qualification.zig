@@ -3130,9 +3130,13 @@ fn verifyGraphMetricProfileEvidence(
     if (std.mem.indexOf(u8, encoded.json, "\"graph_metrics\"") == null) {
         return error.GraphMetricReleaseQualificationProfileEvidenceMismatch;
     }
-    if (std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric\"") == null or
-        std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_query\"") == null or
-        std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric_rerank\"") == null)
+    const direct_profile_entries = countOccurrences(encoded.json, "\"source\":\"graph_metric\"");
+    const traversal_profile_entries = countOccurrences(encoded.json, "\"source\":\"graph_query\"");
+    const rerank_profile_entries = countOccurrences(encoded.json, "\"source\":\"graph_metric_rerank\"");
+    const expected_traversal_profile_entries: usize = if (family == .hits) 2 else 1;
+    if (direct_profile_entries != 1 or
+        traversal_profile_entries != expected_traversal_profile_entries or
+        rerank_profile_entries != 1)
     {
         return error.GraphMetricReleaseQualificationProfileEvidenceMismatch;
     }
@@ -3154,7 +3158,7 @@ fn verifyGraphMetricProfileEvidence(
     if (family == .hits and std.mem.indexOf(u8, encoded.json, "\"metric_name\":\"hits_hub\"") == null) {
         return error.GraphMetricReleaseQualificationProfileEvidenceMismatch;
     }
-    return countOccurrences(encoded.json, "\"source\":");
+    return direct_profile_entries + traversal_profile_entries + rerank_profile_entries;
 }
 
 fn verifyGraphTraversalReadContract(

@@ -100,7 +100,7 @@ function MultiSelectTrigger({
           {children || (
             value.length > 0 ? (
               value.map((v) => (
-                <Badge key={v} variant="secondary" className="text-xs">
+                <Badge key={v} className="text-xs">
                   {v}
                 </Badge>
               ))

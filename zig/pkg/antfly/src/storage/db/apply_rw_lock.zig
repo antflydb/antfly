@@ -34,6 +34,7 @@ pub const ApplyRwLock = struct {
     reader_mutex: std.atomic.Mutex = .unlocked,
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
+    shared_waiters: AtomicU64 = .init(0),
     shared_lock_calls: AtomicU64 = .init(0),
     shared_contended_calls: AtomicU64 = .init(0),
     shared_wait_ns: AtomicU64 = .init(0),
@@ -46,6 +47,8 @@ pub const ApplyRwLock = struct {
     pub fn lockShared(self: *@This()) void {
         const started_ns = monotonicNs();
         _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
+        _ = self.shared_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.shared_waiters.fetchSub(1, .monotonic);
         if (!lockAtomic(&self.reader_gate)) {
             _ = self.shared_contended_calls.fetchAdd(1, .monotonic);
             noteWait(self, .shared, monotonicNs() -| started_ns);
@@ -96,6 +99,7 @@ pub const ApplyRwLock = struct {
     pub fn lockExclusive(self: *@This()) void {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        yieldToQueuedReaders(self);
         const gate_idle = lockAtomic(&self.reader_gate);
         errdefer self.reader_gate.unlock();
         const resource_idle = lockAtomic(&self.resource_mutex);
@@ -108,6 +112,9 @@ pub const ApplyRwLock = struct {
     pub fn unlockExclusive(self: *@This()) void {
         self.resource_mutex.unlock();
         self.reader_gate.unlock();
+        if (builtin.os.tag != .freestanding and !builtin.single_threaded) {
+            std.Thread.yield() catch {};
+        }
     }
 
     pub fn snapshot(self: *const @This()) Stats {
@@ -142,6 +149,14 @@ fn lockAtomic(mutex: *std.atomic.Mutex) bool {
         std.Thread.yield() catch {};
     }
     return attempts == 0;
+}
+
+fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+    var attempts: usize = 0;
+    while (attempts < 64 and lock.shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
+        std.Thread.yield() catch {};
+    }
 }
 
 fn monotonicNs() u64 {
@@ -208,4 +223,46 @@ test "apply rw lock exclusive tryLock succeeds when idle" {
 
     try std.testing.expect(lock.tryLockExclusive());
     lock.unlockExclusive();
+}
+
+test "apply rw lock lets queued readers through sustained exclusive loop" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Context = struct {
+        lock: ApplyRwLock = .{},
+        reader_ready: std.atomic.Value(bool) = .init(false),
+        reader_done: std.atomic.Value(bool) = .init(false),
+        writer_done: std.atomic.Value(bool) = .init(false),
+
+        fn writer(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < 10_000 and !ctx.reader_done.load(.acquire)) : (i += 1) {
+                ctx.lock.lockExclusive();
+                ctx.lock.unlockExclusive();
+            }
+            ctx.writer_done.store(true, .release);
+        }
+
+        fn reader(ctx: *@This()) void {
+            ctx.reader_ready.store(true, .release);
+            ctx.lock.lockShared();
+            ctx.lock.unlockShared();
+            ctx.reader_done.store(true, .release);
+        }
+    };
+
+    var ctx = Context{};
+    const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});
+    defer writer_thread.join();
+
+    const reader_thread = try std.Thread.spawn(.{}, Context.reader, .{&ctx});
+    defer reader_thread.join();
+
+    var spins: usize = 0;
+    while (!ctx.reader_done.load(.acquire) and spins < 100_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(ctx.reader_ready.load(.acquire));
+    try std.testing.expect(ctx.reader_done.load(.acquire));
+    try std.testing.expect(!ctx.writer_done.load(.acquire) or spins < 100_000);
 }

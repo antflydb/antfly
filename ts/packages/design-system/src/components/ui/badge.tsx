@@ -6,9 +6,9 @@ import { cn } from "@/lib/utils";
 
 const badgeVariants = cva(
   [
-    // mono "instrument label" voice — uppercase, tracked, 11px, 1.5px square border
-    "inline-flex items-center justify-center font-mono uppercase tracking-[0.05em] text-[11px] font-medium",
-    "px-2 py-[3px] border-[1.5px] rounded-none w-fit whitespace-nowrap shrink-0",
+    // mono "instrument label" voice — uppercase, tracked, 11px, token-width square border
+    "inline-flex items-center justify-center font-mono uppercase tracking-[0.08em] text-[11px] font-medium",
+    "px-2 py-[3px] border-(length:--border-width) rounded-none w-fit whitespace-nowrap shrink-0",
     "[&>svg]:size-3 [&>svg]:pointer-events-none gap-1",
     "transition-colors overflow-hidden",
     "focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -17,21 +17,13 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
-        // solid amber fill — the loud variant (shadcn convention for default)
-        default:
-          "bg-primary text-primary-foreground border-amber-500 [a&]:hover:bg-amber-300",
-        // subtle muted fill — soft pill, no visible border
-        secondary:
-          "bg-secondary text-secondary-foreground border-transparent [a&]:hover:bg-secondary/80",
-        // semantic destructive — outline only
+        // quiet outline — the workhorse default: hairline border, muted ink
+        default: "bg-transparent border-border text-muted-foreground [a&]:hover:text-foreground",
+        // solid amber fill — deliberate brand moments only
+        brand: "bg-primary text-primary-foreground border-transparent [a&]:hover:bg-amber-300",
+        // semantic destructive — red ink, quiet chassis
         destructive:
-          "bg-transparent border-destructive text-destructive [a&]:hover:bg-destructive/10",
-        // prototype `.badge` — the workhorse: strong-line border, muted ink
-        outline:
-          "bg-transparent border-border-strong text-muted-foreground [a&]:hover:border-foreground [a&]:hover:text-foreground",
-        // amber outline — accent without filling
-        amber:
-          "bg-transparent border-amber-500 text-amber-600 dark:text-amber-400 [a&]:hover:bg-amber-500/10",
+          "bg-transparent border-border text-destructive [a&]:hover:bg-destructive/10",
       },
     },
     defaultVariants: {

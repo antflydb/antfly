@@ -378,6 +378,7 @@ const ReplayChunkBuilder = struct {
                 for (record.changed_artifact_keys) |key| {
                     if (!internal_keys.isGraphEdgeArtifactKey(key) and
                         !internal_keys.isAssetArtifactKey(key) and
+                        !internal_keys.isChunkArtifactRecordKey(key) and
                         !internal_keys.isResolutionArtifactKey(key))
                     {
                         continue;
@@ -530,6 +531,7 @@ fn countGraphArtifactKeys(keys: []const []const u8) usize {
     for (keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key) or
             internal_keys.isAssetArtifactKey(key) or
+            internal_keys.isChunkArtifactRecordKey(key) or
             internal_keys.isResolutionArtifactKey(key))
         {
             count += 1;

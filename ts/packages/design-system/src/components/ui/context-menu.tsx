@@ -37,14 +37,14 @@ function ContextMenuRadioGroup({
 // Shared content classes — matches DropdownMenu / Popover chassis
 const menuContentClasses = cn(
   "bg-popover text-popover-foreground z-50 min-w-[8rem] p-1",
-  "rounded-none border-[1.5px] border-border-strong outline-hidden overflow-x-hidden overflow-y-auto",
+  "rounded-none border-(length:--border-width) border-border-strong outline-hidden overflow-x-hidden overflow-y-auto",
   "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
   "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
   "data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2"
 );
 
 const menuItemClasses = cn(
-  "relative flex cursor-default select-none items-center gap-2 px-2 py-1.5",
+  "relative flex cursor-default select-none items-center gap-2 px-2 py-2",
   "font-mono text-[13px] outline-hidden rounded-none",
   "focus:bg-accent focus:text-accent-foreground",
   "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
@@ -198,7 +198,7 @@ function ContextMenuLabel({
       data-inset={inset}
       className={cn(
         // mono kicker — matches Label / Card-head treatment
-        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "px-2 py-1.5 font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
         "data-[inset]:pl-8",
         className
       )}
@@ -225,7 +225,7 @@ function ContextMenuShortcut({ className, ...props }: React.ComponentProps<"span
     <span
       data-slot="context-menu-shortcut"
       className={cn(
-        "text-muted-foreground ml-auto font-mono text-[11px] tracking-[0.05em]",
+        "text-muted-foreground ml-auto font-mono text-[11px]",
         className
       )}
       {...props}

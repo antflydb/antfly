@@ -703,9 +703,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm">Field Selection</span>
                           {selectedFields.length > 0 && (
-                            <Badge variant="secondary" className="h-5 text-xs">
-                              {selectedFields.length}
-                            </Badge>
+                            <Badge className="h-5 text-xs">{selectedFields.length}</Badge>
                           )}
                         </div>
                       </AccordionTrigger>
@@ -726,7 +724,6 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
                               return (
                                 <Badge
                                   key={field}
-                                  variant="secondary"
                                   className="cursor-pointer hover:bg-destructive hover:text-destructive-foreground transition-colors h-6 text-xs"
                                   onClick={() => handleRemoveField(field)}
                                 >

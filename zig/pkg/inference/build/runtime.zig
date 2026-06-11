@@ -66,6 +66,7 @@ pub const SharedModules = struct {
     protobuf: ?*std.Build.Module = null,
     sentencepiece_proto: ?*std.Build.Module = null,
     ml: ?*std.Build.Module = null,
+    ml_tabular: ?*std.Build.Module = null,
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
@@ -103,6 +104,7 @@ pub const Graph = struct {
     protobuf_mod: *std.Build.Module,
     sentencepiece_proto_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
+    ml_tabular_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
     pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
@@ -181,6 +183,7 @@ pub fn create(config: Config) Graph {
     const protobuf_mod = shared.protobuf orelse protobuf_dep.module("protobuf");
     const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep, paths, config.register_public_modules);
     const ml_mod = shared.ml orelse createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
+    const ml_tabular_mod = shared.ml_tabular orelse createSharedModuleNamed(config, "ml_tabular", "lib/ml/tabular/src/root.zig");
     const onnx_graph_mod = shared.onnx_graph orelse blk: {
         const mod = b.dependency("onnx_graph", .{
             .target = target,
@@ -276,6 +279,7 @@ pub fn create(config: Config) Graph {
         .scraping_mod = scraping_mod,
         .image_mod = image_mod,
         .ml_mod = ml_mod,
+        .ml_tabular_mod = ml_tabular_mod,
         .prometheus_mod = prometheus_mod,
         .structlog_mod = structlog_mod,
         .onnx_graph_mod = onnx_graph_mod,
@@ -301,6 +305,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("antfly_image", image_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("ml", ml_mod);
+    inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     inference_internal_mod.addImport("pjrt", pjrt_mod);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
@@ -329,6 +334,7 @@ pub fn create(config: Config) Graph {
         .protobuf_mod = protobuf_mod,
         .sentencepiece_proto_mod = sentencepiece_proto_mod,
         .ml_mod = ml_mod,
+        .ml_tabular_mod = ml_tabular_mod,
         .onnx_graph_mod = onnx_graph_mod,
         .pjrt_mod = pjrt_mod,
         .inference_api_mod = inference_api_mod,
@@ -378,6 +384,7 @@ const InferenceRootImports = struct {
     scraping_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
+    ml_tabular_mod: *std.Build.Module,
     prometheus_mod: *std.Build.Module,
     structlog_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
@@ -402,6 +409,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("antfly_scraping", imports.scraping_mod);
     module.addImport("antfly_image", imports.image_mod);
     module.addImport("ml", imports.ml_mod);
+    module.addImport("ml_tabular", imports.ml_tabular_mod);
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
     module.addImport("onnx_graph", imports.onnx_graph_mod);

@@ -22,13 +22,16 @@ apps/playground/         → design-system gallery (unpublished; used by
 
 ## Conventions
 
-- **Tag-based releases**: `<package>-v<semver>` — e.g. `sdk-v0.0.12`,
-  `components-v0.0.10`, `design-system-v0.0.1`. See
-  `.github/workflows/npm-publish.yml`. npm Trusted Publishing via OIDC; no
-  secrets in CI.
-- **Versioning**: the tag's numeric portion must match the target package's
-  `version` field. The workflow filters by tag prefix and runs
-  `pnpm --filter <pkg> publish --provenance`.
+- **Tag-based releases**: `ts/antfly/<package>/v<semver>` on the antfly
+  monorepo — e.g. `ts/antfly/sdk/v0.0.12`, `ts/antfly/design-system/v0.2.0`.
+  See `.github/workflows/ts-npm-publish.yml` at the repo root. npm Trusted
+  Publishing via OIDC; no secrets in CI. (The old `<package>-v<semver>`
+  convention belonged to the retired standalone antfly-ts repo.)
+- **Versioning**: bump the package's `version` field before tagging — the
+  workflow publishes whatever version package.json declares (it does not
+  cross-check the tag), and npm rejects re-publishing an existing version.
+  CI runs `pnpm install --frozen-lockfile`, `pnpm build --force`, and
+  `pnpm test` before `pnpm --filter <pkg> publish --provenance`.
 - **Commands** (from repo root):
   - `pnpm install` — install all workspaces
   - `pnpm build` / `dev` / `test` / `typecheck` / `lint` — turbo-delegated

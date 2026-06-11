@@ -16,7 +16,7 @@ const std = @import("std");
 const lsm_table_file = @import("table_file.zig");
 
 pub const magic = "ALSMMAN1";
-pub const version: u32 = 7;
+pub const version: u32 = 8;
 
 pub const RunMeta = struct {
     id: u64,
@@ -29,7 +29,6 @@ pub const RunMeta = struct {
     largest_namespace_name: ?[]const u8,
     largest_key: []const u8,
     entry_count: u32,
-    bloom_filter: []const u8,
 };
 
 pub const ObsoletePathMeta = struct {
@@ -48,7 +47,6 @@ pub const OwnedRunMeta = struct {
     largest_namespace_name: ?[]u8,
     largest_key: []u8,
     entry_count: u32,
-    bloom_filter: []u8,
 
     pub fn deinit(self: *OwnedRunMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -56,7 +54,6 @@ pub const OwnedRunMeta = struct {
         allocator.free(self.smallest_key);
         if (self.largest_namespace_name) |name| allocator.free(name);
         allocator.free(self.largest_key);
-        allocator.free(self.bloom_filter);
         self.* = undefined;
     }
 };
@@ -102,7 +99,6 @@ pub const BorrowedRunMeta = struct {
     largest_namespace_name: ?[]const u8,
     largest_key: []const u8,
     entry_count: u32,
-    bloom_filter: []const u8,
 };
 
 pub const BorrowedObsoletePathMeta = struct {
@@ -144,13 +140,11 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
         try appendU32(allocator, &bytes, if (run.largest_namespace_name) |name| @intCast(name.len) else 0);
         try appendU32(allocator, &bytes, @intCast(run.largest_key.len));
         try appendU32(allocator, &bytes, run.entry_count);
-        try appendU32(allocator, &bytes, @intCast(run.bloom_filter.len));
         try bytes.appendSlice(allocator, run.path);
         if (run.smallest_namespace_name) |name| try bytes.appendSlice(allocator, name);
         try bytes.appendSlice(allocator, run.smallest_key);
         if (run.largest_namespace_name) |name| try bytes.appendSlice(allocator, name);
         try bytes.appendSlice(allocator, run.largest_key);
-        try bytes.appendSlice(allocator, run.bloom_filter);
     }
     for (manifest.obsolete_paths) |obsolete| {
         try appendU64(allocator, &bytes, obsolete.delete_after_ns);
@@ -200,7 +194,6 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
         const largest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
         const largest_len: usize = @intCast(try readU32(raw, &cursor));
         const entry_count = try readU32(raw, &cursor);
-        const bloom_len: usize = @intCast(try readU32(raw, &cursor));
 
         run.* = .{
             .id = id,
@@ -213,7 +206,6 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
             .largest_namespace_name = if (largest_namespace_len > 0) try allocator.dupe(u8, try readSlice(raw, &cursor, largest_namespace_len)) else null,
             .largest_key = try allocator.dupe(u8, try readSlice(raw, &cursor, largest_len)),
             .entry_count = entry_count,
-            .bloom_filter = try allocator.dupe(u8, try readSlice(raw, &cursor, bloom_len)),
         };
         initialized += 1;
     }
@@ -263,7 +255,6 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
         const largest_namespace_len: usize = @intCast(try readU32(raw, &cursor));
         const largest_len: usize = @intCast(try readU32(raw, &cursor));
         const entry_count = try readU32(raw, &cursor);
-        const bloom_len: usize = @intCast(try readU32(raw, &cursor));
 
         run.* = .{
             .id = id,
@@ -276,7 +267,6 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
             .largest_namespace_name = if (largest_namespace_len > 0) try readSlice(raw, &cursor, largest_namespace_len) else null,
             .largest_key = try readSlice(raw, &cursor, largest_len),
             .entry_count = entry_count,
-            .bloom_filter = try readSlice(raw, &cursor, bloom_len),
         };
     }
 
@@ -359,7 +349,6 @@ test "manifest codec round trips run metadata" {
             .largest_namespace_name = null,
             .largest_key = "doc:z",
             .entry_count = 24,
-            .bloom_filter = "bloom-a",
         },
         .{
             .id = 8,
@@ -378,7 +367,6 @@ test "manifest codec round trips run metadata" {
             .largest_namespace_name = "meta",
             .largest_key = "meta:z",
             .entry_count = 3,
-            .bloom_filter = "bloom-b",
         },
     };
 
@@ -414,7 +402,6 @@ test "manifest codec round trips run metadata" {
     try std.testing.expectEqual(@as(u64, 1200), decoded.runs[1].compression_stats.logical_entry_bytes);
     try std.testing.expectEqual(@as(u64, 4), decoded.runs[1].compression_stats.compressed_blocks);
     try std.testing.expectEqual(@as(u32, 3), decoded.runs[1].entry_count);
-    try std.testing.expectEqualStrings("bloom-b", decoded.runs[1].bloom_filter);
     try std.testing.expectEqual(@as(usize, 1), decoded.obsolete_paths.len);
     try std.testing.expectEqual(@as(u64, 1234), decoded.obsolete_paths[0].delete_after_ns);
     try std.testing.expectEqualStrings("runs/000001.tbl", decoded.obsolete_paths[0].path);
@@ -439,7 +426,6 @@ test "manifest borrowed codec round trips run metadata" {
             .largest_namespace_name = null,
             .largest_key = "doc:z",
             .entry_count = 24,
-            .bloom_filter = "bloom-a",
         },
         .{
             .id = 8,
@@ -458,7 +444,6 @@ test "manifest borrowed codec round trips run metadata" {
             .largest_namespace_name = "meta",
             .largest_key = "meta:z",
             .entry_count = 3,
-            .bloom_filter = "bloom-b",
         },
     };
 
@@ -493,7 +478,6 @@ test "manifest borrowed codec round trips run metadata" {
     try std.testing.expectEqual(@as(u64, 1200), decoded.runs[1].compression_stats.logical_entry_bytes);
     try std.testing.expectEqual(@as(u64, 4), decoded.runs[1].compression_stats.compressed_blocks);
     try std.testing.expectEqual(@as(u32, 3), decoded.runs[1].entry_count);
-    try std.testing.expectEqualStrings("bloom-b", decoded.runs[1].bloom_filter);
     try std.testing.expectEqual(@as(usize, 1), decoded.obsolete_paths.len);
     try std.testing.expectEqual(@as(u64, 1234), decoded.obsolete_paths[0].delete_after_ns);
     try std.testing.expectEqualStrings("runs/000001.tbl", decoded.obsolete_paths[0].path);

@@ -157,6 +157,7 @@ pub const PathEdgeInfo = struct {
     target: []const u8,
     edge_type: []const u8,
     weight: f64,
+    metadata: []const u8 = "",
 };
 
 pub const GraphResultNode = struct {
@@ -187,6 +188,7 @@ pub const GraphResultNode = struct {
                 alloc.free(e.source);
                 alloc.free(e.target);
                 alloc.free(e.edge_type);
+                if (e.metadata.len > 0) alloc.free(e.metadata);
             }
             alloc.free(pe);
         }
@@ -1114,6 +1116,7 @@ fn clonePatternPathEdgesFromInfoAlloc(alloc: Allocator, edges: []const PathEdgeI
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
         initialized += 1;
     }
@@ -1125,6 +1128,7 @@ fn freeGraphPatternPathEdgeItems(alloc: Allocator, edges: []const paths_mod.Path
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
 }
 
@@ -1156,6 +1160,7 @@ fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphResultN
             .target = try alloc.dupe(u8, e.target),
             .edge_type = try alloc.dupe(u8, e.edge_type),
             .weight = e.weight,
+            .metadata = if (e.metadata.len > 0) try alloc.dupe(u8, e.metadata) else "",
         };
     }
 
@@ -1355,6 +1360,7 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const PathEdgeInfo, initialized:
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     alloc.free(edges);
 }
@@ -1371,6 +1377,7 @@ fn freeResultNode(alloc: Allocator, node: GraphResultNode) void {
             alloc.free(e.source);
             alloc.free(e.target);
             alloc.free(e.edge_type);
+            if (e.metadata.len > 0) alloc.free(e.metadata);
         }
         alloc.free(pe);
     }

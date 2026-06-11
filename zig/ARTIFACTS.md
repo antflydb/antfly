@@ -98,10 +98,10 @@ Artifacts are document-adjacent and should be returned through ordinary document
 lookup when requested:
 
 ```http
-GET /tables/{table}/lookup/{document_id}
-GET /tables/{table}/lookup/{document_id}?fields=title,_artifacts
-GET /tables/{table}/lookup/{document_id}?fields=_artifacts.*
-GET /tables/{table}/lookup/{document_id}?fields=_artifacts.page_ocr_v1.value
+GET /tables/{table}/documents/{document_id}
+GET /tables/{table}/documents/{document_id}?fields=title,_artifacts
+GET /tables/{table}/documents/{document_id}?fields=_artifacts.*
+GET /tables/{table}/documents/{document_id}?fields=_artifacts.page_ocr_v1.value
 ```
 
 The default lookup response should not hydrate artifacts. Artifact hydration is

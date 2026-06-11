@@ -76,6 +76,32 @@ pub fn resolvePublicArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !Pu
 }
 
 pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !?EmbeddingArtifactIdentity {
+    if (internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+        const base_key = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, key)) orelse return null;
+        errdefer alloc.free(base_key);
+        if (base_key.len >= key.len or key[base_key.len] != internal_keys.derived_embedding_kind) return error.InvalidInternalUserKey;
+        const embedding_name_component = (try decodeInternalKeyComponentAlloc(alloc, key, base_key.len + 1)) orelse return error.InvalidInternalUserKey;
+        errdefer alloc.free(embedding_name_component.value);
+        if (embedding_name_component.next != key.len) return error.InvalidInternalUserKey;
+        const parent_doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, base_key)) orelse return error.InvalidInternalUserKey;
+        errdefer alloc.free(parent_doc_key);
+
+        var identity = EmbeddingArtifactIdentity{
+            .embedding_name = embedding_name_component.value,
+            .doc_key = base_key,
+            .parent_doc_key = parent_doc_key,
+        };
+        errdefer identity.deinit(alloc);
+
+        if (try decodeChunkArtifactSourceAlloc(alloc, base_key)) |source| {
+            identity.source_artifact_name = source.name;
+            identity.chunk_id = source.chunk_id;
+            if (source.unit_id) |unit_id| alloc.free(unit_id);
+        }
+
+        return identity;
+    }
+
     var artifact_ref = (try decodeArtifactRefAlloc(alloc, key)) orelse return null;
     defer artifact_ref.deinit(alloc);
     if (artifact_ref.kind != .embedding) return null;
@@ -106,6 +132,52 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
     return identity;
 }
 
+const DecodedChunkArtifactSource = struct {
+    name: []u8,
+    chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
+
+    fn deinit(self: *DecodedChunkArtifactSource, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
+        self.* = undefined;
+    }
+};
+
+fn decodeChunkArtifactSourceAlloc(alloc: Allocator, key: []const u8) !?DecodedChunkArtifactSource {
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return null;
+    const doc_term = internal_keys.findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != internal_keys.artifact_kind) return error.InvalidInternalUserKey;
+    pos += 1;
+
+    const type_component = (try decodeInternalKeyComponentAlloc(alloc, key, pos)) orelse return error.InvalidInternalUserKey;
+    defer alloc.free(type_component.value);
+    if (!std.mem.eql(u8, type_component.value, "chunk")) return error.InvalidInternalUserKey;
+    pos = type_component.next;
+
+    const name_component = (try decodeInternalKeyComponentAlloc(alloc, key, pos)) orelse return error.InvalidInternalUserKey;
+    errdefer alloc.free(name_component.value);
+    pos = name_component.next;
+
+    var unit_id: ?[]u8 = null;
+    errdefer if (unit_id) |owned| alloc.free(owned);
+    if (pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+        pos += 1;
+        const unit_component = (try decodeInternalKeyComponentAlloc(alloc, key, pos)) orelse return error.InvalidInternalUserKey;
+        unit_id = unit_component.value;
+        pos = unit_component.next;
+    }
+
+    if (pos + 1 + @sizeOf(u32) != key.len or key[pos] != internal_keys.chunk_record_kind) return error.InvalidInternalUserKey;
+    const chunk_bytes: *const [@sizeOf(u32)]u8 = @ptrCast(key[pos + 1 .. pos + 1 + @sizeOf(u32)].ptr);
+    return .{
+        .name = name_component.value,
+        .chunk_id = std.mem.readInt(u32, chunk_bytes, .big),
+        .unit_id = unit_id,
+    };
+}
+
 pub fn decodeArtifactRefAlloc(alloc: Allocator, key: []const u8) !?types.ArtifactRef {
     if (!internal_keys.isInternalUserKey(key)) return null;
 
@@ -126,7 +198,28 @@ pub fn decodeArtifactRefAlloc(alloc: Allocator, key: []const u8) !?types.Artifac
     errdefer alloc.free(name_component.value);
 
     var source_chunk_id: ?u32 = null;
-    if (std.mem.eql(u8, type_component.value, "chunk")) {
+    var source_unit_id: ?[]u8 = null;
+    errdefer if (source_unit_id) |unit_id| alloc.free(unit_id);
+    if (std.mem.eql(u8, type_component.value, "asset") and pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+        pos += 1;
+        const unit_component = (try decodeInternalKeyComponentAlloc(alloc, key, pos)) orelse return error.InvalidInternalUserKey;
+        source_unit_id = unit_component.value;
+        pos = unit_component.next;
+        if (pos == key.len) {
+            return .{
+                .document_id = document_id,
+                .name = name_component.value,
+                .kind = .asset,
+                .unit_id = source_unit_id,
+            };
+        }
+    } else if (std.mem.eql(u8, type_component.value, "chunk")) {
+        if (pos < key.len and key[pos] == internal_keys.document_unit_record_kind) {
+            pos += 1;
+            const unit_component = (try decodeInternalKeyComponentAlloc(alloc, key, pos)) orelse return error.InvalidInternalUserKey;
+            source_unit_id = unit_component.value;
+            pos = unit_component.next;
+        }
         if (pos + 1 + @sizeOf(u32) > key.len or key[pos] != internal_keys.chunk_record_kind) return error.InvalidInternalUserKey;
         const chunk_bytes: *const [@sizeOf(u32)]u8 = @ptrCast(key[pos + 1 .. pos + 1 + @sizeOf(u32)].ptr);
         source_chunk_id = std.mem.readInt(u32, chunk_bytes, .big);
@@ -137,6 +230,7 @@ pub fn decodeArtifactRefAlloc(alloc: Allocator, key: []const u8) !?types.Artifac
                 .name = name_component.value,
                 .kind = .chunk,
                 .chunk_id = source_chunk_id,
+                .unit_id = source_unit_id,
             };
         }
     }
@@ -160,6 +254,7 @@ pub fn decodeArtifactRefAlloc(alloc: Allocator, key: []const u8) !?types.Artifac
         .kind = try decodeArtifactKind(type_component.value),
         .name = name_component.value,
         .chunk_id = source_chunk_id,
+        .unit_id = source_unit_id,
     };
 
     return .{
@@ -185,6 +280,10 @@ pub fn artifactPublicIdAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) 
     if (artifact_ref.chunk_id) |chunk_id| {
         try appendDecimalComponent(alloc, &out, chunk_id);
     }
+    if (artifact_ref.unit_id) |unit_id| {
+        try out.appendSlice(alloc, ":unit:");
+        try appendBase64UrlComponent(alloc, &out, unit_id);
+    }
     if (artifact_ref.source) |source| {
         try out.appendSlice(alloc, ":from:");
         try out.appendSlice(alloc, artifactKindLabel(source.kind));
@@ -192,6 +291,10 @@ pub fn artifactPublicIdAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) 
         try appendBase64UrlComponent(alloc, &out, source.name);
         if (source.chunk_id) |chunk_id| {
             try appendDecimalComponent(alloc, &out, chunk_id);
+        }
+        if (source.unit_id) |unit_id| {
+            try out.appendSlice(alloc, ":unit:");
+            try appendBase64UrlComponent(alloc, &out, unit_id);
         }
     }
 
@@ -218,8 +321,15 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
         artifact_ref.chunk_id = try std.fmt.parseUnsigned(u32, chunk_raw, 10);
     }
 
-    if (parts.next()) |marker| {
-        if (!std.mem.eql(u8, marker, "from")) return error.InvalidArgument;
+    var marker = parts.next();
+    if ((artifact_ref.kind == .chunk or artifact_ref.kind == .asset) and marker != null and std.mem.eql(u8, marker.?, "unit")) {
+        const unit_raw = parts.next() orelse return error.InvalidArgument;
+        artifact_ref.unit_id = try decodeBase64UrlComponentAlloc(alloc, unit_raw);
+        marker = parts.next();
+    }
+
+    if (marker) |value| {
+        if (!std.mem.eql(u8, value, "from")) return error.InvalidArgument;
 
         const source_kind = parts.next() orelse return error.InvalidArgument;
         const source_name = parts.next() orelse return error.InvalidArgument;
@@ -227,17 +337,26 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
             .kind = try decodeArtifactKind(source_kind),
             .name = try decodeBase64UrlComponentAlloc(alloc, source_name),
         };
-        errdefer source.deinit(alloc);
+        var source_owned = true;
+        errdefer if (source_owned) source.deinit(alloc);
 
         if (source.kind == .chunk) {
             const source_chunk_raw = parts.next() orelse return error.InvalidArgument;
             source.chunk_id = try std.fmt.parseUnsigned(u32, source_chunk_raw, 10);
         }
 
+        var source_marker = parts.next();
+        if (source.kind == .chunk and source_marker != null and std.mem.eql(u8, source_marker.?, "unit")) {
+            const source_unit_raw = parts.next() orelse return error.InvalidArgument;
+            source.unit_id = try decodeBase64UrlComponentAlloc(alloc, source_unit_raw);
+            source_marker = parts.next();
+        }
+        if (source_marker != null) return error.InvalidArgument;
+
         artifact_ref.source = source;
+        source_owned = false;
     }
 
-    if (parts.next() != null) return error.InvalidArgument;
     try validateArtifactRef(artifact_ref);
     return artifact_ref;
 }
@@ -246,8 +365,14 @@ pub fn internalKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
     try validateArtifactRef(artifact_ref);
 
     return switch (artifact_ref.kind) {
-        .chunk => internal_keys.chunkArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, artifact_ref.chunk_id.?),
-        .asset => internal_keys.artifactNamedPrefixAlloc(alloc, artifact_ref.document_id, "asset", artifact_ref.name),
+        .chunk => if (artifact_ref.unit_id) |unit_id|
+            internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, unit_id, artifact_ref.chunk_id.?)
+        else
+            internal_keys.chunkArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, artifact_ref.chunk_id.?),
+        .asset => if (artifact_ref.unit_id) |unit_id|
+            internal_keys.documentUnitArtifactKeyAlloc(alloc, artifact_ref.document_id, artifact_ref.name, unit_id)
+        else
+            internal_keys.artifactNamedPrefixAlloc(alloc, artifact_ref.document_id, "asset", artifact_ref.name),
         .embedding => {
             if (artifact_ref.source) |source| {
                 const base_ref = types.ArtifactRef{
@@ -255,6 +380,7 @@ pub fn internalKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.Arti
                     .name = source.name,
                     .kind = source.kind,
                     .chunk_id = source.chunk_id,
+                    .unit_id = source.unit_id,
                     .source = null,
                 };
                 const base_key = try internalKeyForArtifactRefAlloc(alloc, base_ref);
@@ -321,7 +447,7 @@ fn validateArtifactRef(artifact_ref: types.ArtifactRef) !void {
             if (artifact_ref.chunk_id != null or artifact_ref.source != null) return error.InvalidArgument;
         },
         .embedding => {
-            if (artifact_ref.chunk_id != null) return error.InvalidArgument;
+            if (artifact_ref.chunk_id != null or artifact_ref.unit_id != null) return error.InvalidArgument;
         },
     }
 
@@ -329,7 +455,7 @@ fn validateArtifactRef(artifact_ref: types.ArtifactRef) !void {
         if (artifact_ref.kind != .embedding) return error.InvalidArgument;
         switch (source.kind) {
             .chunk => if (source.chunk_id == null) return error.InvalidArgument,
-            .asset, .embedding => if (source.chunk_id != null) return error.InvalidArgument,
+            .asset, .embedding => if (source.chunk_id != null or source.unit_id != null) return error.InvalidArgument,
         }
     }
 }
@@ -339,11 +465,23 @@ fn expectArtifactRefEqual(expected: types.ArtifactRef, actual: types.ArtifactRef
     try std.testing.expectEqualStrings(expected.name, actual.name);
     try std.testing.expectEqual(expected.kind, actual.kind);
     try std.testing.expectEqual(expected.chunk_id, actual.chunk_id);
+    if (expected.unit_id) |expected_unit_id| {
+        const actual_unit_id = actual.unit_id orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_unit_id, actual_unit_id);
+    } else {
+        try std.testing.expect(actual.unit_id == null);
+    }
     if (expected.source) |expected_source| {
         const actual_source = actual.source orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(expected_source.kind, actual_source.kind);
         try std.testing.expectEqualStrings(expected_source.name, actual_source.name);
         try std.testing.expectEqual(expected_source.chunk_id, actual_source.chunk_id);
+        if (expected_source.unit_id) |expected_unit_id| {
+            const actual_unit_id = actual_source.unit_id orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(expected_unit_id, actual_unit_id);
+        } else {
+            try std.testing.expect(actual_source.unit_id == null);
+        }
     } else {
         try std.testing.expect(actual.source == null);
     }
@@ -375,6 +513,59 @@ test "artifact public id round trips chunk artifact refs" {
     try expectArtifactRefEqual(artifact_ref, decoded_internal);
 }
 
+test "artifact public id round trips document unit chunk artifact refs" {
+    const alloc = std.testing.allocator;
+
+    var artifact_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "document_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 3,
+        .unit_id = try alloc.dupe(u8, "page:000001"),
+    };
+    defer artifact_ref.deinit(alloc);
+
+    const public_id = try artifactPublicIdAlloc(alloc, artifact_ref);
+    defer alloc.free(public_id);
+
+    var decoded = (try decodeArtifactPublicIdAlloc(alloc, public_id)).?;
+    defer decoded.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded);
+
+    const internal_key = try internalKeyForArtifactRefAlloc(alloc, decoded);
+    defer alloc.free(internal_key);
+
+    var decoded_internal = (try decodeArtifactRefAlloc(alloc, internal_key)).?;
+    defer decoded_internal.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded_internal);
+}
+
+test "artifact public id round trips document unit asset artifact refs" {
+    const alloc = std.testing.allocator;
+
+    var artifact_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "document_units_v1"),
+        .kind = .asset,
+        .unit_id = try alloc.dupe(u8, "page:000001"),
+    };
+    defer artifact_ref.deinit(alloc);
+
+    const public_id = try artifactPublicIdAlloc(alloc, artifact_ref);
+    defer alloc.free(public_id);
+
+    var decoded = (try decodeArtifactPublicIdAlloc(alloc, public_id)).?;
+    defer decoded.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded);
+
+    const internal_key = try internalKeyForArtifactRefAlloc(alloc, decoded);
+    defer alloc.free(internal_key);
+
+    var decoded_internal = (try decodeArtifactRefAlloc(alloc, internal_key)).?;
+    defer decoded_internal.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded_internal);
+}
+
 test "artifact public id round trips derived embedding refs" {
     const alloc = std.testing.allocator;
 
@@ -386,6 +577,37 @@ test "artifact public id round trips derived embedding refs" {
             .kind = .chunk,
             .name = try alloc.dupe(u8, "body_chunks_v1"),
             .chunk_id = 2,
+        },
+    };
+    defer artifact_ref.deinit(alloc);
+
+    const public_id = try artifactPublicIdAlloc(alloc, artifact_ref);
+    defer alloc.free(public_id);
+
+    var decoded = (try decodeArtifactPublicIdAlloc(alloc, public_id)).?;
+    defer decoded.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded);
+
+    const internal_key = try internalKeyForArtifactRefAlloc(alloc, decoded);
+    defer alloc.free(internal_key);
+
+    var decoded_internal = (try decodeArtifactRefAlloc(alloc, internal_key)).?;
+    defer decoded_internal.deinit(alloc);
+    try expectArtifactRefEqual(artifact_ref, decoded_internal);
+}
+
+test "artifact public id round trips document unit chunk derived embedding refs" {
+    const alloc = std.testing.allocator;
+
+    var artifact_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "document_dense_v1"),
+        .kind = .embedding,
+        .source = .{
+            .kind = .chunk,
+            .name = try alloc.dupe(u8, "document_chunks_v1"),
+            .chunk_id = 3,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
         },
     };
     defer artifact_ref.deinit(alloc);
@@ -436,5 +658,23 @@ test "decode embedding artifact identity for chunk embedding" {
     try std.testing.expectEqualStrings(chunk_key, identity.doc_key);
     try std.testing.expectEqualStrings("doc:a", identity.parent_doc_key.?);
     try std.testing.expectEqualStrings("body_chunks_v1", identity.source_artifact_name.?);
+    try std.testing.expectEqual(@as(u32, 3), identity.chunk_id.?);
+}
+
+test "decode embedding artifact identity for document unit chunk embedding" {
+    const alloc = std.testing.allocator;
+
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 3);
+    defer alloc.free(chunk_key);
+    const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_dense_v1");
+    defer alloc.free(key);
+
+    var identity = (try decodeEmbeddingArtifactIdentityAlloc(alloc, key)).?;
+    defer identity.deinit(alloc);
+
+    try std.testing.expectEqualStrings("document_dense_v1", identity.embedding_name);
+    try std.testing.expectEqualStrings(chunk_key, identity.doc_key);
+    try std.testing.expectEqualStrings("doc:a", identity.parent_doc_key.?);
+    try std.testing.expectEqualStrings("document_chunks_v1", identity.source_artifact_name.?);
     try std.testing.expectEqual(@as(u32, 3), identity.chunk_id.?);
 }

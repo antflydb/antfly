@@ -80,17 +80,14 @@ pub fn textEncoderForward(
         hidden = normed;
     }
 
-    // EOS token pooling: take embedding at last non-padding position per batch
+    // EOS token pooling: CLIP tokenizers use the highest token id as EOT.
     const hidden_data = try cb.toFloat32(hidden, allocator);
     defer allocator.free(hidden_data);
     cb.free(hidden);
 
     const eos_embeddings = try allocator.alloc(f32, batch * H);
     for (0..batch) |b| {
-        var eos_pos: usize = 0;
-        for (0..seq_len) |s| {
-            if (input_ids[b * seq_len + s] != 0) eos_pos = s;
-        }
+        const eos_pos = clipEotPosition(input_ids, b, seq_len);
         @memcpy(eos_embeddings[b * H ..][0..H], hidden_data[(b * seq_len + eos_pos) * H ..][0..H]);
     }
 
@@ -107,6 +104,29 @@ pub fn textEncoderForward(
     const projected = try cb.linearNoBias(eos_ct, proj_w, batch, H, cfg.projection_dim);
     defer cb.free(projected);
     return try cb.toFloat32(projected, allocator);
+}
+
+fn clipEotPosition(input_ids: []const i64, batch_index: usize, seq_len: usize) usize {
+    var eos_pos: usize = 0;
+    var eos_id: i64 = std.math.minInt(i64);
+    for (0..seq_len) |s| {
+        const token_id = input_ids[batch_index * seq_len + s];
+        if (token_id > eos_id) {
+            eos_id = token_id;
+            eos_pos = s;
+        }
+    }
+    return eos_pos;
+}
+
+test "clip text pooling selects first highest token id as eot" {
+    const ids = [_]i64{
+        49406, 111, 49407, 49407, 0,
+        49406, 222, 333,   49407, 0,
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), clipEotPosition(&ids, 0, 5));
+    try std.testing.expectEqual(@as(usize, 3), clipEotPosition(&ids, 1, 5));
 }
 
 // ---- Vision Encoder (ViT) ----
@@ -360,29 +380,148 @@ fn selfAttn(
     defer cb.free(K);
     defer cb.free(V);
 
+    const Q_heads = try packTokenMajorToHeadMajor(cb, allocator, Q, batch, seq_len, num_heads, head_dim);
+    defer cb.free(Q_heads);
+    const K_heads = try packTokenMajorToHeadMajor(cb, allocator, K, batch, seq_len, num_heads, head_dim);
+    defer cb.free(K_heads);
+    const V_heads = try packTokenMajorToHeadMajor(cb, allocator, V, batch, seq_len, num_heads, head_dim);
+    defer cb.free(V_heads);
+
     const attn_out = if (causal)
-        try cb.causalSelfAttention(Q, K, V, null, batch, seq_len, num_heads, head_dim)
+        try cb.causalSelfAttention(Q_heads, K_heads, V_heads, null, batch, seq_len, num_heads, head_dim)
     else blk: {
         const ones = try allocator.alloc(i64, batch * seq_len);
         defer allocator.free(ones);
         @memset(ones, 1);
-        break :blk try cb.scaledDotProductAttention(Q, K, V, ones, null, batch, seq_len, num_heads, head_dim);
+        break :blk try cb.scaledDotProductAttention(Q_heads, K_heads, V_heads, ones, null, batch, seq_len, num_heads, head_dim);
     };
     defer cb.free(attn_out);
+    const attn_token_major = try unpackHeadMajorToTokenMajor(cb, allocator, attn_out, batch, seq_len, num_heads, head_dim);
+    defer cb.free(attn_token_major);
 
     var o_w_buf: [128]u8 = undefined;
     var o_b_buf: [128]u8 = undefined;
     const o_w = try cb.getWeight(try fmt(&o_w_buf, "{s}.{d}.self_attn.out_proj.weight", .{ prefix, layer }));
     const o_b = try cb.getWeight(try fmt(&o_b_buf, "{s}.{d}.self_attn.out_proj.bias", .{ prefix, layer }));
-    return (try cb.linearAdd(attn_out, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
-        const projected = try cb.linear(attn_out, o_w, o_b, total, hidden, hidden);
+    return (try cb.linearAdd(attn_token_major, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
+        const projected = try cb.linear(attn_token_major, o_w, o_b, total, hidden, hidden);
         defer cb.free(projected);
         break :blk try cb.add(residual, projected);
     };
 }
 
+fn packTokenMajorToHeadMajor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !CT {
+    const token_major = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(token_major);
+    const head_major = try packTokenMajorDataToHeadMajor(allocator, token_major, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(head_major);
+    const shape = [_]i32{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim) };
+    return cb.fromFloat32Shape(head_major, &shape);
+}
+
+fn unpackHeadMajorToTokenMajor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !CT {
+    const head_major = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(head_major);
+    const token_major = try unpackHeadMajorDataToTokenMajor(allocator, head_major, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(token_major);
+    const shape = [_]i32{ @intCast(batch * seq_len), @intCast(num_heads * head_dim) };
+    return cb.fromFloat32Shape(token_major, &shape);
+}
+
+fn packTokenMajorDataToHeadMajor(
+    allocator: std.mem.Allocator,
+    token_major: []const f32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const expected = batch * seq_len * hidden;
+    if (token_major.len != expected) return error.InvalidAttentionShape;
+
+    const head_major = try allocator.alloc(f32, expected);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| {
+            for (0..num_heads) |h| {
+                const src = (b * seq_len + s) * hidden + h * head_dim;
+                const dst = (b * num_heads + h) * seq_len * head_dim + s * head_dim;
+                @memcpy(head_major[dst..][0..head_dim], token_major[src..][0..head_dim]);
+            }
+        }
+    }
+    return head_major;
+}
+
+fn unpackHeadMajorDataToTokenMajor(
+    allocator: std.mem.Allocator,
+    head_major: []const f32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    const hidden = num_heads * head_dim;
+    const expected = batch * seq_len * hidden;
+    if (head_major.len != expected) return error.InvalidAttentionShape;
+
+    const token_major = try allocator.alloc(f32, expected);
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            for (0..seq_len) |s| {
+                const src = (b * num_heads + h) * seq_len * head_dim + s * head_dim;
+                const dst = (b * seq_len + s) * hidden + h * head_dim;
+                @memcpy(token_major[dst..][0..head_dim], head_major[src..][0..head_dim]);
+            }
+        }
+    }
+    return token_major;
+}
+
 fn fmt(buf: *[128]u8, comptime format: []const u8, args: anytype) ![]const u8 {
     return std.fmt.bufPrint(buf, format, args) catch return error.WeightNameTooLong;
+}
+
+test "clip attention layout pack round-trips token major hidden rows" {
+    const allocator = std.testing.allocator;
+    const batch = 2;
+    const seq_len = 3;
+    const num_heads = 2;
+    const head_dim = 2;
+    const hidden = num_heads * head_dim;
+
+    var token_major: [batch * seq_len * hidden]f32 = undefined;
+    for (&token_major, 0..) |*value, i| value.* = @floatFromInt(i);
+
+    const head_major = try packTokenMajorDataToHeadMajor(allocator, &token_major, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(head_major);
+
+    try std.testing.expectEqual(@as(f32, 0), head_major[0]);
+    try std.testing.expectEqual(@as(f32, 1), head_major[1]);
+    try std.testing.expectEqual(@as(f32, 4), head_major[2]);
+    try std.testing.expectEqual(@as(f32, 5), head_major[3]);
+    try std.testing.expectEqual(@as(f32, 2), head_major[seq_len * head_dim]);
+    try std.testing.expectEqual(@as(f32, 3), head_major[seq_len * head_dim + 1]);
+
+    const round_trip = try unpackHeadMajorDataToTokenMajor(allocator, head_major, batch, seq_len, num_heads, head_dim);
+    defer allocator.free(round_trip);
+    try std.testing.expectEqualSlices(f32, &token_major, round_trip);
 }
 
 test "native clip vision patch weight direct path matches explicit 2d reshape" {

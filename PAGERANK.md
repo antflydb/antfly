@@ -4753,9 +4753,9 @@ than PR unit coverage:
   traversal gate must record three published checks and three fresh rejections.
   Query profile is checked as an explainable
   read-surface gate too: non-HITS families must emit three graph metric profile
-  entries for direct metric, traversal, and rerank sources, while HITS must emit
-  four entries because traversal profile includes both authority and hub
-  statuses. Paired HITS active and failed reads must
+  entries with exactly one direct metric source, one traversal source, and one
+  rerank source, while HITS must emit four entries because traversal profile
+  includes separate authority and hub statuses. Paired HITS active and failed reads must
   return both authority/hub published results, one paired direct fresh
   rejection, separate authority/hub rerank fresh rejections, and paired
   traversal projection metric results, while non-HITS families must keep those

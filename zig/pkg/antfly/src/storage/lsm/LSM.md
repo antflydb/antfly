@@ -93,8 +93,12 @@ slow storage IO.
 - Each backend may have at most one immutable flush publisher active at a time.
   Compaction concurrency is controlled by the compaction scheduler and
   ResourceManager budgets.
-- Soft pressure schedules or accelerates background maintenance. Hard pressure
-  can delay writes or require one bounded writer-assist step.
+- Soft pressure schedules or accelerates background maintenance. Detached
+  maintenance jobs drain a bounded batch of steps per wake so normal ingest can
+  catch up in the storage lane before hard pressure reaches HTTP writers. When
+  no external maintenance waker is configured, debt notes from writes, snapshots,
+  and obsolete-file tracking enter the same detached admission path directly.
+  Hard pressure can delay writes or require one bounded writer-assist step.
 - Metrics must make pressure explicit: mutable bytes, immutable bytes, L0
   runs/bytes, compaction grants/denials, WAL retention/checkpoint lag, and
   maintenance job queue state.
@@ -110,6 +114,10 @@ Status is an observability plane, not a repair mechanism.
 - Writers and background workers publish status snapshots as they make progress.
   Missing or stale cached data should be reported as missing/stale, not repaired
   by probing live state from the request path.
+- Dense/index visibility hooks must not block worker completion on full status
+  refreshes. If the apply lock is busy, publish a bounded best-effort snapshot,
+  mark the table dirty, and let a later explicit status path refresh
+  consistently.
 
 ### Acceptance Criteria
 
@@ -475,7 +483,7 @@ Large-ingest guardrails:
 
 1. [x] Split point lookup into a bloom/range precheck phase followed by a read
    phase for surviving runs.
-   - [x] First slice: point reads now consult the manifest-carried run bloom
+   - [x] First slice: point reads now consult the SSTable-carried run bloom
      before loading a persisted run table index/block from `getFromRunIndices`.
    - [x] Persisted path-backed point reads now run a precheck pass over
      candidate runs using run bounds, run bloom, and table filter metadata
@@ -609,9 +617,11 @@ Large-ingest guardrails:
    - [x] Detached maintenance slice: backends with a detached background
      executor now enqueue one `.maintenance` job when post-write flush/compaction
      debt is visible and no immutable flush job is already responsible for the
-     same work. The job runs a bounded maintenance step off the foreground path,
+     same work. The job drains a bounded batch of maintenance steps off the foreground path,
      so soft L0 debt can make progress without waiting for a later writer to
-     call maintenance explicitly.
+     call maintenance explicitly. Backends without an external maintenance waker
+     now route `notePotentialMaintenanceDebt()` through this same detached
+     admission path.
    - [x] Continuation slice: a detached maintenance job that makes progress now
      clears its in-flight bit and re-enters the same admission path while score
      remains nonzero. Background LSM work therefore drains visible debt as a
@@ -720,6 +730,24 @@ before later table flush. The Zig LSM has table files, run metadata, compaction
 primitives, bulk-ingest modes, and now a bounded node-round maintenance
 scheduler, but it still lacks Pebble's dedicated foreground WAL, immutable
 memtable queue, background worker pool, and mature stall policy.
+
+The intended boundary is now explicit:
+
+- Normal API/VectorDBBench upload is an online write path. The API submits
+  batches as ordinary storage writes and does not open a long-lived API-owned
+  bulk session. Flush, L0 pressure, compaction, stalls, and maintenance
+  scheduling remain storage-owned.
+- True bulk ingest is an external/sorted-ingest or rebuild/import primitive. It
+  is appropriate when the caller can build sorted, final-state table/index data
+  before publication, similar to RocksDB `IngestExternalFile` or Pebble
+  `DB.Ingest`. It is not the default shape for random online POST batches or
+  rewrite-heavy HBC mutation streams. A per-batch `.bulk_ingest` experiment for
+  normal VDBBench upload made insert callers pay foreground pressure compaction
+  and still grew the root aggressively, so it is explicitly not the online
+  design target.
+- Dense/HBC index maintenance should be owned by the derived/index storage
+  workers. The API must not need to optimize or compact an index to make normal
+  writes query-visible.
 
 Current symptoms:
 
@@ -866,12 +894,11 @@ Design target:
 Status: first backend slice implemented
 
 The latest 1M public guardrail showed a specific remaining architectural bug:
-dense query-visible publish is still coupled to LSM cleanup. The public
-auto-bulk path asks for `compact = false`, but it also passes `flush = true`
-and `max_deferred_l0_runs = 64`. In the LSM backend, that path still drains all
-mutable/immutable state and then loops in `compactDeferredL0RunsToLimit()` under
-the backend lock until L0 is below the requested limit. Samples from the failed
-1M run showed the hot stack in:
+normal online writes were being shaped like an API-owned bulk session. That made
+query-visible publish and storage cleanup too easy to couple: an upload could
+accumulate many small primary or HBC L0 runs behind a long-lived session, then
+pay the bill in finish/optimize or dense catch-up. Earlier failed runs showed
+hot stacks like:
 
 - `IndexManager.finishDenseBulkIngestEntryWithOptions`
 - `HBCIndex.finishBulkIngestSessionWithOptions`
@@ -1667,8 +1694,8 @@ Implemented in this pass:
 - New table files now load indexes via:
   - one fixed-size footer trailer read
   - one contiguous metadata read
-- Bloom-negative reads now require and use manifest-carried `encoded_bloom_filter` bytes, avoiding whole-table I/O on common negative probes after reopen.
-- Once a manifest bloom has been decoded for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
+- Bloom-negative reads now materialize run bloom filters from SSTable table indexes, avoiding whole-table I/O on common negative probes after reopen without bloating the manifest.
+- Once an SSTable bloom has been materialized for a live run, later read snapshots now borrow that decoded filter instead of re-decoding it per transaction.
 - Added a backend-local `TableIndex` cache for no-shared-cache readers, and point reads now use `footer metadata + one data block read` instead of loading the full table on first access after reopen.
 - Added a small backend-local run-block cache for no-shared-cache readers so repeated point reads in the same backend can reuse the previously fetched data block without additional file I/O.
 - Added a new v5 table format that stores per-block upper-bound metadata in the footer bundle. Point reads now use that metadata to jump directly to a single candidate data block instead of binary-searching across entry offsets and potentially touching multiple blocks.

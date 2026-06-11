@@ -62,6 +62,11 @@ pub fn parseCreateEmbeddingBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.EmbedRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for predict.
+pub fn parsePredictBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PredictRequest) {
+    return std.json.parseFromSlice(types.PredictRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -82,6 +87,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/extract", .operation_id = "extract" },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels" },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding" },
+    .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors" },
+    .{ .method = "POST", .path = "/predict", .operation_id = "predict" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -107,6 +114,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "createEmbedding")) @compileError("ServerRouter: Impl missing required method 'createEmbedding'");
+        if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
+        if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
     }
 
     return struct {
@@ -133,6 +142,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/extract", extract);
             try server.get("/models", listModels);
             try server.post("/embeddings", createEmbedding);
+            try server.get("/predictors", listPredictors);
+            try server.post("/predict", predict);
         }
 
         /// Create embeddings (alias of `/embeddings`)
@@ -218,6 +229,20 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.createEmbedding(ctx);
         }
+
+        /// List Traditional ML predictors
+        /// GET /predictors
+        fn listPredictors(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.listPredictors(ctx);
+        }
+
+        /// Run a traditional ML predictor
+        /// POST /predict
+        fn predict(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.predict(ctx);
+        }
     };
 }
 
@@ -235,3 +260,5 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createEmbedding(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response

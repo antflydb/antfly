@@ -821,6 +821,65 @@ pub const ScanResult = struct {
     }
 };
 
+pub const DocumentArtifactReprocessShardResume = struct {
+    group_id: ?u64 = null,
+    next_key: []const u8,
+    limit: u32 = 0,
+};
+
+pub const DocumentArtifactTableReprocessRequest = struct {
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    limit: u32 = 100,
+    shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    key: []u8,
+    error_code: []u8,
+
+    pub fn deinit(self: *DocumentArtifactReprocessFailure, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.error_code);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactReprocessShardCursor = struct {
+    group_id: ?u64 = null,
+    next_key: []u8,
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+
+    pub fn deinit(self: *DocumentArtifactReprocessShardCursor, alloc: Allocator) void {
+        alloc.free(self.next_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactTableReprocessResult = struct {
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+    next_key: ?[]u8 = null,
+    failures: []DocumentArtifactReprocessFailure = &.{},
+    shard_cursors: []DocumentArtifactReprocessShardCursor = &.{},
+
+    pub fn deinit(self: *DocumentArtifactTableReprocessResult, alloc: Allocator) void {
+        if (self.next_key) |value| alloc.free(value);
+        for (self.failures) |*failure| failure.deinit(alloc);
+        if (self.failures.len > 0) alloc.free(self.failures);
+        for (self.shard_cursors) |*cursor| cursor.deinit(alloc);
+        if (self.shard_cursors.len > 0) alloc.free(self.shard_cursors);
+        self.* = undefined;
+    }
+};
+
 pub const RelationalRowsQueryOrderDirection = enum {
     asc,
     desc,
@@ -2287,6 +2346,7 @@ pub const SearchHit = struct {
     doc_ordinal: ?u32 = null,
     score: ?f32 = null,
     score_details: ?GraphMetricRerankScoreDetails = null,
+    index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
@@ -2297,6 +2357,7 @@ pub const SearchHit = struct {
             .doc_ordinal = self.doc_ordinal,
             .score = self.score,
             .score_details = if (self.score_details) |details| try details.clone(alloc) else null,
+            .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
@@ -2304,6 +2365,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             if (cloned.score_details) |*details| details.deinit(alloc);
+            freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
@@ -2326,6 +2388,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.score_details) |*details| details.deinit(alloc);
+        freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
@@ -2333,6 +2396,29 @@ pub const SearchHit = struct {
         self.* = undefined;
     }
 };
+
+pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
+    if (scores.len == 0) return &.{};
+    const cloned = try alloc.alloc(fusion_mod.IndexScore, scores.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(cloned);
+    }
+    for (scores, 0..) |score, i| {
+        cloned[i] = .{
+            .index_name = try alloc.dupe(u8, score.index_name),
+            .score = score.score,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
+    for (scores) |score| alloc.free(score.index_name);
+    if (scores.len > 0) alloc.free(scores);
+}
 
 pub const ChunkHit = struct {
     id: []u8,

@@ -52,6 +52,7 @@ pub const PathEdge = struct {
     target: []const u8,
     edge_type: []const u8,
     weight: f64,
+    metadata: []const u8 = "",
 };
 
 pub const Path = struct {
@@ -68,6 +69,7 @@ pub fn freePath(alloc: Allocator, path: Path) void {
         alloc.free(e.source);
         alloc.free(e.target);
         alloc.free(e.edge_type);
+        if (e.metadata.len > 0) alloc.free(e.metadata);
     }
     alloc.free(path.edges);
 }
@@ -94,6 +96,7 @@ const OwnedEdgeInfo = struct {
     target: []const u8,
     edge_type: []const u8,
     weight: f64,
+    metadata: []const u8 = "",
 };
 
 fn pathNodeLessThan(_: void, a: *PathNode, b: *PathNode) std.math.Order {
@@ -170,6 +173,7 @@ fn bfsShortestPath(
                 alloc.free(e.source);
                 alloc.free(e.target);
                 alloc.free(e.edge_type);
+                if (e.metadata.len > 0) alloc.free(e.metadata);
             }
             alloc.destroy(n);
         }
@@ -238,6 +242,7 @@ fn bfsShortestPath(
                     .target = try alloc.dupe(u8, edge.target),
                     .edge_type = try alloc.dupe(u8, edge.edge_type),
                     .weight = edge.weight,
+                    .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
                 },
             };
             try node_pool.append(alloc, node);
@@ -275,6 +280,7 @@ fn dijkstraPath(
                 alloc.free(e.source);
                 alloc.free(e.target);
                 alloc.free(e.edge_type);
+                if (e.metadata.len > 0) alloc.free(e.metadata);
             }
             alloc.destroy(n);
         }
@@ -363,6 +369,7 @@ fn dijkstraPath(
                         .target = try alloc.dupe(u8, edge.target),
                         .edge_type = try alloc.dupe(u8, edge.edge_type),
                         .weight = edge.weight,
+                        .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
                     },
                 };
                 try node_pool.append(alloc, node);
@@ -566,6 +573,7 @@ fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
                 .target = try alloc.dupe(u8, pe.target),
                 .edge_type = try alloc.dupe(u8, pe.edge_type),
                 .weight = pe.weight,
+                .metadata = if (pe.metadata.len > 0) try alloc.dupe(u8, pe.metadata) else "",
             };
             total_weight += pe.weight;
         }

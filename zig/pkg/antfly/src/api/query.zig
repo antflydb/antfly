@@ -1260,6 +1260,7 @@ fn cloneGraphPatternMatch(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (source.path.len > 0) alloc.free(path);
     }
@@ -1269,6 +1270,7 @@ fn cloneGraphPatternMatch(
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
         initialized_path += 1;
     }
@@ -1300,6 +1302,7 @@ fn cloneGraphResultNode(
                 .target = try alloc.dupe(u8, item.target),
                 .edge_type = try alloc.dupe(u8, item.edge_type),
                 .weight = item.weight,
+                .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
             };
         }
         break :blk out;
@@ -1355,6 +1358,7 @@ fn cloneGraphPath(
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
     }
 

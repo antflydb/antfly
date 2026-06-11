@@ -14,9 +14,9 @@ function Switch({ className, ...props }: React.ComponentProps<typeof SwitchPrimi
         // (compact / comfortable) doesn't distort the thumb fit. Flex centers
         // the thumb vertically; px-[1px] gives the 1px inset on each side.
         "inline-flex items-center shrink-0 w-[38px] h-[20px] px-[1px]",
-        "rounded-none border-[1.5px] border-input bg-transparent",
-        // checked: amber fill + amber-500 border
-        "data-[state=checked]:bg-primary data-[state=checked]:border-amber-500",
+        "rounded-none border-(length:--border-width) border-input bg-transparent",
+        // checked: ink fill — amber is reserved for the primary action
+        "data-[state=checked]:bg-foreground data-[state=checked]:border-foreground",
         // focus
         "outline-none transition-colors",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -30,8 +30,8 @@ function Switch({ className, ...props }: React.ComponentProps<typeof SwitchPrimi
         className={cn(
           // square knob, fixed 14×14, horizontal translate only
           "pointer-events-none block size-[14px] rounded-none",
-          // off: muted ink. on: ink-on-amber.
-          "bg-muted-foreground data-[state=checked]:bg-primary-foreground",
+          // off: muted ink. on: paper-on-ink.
+          "bg-muted-foreground data-[state=checked]:bg-background",
           "transition-transform data-[state=checked]:translate-x-[19px]"
         )}
       />

@@ -8,8 +8,10 @@ import { cn } from "@/lib/utils";
  * Buttons in the Antfly design language:
  *   - Mono "instrument" voice (Roboto Mono, 13px, weight 500, 0.03em tracking)
  *   - Square corners (rounded-none)
- *   - 1.5px borders on outlined variants — the visual language is borders, not shadows
- *   - Amber primary fill with ink text; amber-300 hover
+ *   - token-width (--border-width) borders on outlined variants — the visual language is borders, not shadows
+ *   - Ink fill is the everyday primary; the amber `brand` fill is reserved
+ *     for special, infrequent actions (create a table — not apply a filter)
+ *     and appears at most once per screen
  *   - Snappy/linear motion (no spring easing)
  */
 const buttonVariants = cva(
@@ -29,22 +31,25 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Primary — amber fill, ink text, darker amber border, lighter amber hover
+        // Everyday primary — ink fill that contrasts the theme (dark on
+        // light, light on dark); full weight without spending the accent
         default:
-          "bg-primary text-primary-foreground border-[1.5px] border-amber-500 hover:bg-amber-300",
-        // Destructive — outlined red that fills on hover
+          "bg-foreground text-background border-(length:--border-width) border-transparent hover:bg-foreground/85",
+        // Brand — the amber fill. Special, infrequent actions only;
+        // at most one per screen
+        brand:
+          "bg-primary text-primary-foreground border-(length:--border-width) border-transparent hover:bg-amber-300",
+        // Destructive — red ink on a normal chassis; one signal, no shouting
         destructive:
-          "bg-transparent text-destructive border-[1.5px] border-destructive hover:bg-destructive hover:text-white",
-        // Outline / Secondary — bordered, ink text, border darkens on hover
+          "bg-transparent text-destructive border-(length:--border-width) border-input hover:bg-destructive/10",
+        // Outline — bordered, ink text, quiet background hover
         outline:
-          "bg-transparent text-foreground border-[1.5px] border-input hover:border-foreground hover:bg-secondary",
-        secondary:
-          "bg-transparent text-foreground border-[1.5px] border-input hover:border-foreground hover:bg-secondary",
+          "bg-transparent text-foreground border-(length:--border-width) border-input hover:bg-secondary",
         // Ghost — no border, muted text, lights up on hover
         ghost:
-          "bg-transparent text-muted-foreground border-[1.5px] border-transparent hover:text-foreground hover:bg-secondary",
+          "bg-transparent text-muted-foreground border-(length:--border-width) border-transparent hover:text-foreground hover:bg-secondary",
         // Link — text only, underline on hover (no border)
-        link: "text-primary underline-offset-4 hover:underline border-[1.5px] border-transparent",
+        link: "text-primary underline-offset-4 hover:underline border-(length:--border-width) border-transparent",
       },
       size: {
         default: "h-9 px-4 has-[>svg]:px-3",

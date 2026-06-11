@@ -29939,6 +29939,23 @@ test "postgres sql adapter lowers length into expression AST" {
     try std.testing.expectEqual(@as(usize, 1), trimmed.query.order_by.len);
     try std.testing.expect(trimmed.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, trimmed.query.order_by[0].expression.?.kind);
+
+    var replaced = try lowerSelectAlloc(
+        alloc,
+        "SELECT replace(status, '-', ' ') AS status_words FROM usage_records WHERE replace(status, '-', ' ') = $1 ORDER BY replace(status, '-', ' ') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active user" }},
+    );
+    defer replaced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replaced.query.expressions.len);
+    try std.testing.expectEqualStrings("status_words", replaced.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), replaced.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), replaced.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), replaced.query.order_by.len);
+    try std.testing.expect(replaced.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.query.order_by[0].expression.?.kind);
 }
 
 test "postgres sql adapter lowers unary minus into expression AST" {
@@ -35570,6 +35587,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .params = &.{.{ .string = "active" }},
         },
         .{
+            .name = "single table replace predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 0, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+            .sql = "SELECT replace(status, '-', ' ') AS status_words FROM usage_records WHERE replace(status, '-', ' ') = $1 ORDER BY replace(status, '-', ' ') ASC LIMIT 5",
+            .params = &.{.{ .string = "active user" }},
+        },
+        .{
             .name = "single table nested case-fold text expression query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 0, .order_by = 1, .limit = 5 },
@@ -39843,6 +39868,22 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     try std.testing.expectEqualStrings("\"ACTIVE\"", trim_patch.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), trim_patch.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE\"}", trim_patch.batch.returning_rows[0]);
+
+    var replace_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER') ON CONFLICT (email) DO UPDATE SET status = replace(excluded.next_status, '_', '-') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer replace_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), replace_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), replace_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", replace_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ACTIVE-USER\"", replace_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), replace_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE-USER\"}", replace_patch.batch.returning_rows[0]);
 
     var case_patch = try lowerInsertWithResolverAlloc(
         alloc,

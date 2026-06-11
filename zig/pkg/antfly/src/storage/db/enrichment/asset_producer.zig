@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 
 pub const ProducerType = enum {
     copy,
+    document_extraction,
     generator,
     reader,
     transcriber,
@@ -25,6 +26,7 @@ pub const ProducerType = enum {
 
     pub fn parse(text: []const u8) ?ProducerType {
         if (std.mem.eql(u8, text, "copy")) return .copy;
+        if (std.mem.eql(u8, text, "document_extraction")) return .document_extraction;
         if (std.mem.eql(u8, text, "generator")) return .generator;
         if (std.mem.eql(u8, text, "reader")) return .reader;
         if (std.mem.eql(u8, text, "transcriber")) return .transcriber;
@@ -107,6 +109,16 @@ test "asset producer parses typed config" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(ProducerType.reader, cfg.type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"provider\":\"vertex\"") != null);
+}
+
+test "asset producer parses document extraction config" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseProducerConfig(alloc,
+        \\{"type":"document_extraction","config":{"routes":[{"match":{"content_type":"text/plain"},"extractor":{"type":"text","unit":"document"}}]}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(ProducerType.document_extraction, cfg.type);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"routes\"") != null);
 }
 
 test "asset producer parses extractor config" {

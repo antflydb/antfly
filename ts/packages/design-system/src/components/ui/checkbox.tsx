@@ -12,11 +12,11 @@ function Checkbox({ className, ...props }: React.ComponentProps<typeof CheckboxP
       data-slot="checkbox"
       className={cn(
         "peer shrink-0 self-start mt-0.5",
-        // 16px square, deliberate 1.5px border, no radius, no shadow
-        "size-4 rounded-none border-[1.5px] border-input bg-transparent",
-        // checked state: amber fill + ink check
-        "data-[state=checked]:bg-primary data-[state=checked]:text-primary-foreground data-[state=checked]:border-primary",
-        "dark:data-[state=checked]:bg-primary",
+        // 16px square, deliberate token-width (--border-width) border, no radius, no shadow
+        "size-4 rounded-none border-(length:--border-width) border-input bg-transparent",
+        // checked state: ink fill — amber is reserved for the primary action
+        "data-[state=checked]:bg-foreground data-[state=checked]:text-background data-[state=checked]:border-foreground",
+        "dark:data-[state=checked]:bg-foreground",
         // focus
         "outline-none transition-[color,background-color,border-color,box-shadow]",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",

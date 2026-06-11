@@ -71,11 +71,20 @@ pub fn main(init: std.process.Init) !void {
     const alloc = gpa_state.allocator();
 
     const cfg = try parseArgs(init.minimal.args);
+    std.debug.print("recall_harness_start dataset_dir={s} dataset_filter={s} suite={s}\n", .{
+        cfg.dataset_dir,
+        cfg.dataset_filter orelse "<all>",
+        @tagName(cfg.suite),
+    });
+
     var heartbeat = Heartbeat{};
-    const heartbeat_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat});
+    const heartbeat_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat}) catch |err| blk: {
+        std.debug.print("recall_harness_heartbeat_disabled err={s}\n", .{@errorName(err)});
+        break :blk null;
+    };
     defer {
         heartbeat.stop.store(true, .release);
-        heartbeat_thread.join();
+        if (heartbeat_thread) |thread| thread.join();
     }
 
     var ok = true;
@@ -168,7 +177,13 @@ fn runSuite(
             "recall_harness_case_start suite={s} dataset={s} randomize={any} count={d} topk={d}\n",
             .{ suite_name, case.dataset, case.randomize, case.count, case.top_k },
         );
-        const actual = try runner(io, alloc, cfg, dataset_path, case);
+        const actual = runner(io, alloc, cfg, dataset_path, case) catch |err| {
+            std.debug.print(
+                "recall_harness_case_error suite={s} dataset={s} path={s} randomize={any} count={d} topk={d} err={s}\n",
+                .{ suite_name, case.dataset, dataset_path, case.randomize, case.count, case.top_k, @errorName(err) },
+            );
+            return err;
+        };
         const case_ok = compareMetrics(case, actual);
         all_ok = all_ok and case_ok;
 
@@ -299,11 +314,23 @@ fn calculateQuantizerRecallMetric(
             );
         }
         const query = queries.atConst(query_idx);
-        try quantizer.estimateDistancesWithScratch(&quantized, query, estimated, error_bounds, &scratch);
+        quantizer.estimateDistancesWithScratch(&quantized, query, estimated, error_bounds, &scratch) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=quantizer dataset={s} metric={s} query={d}/{d} phase=estimate err={s}\n",
+                .{ dataset_label, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         for (prediction, 0..) |*slot, i| slot.* = i;
         std.mem.sort(usize, prediction, commonDistanceCtx(estimated), distanceLessThan);
 
-        const truth = try common.calculateTruth(alloc, top_k, metric, query, data);
+        const truth = common.calculateTruth(alloc, top_k, metric, query, data) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=quantizer dataset={s} metric={s} query={d}/{d} phase=truth err={s}\n",
+                .{ dataset_label, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer alloc.free(truth);
         recall_sum += common.calculateRecall(prediction[0..top_k], truth);
     }
@@ -374,7 +401,13 @@ fn calculateHBCRecallMetric(
         "recall_harness_metric_start suite=hbc dataset={s} randomize={any} metric={s} data={d} queries={d}\n",
         .{ dataset_label, randomize, @tagName(metric), split.data.count, split.queries.count },
     );
-    var built = try buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing);
+    var built = buildHBCIndex(alloc, split, randomize, metric, bulk_build, centroid_only_routing) catch |err| {
+        std.debug.print(
+            "recall_harness_build_error suite=hbc dataset={s} randomize={any} metric={s} err={s}\n",
+            .{ dataset_label, randomize, @tagName(metric), @errorName(err) },
+        );
+        return err;
+    };
     defer built.deinit();
     std.debug.print(
         "recall_harness_build_done suite=hbc dataset={s} randomize={any} metric={s}\n",
@@ -393,7 +426,13 @@ fn calculateHBCRecallMetric(
             );
         }
         const query = queries.atConst(query_idx);
-        var results = try built.idx.search(query, top_k);
+        var results = built.idx.search(query, top_k) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=hbc dataset={s} randomize={any} metric={s} query={d}/{d} phase=search err={s}\n",
+                .{ dataset_label, randomize, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer results.deinit();
 
         const hits = results.getHits();
@@ -403,7 +442,13 @@ fn calculateHBCRecallMetric(
             slot.* = @intCast(hits[i].vector_id - 1);
         }
 
-        const truth = try common.calculateTruth(alloc, top_k, metric, query, data);
+        const truth = common.calculateTruth(alloc, top_k, metric, query, data) catch |err| {
+            std.debug.print(
+                "recall_harness_query_error suite=hbc dataset={s} randomize={any} metric={s} query={d}/{d} phase=truth err={s}\n",
+                .{ dataset_label, randomize, @tagName(metric), query_number, queries.count, @errorName(err) },
+            );
+            return err;
+        };
         defer alloc.free(truth);
         recall_sum += common.calculateRecall(prediction, truth);
     }

@@ -44,13 +44,29 @@ pub fn fusionStrategy(name: []const u8) ?matcher.FusionStrategy {
     return null;
 }
 
+pub const ResolverSourceArtifactKind = enum {
+    /// Root and unit-scoped asset artifacts. This is the legacy default.
+    asset,
+    /// Chunk-scoped artifacts produced under an asset or unit.
+    chunk,
+    /// Consume every artifact kind with the configured artifact name.
+    any,
+
+    pub fn matches(self: ResolverSourceArtifactKind, actual: ResolverSourceArtifactKind) bool {
+        return self == .any or self == actual;
+    }
+};
+
 pub const ResolverConfig = struct {
     /// Catalog name of the resolver.
     name: []const u8,
     /// Entity table that canonical entities live in.
     table: []const u8,
-    /// Extraction artifact this resolver consumes (asset artifact name).
+    /// Extraction artifact this resolver consumes.
     source_artifact: []const u8,
+    /// Kind of extraction artifact this resolver consumes. Existing configs
+    /// default to asset artifacts; chunk-level mention streams must opt in.
+    source_artifact_kind: ResolverSourceArtifactKind = .asset,
     /// Resolution artifact this resolver writes.
     resolution_artifact: []const u8,
     /// Template that renders a canonical entity key from a mention.
@@ -99,6 +115,7 @@ pub const ResolverConfig = struct {
             .name = try alloc.dupe(u8, cfg.name),
             .table = try alloc.dupe(u8, cfg.table),
             .source_artifact = try alloc.dupe(u8, cfg.source_artifact),
+            .source_artifact_kind = cfg.source_artifact_kind,
             .resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact),
             .key_template = try alloc.dupe(u8, cfg.key_template),
             .type_must_match = cfg.type_must_match,
@@ -136,6 +153,22 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        if (self.name.len == 0 or
+            self.table.len == 0 or
+            self.source_artifact.len == 0 or
+            self.resolution_artifact.len == 0 or
+            self.key_template.len == 0)
+        {
+            return error.InvalidResolverConfig;
+        }
+        if (std.mem.eql(u8, self.source_artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
+        if (self.candidate_search.len > 0 and
+            !std.mem.eql(u8, self.candidate_search, "exact_key") and
+            !std.mem.eql(u8, self.candidate_search, "prefix") and
+            !std.mem.eql(u8, self.candidate_search, "ann"))
+        {
+            return error.InvalidResolverConfig;
+        }
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
@@ -193,6 +226,7 @@ test "resolver catalog round trip" {
             .name = "knowledge_graph",
             .table = "entities",
             .source_artifact = "relations_v1",
+            .source_artifact_kind = .chunk,
             .resolution_artifact = "resolution_v1",
             .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
             .scorer_json = "{\"comparisons\":[],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}",
@@ -219,6 +253,7 @@ test "resolver catalog round trip" {
     try std.testing.expectEqualStrings("knowledge_graph", decoded[0].name);
     try std.testing.expectEqualStrings("entities", decoded[0].table);
     try std.testing.expectEqualStrings("relations_v1", decoded[0].source_artifact);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.chunk, decoded[0].source_artifact_kind);
     try std.testing.expectEqualStrings("resolution_v1", decoded[0].resolution_artifact);
     try std.testing.expectEqualStrings("{{ lower _entity.label }}/{{ slug _entity.canonical_text }}", decoded[0].key_template);
     try std.testing.expect(decoded[0].type_must_match);
@@ -226,6 +261,7 @@ test "resolver catalog round trip" {
     try std.testing.expect(decoded[0].scorer_json.len > 0);
 
     try std.testing.expectEqualStrings("people_only", decoded[1].name);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.asset, decoded[1].source_artifact_kind);
     try std.testing.expect(!decoded[1].type_must_match);
     try std.testing.expectEqual(@as(usize, 0), decoded[1].scorer_json.len);
     try std.testing.expectEqual(@as(u64, 0), decoded[1].config_generation);
@@ -239,6 +275,29 @@ test "resolver catalog round trip preserves order and empty list" {
     const decoded_empty = try deserializeCatalog(alloc, empty);
     defer alloc.free(decoded_empty);
     try std.testing.expectEqual(@as(usize, 0), decoded_empty.len);
+}
+
+test "resolver catalog defaults legacy source artifact kind to asset" {
+    const alloc = std.testing.allocator;
+
+    const decoded = try deserializeCatalog(alloc,
+        \\[
+        \\  {
+        \\    "name": "legacy",
+        \\    "table": "entities",
+        \\    "source_artifact": "relations_v1",
+        \\    "resolution_artifact": "resolution_v1",
+        \\    "key_template": "{{ slug _entity.text }}"
+        \\  }
+        \\]
+    );
+    defer {
+        for (decoded) |*cfg| cfg.deinit(alloc);
+        alloc.free(decoded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), decoded.len);
+    try std.testing.expectEqual(ResolverSourceArtifactKind.asset, decoded[0].source_artifact_kind);
 }
 
 test "resolver config validates fusion strategy and folds confidence into the weight" {
@@ -278,4 +337,61 @@ test "resolver config validates fusion strategy and folds confidence into the we
     bad_prior.fusion_combine = "max";
     bad_prior.fusion_prior = 1.5;
     try std.testing.expectError(error.InvalidResolverConfig, bad_prior.validate());
+}
+
+test "resolver config validates required references and candidate mode" {
+    const base = ResolverConfig{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ _entity.text }}",
+    };
+
+    try base.validate();
+
+    var missing_name = base;
+    missing_name.name = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_name.validate());
+
+    var missing_table = base;
+    missing_table.table = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_table.validate());
+
+    var missing_source = base;
+    missing_source.source_artifact = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_source.validate());
+
+    var missing_resolution = base;
+    missing_resolution.resolution_artifact = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_resolution.validate());
+
+    var missing_key_template = base;
+    missing_key_template.key_template = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_key_template.validate());
+
+    var recursive_artifact = base;
+    recursive_artifact.resolution_artifact = recursive_artifact.source_artifact;
+    try std.testing.expectError(error.InvalidResolverConfig, recursive_artifact.validate());
+
+    var bad_candidate_mode = base;
+    bad_candidate_mode.candidate_search = "nearest";
+    try std.testing.expectError(error.InvalidResolverConfig, bad_candidate_mode.validate());
+
+    var exact_key = base;
+    exact_key.candidate_search = "exact_key";
+    try exact_key.validate();
+
+    var prefix = base;
+    prefix.candidate_search = "prefix";
+    try prefix.validate();
+
+    var ann_missing_reference = base;
+    ann_missing_reference.candidate_search = "ann";
+    try std.testing.expectError(error.InvalidResolverConfig, ann_missing_reference.validate());
+
+    var ann_with_index = base;
+    ann_with_index.candidate_search = "ann";
+    ann_with_index.candidate_ann_index = "entity_name_embedding";
+    try ann_with_index.validate();
 }

@@ -1206,6 +1206,11 @@ components:
           type: object
           additionalProperties: true
           description: "Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node."
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Parsed evidence envelope for provenance labels and edge metadata"
         edges:
           x-go-type-skip-optional-pointer: true
           type: array

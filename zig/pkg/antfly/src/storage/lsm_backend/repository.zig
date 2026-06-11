@@ -57,13 +57,13 @@ pub const Run = struct {
     largest_key: []u8,
     entry_count: u32,
     bloom_filter: ?bloom.OwnedFilter,
-    encoded_bloom_filter: ?[]u8,
     owns_metadata: bool = true,
     owns_bloom_filter: bool = true,
     cached_state_index: ?usize = null,
     cached_index_index: ?usize = null,
     cached_table_index: ?usize = null,
     table_index: ?lsm_table_file.TableIndex = null,
+    version_ref_pinned: bool = false,
     state: ?state_mod.State,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
@@ -73,7 +73,6 @@ pub const Run = struct {
             allocator.free(self.smallest_key);
             if (self.largest_namespace_name) |name| allocator.free(name);
             allocator.free(self.largest_key);
-            if (self.encoded_bloom_filter) |raw| allocator.free(raw);
         }
         if (self.owns_bloom_filter) {
             if (self.bloom_filter) |*filter| filter.deinit(allocator);
@@ -92,13 +91,13 @@ pub const Run = struct {
             .largest_key = &.{},
             .entry_count = 0,
             .bloom_filter = null,
-            .encoded_bloom_filter = null,
             .owns_metadata = false,
             .owns_bloom_filter = false,
             .cached_state_index = null,
             .cached_index_index = null,
             .cached_table_index = null,
             .table_index = null,
+            .version_ref_pinned = false,
             .state = null,
         };
     }
@@ -121,10 +120,22 @@ pub const Run = struct {
 
     pub fn ensureBloomFilter(self: *Run, allocator: Allocator) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
-        const encoded = self.encoded_bloom_filter orelse return error.RunBloomFilterUnavailable;
-        self.bloom_filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded);
-        self.owns_bloom_filter = true;
-        return self.bloom_filter.?;
+        var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+        defer native.deinit();
+        return try self.ensureBloomFilterWithStorage(allocator, native.storage());
+    }
+
+    pub fn ensureBloomFilterWithOptionalStorage(self: *Run, allocator: Allocator, storage: ?storage_io.Storage) !bloom.OwnedFilter {
+        if (storage) |concrete| return try self.ensureBloomFilterWithStorage(allocator, concrete);
+        return try self.ensureBloomFilter(allocator);
+    }
+
+    pub fn ensureBloomFilterWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !bloom.OwnedFilter {
+        if (self.bloom_filter) |filter| return filter;
+        if (self.table_index) |index| return index.filter;
+        const path = self.path orelse return error.RunBloomFilterUnavailable;
+        self.table_index = try loadRunTableIndexAllocWithStorage(storage, allocator, path);
+        return self.table_index.?.filter;
     }
 };
 
@@ -150,7 +161,6 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(allocator) else null,
-        .encoded_bloom_filter = if (source.encoded_bloom_filter) |encoded| try allocator.dupe(u8, encoded) else null,
         .cached_state_index = null,
         .cached_index_index = null,
         .cached_table_index = null,
@@ -188,7 +198,6 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_bloom_filter = false,
         .cached_state_index = null,
         .cached_index_index = null,
@@ -256,8 +265,6 @@ pub fn loadManifestIfPresentWithStorage(
     next_run_id.* = decoded.next_run_id;
     try runs.ensureTotalCapacity(allocator, decoded.runs.len);
     for (decoded.runs) |*meta| {
-        if (meta.bloom_filter.len == 0) return error.MissingRunBloomFilter;
-
         try runs.append(allocator, .{
             .id = meta.id,
             .level = meta.level,
@@ -270,7 +277,6 @@ pub fn loadManifestIfPresentWithStorage(
             .largest_key = @constCast(meta.largest_key),
             .entry_count = meta.entry_count,
             .bloom_filter = null,
-            .encoded_bloom_filter = @constCast(meta.bloom_filter),
             .owns_metadata = false,
             .state = null,
         });
@@ -349,14 +355,10 @@ pub fn persistRunFileWithStorageAccounted(
     if (run.owns_bloom_filter) {
         if (run.bloom_filter) |*filter| filter.deinit(allocator);
     }
-    if (run.owns_metadata) {
-        if (run.encoded_bloom_filter) |encoded| allocator.free(encoded);
-    }
     run.size_bytes = persisted.size_bytes;
     run.compression_stats = persisted.compression_stats;
     run.bloom_filter = persisted.filter;
     run.owns_bloom_filter = true;
-    run.encoded_bloom_filter = null;
     return persisted.path;
 }
 
@@ -441,11 +443,6 @@ pub fn persistManifestWithStorageCount(
     var metas = try allocator.alloc(lsm_manifest.RunMeta, runs.len);
     defer allocator.free(metas);
     for (runs, 0..) |run, i| {
-        const encoded_filter = if (run.encoded_bloom_filter) |raw|
-            try allocator.dupe(u8, raw)
-        else
-            try run.bloom_filter.?.encodeAlloc(allocator);
-        errdefer allocator.free(encoded_filter);
         metas[i] = .{
             .id = run.id,
             .level = run.level,
@@ -457,10 +454,8 @@ pub fn persistManifestWithStorageCount(
             .largest_namespace_name = run.largest_namespace_name,
             .largest_key = run.largest_key,
             .entry_count = run.entry_count,
-            .bloom_filter = encoded_filter,
         };
     }
-    defer for (metas) |meta| allocator.free(meta.bloom_filter);
 
     var obsolete_metas = try allocator.alloc(lsm_manifest.ObsoletePathMeta, obsolete_paths.len);
     defer allocator.free(obsolete_metas);
@@ -561,19 +556,18 @@ pub fn loadRunTableIndexAllocWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.TableIndex {
-    const footer_bytes = storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len) catch |err| switch (err) {
-        error.EndOfStream, error.FileNotFound => null,
-        else => return err,
-    };
-    defer if (footer_bytes) |bytes| allocator.free(bytes);
+    // A missing or truncated run file usually means a concurrent writer
+    // obsoleted and reclaimed it after this reader loaded the manifest;
+    // propagate the transient error so callers can retry against a fresh
+    // manifest instead of misreporting a format mismatch.
+    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
+    defer allocator.free(footer_bytes);
 
-    if (footer_bytes) |bytes| {
-        if (lsm_table_file.hasFooterMagic(bytes)) {
-            const footer = try lsm_table_file.decodeFooterBytes(bytes);
-            const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-            defer allocator.free(metadata_bytes);
-            return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
-        }
+    if (lsm_table_file.hasFooterMagic(footer_bytes)) {
+        const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+        const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+        defer allocator.free(metadata_bytes);
+        return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
     }
     return error.UnsupportedVersion;
 }
@@ -992,6 +986,56 @@ const WrittenTableFile = struct {
     compression_stats: lsm_table_file.CompressionStats,
 };
 
+test "repository manifest persist omits run bloom filters" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A", .tombstone = false },
+    };
+    const filter = try lsm_table_file.buildFilterAlloc(allocator, &entries, .{});
+
+    var run = Run{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 4096,
+        .path = try allocator.dupe(u8, "/repository-manifest-small/runs/1.tbl"),
+        .smallest_namespace_name = try allocator.dupe(u8, "docs"),
+        .smallest_key = try allocator.dupe(u8, "doc:a"),
+        .largest_namespace_name = try allocator.dupe(u8, "docs"),
+        .largest_key = try allocator.dupe(u8, "doc:z"),
+        .entry_count = 128,
+        .bloom_filter = filter,
+        .state = null,
+    };
+    defer run.deinit(allocator);
+
+    var runs = [_]Run{run};
+    const written = try persistManifestWithStorageCount(storage.storage(), allocator, "/repository-manifest-small", 2, &runs, &.{});
+    try std.testing.expect(written < 512);
+
+    const manifest_path = try joinPath(allocator, "/repository-manifest-small", "manifest.bin");
+    defer allocator.free(manifest_path);
+    const raw = try storage.storage().readFileAlloc(allocator, manifest_path, 1024);
+    defer allocator.free(raw);
+    try std.testing.expect(raw.len < 512);
+}
+
+test "repository run table index load surfaces missing run file" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const missing_path = try runPath(allocator, "/repository-missing-run", 7);
+    defer allocator.free(missing_path);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
+    );
+}
+
 test "repository streams state run publication through table builder accounting" {
     const allocator = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(allocator);
@@ -1027,7 +1071,6 @@ test "repository streams state run publication through table builder accounting"
         .largest_key = @constCast("doc:0063"),
         .entry_count = 64,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = true,
         .state = state,
@@ -1106,7 +1149,6 @@ test "repository table builder peak stays below whole-run logical payload" {
         .largest_key = @constCast("doc:001023"),
         .entry_count = @intCast(entry_count),
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = true,
         .state = state,

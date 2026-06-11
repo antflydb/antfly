@@ -221,7 +221,7 @@ const QueryBuilder: React.FC<QueryBuilderProps> = ({
               <div className="flex items-center gap-2">
                 <span className="font-medium text-sm">Aggregations</span>
                 {queryRequest.aggregations && Object.keys(queryRequest.aggregations).length > 0 && (
-                  <Badge variant="secondary" className="h-5 text-xs">
+                  <Badge className="h-5 text-xs">
                     {Object.keys(queryRequest.aggregations).length}
                   </Badge>
                 )}

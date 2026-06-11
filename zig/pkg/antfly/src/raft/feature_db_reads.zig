@@ -64,6 +64,29 @@ pub const FeatureDBReads = struct {
         return try db.lookup(alloc, key, opts);
     }
 
+    pub fn documentArtifactManifestWithConsistency(
+        self: FeatureDBReads,
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        try self.reads.prepareLookupWithConsistency(self.group_id, doc_key, .{}, consistency);
+        return try db.getDocumentArtifactManifest(alloc, doc_key, artifact_name);
+    }
+
+    pub fn documentArtifactManifestsWithConsistency(
+        self: FeatureDBReads,
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        doc_key: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !db_mod.types.DocumentArtifactManifestList {
+        try self.reads.prepareLookupWithConsistency(self.group_id, doc_key, .{}, consistency);
+        return try db.listDocumentArtifactManifests(alloc, doc_key);
+    }
+
     pub fn search(
         self: FeatureDBReads,
         alloc: std.mem.Allocator,

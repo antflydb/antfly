@@ -85,12 +85,19 @@ export interface ClusterData {
   refresh: () => void;
 }
 
-function statusState(value: string | undefined, live: boolean | undefined): "Healthy" | "Unhealthy" {
+function statusState(
+  value: string | undefined,
+  live: boolean | undefined
+): "Healthy" | "Unhealthy" {
   if (live === false) return "Unhealthy";
-  return value === "unhealthy" || value === "error" || value === "degraded" ? "Unhealthy" : "Healthy";
+  return value === "unhealthy" || value === "error" || value === "degraded"
+    ? "Unhealthy"
+    : "Healthy";
 }
 
-function storesFromDataSection(data: ClusterDataSection | undefined): Record<string, StoreInfo> | undefined {
+function storesFromDataSection(
+  data: ClusterDataSection | undefined
+): Record<string, StoreInfo> | undefined {
   if (!data?.nodes || data.nodes.length === 0) return undefined;
   return Object.fromEntries(
     data.nodes.map((node) => {
@@ -110,7 +117,9 @@ function storesFromDataSection(data: ClusterDataSection | undefined): Record<str
   );
 }
 
-function shardsFromDataSection(data: ClusterDataSection | undefined): Record<string, ShardStatus> | undefined {
+function shardsFromDataSection(
+  data: ClusterDataSection | undefined
+): Record<string, ShardStatus> | undefined {
   if (!data?.ranges || data.ranges.length === 0) return undefined;
 
   const replicasByGroup = new Map<number, ClusterDataReplicaStatus[]>();
@@ -125,7 +134,10 @@ function shardsFromDataSection(data: ClusterDataSection | undefined): Record<str
       const id = String(range.group_id);
       const replicas = replicasByGroup.get(range.group_id) ?? [];
       const peers = replicas.map((replica) => String(replica.data_id));
-      const leaderId = range.leader_data_id === null || range.leader_data_id === undefined ? "" : String(range.leader_data_id);
+      const leaderId =
+        range.leader_data_id === null || range.leader_data_id === undefined
+          ? ""
+          : String(range.leader_data_id);
       const voters = peers.length > 0 ? peers : leaderId ? [leaderId] : [];
       return [
         id,

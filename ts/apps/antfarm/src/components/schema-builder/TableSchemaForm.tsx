@@ -266,7 +266,7 @@ const TableSchemaForm: React.FC<TableSchemaFormProps> = ({ onSubmit }) => {
       )}
 
       <FormActions className="justify-start mt-2">
-        <Button type="submit" variant="default">
+        <Button type="submit" variant="brand">
           Create Table
         </Button>
       </FormActions>

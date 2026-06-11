@@ -132,9 +132,9 @@
   --warning-900: #78350f;
   --warning-fg: #ffffff;
 
-  --border:        #e4e3e0;   /* subtle separator — table rows, card-head divider */
-  --border-strong: #cbcac6;   /* chassis border — card outer, badge, button-outline */
-  --input:         #e4e3e0;
+  --border:        #e4e3e0;   /* subtle separator — in-flow chassis, table rows, dividers */
+  --border-strong: #cbcac6;   /* firm edge — floating surfaces (dialog, popover, menus) */
+  --input:         #cbcac6;   /* control edge — firmer than --border so controls pop */
   --ring:          #1b1b1a;   /* ink focus ring */
 
   /* Chart palette — amber leads, ink/neutral pair, then semantic family */
@@ -281,9 +281,9 @@
   --warning-900: #fef3c7;
   --warning-fg: #ffffff;
 
-  --border:        #2c2c2c;   /* subtle separator — table rows, card-head divider */
-  --border-strong: #444443;   /* chassis border — card outer, badge, button-outline */
-  --input:         #2c2c2c;
+  --border:        #2c2c2c;   /* subtle separator — in-flow chassis, table rows, dividers */
+  --border-strong: #444443;   /* firm edge — floating surfaces (dialog, popover, menus) */
+  --input:         #444443;   /* control edge — firmer than --border so controls pop */
   --ring:          #ededec;   /* ink focus ring (light ink on dark) */
 
   --chart-1: var(--primary);

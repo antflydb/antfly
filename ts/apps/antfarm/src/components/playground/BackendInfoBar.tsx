@@ -119,7 +119,7 @@ export function BackendInfoBar() {
 
       {/* Runtime info */}
       {runtime && (
-        <Badge variant="outline" className="gap-1 text-xs">
+        <Badge className="gap-1 text-xs">
           <Cpu className="h-3 w-3" />
           {enabledBackends.length > 0 ? enabledBackends.join(", ") : "runtime"}
         </Badge>
@@ -127,7 +127,9 @@ export function BackendInfoBar() {
 
       {/* Available backends */}
       {enabledBackends.length > 1 && (
-        <span className="text-xs text-muted-foreground ml-auto">{enabledBackends.length} backends</span>
+        <span className="text-xs text-muted-foreground ml-auto">
+          {enabledBackends.length} backends
+        </span>
       )}
     </div>
   );

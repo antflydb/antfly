@@ -85,6 +85,8 @@ pub const BackendType = enum {
     }
 };
 
+const backend_order_capacity = std.meta.fields(BackendType).len;
+
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
@@ -121,7 +123,7 @@ pub const SessionManager = struct {
     ) !Session {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
-        var effective_buf: [4]BackendType = undefined;
+        var effective_buf: [backend_order_capacity]BackendType = undefined;
         const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
 
         for (effective_backends) |backend| {
@@ -262,17 +264,21 @@ pub const SessionManager = struct {
 fn configuredPreferredBackends() []const BackendType {
     if (build_options.enable_wasm) return &.{.wasm};
     if (preferredBackendOverride()) |backend| {
-        return switch (backend) {
-            .onnx => &.{.onnx},
-            .metal => if (build_options.enable_metal) &.{.metal} else &.{.native},
-            .mlx => if (build_options.enable_mlx) &.{.mlx} else &.{.native},
-            .cuda => if (build_options.enable_cuda) &.{.cuda} else &.{.native},
-            .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .mlx, .native } else &.{ .onnx, .metal, .mlx, .native },
-            .native => &.{.native},
-            .wasm => &.{ .onnx, .metal, .mlx, .native },
-        };
+        return preferredBackendsForOverride(backend);
     }
     return &.{ .onnx, .metal, .mlx, .native };
+}
+
+fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
+    return switch (backend) {
+        .onnx => &.{ .onnx, .metal, .mlx, .native },
+        .metal => if (build_options.enable_metal) &.{ .metal, .onnx, .mlx, .native } else &.{ .native, .onnx, .mlx },
+        .mlx => if (build_options.enable_mlx) &.{ .mlx, .onnx, .metal, .native } else &.{ .native, .onnx, .metal },
+        .cuda => if (build_options.enable_cuda) &.{ .cuda, .onnx, .metal, .mlx, .native } else &.{ .native, .onnx, .metal, .mlx },
+        .pjrt => if (build_options.enable_pjrt) &.{ .pjrt, .onnx, .metal, .mlx, .native } else &.{ .onnx, .metal, .mlx, .native },
+        .native => &.{ .native, .onnx, .metal, .mlx },
+        .wasm => &.{ .onnx, .metal, .mlx, .native },
+    };
 }
 
 fn defaultImportedOnnxBackend() BackendType {
@@ -300,6 +306,11 @@ test "onnx graph import is available without onnx runtime and in wasm" {
     }
 }
 
+test "preferred backend override keeps fallback backends" {
+    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .metal, .mlx, .native }, preferredBackendsForOverride(.onnx));
+    try std.testing.expectEqualSlices(BackendType, &.{ .native, .onnx, .metal, .mlx }, preferredBackendsForOverride(.native));
+}
+
 test "explicit graph runtime uses imported onnx path before external runtime" {
     var manager = SessionManager.init(std.testing.allocator);
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.onnx"));
@@ -310,7 +321,9 @@ test "explicit graph runtime uses imported onnx path before external runtime" {
 
 fn preferredBackendOverride() ?BackendType {
     if (build_options.enable_wasm or !build_options.link_libc) return null;
-    const value = std.c.getenv("TERMITE_PREFERRED_BACKEND") orelse return null;
+    const value = std.c.getenv("ANTFLY_INFERENCE_PREFERRED_BACKEND") orelse
+        std.c.getenv("TERMITE_PREFERRED_BACKEND") orelse
+        return null;
     const slice = std.mem.span(value);
     if (std.ascii.eqlIgnoreCase(slice, "auto")) return null;
     if (std.ascii.eqlIgnoreCase(slice, "onnx")) return .onnx;
@@ -355,7 +368,7 @@ fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
 
 fn effectiveBackendOrder(
     allocator: std.mem.Allocator,
-    scratch: *[4]BackendType,
+    scratch: *[backend_order_capacity]BackendType,
     preferred: []const BackendType,
     manifest: ?manifest_mod.ModelManifest,
 ) []const BackendType {
@@ -372,7 +385,7 @@ fn effectiveBackendOrder(
 }
 
 fn effectiveBackendOrderForPreference(
-    scratch: *[4]BackendType,
+    scratch: *[backend_order_capacity]BackendType,
     preferred: []const BackendType,
     prefer_blas_before_mlx: bool,
 ) []const BackendType {
@@ -404,7 +417,7 @@ fn effectiveBackendOrderForPreference(
 }
 
 fn reorderNativeAheadOfOnnx(
-    scratch: *[4]BackendType,
+    scratch: *[backend_order_capacity]BackendType,
     preferred: []const BackendType,
     prefer_blas_before_mlx: bool,
 ) []const BackendType {
@@ -457,21 +470,28 @@ test "shouldPreferBlasBeforeMlxForBytes prefers native only above eager dense th
 
 test "effective backend order prefers native before mlx for large gguf generators" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [backend_order_capacity]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
     try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .metal, .mlx }, effective);
 }
 
+test "effective backend order handles five backend preference lists" {
+    const preferred = [_]BackendType{ .cuda, .onnx, .metal, .mlx, .native };
+    var scratch: [backend_order_capacity]BackendType = undefined;
+    const effective = effectiveBackendOrderForPreference(&scratch, &preferred, true);
+    try std.testing.expectEqualSlices(BackendType, &.{ .onnx, .native, .cuda, .metal, .mlx }, effective);
+}
+
 test "effective backend order preserves mlx preference for small gguf generators" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [backend_order_capacity]BackendType = undefined;
     const effective = effectiveBackendOrderForPreference(&scratch, &preferred, false);
     try std.testing.expectEqualSlices(BackendType, &preferred, effective);
 }
 
 test "effective backend order preserves order for non-gguf models" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [backend_order_capacity]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
         .model_type = .generator,
@@ -483,7 +503,7 @@ test "effective backend order preserves order for non-gguf models" {
 
 test "effective backend order prefers native layoutlmv3 before onnx" {
     const preferred = [_]BackendType{ .onnx, .metal, .mlx, .native };
-    var scratch: [4]BackendType = undefined;
+    var scratch: [backend_order_capacity]BackendType = undefined;
     const manifest: manifest_mod.ModelManifest = .{
         .allocator = std.testing.allocator,
         .native_arch_hint = .layoutlmv3,

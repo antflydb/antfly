@@ -49,9 +49,7 @@ const BarChart: React.FC<{
     <div className="space-y-1.5">
       <div className="flex items-center gap-2 mb-2">
         <span className="text-sm font-medium">{name}</span>
-        <Badge variant="secondary" className="text-[10px]">
-          {buckets.length} buckets
-        </Badge>
+        <Badge className="text-[10px]">{buckets.length} buckets</Badge>
       </div>
       {buckets.map((bucket) => {
         const count = bucket.doc_count ?? 0;

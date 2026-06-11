@@ -26,9 +26,9 @@ function RadioGroupItem({
     <RadioGroupPrimitive.Item
       data-slot="radio-group-item"
       className={cn(
-        // round — radio convention. 1.5px border, no shadow.
-        "aspect-square size-4 shrink-0 rounded-full border-[1.5px] border-input bg-transparent",
-        "text-primary",
+        // round — radio convention. token-width border, no shadow.
+        "aspect-square size-4 shrink-0 rounded-full border-(length:--border-width) border-input bg-transparent",
+        "text-foreground",
         // focus
         "outline-none transition-[color,box-shadow]",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -45,7 +45,7 @@ function RadioGroupItem({
       >
         <span
           aria-hidden
-          className="bg-primary absolute top-1/2 left-1/2 size-[6px] rounded-full -translate-x-1/2 -translate-y-1/2"
+          className="bg-foreground absolute top-1/2 left-1/2 size-[6px] rounded-full -translate-x-1/2 -translate-y-1/2"
         />
       </RadioGroupPrimitive.Indicator>
     </RadioGroupPrimitive.Item>

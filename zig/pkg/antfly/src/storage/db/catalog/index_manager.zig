@@ -130,6 +130,7 @@ const text_backfill_batch_size: usize = 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
+pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -771,6 +772,21 @@ pub const IndexManager = struct {
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
     status_only_index_configs: []types.IndexConfig,
+    // Indexes whose persisted artifacts failed to open (e.g. UnsupportedVersion).
+    // Their configs are quarantined into status_only_index_configs so the
+    // catalog, status reporting, and drop/recreate keep working while the
+    // runtime index stays absent; this map carries the per-index load error
+    // and retry/backoff state for self-healing (retryFailedIndexLoads).
+    // Keys are duped index names; err_name values are static @errorName memory.
+    failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+
+    pub const FailedIndexLoad = struct {
+        err_name: []const u8,
+        retry_attempts: u32 = 0,
+        // Monotonic deadline before which retryFailedIndexLoads skips this
+        // index. 0 = due immediately (first retry happens on the next tick).
+        next_retry_ns: u64 = 0,
+    };
 
     pub const TextIndex = struct {
         apply_mutex: *std.atomic.Mutex,
@@ -1885,6 +1901,8 @@ pub const IndexManager = struct {
             self.freeAlgebraicIndexEntry(entry);
         }
         self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
+        self.failed_index_loads.deinit(self.alloc);
         for (self.enrichments.items) |*entry| entry.deinit(self.alloc);
         for (self.resolvers.items) |*entry| entry.deinit(self.alloc);
         self.text_indexes.deinit(self.alloc);
@@ -1902,6 +1920,163 @@ pub const IndexManager = struct {
         for (self.status_only_index_configs) |*cfg| cfg.deinit(self.alloc);
         if (self.status_only_index_configs.len > 0) self.alloc.free(self.status_only_index_configs);
         self.status_only_index_configs = &.{};
+    }
+
+    /// Load error recorded for `name` during the last catalog load, or null
+    /// if the index loaded normally (or is not configured).
+    pub fn loadFailure(self: *const IndexManager, name: []const u8) ?[]const u8 {
+        return (self.failed_index_loads.get(name) orelse return null).err_name;
+    }
+
+    pub fn hasLoadFailures(self: *const IndexManager) bool {
+        return self.failed_index_loads.count() > 0;
+    }
+
+    fn clearFailedIndexLoads(self: *IndexManager) void {
+        var it = self.failed_index_loads.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.failed_index_loads.clearRetainingCapacity();
+    }
+
+    fn dropFailedIndexLoad(self: *IndexManager, name: []const u8) void {
+        if (self.failed_index_loads.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+    }
+
+    fn appendStatusOnlyConfig(self: *IndexManager, cfg: types.IndexConfig) !void {
+        const old = self.status_only_index_configs;
+        const replacement = try self.alloc.alloc(types.IndexConfig, old.len + 1);
+        @memcpy(replacement[0..old.len], old);
+        replacement[old.len] = cfg;
+        if (old.len > 0) self.alloc.free(old);
+        self.status_only_index_configs = replacement;
+    }
+
+    /// Quarantine an index whose persisted artifacts could not be opened:
+    /// keep its config visible (catalog persistence, status, drop/recreate)
+    /// while the runtime index stays absent, and record the load error.
+    /// Errors from an index open that indicate a transient read race rather
+    /// than persistent artifact damage: a read-only replica open can race
+    /// the writer's obsolete-run reclaim (FileNotFound after the manifest
+    /// load), or table churn can invalidate the open mid-flight. On
+    /// read-only opens these must propagate instead of quarantining — the
+    /// query layer reopens against a fresh manifest and retries
+    /// (queryWithTransientReadRetry), whereas a quarantined replica would
+    /// serve IndexUnavailable until the read cache next invalidates it: the
+    /// quarantine retry worker only runs on the writer. Writer opens keep
+    /// quarantining everything — the writer cannot race its own (not yet
+    /// started) reclaim, so FileNotFound there is persistent damage, and
+    /// the writer's self-heal worker covers the unlikely transient case.
+    /// Only meaningful now that the LSM run-table loader classifies
+    /// FileNotFound separately from UnsupportedVersion.
+    fn indexOpenErrorIsTransientRead(err: anyerror) bool {
+        return switch (err) {
+            error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
+            else => false,
+        };
+    }
+
+    fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
+        if (self.loadFailure(cfg.name) != null) return;
+        var cloned = try types.IndexConfig.clone(self.alloc, cfg);
+        errdefer cloned.deinit(self.alloc);
+        try self.appendStatusOnlyConfig(cloned);
+        // The clone is owned by status_only_index_configs from here on.
+        const name_key = try self.alloc.dupe(u8, cfg.name);
+        errdefer self.alloc.free(name_key);
+        try self.failed_index_loads.put(self.alloc, name_key, .{ .err_name = @errorName(err) });
+    }
+
+    const quarantine_retry_base_backoff_ns: u64 = 30 * std.time.ns_per_s;
+    const quarantine_retry_max_backoff_ns: u64 = 10 * std.time.ns_per_min;
+
+    fn quarantineRetryBackoffNs(attempts: u32) u64 {
+        const shift: u6 = @intCast(@min(attempts, 5));
+        return @min(quarantine_retry_base_backoff_ns << shift, quarantine_retry_max_backoff_ns);
+    }
+
+    pub const QuarantineRetryResult = struct {
+        recovered: usize = 0,
+        remaining: usize = 0,
+    };
+
+    /// Re-attempts opening quarantined indexes whose backoff deadline has
+    /// passed (all of them when `force` is set). A successful open registers
+    /// the runtime index, removes the quarantined config from the
+    /// status-only list, and clears the recorded load error — the same end
+    /// state as a clean open-time load. A failed attempt updates the
+    /// recorded error and pushes the next attempt out exponentially
+    /// (30s..10min). `remaining` is the quarantine count after this pass,
+    /// read under the catalog lock so callers can stop polling at zero.
+    pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.failed_index_loads.count() == 0) return .{};
+
+        var due_names = std.ArrayListUnmanaged([]const u8).empty;
+        defer due_names.deinit(self.alloc);
+        var it = self.failed_index_loads.iterator();
+        while (it.next()) |entry| {
+            if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
+            // Keys are owned by the map and stable across the value updates
+            // below (no inserts/removes until the success path).
+            try due_names.append(self.alloc, entry.key_ptr.*);
+        }
+
+        var recovered: usize = 0;
+        for (due_names.items) |name| {
+            const cfg = blk: {
+                for (self.status_only_index_configs) |*candidate| {
+                    if (std.mem.eql(u8, candidate.name, name)) break :blk candidate.*;
+                }
+                // Config vanished (concurrent drop); clear the stale record.
+                self.dropFailedIndexLoad(name);
+                continue;
+            };
+            var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
+                const record = self.failed_index_loads.getPtr(name) orelse continue;
+                record.err_name = @errorName(err);
+                record.retry_attempts +|= 1;
+                record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
+                std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
+                    name,
+                    record.retry_attempts,
+                    @errorName(err),
+                });
+                continue;
+            };
+            // Pre-allocate the shrunken status-only list so registration and
+            // de-quarantine commit together once the open has succeeded.
+            const old = self.status_only_index_configs;
+            const replacement: []types.IndexConfig = if (old.len <= 1)
+                &.{}
+            else
+                self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
+                    opened.deinit(self);
+                    return err;
+                };
+            self.appendOpenedIndex(opened) catch |err| {
+                if (replacement.len > 0) self.alloc.free(replacement);
+                opened.deinit(self);
+                return err;
+            };
+            var wi: usize = 0;
+            for (old) |old_cfg| {
+                if (std.mem.eql(u8, old_cfg.name, name)) {
+                    var removed = old_cfg;
+                    removed.deinit(self.alloc);
+                    continue;
+                }
+                replacement[wi] = old_cfg;
+                wi += 1;
+            }
+            if (old.len > 0) self.alloc.free(old);
+            self.status_only_index_configs = replacement;
+            // Log before dropFailedIndexLoad frees the `name` key buffer.
+            std.log.info("quarantined index recovered name={s} kind={s}", .{ name, @tagName(cfg.kind) });
+            self.dropFailedIndexLoad(name);
+            recovered += 1;
+        }
+        return .{ .recovered = recovered, .remaining = self.failed_index_loads.count() };
     }
 
     fn accountFullTextPendingBytes(self: *IndexManager, pending_bytes: u64) !void {
@@ -2019,7 +2194,7 @@ pub const IndexManager = struct {
         return error.IndexNotFound;
     }
 
-    pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
+    fn lsmMaintenanceScoreUnlocked(self: *const IndexManager) u64 {
         var score: u64 = 0;
         for (self.text_indexes.items) |*entry| {
             score = @max(score, entry.persistent.lsmMaintenanceScore());
@@ -2028,6 +2203,13 @@ pub const IndexManager = struct {
             score = @max(score, entry.index.lsmMaintenanceScore());
         }
         return score;
+    }
+
+    pub fn lsmMaintenanceScore(self: *const IndexManager) u64 {
+        const mutable: *IndexManager = @constCast(self);
+        mutable.catalog_mutex.lockShared();
+        defer mutable.catalog_mutex.unlockShared();
+        return self.lsmMaintenanceScoreUnlocked();
     }
 
     fn lsmMaintenanceDebtHintUnlocked(self: *const IndexManager) u64 {
@@ -2047,7 +2229,27 @@ pub const IndexManager = struct {
         return self.lsmMaintenanceDebtHintUnlocked();
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *IndexManager) ?u64 {
+        if (!self.catalog_mutex.tryLockShared()) return null;
+        defer self.catalog_mutex.unlockShared();
+
+        var delay_ns: ?u64 = null;
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            }
+        }
+        return delay_ns;
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *IndexManager) void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         for (self.text_indexes.items) |*entry| {
             entry.persistent.refreshLsmMaintenanceDebtHint();
         }
@@ -2406,7 +2608,48 @@ pub const IndexManager = struct {
         );
     }
 
+    fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool) !bool {
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) {
+                    const progressed = if (best_effort)
+                        try entry.persistent.runLsmMaintenanceStepBestEffort()
+                    else
+                        try entry.persistent.runLsmMaintenanceStep();
+                    if (progressed) return true;
+                }
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0) {
+                    const progressed = if (best_effort)
+                        try entry.index.runLsmMaintenanceStepBestEffort()
+                    else
+                        try entry.index.runLsmMaintenanceStep();
+                    if (progressed) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    pub fn runLsmObsoleteReclaimDue(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return try self.runLsmObsoleteReclaimDueUnlocked(false);
+    }
+
+    pub fn runLsmObsoleteReclaimDueBestEffort(self: *IndexManager) !bool {
+        if (!self.catalog_mutex.tryLockShared()) return false;
+        defer self.catalog_mutex.unlockShared();
+        return try self.runLsmObsoleteReclaimDueUnlocked(true);
+    }
+
     pub fn runLsmMaintenanceStep(self: *IndexManager) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
         var best_kind: enum { none, text, dense } = .none;
         var best_index: usize = 0;
         var best_score: u64 = 0;
@@ -2445,7 +2688,8 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
-            const score = entry.persistent.lsmMaintenanceDebtHint();
+            const raw_score = entry.persistent.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -2453,7 +2697,8 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
-            const score = entry.index.lsmMaintenanceDebtHint();
+            const raw_score = entry.index.lsmMaintenanceDebtHint();
+            const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;
@@ -3130,9 +3375,20 @@ pub const IndexManager = struct {
         boundary_reassignment_min_improvement: f32 = 0.0,
     };
 
+    // Node budget per tree-link repair sweep run from the dense maintenance
+    // lane. Repairs persist as the sweep goes, so an exhausted budget simply
+    // resumes on the next maintenance pass.
+    const dense_link_repair_max_nodes: usize = 4096;
+
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            // A write path observed a tree-link inconsistency (stale parent
+            // pointer / dangling node reference): run a bounded repair sweep
+            // before posting maintenance so traversals stop tripping on it.
+            if (try entry.index.maybeRepairTreeLinks(dense_link_repair_max_nodes)) |link_repair| {
+                total_steps += @intCast(link_repair.repaired());
+            }
             const backlog = try entry.index.postingBacklogStats();
             if (!backlog.needsRepair()) continue;
 
@@ -3187,6 +3443,7 @@ pub const IndexManager = struct {
         const load_started_ns = nowNs();
         self.bindPrimaryStore(store);
         self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
 
@@ -3211,13 +3468,29 @@ pub const IndexManager = struct {
         var parallelism: usize = 1;
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) {
             for (configs) |cfg| {
-                try self.openConfiguredIndex(store, cfg, allow_backfill, read_only);
+                self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                    if (read_only and indexOpenErrorIsTransientRead(err)) return err;
+                    std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
+                        cfg.name,
+                        @tagName(cfg.kind),
+                        @errorName(err),
+                    });
+                    try self.recordFailedIndexLoad(cfg, err);
+                };
             }
         } else {
             parallelism = self.resolvedLoadParallelism(configs.len);
             if (parallelism <= 1) {
                 for (configs) |cfg| {
-                    try self.openConfiguredIndex(store, cfg, allow_backfill, read_only);
+                    self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                        if (read_only and indexOpenErrorIsTransientRead(err)) return err;
+                        std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
+                            cfg.name,
+                            @tagName(cfg.kind),
+                            @errorName(err),
+                        });
+                        try self.recordFailedIndexLoad(cfg, err);
+                    };
                 }
             } else {
                 for (configs) |cfg| {
@@ -3243,6 +3516,7 @@ pub const IndexManager = struct {
 
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
         self.bindPrimaryStore(store);
+        self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
 
@@ -3351,8 +3625,16 @@ pub const IndexManager = struct {
         for (threads[0..spawned]) |*thread| thread.join();
         threads_joined = true;
 
-        for (results) |*result| {
-            if (result.err) |err| return err;
+        // A failed index load quarantines that index instead of failing the
+        // whole table open; the other indexes stay usable and the failure is
+        // reported via loadFailure()/status so clients can drop+recreate.
+        // Transient read races on read-only opens propagate instead (the
+        // deferred results cleanup releases any other opened indexes).
+        for (results, 0..) |*result, i| {
+            if (result.err) |err| {
+                if (read_only and indexOpenErrorIsTransientRead(err)) return err;
+                try self.recordFailedIndexLoad(configs[i], err);
+            }
         }
 
         for (results) |*result| {
@@ -3560,6 +3842,7 @@ pub const IndexManager = struct {
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
+            if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
@@ -3615,7 +3898,13 @@ pub const IndexManager = struct {
     pub fn remove(self: *IndexManager, store: anytype, name: []const u8) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (try self.removeStatusOnlyConfig(store, name)) return true;
+        if (try self.removeStatusOnlyConfig(store, name)) {
+            // Quarantined (failed-to-load) indexes live in the status-only
+            // list; removing one must also clear its recorded load error so a
+            // subsequent recreate starts clean.
+            self.dropFailedIndexLoad(name);
+            return true;
+        }
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
                 const index_path = try self.indexPath(name);
@@ -3923,7 +4212,11 @@ pub const IndexManager = struct {
     }
 
     pub fn managedIndexes(self: *const IndexManager, alloc: Allocator) ![]ManagedIndexRef {
-        const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len;
+        var status_only_count: usize = 0;
+        for (self.status_only_index_configs) |cfg| {
+            if (self.loadFailure(cfg.name) == null) status_only_count += 1;
+        }
+        const total = self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + status_only_count;
         var refs = try alloc.alloc(ManagedIndexRef, total);
         var initialized: usize = 0;
         errdefer {
@@ -3967,6 +4260,10 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         for (self.status_only_index_configs) |cfg| {
+            // Quarantined indexes (config retained after a load failure) have
+            // no runtime; replay/apply/maintenance work driven off this list
+            // must skip them or it would fail with IndexNotFound.
+            if (self.loadFailure(cfg.name) != null) continue;
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, cfg.name),
                 .kind = cfg.kind,
@@ -4028,6 +4325,20 @@ pub const IndexManager = struct {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         errdefer enrichment_types.deinitGeneratedRequests(alloc, requests.items);
 
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            try requests.append(alloc, .{
+                .kind = .asset,
+                .index_name = try alloc.dupe(u8, entry.name),
+                .artifact_name = try alloc.dupe(u8, entry.name),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .source_field = try alloc.dupe(u8, entry.source_field),
+                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+            });
+        }
+
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
@@ -4072,6 +4383,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
                     if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
@@ -4153,21 +4465,51 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                 });
+            } else if (entry.embedding_name) |embedding_name| {
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
+                if (embedding_cfg.expected_dims != 0) continue;
+                if (embedding_cfg.source_artifact_name.len > 0) {
+                    const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
+                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                        try requests.append(alloc, .{
+                            .kind = .chunk_text,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                            .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                    if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
+                        try requests.append(alloc, .{
+                            .kind = .sparse_embedding,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .embedding_name = try alloc.dupe(u8, embedding_name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                    try requests.append(alloc, .{
+                        .kind = .sparse_embedding,
+                        .index_name = try alloc.dupe(u8, entry.config.name),
+                        .artifact_name = "",
+                        .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .doc_key = try alloc.dupe(u8, doc_key),
+                        .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                        .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                    });
+                }
             }
-        }
-
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-            });
         }
 
         return try requests.toOwnedSlice(alloc);
@@ -4741,11 +5083,18 @@ pub const IndexManager = struct {
             .sparse_vector => {
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
                     .embedding_name = if (sparse_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else
@@ -6353,13 +6702,42 @@ pub const IndexManager = struct {
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         if (try self.configRequiresEnrichmentReplay(cfg)) return;
         if (try self.configHasPendingSparseEmbeddingArtifactReplay(store, cfg)) return;
+        // Backfill rebuilds the index from the full store contents, so it is
+        // current through the store's durable per-kind latest replay marker
+        // even when the replay records themselves have already been pruned.
+        // On a fresh instance with pruned records lastReplaySequence(0) is 0;
+        // saving that alone regresses the checkpoint below the marker and
+        // traps startup catch-up in a permanent-debt loop that re-backfills
+        // and re-regresses forever.
+        var backfilled_sequence = store.lastReplaySequence(0);
+        if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
+            backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
+        }
         try apply_state.saveAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
             self.applied_sequence_checkpoint_path,
             cfg.name,
-            store.lastReplaySequence(0),
+            backfilled_sequence,
         );
+    }
+
+    fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .pointer => |ptr| @hasDecl(ptr.child, "latestReplaySequenceForHint"),
+            .@"struct" => @hasDecl(T, "latestReplaySequenceForHint"),
+            else => false,
+        };
+    }
+
+    fn replayHintForIndexKind(kind: types.IndexKind) change_journal_mod.TargetHint {
+        return switch (kind) {
+            .full_text => .full_text,
+            .dense_vector => .dense_vector,
+            .sparse_vector => .sparse_vector,
+            .graph => .graph,
+            .algebraic => .algebraic,
+        };
     }
 
     fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {
@@ -6446,6 +6824,7 @@ pub const IndexManager = struct {
     }
 
     fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
+        if (test_inject_index_open_error) |err| return err;
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
@@ -6711,6 +7090,12 @@ pub const IndexManager = struct {
                 var backfill_ns: u64 = 0;
                 const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
                 defer sparse_cfg.deinit(self.alloc);
+                const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
+                defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
 
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -6737,13 +7122,14 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
-                    .chunk_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
-                    .embedding_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
+                    .embedding_name = if (sparse_generator) |generator| blk: {
                         break :blk if (generator.embedding_name) |embedding_name|
                             try self.alloc.dupe(u8, embedding_name)
                         else
@@ -6785,7 +7171,11 @@ pub const IndexManager = struct {
                 var graph_cfg_moved = false;
                 errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
                 if (graph_cfg.artifact_source) |source| {
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
                 if (graph_cfg.shorthand_asset) |*asset| {
                     asset.deinit(self.alloc);
@@ -7068,7 +7458,11 @@ pub const IndexManager = struct {
                     if (graph_cfg.shorthand_asset) |asset| {
                         if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
                     }
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
             },
             else => {},
@@ -7080,6 +7474,7 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.chunk, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
                 !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
@@ -7130,9 +7525,11 @@ pub const IndexManager = struct {
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+                if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.asset, cfg.source_artifact_name) == null) {
+                    return error.InvalidEnrichmentConfig;
+                }
             },
             .embedding => {
-                if (cfg.expected_dims == 0) return error.InvalidEnrichmentConfig;
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
@@ -7356,8 +7753,8 @@ pub const IndexManager = struct {
                 .index = i,
                 .size = seg.data.bytes().len,
                 .doc_count = seg.reader.doc_count,
-                .deleted_count = if (seg.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-                .has_deletions = seg.deleted != null,
+                .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
+                .has_deletions = seg.shared.deleted != null,
             });
         }
         if (infos.items.len < 2) return null;
@@ -7393,7 +7790,7 @@ pub const IndexManager = struct {
             const source_seg = &snap.segments[seg_idx];
             source[i] = .{
                 .id = source_seg.id,
-                .deleted = if (source_seg.deleted) |*deleted| try deleted.clone(self.alloc) else null,
+                .deleted = if (source_seg.shared.deleted) |*deleted| try deleted.clone(self.alloc) else null,
             };
             source_initialized += 1;
             merge_indices[i] = seg_idx;
@@ -7464,9 +7861,9 @@ pub const IndexManager = struct {
         for (task.source) |source| {
             const seg = findSegmentById(snap, source.id) orelse return false;
             if (source.deleted) |expected| {
-                const current_deleted = seg.deleted orelse return false;
+                const current_deleted = seg.shared.deleted orelse return false;
                 if (!current_deleted.eql(&expected)) return false;
-            } else if (seg.deleted != null) {
+            } else if (seg.shared.deleted != null) {
                 return false;
             }
         }
@@ -10595,7 +10992,7 @@ pub const IndexManager = struct {
                 },
             );
             std.log.info(
-                "antfly_bench_hbc_lsm_pressure phase={s} index={s} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
+                "antfly_bench_hbc_lsm_pressure phase={s} index={s} compactable_l0_runs={d} soft_limit_l0_runs={d} hard_limit_l0_runs={d} write_stall_l0_run_debt={d} soft_limit_l0_bytes={d} hard_limit_l0_bytes={d} write_stall_l0_byte_debt={d} level_overflow_runs={d} level_overflow_bytes={d} obsolete_paths={d} obsolete_paths_reclaimable={d} obsolete_paths_pinned_by_readers={d} obsolete_paths_pinned_by_versions={d} obsolete_paths_waiting_for_retry={d} obsolete_delete_failures={d} obsolete_delete_retries={d} active_readers={d} active_bulk_ingest_batches={d} manifest_dirty={any} obsolete_manifest_dirty={any}",
                 .{
                     phase,
                     entry.config.name,
@@ -10609,6 +11006,12 @@ pub const IndexManager = struct {
                     maintenance.level_overflow_runs,
                     maintenance.level_overflow_bytes,
                     maintenance.obsolete_paths,
+                    maintenance.obsolete_paths_reclaimable,
+                    maintenance.obsolete_paths_pinned_by_readers,
+                    maintenance.obsolete_paths_pinned_by_versions,
+                    maintenance.obsolete_paths_waiting_for_retry,
+                    maintenance.obsolete_delete_failures,
+                    maintenance.obsolete_delete_retries,
                     maintenance.active_readers,
                     maintenance.active_bulk_ingest_batches,
                     maintenance.manifest_dirty,
@@ -12104,8 +12507,9 @@ fn isMetadataKey(key: []const u8) bool {
 }
 
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
-    if (entry.chunk_name) |chunk_name| {
-        return internal_keys.matchesChunkArtifactName(key, chunk_name);
+    if (entry.chunk_name) |artifact_name| {
+        return internal_keys.matchesChunkArtifactName(key, artifact_name) or
+            internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
     if (self.relational_base_rows) {
         if (internal_keys.isRelationalRowKey(key)) return true;
@@ -13016,6 +13420,26 @@ fn hasGeneratedDenseEmbeddingRequest(
     return false;
 }
 
+fn hasGeneratedSparseEmbeddingRequest(
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    doc_key: []const u8,
+    source_field: []const u8,
+    source_template: []const u8,
+    artifact_name: []const u8,
+    embedding_name: []const u8,
+) bool {
+    for (requests) |request| {
+        if (request.kind != .sparse_embedding) continue;
+        if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
+        if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
+        if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
+        if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
@@ -13379,7 +13803,10 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     if (trimmed.len == 0) return;
     if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
-    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, expr, "_doc.key")) return;
+    if (std.mem.eql(u8, expr, "_artifact.value")) return;
+    if (std.mem.startsWith(u8, expr, "_artifact.value.")) return;
+    return error.InvalidIndexConfig;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
@@ -16730,7 +17157,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
     try std.testing.expectEqualStrings("doc:inline", metadata);
 }
 
-test "loadConfiguredIndexesParallel returns worker errors without double-joining threads" {
+test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -16764,7 +17191,14 @@ test "loadConfiguredIndexesParallel returns worker errors without double-joining
         try manager.ensureConfiguredIndexDir(cfg);
     }
 
-    try std.testing.expectError(error.InvalidIndexConfig, manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false));
+    // A worker error no longer fails the load: the failing index is
+    // quarantined (config retained, error recorded) while the healthy one
+    // loads normally — and the worker threads still join exactly once.
+    try manager.loadConfiguredIndexesParallel(&store, &configs, 2, true, false);
+    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+    try std.testing.expect(manager.denseIndex("dv_bad") == null);
+    const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
 }
 
 test "dense apply resource manager accounts working bytes and releases them" {

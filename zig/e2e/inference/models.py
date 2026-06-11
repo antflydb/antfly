@@ -20,6 +20,7 @@ Models are stored in the flat default inference layout:
 When ANTFLY_INFERENCE_DOWNLOAD=1 is set, the E2E harness can lazily fetch missing models
 by shelling out to `antfly inference pull` instead of using huggingface_hub directly.
 Set ANTFLY_INFERENCE_MODELS_DIR to control where models are stored.
+Set ANTFLY_INFERENCE_ML_DIR to control where Traditional ML predictors are stored.
 """
 
 from __future__ import annotations
@@ -243,6 +244,19 @@ def models_dir() -> Path:
     else:
         home = os.environ.get("HOME")
         directory = Path(home) / ".antfly" / "inference" / "models" if home else Path("./models")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def ml_dir() -> Path:
+    """Return the Traditional ML directory, creating it if needed."""
+
+    configured = os.environ.get("ANTFLY_INFERENCE_ML_DIR")
+    if configured:
+        directory = Path(configured)
+    else:
+        home = os.environ.get("HOME")
+        directory = Path(home) / ".antfly" / "inference" / "ml" if home else Path("./ml")
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 

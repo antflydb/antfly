@@ -103,6 +103,23 @@ from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
 from .distance_unit import DistanceUnit
 from .doc_id_query import DocIdQuery
+from .document_artifact_child_range import DocumentArtifactChildRange
+from .document_artifact_manifest import DocumentArtifactManifest
+from .document_artifact_manifest_list import DocumentArtifactManifestList
+from .document_artifact_reprocess_failure import DocumentArtifactReprocessFailure
+from .document_artifact_reprocess_job import DocumentArtifactReprocessJob
+from .document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
+from .document_artifact_reprocess_job_reprocess_status import DocumentArtifactReprocessJobReprocessStatus
+from .document_artifact_reprocess_job_start_request import DocumentArtifactReprocessJobStartRequest
+from .document_artifact_reprocess_response import DocumentArtifactReprocessResponse
+from .document_artifact_reprocess_response_reprocess import DocumentArtifactReprocessResponseReprocess
+from .document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
+from .document_artifact_table_reprocess_request import DocumentArtifactTableReprocessRequest
+from .document_artifact_table_reprocess_response import DocumentArtifactTableReprocessResponse
+from .document_artifact_table_reprocess_response_reprocess import DocumentArtifactTableReprocessResponseReprocess
+from .document_artifact_table_reprocess_response_reprocess_status import (
+    DocumentArtifactTableReprocessResponseReprocessStatus,
+)
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
 from .duck_duck_go_search_config import DuckDuckGoSearchConfig
@@ -188,6 +205,7 @@ from .geo_point import GeoPoint
 from .geo_shape_geometry_relation import GeoShapeGeometryRelation
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
+from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .google_search_config import GoogleSearchConfig
@@ -231,6 +249,7 @@ from .graph_query_result_metric_status import GraphQueryResultMetricStatus
 from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
+from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_node_metrics import GraphResultNodeMetrics
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
@@ -309,6 +328,13 @@ from .inference_models_response_recognizers import InferenceModelsResponseRecogn
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
+from .inference_predict_request import InferencePredictRequest
+from .inference_predict_response import InferencePredictResponse
+from .inference_predictor_info import InferencePredictorInfo
+from .inference_predictor_task import InferencePredictorTask
+from .inference_predictors_response import InferencePredictorsResponse
+from .inference_predictors_response_object import InferencePredictorsResponseObject
+from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
@@ -362,6 +388,7 @@ from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
 from .linear_merge_result import LinearMergeResult
+from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
@@ -418,6 +445,11 @@ from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
 from .query_builder_request_example_documents_item import QueryBuilderRequestExampleDocumentsItem
 from .query_hit import QueryHit
+from .query_hit_hierarchy import QueryHitHierarchy
+from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
+from .query_hit_hierarchy_artifact import QueryHitHierarchyArtifact
+from .query_hit_hierarchy_chunks_item import QueryHitHierarchyChunksItem
+from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
@@ -744,6 +776,21 @@ __all__ = (
     "DistanceRange",
     "DistanceUnit",
     "DocIdQuery",
+    "DocumentArtifactChildRange",
+    "DocumentArtifactManifest",
+    "DocumentArtifactManifestList",
+    "DocumentArtifactReprocessFailure",
+    "DocumentArtifactReprocessJob",
+    "DocumentArtifactReprocessJobPhase",
+    "DocumentArtifactReprocessJobReprocessStatus",
+    "DocumentArtifactReprocessJobStartRequest",
+    "DocumentArtifactReprocessResponse",
+    "DocumentArtifactReprocessResponseReprocess",
+    "DocumentArtifactReprocessShardCursor",
+    "DocumentArtifactTableReprocessRequest",
+    "DocumentArtifactTableReprocessResponse",
+    "DocumentArtifactTableReprocessResponseReprocess",
+    "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentSchema",
     "DocumentSchemaSchema",
     "DuckDuckGoSearchConfig",
@@ -829,6 +876,7 @@ __all__ = (
     "GeoShapeGeometryRelation",
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
+    "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GoogleSearchConfig",
@@ -872,6 +920,7 @@ __all__ = (
     "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
+    "GraphResultNodeEvidence",
     "GraphResultNodeMetrics",
     "GroundTruth",
     "ImageURL",
@@ -950,6 +999,13 @@ __all__ = (
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
+    "InferencePredictorInfo",
+    "InferencePredictorsResponse",
+    "InferencePredictorsResponseObject",
+    "InferencePredictorsResponsePredictors",
+    "InferencePredictorTask",
+    "InferencePredictRequest",
+    "InferencePredictResponse",
     "InferenceReadObject",
     "InferenceReadObjectObject",
     "InferenceReadRequest",
@@ -1003,6 +1059,7 @@ __all__ = (
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
     "LinearMergeResult",
+    "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
     "LookupKeyResponse200",
     "LsmStorageStatus",
@@ -1059,6 +1116,11 @@ __all__ = (
     "QueryBuilderRequestConstraints",
     "QueryBuilderRequestExampleDocumentsItem",
     "QueryHit",
+    "QueryHitHierarchy",
+    "QueryHitHierarchyAncestors",
+    "QueryHitHierarchyArtifact",
+    "QueryHitHierarchyChunksItem",
+    "QueryHitHierarchyLevel",
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",

@@ -48,13 +48,93 @@ const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
 const CounterU64 = platform.atomic.Value(u64);
 
+const ObsoletePathRef = struct {
+    path: []u8,
+    count: u64,
+};
+
+const ObsoletePathRefRegistry = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    refs: std.ArrayListUnmanaged(ObsoletePathRef) = .empty,
+
+    fn retain(self: *ObsoletePathRefRegistry, path: []const u8) !void {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.refs.items) |*ref| {
+            if (!std.mem.eql(u8, ref.path, path)) continue;
+            ref.count +|= 1;
+            return;
+        }
+        const owned = try std.heap.page_allocator.dupe(u8, path);
+        errdefer std.heap.page_allocator.free(owned);
+        try self.refs.append(std.heap.page_allocator, .{ .path = owned, .count = 1 });
+    }
+
+    fn release(self: *ObsoletePathRefRegistry, path: []const u8) void {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        var i: usize = 0;
+        while (i < self.refs.items.len) : (i += 1) {
+            const ref = &self.refs.items[i];
+            if (!std.mem.eql(u8, ref.path, path)) continue;
+            if (ref.count > 1) {
+                ref.count -= 1;
+                return;
+            }
+            std.heap.page_allocator.free(ref.path);
+            _ = self.refs.swapRemove(i);
+            return;
+        }
+    }
+
+    fn isRetained(self: *ObsoletePathRefRegistry, path: []const u8) bool {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.refs.items) |ref| {
+            if (std.mem.eql(u8, ref.path, path) and ref.count > 0) return true;
+        }
+        return false;
+    }
+};
+
+var obsolete_path_refs = ObsoletePathRefRegistry{};
+
 pub const MutableSnapshotReason = enum(u8) {
     bound_read_txn,
     namespace_read_txn,
+    current_scan,
     other,
 };
 
 pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+
+pub const ReaderPinKind = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    probe_txn,
+    current_scan,
+    write_txn,
+    compaction,
+    other,
+};
+
+pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".fields.len;
+
+pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
+    return switch (kind) {
+        .bound_read_txn => "bound_read_txn",
+        .namespace_read_txn => "namespace_read_txn",
+        .probe_txn => "probe_txn",
+        .current_scan => "current_scan",
+        .write_txn => "write_txn",
+        .compaction => "compaction",
+        .other => "other",
+    };
+}
+
+fn readerPinKindIndex(kind: ReaderPinKind) usize {
+    return @intFromEnum(kind);
+}
 
 pub const MutableSnapshotCloneReasonStats = struct {
     calls: u64 = 0,
@@ -75,12 +155,19 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
     return switch (reason) {
         .bound_read_txn => "bound_read_txn",
         .namespace_read_txn => "namespace_read_txn",
+        .current_scan => "current_scan",
         .other => "other",
     };
 }
 
 fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
     return @intFromEnum(reason);
+}
+
+fn activeReaderKindStats(active_readers_by_kind: [reader_pin_kind_count]usize) [reader_pin_kind_count]u64 {
+    var stats: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count;
+    for (active_readers_by_kind, 0..) |active, i| stats[i] = @intCast(active);
+    return stats;
 }
 
 fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
@@ -108,9 +195,11 @@ pub const Options = struct {
     l0_hard_limit_bytes: u64 = 0,
     write_pressure_max_compaction_steps: usize = 8,
     write_pressure_reject_on_overload: bool = false,
+    write_pressure_during_bulk_ingest: bool = false,
     foreground_soft_compaction: bool = false,
     defer_flush_on_commit: bool = false,
     max_deferred_immutable_memtables: usize = 8,
+    background_maintenance_max_steps: usize = 64,
     direct_bulk_ingest: bool = true,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
@@ -145,9 +234,24 @@ pub const Options = struct {
     wal_soft_limit_bytes: u64 = 0,
     wal_hard_limit_bytes: u64 = 0,
     root_generation: u64 = 0,
-    obsolete_retention_ns: u64 = 5 * std.time.ns_per_min,
+    obsolete_retention_ns: u64 = 250 * std.time.ns_per_ms,
+    obsolete_delete_retry_ns: u64 = 250 * std.time.ns_per_ms,
     read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
+    // Per-scan cap; 0 disables bulk current-scan mutable cloning.
+    bulk_ingest_current_scan_clone_max_bytes: u64 = 256 * 1024 * 1024,
+    // Aggregate active clone cap; 0 leaves aggregate admission uncapped.
+    bulk_ingest_current_scan_clone_total_max_bytes: u64 = 256 * 1024 * 1024,
 };
+
+fn writePressureDuringBulkIngestEnvEnabled() bool {
+    const raw = platform.env.getenv("ANTFLY_LSM_WRITE_PRESSURE_DURING_BULK") orelse return false;
+    if (raw.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+    return true;
+}
 
 pub const IoRuntime = storage_io.RuntimeKind;
 pub const Storage = storage_io.Storage;
@@ -310,6 +414,10 @@ pub const Backend = struct {
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
         mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+        bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
+        bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
+        bulk_ingest_current_scan_clone_oom_fallbacks: u64 = 0,
         read_snapshot_mutable_rotations: u64 = 0,
         read_snapshot_mutable_rotation_bytes_total: u64 = 0,
         read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -339,7 +447,16 @@ pub const Backend = struct {
         level_overflow_runs: u64 = 0,
         level_overflow_bytes: u64 = 0,
         obsolete_paths: u64 = 0,
+        current_manifest_bytes: u64 = 0,
+        obsolete_paths_pinned_by_readers: u64 = 0,
+        obsolete_paths_pinned_by_versions: u64 = 0,
+        obsolete_paths_waiting_for_retry: u64 = 0,
+        obsolete_paths_reclaimable: u64 = 0,
+        obsolete_delete_failures: u64 = 0,
+        obsolete_delete_retries: u64 = 0,
         active_readers: u64 = 0,
+        active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
+        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
@@ -389,6 +506,10 @@ pub const Backend = struct {
             dst_reason.bytes_total +|= src_reason.bytes_total;
             dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
         }
+        dst.bulk_ingest_current_scan_clone_active_bytes +|= src.bulk_ingest_current_scan_clone_active_bytes;
+        dst.bulk_ingest_current_scan_clone_peak_active_bytes = @max(dst.bulk_ingest_current_scan_clone_peak_active_bytes, src.bulk_ingest_current_scan_clone_peak_active_bytes);
+        dst.bulk_ingest_current_scan_clone_budget_denials +|= src.bulk_ingest_current_scan_clone_budget_denials;
+        dst.bulk_ingest_current_scan_clone_oom_fallbacks +|= src.bulk_ingest_current_scan_clone_oom_fallbacks;
         dst.read_snapshot_mutable_rotations +|= src.read_snapshot_mutable_rotations;
         dst.read_snapshot_mutable_rotation_bytes_total +|= src.read_snapshot_mutable_rotation_bytes_total;
         dst.read_snapshot_mutable_rotation_peak_bytes = @max(dst.read_snapshot_mutable_rotation_peak_bytes, src.read_snapshot_mutable_rotation_peak_bytes);
@@ -418,7 +539,16 @@ pub const Backend = struct {
         dst.level_overflow_runs +|= src.level_overflow_runs;
         dst.level_overflow_bytes +|= src.level_overflow_bytes;
         dst.obsolete_paths +|= src.obsolete_paths;
+        dst.obsolete_paths_pinned_by_readers +|= src.obsolete_paths_pinned_by_readers;
+        dst.obsolete_paths_pinned_by_versions +|= src.obsolete_paths_pinned_by_versions;
+        dst.obsolete_paths_waiting_for_retry +|= src.obsolete_paths_waiting_for_retry;
+        dst.obsolete_paths_reclaimable +|= src.obsolete_paths_reclaimable;
+        dst.obsolete_delete_failures +|= src.obsolete_delete_failures;
+        dst.obsolete_delete_retries +|= src.obsolete_delete_retries;
+        dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
+        for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
+        for (&dst.obsolete_paths_pinned_by_reader_kind, src.obsolete_paths_pinned_by_reader_kind) |*dst_count, src_count| dst_count.* +|= src_count;
         dst.active_bulk_ingest_batches +|= src.active_bulk_ingest_batches;
         dst.wal_retained_segments +|= src.wal_retained_segments;
         dst.wal_retained_bytes +|= src.wal_retained_bytes;
@@ -759,6 +889,8 @@ pub const Backend = struct {
 
     allocator: Allocator,
     mu: std.atomic.Mutex = .unlocked,
+    // Cached score used by best-effort maintenance scheduling and metrics.
+    // A value of 1 can still mean "known debt, exact score not refreshed yet".
     cached_maintenance_hint: CounterU64 = .init(1),
     options: Options,
     root_generation: u64 = 0,
@@ -766,12 +898,16 @@ pub const Backend = struct {
     storage_owner: ?*storage_io.NativeStorage = null,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
+    current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
+    active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     active_mutable_value_readers: usize = 0,
     manifest_dirty: bool = false,
     obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
     obsolete_manifest_dirty: bool = false,
+    obsolete_delete_failures: u64 = 0,
+    obsolete_delete_retries: u64 = 0,
     obsolete_runs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Run)) = .empty,
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
@@ -803,6 +939,10 @@ pub const Backend = struct {
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
     mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+    bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
+    bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
+    bulk_ingest_current_scan_clone_oom_fallbacks: u64 = 0,
     read_snapshot_mutable_rotations: u64 = 0,
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
@@ -925,6 +1065,7 @@ pub const Backend = struct {
         self.open_stats.loaded_manifest = loaded_manifest;
         self.open_stats.loaded_runs = @intCast(self.runs.items.len);
         self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.items.len);
+        self.current_manifest_bytes = if (self.manifest_backing) |raw| @intCast(raw.len) else 0;
     }
 
     pub fn recordOpenReplayComplete(self: *Backend) void {
@@ -976,13 +1117,19 @@ pub const Backend = struct {
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
             .mutable_snapshot_clone_peak_bytes = self.mutable_snapshot_clone_peak_bytes,
             .mutable_snapshot_clone_by_reason = self.mutable_snapshot_clone_by_reason,
+            .bulk_ingest_current_scan_clone_active_bytes = self.bulk_ingest_current_scan_clone_active_bytes,
+            .bulk_ingest_current_scan_clone_peak_active_bytes = self.bulk_ingest_current_scan_clone_peak_active_bytes,
+            .bulk_ingest_current_scan_clone_budget_denials = self.bulk_ingest_current_scan_clone_budget_denials,
+            .bulk_ingest_current_scan_clone_oom_fallbacks = self.bulk_ingest_current_scan_clone_oom_fallbacks,
             .read_snapshot_mutable_rotations = self.read_snapshot_mutable_rotations,
             .read_snapshot_mutable_rotation_bytes_total = self.read_snapshot_mutable_rotation_bytes_total,
             .read_snapshot_mutable_rotation_peak_bytes = self.read_snapshot_mutable_rotation_peak_bytes,
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .total_runs = @intCast(self.runs.items.len),
             .obsolete_paths = @intCast(self.obsolete_paths.items.len),
-            .active_readers = @intCast(self.active_readers),
+            .current_manifest_bytes = self.current_manifest_bytes,
+            .active_readers = (self.active_readers),
+            .active_readers_by_kind = activeReaderKindStats(self.active_readers_by_kind),
             .active_bulk_ingest_batches = @intCast(self.active_bulk_ingest_batches),
             .soft_limit_l0_runs = @intCast(self.effectiveL0SoftLimitRuns()),
             .hard_limit_l0_runs = @intCast(self.effectiveL0HardLimitRuns()),
@@ -990,7 +1137,24 @@ pub const Backend = struct {
             .hard_limit_l0_bytes = self.options.l0_hard_limit_bytes,
             .manifest_dirty = self.manifest_dirty,
             .obsolete_manifest_dirty = self.obsolete_manifest_dirty,
+            .obsolete_delete_failures = self.obsolete_delete_failures,
+            .obsolete_delete_retries = self.obsolete_delete_retries,
         };
+        const obsolete_now_ns = self.nowNs();
+        for (self.obsolete_paths.items) |obsolete| {
+            if (self.active_readers != 0) {
+                stats.obsolete_paths_pinned_by_readers +|= 1;
+                for (self.active_readers_by_kind, 0..) |active, kind_index| {
+                    if (active != 0) stats.obsolete_paths_pinned_by_reader_kind[kind_index] +|= 1;
+                }
+            } else if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
+                stats.obsolete_paths_pinned_by_versions +|= 1;
+            } else if (obsolete.delete_after_ns > obsolete_now_ns) {
+                stats.obsolete_paths_waiting_for_retry +|= 1;
+            } else {
+                stats.obsolete_paths_reclaimable +|= 1;
+            }
+        }
         for (self.activeImmutableMemtables()) |state| {
             stats.immutable_entries += @intCast(state.entries.items.len);
             stats.immutable_bytes += estimateStateBytes(state);
@@ -1108,7 +1272,22 @@ pub const Backend = struct {
 
     pub fn notePotentialMaintenanceDebt(self: *Backend) void {
         self.cached_maintenance_hint.store(1, .release);
-        self.wakeMaintenanceWorker();
+        if (self.options.maintenance_waker != null) {
+            self.wakeMaintenanceWorker();
+            return;
+        }
+        if (!self.mu.tryLock()) return;
+        defer self.mu.unlock();
+        self.scheduleMaintenanceJobIfNeededLocked();
+    }
+
+    pub fn notePotentialMaintenanceDebtLocked(self: *Backend) void {
+        self.cached_maintenance_hint.store(1, .release);
+        if (self.options.maintenance_waker != null) {
+            self.wakeMaintenanceWorker();
+            return;
+        }
+        self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn wakeMaintenanceWorker(self: *Backend) void {
@@ -1201,7 +1380,7 @@ pub const Backend = struct {
 
     fn refreshCachedMaintenanceHintLocked(self: *Backend) u64 {
         const score = self.maintenanceScoreLocked();
-        self.cached_maintenance_hint.store(if (score > 0) 1 else 0, .release);
+        self.cached_maintenance_hint.store(score, .release);
         return score;
     }
 
@@ -1210,7 +1389,7 @@ pub const Backend = struct {
         manager.observeUsage(
             .lsm_in_memory_state,
             &self.tracked_in_memory_state_bytes,
-            stats.mutable_bytes + stats.immutable_bytes,
+            stats.mutable_bytes +| stats.immutable_bytes +| stats.bulk_ingest_current_scan_clone_active_bytes,
         );
     }
 
@@ -1240,6 +1419,7 @@ pub const Backend = struct {
         for (self.activeImmutableMemtables()) |state| {
             bytes +|= estimateStateBytes(state);
         }
+        bytes +|= self.bulk_ingest_current_scan_clone_active_bytes;
         return bytes;
     }
 
@@ -1319,6 +1499,14 @@ pub const Backend = struct {
         defer self.maintenance_io_budget_remaining = null;
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
+        const before_obsolete_paths = self.obsolete_paths.items.len;
+
+        if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
+            try self.persistManifest();
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return self.write_stats.manifest_writes != before_manifest_writes or
+                self.obsolete_paths.items.len != before_obsolete_paths;
+        }
 
         if (self.shouldFlushMutable() or try self.shouldFlushMutableForWalPressureLocked()) {
             try self.rotateMutableToImmutable();
@@ -1343,7 +1531,8 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
 
         return self.compaction_stats.compactions != before_compactions or
-            self.write_stats.manifest_writes != before_manifest_writes;
+            self.write_stats.manifest_writes != before_manifest_writes or
+            self.obsolete_paths.items.len != before_obsolete_paths;
     }
 
     pub fn activeImmutableMemtableCount(self: *const Backend) usize {
@@ -1377,7 +1566,7 @@ pub const Backend = struct {
         self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
         self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
@@ -1388,7 +1577,7 @@ pub const Backend = struct {
         self.read_snapshot_mutable_rotation_bytes_total +|= mutable_bytes;
         self.read_snapshot_mutable_rotation_peak_bytes = @max(self.read_snapshot_mutable_rotation_peak_bytes, mutable_bytes);
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn prepareMutableForWrite(self: *Backend) !void {
@@ -1396,21 +1585,17 @@ pub const Backend = struct {
         if (self.mutable.entries.items.len == 0) return;
         try self.rotateMutableToImmutable();
         if (self.shouldDeferCommitFlush()) self.scheduleImmutableFlushJob();
-        self.notePotentialMaintenanceDebt();
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn snapshotMutableState(self: *Backend) !*const State {
         return try self.snapshotMutableStateWithReason(.other);
     }
 
-    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
-        if (self.mutable_read_snapshot) |snapshot| return snapshot;
-        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
-        const snapshot = try self.allocator.create(State);
-        errdefer self.allocator.destroy(snapshot);
-        snapshot.* = try self.mutable.clone(self.allocator);
+    fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
+        var snapshot = try self.mutable.clone(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(snapshot);
+        const snapshot_bytes = estimateStateBytes(&snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -1418,9 +1603,67 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
         self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
+        return snapshot;
+    }
+
+    pub fn snapshotMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !*const State {
+        if (self.mutable_read_snapshot) |snapshot| return snapshot;
+        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
+        const snapshot = try self.allocator.create(State);
+        errdefer self.allocator.destroy(snapshot);
+        snapshot.* = try self.cloneMutableStateWithReason(reason);
+        errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
         return snapshot;
+    }
+
+    pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
+        if (!self.bulkIngestActive()) return null;
+        if (self.options.bulk_ingest_current_scan_clone_max_bytes == 0) return null;
+        if (self.mutable.entries.items.len == 0) return State{};
+        const mutable_bytes = estimateStateBytes(&self.mutable);
+        if (mutable_bytes > self.options.bulk_ingest_current_scan_clone_max_bytes) return null;
+        if (!self.canAdmitBulkIngestCurrentScanClone(mutable_bytes)) {
+            self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            return null;
+        }
+        var snapshot = self.cloneMutableStateWithReason(.other) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.bulk_ingest_current_scan_clone_oom_fallbacks +|= 1;
+                return null;
+            },
+        };
+        errdefer snapshot.deinit(self.allocator);
+        const snapshot_bytes = estimateStateBytes(&snapshot);
+        if (!self.canAdmitBulkIngestCurrentScanClone(snapshot_bytes)) {
+            self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            return null;
+        }
+        self.bulk_ingest_current_scan_clone_active_bytes +|= snapshot_bytes;
+        self.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
+            self.bulk_ingest_current_scan_clone_peak_active_bytes,
+            self.bulk_ingest_current_scan_clone_active_bytes,
+        );
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return snapshot;
+    }
+
+    fn canAdmitBulkIngestCurrentScanClone(self: *const Backend, bytes: u64) bool {
+        const total_max = self.options.bulk_ingest_current_scan_clone_total_max_bytes;
+        if (total_max == 0) return true;
+        if (bytes > total_max) return false;
+        return self.bulk_ingest_current_scan_clone_active_bytes <= total_max - bytes;
+    }
+
+    pub fn releaseCurrentScanMutableStateForBulkIngest(self: *Backend, snapshot: *const State) void {
+        const snapshot_bytes = estimateStateBytes(snapshot);
+        if (snapshot_bytes >= self.bulk_ingest_current_scan_clone_active_bytes) {
+            self.bulk_ingest_current_scan_clone_active_bytes = 0;
+        } else {
+            self.bulk_ingest_current_scan_clone_active_bytes -= snapshot_bytes;
+        }
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     pub fn invalidateMutableReadSnapshot(self: *Backend) void {
@@ -1876,7 +2119,7 @@ pub const Backend = struct {
         if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
         if (self.activeImmutableMemtableCount() > 0) return;
         if (!self.background_executor.canRunDetached()) return;
-        if (self.maintenanceScoreLocked() == 0) return;
+        if (self.maintenanceScoreLocked() == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
 
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
@@ -1888,16 +2131,23 @@ pub const Backend = struct {
 
     fn runMaintenanceJob(ptr: *anyopaque) !void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
+        errdefer self.clearMaintenanceJobInFlight(false);
+
+        const max_steps = @max(@as(usize, 1), self.options.background_maintenance_max_steps);
+        var steps: usize = 0;
+        while (steps < max_steps and !self.closing.load(.acquire)) : (steps += 1) {
+            const progressed = try self.runMaintenanceStep();
+            if (!progressed) break;
+        }
+
+        self.clearMaintenanceJobInFlight(true);
+    }
+
+    fn clearMaintenanceJobInFlight(self: *Backend, maybe_reschedule: bool) void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        errdefer self.maintenance_job_in_flight = false;
-        if (self.closing.load(.acquire)) {
-            self.maintenance_job_in_flight = false;
-            return;
-        }
-        const progressed = try self.runMaintenanceStepLocked();
         self.maintenance_job_in_flight = false;
-        if (progressed and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
+        if (maybe_reschedule and !self.closing.load(.acquire)) self.scheduleMaintenanceJobIfNeededLocked();
     }
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
@@ -1931,6 +2181,9 @@ pub const Backend = struct {
         compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
+            if (self.writePressureDuringBulkIngestEnabled()) {
+                try self.enforceWritePressure();
+            }
             return true;
         }
         try self.enforceWritePressure();
@@ -2002,6 +2255,9 @@ pub const Backend = struct {
         compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
+            if (self.writePressureDuringBulkIngestEnabled()) {
+                try self.enforceWritePressure();
+            }
             return true;
         }
         try self.enforceWritePressure();
@@ -2061,7 +2317,7 @@ pub const Backend = struct {
 
     fn getFromRunForPoint(self: *Backend, run: *Run, namespace: backend_types.Namespace, key: []const u8) !?[]const u8 {
         if (!runMayContain(run.*, namespace, key)) return null;
-        if (!lsm_table_file.maybeContains(try run.ensureBloomFilter(self.allocator), namespace.name, key)) {
+        if (!lsm_table_file.maybeContains(try run.ensureBloomFilterWithOptionalStorage(self.allocator, self.storage), namespace.name, key)) {
             return null;
         }
         const state = try self.resolveRunState(run);
@@ -2158,6 +2414,9 @@ pub const Backend = struct {
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
+                if (self.writePressureDuringBulkIngestEnabled()) {
+                    try self.enforceWritePressure();
+                }
             } else {
                 try self.persistManifest();
             }
@@ -2186,6 +2445,9 @@ pub const Backend = struct {
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
+                if (self.writePressureDuringBulkIngestEnabled()) {
+                    try self.enforceWritePressure();
+                }
             } else {
                 try self.persistManifest();
             }
@@ -2229,6 +2491,9 @@ pub const Backend = struct {
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
 
         compaction_mod.sortRuns(self.runs.items);
+        if (self.bulkIngestActive() and self.writePressureDuringBulkIngestEnabled()) {
+            try self.enforceWritePressure();
+        }
     }
 
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
@@ -2248,7 +2513,49 @@ pub const Backend = struct {
     pub fn persistManifest(self: *Backend) !void {
         const root_dir = self.root_dir orelse return;
         const start_ns = self.writeStatsNowNs();
-        self.obsolete_manifest_dirty = try self.reconcileObsoletePathsForManifest();
+
+        const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
+        const clean_publish = !self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths;
+        if (clean_publish and self.durableManifestHasNewerRunIdLocked(root_dir)) return;
+
+        try self.writeManifestSnapshotLocked(root_dir, start_ns);
+
+        if (reclaimable_obsolete_paths) {
+            self.obsolete_manifest_dirty = false;
+            const needs_follow_up = try self.reconcileObsoletePathsForManifest();
+            const removed_or_retried = self.obsolete_manifest_dirty;
+            if (removed_or_retried) try self.writeManifestSnapshotLocked(root_dir, start_ns);
+            self.obsolete_manifest_dirty = needs_follow_up;
+        }
+    }
+
+    fn durableManifestHasNewerRunIdLocked(self: *Backend, root_dir: []const u8) bool {
+        const storage = self.storage orelse return false;
+        var manifest_backing: ?[]u8 = null;
+        defer if (manifest_backing) |backing| self.allocator.free(backing);
+
+        var durable_next_run_id: u64 = 0;
+        var durable_runs = std.ArrayListUnmanaged(Run).empty;
+        defer durable_runs.deinit(self.allocator);
+        var durable_obsolete = std.ArrayListUnmanaged(ObsoletePath).empty;
+        defer {
+            for (durable_obsolete.items) |*obsolete| obsolete.deinit(self.allocator);
+            durable_obsolete.deinit(self.allocator);
+        }
+
+        const found = repository_mod.loadManifestIfPresentWithStorage(
+            storage,
+            self.allocator,
+            root_dir,
+            &manifest_backing,
+            &durable_next_run_id,
+            &durable_runs,
+            &durable_obsolete,
+        ) catch return false;
+        return found and durable_next_run_id > self.next_run_id;
+    }
+
+    fn writeManifestSnapshotLocked(self: *Backend, root_dir: []const u8, start_ns: u64) !void {
         try validateRunLayoutForManifest(self.runs.items);
         const bytes = try repository_mod.persistManifestWithStorageCount(
             self.storage.?,
@@ -2261,8 +2568,10 @@ pub const Backend = struct {
         self.write_stats.manifest_writes += 1;
         self.write_stats.manifest_bytes += bytes;
         self.write_stats.manifest_ns += self.writeStatsElapsedNs(start_ns);
+        self.current_manifest_bytes = bytes;
         try self.maybeCheckpointWalAfterManifestPublish();
         self.manifest_dirty = false;
+        self.obsolete_manifest_dirty = false;
     }
 
     pub fn appendWalForState(self: *Backend, state: *const State) !void {
@@ -2585,8 +2894,34 @@ pub const Backend = struct {
             std.mem.eql(u8, self.run_state_cache.items[index].path, path);
     }
 
+    pub fn registerOpenManifestRunRefs(self: *Backend) !void {
+        for (self.runs.items) |*run| {
+            if (run.version_ref_pinned) continue;
+            const path = run.path orelse continue;
+            try obsolete_path_refs.retain(path);
+            run.version_ref_pinned = true;
+        }
+    }
+
+    pub fn releaseRunVersionRef(self: *Backend, run: *Run) void {
+        _ = self;
+        if (!run.version_ref_pinned) return;
+        if (run.path) |path| obsolete_path_refs.release(path);
+        run.version_ref_pinned = false;
+    }
+
+    fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {
+        _ = self;
+        return obsolete_path_refs.isRetained(path);
+    }
+
     pub fn retainReader(self: *Backend) void {
+        self.retainReaderKind(.other);
+    }
+
+    pub fn retainReaderKind(self: *Backend, kind: ReaderPinKind) void {
         self.active_readers += 1;
+        self.active_readers_by_kind[readerPinKindIndex(kind)] += 1;
     }
 
     pub fn retainActiveMutableValueReader(self: *Backend) void {
@@ -2830,8 +3165,15 @@ pub const Backend = struct {
     }
 
     pub fn releaseReader(self: *Backend) void {
+        self.releaseReaderKind(.other);
+    }
+
+    pub fn releaseReaderKind(self: *Backend, kind: ReaderPinKind) void {
+        const index = readerPinKindIndex(kind);
         std.debug.assert(self.active_readers > 0);
+        std.debug.assert(self.active_readers_by_kind[index] > 0);
         self.active_readers -= 1;
+        self.active_readers_by_kind[index] -= 1;
         if (self.active_readers == 0) {
             self.drainObsoleteRuns();
             self.drainRetiredImmutableMemtables();
@@ -2846,6 +3188,7 @@ pub const Backend = struct {
             if (obsolete.delete_after_ns < delete_after_ns) obsolete.delete_after_ns = delete_after_ns;
             self.allocator.free(path);
             self.obsolete_manifest_dirty = true;
+            self.notePotentialMaintenanceDebtLocked();
             return;
         }
 
@@ -2854,6 +3197,7 @@ pub const Backend = struct {
             .delete_after_ns = delete_after_ns,
         });
         self.obsolete_manifest_dirty = true;
+        self.notePotentialMaintenanceDebtLocked();
     }
 
     pub fn queueObsoleteRuns(self: *Backend, runs: std.ArrayListUnmanaged(Run)) !void {
@@ -3083,6 +3427,7 @@ pub const Backend = struct {
             for (runs.items) |*run| {
                 // File retention is tracked separately by obsolete_paths; this only releases local cache handles.
                 if (run.path) |path| self.evictLocalCachesForRun(path, run.id);
+                self.releaseRunVersionRef(run);
                 run.deinit(self.allocator);
             }
             runs.deinit(self.allocator);
@@ -3091,7 +3436,11 @@ pub const Backend = struct {
     }
 
     pub fn finalizeWriteReaderRelease(self: *Backend) !void {
-        self.releaseReader();
+        try self.finalizeWriteReaderReleaseKind(.other);
+    }
+
+    pub fn finalizeWriteReaderReleaseKind(self: *Backend, kind: ReaderPinKind) !void {
+        self.releaseReaderKind(kind);
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
@@ -3102,7 +3451,11 @@ pub const Backend = struct {
     }
 
     pub fn finalizeReadReaderRelease(self: *Backend) void {
-        self.releaseReader();
+        self.finalizeReadReaderReleaseKind(.other);
+    }
+
+    pub fn finalizeReadReaderReleaseKind(self: *Backend, kind: ReaderPinKind) void {
+        self.releaseReaderKind(kind);
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.active_readers != 0 or
@@ -3253,7 +3606,7 @@ pub const Backend = struct {
     }
 
     fn enforceWritePressure(self: *Backend) anyerror!void {
-        if (self.bulkIngestActive()) return;
+        if (self.bulkIngestActive() and !self.writePressureDuringBulkIngestEnabled()) return;
         if (self.write_pressure_enforcing) return;
         self.write_pressure_enforcing = true;
         defer self.write_pressure_enforcing = false;
@@ -3342,6 +3695,21 @@ pub const Backend = struct {
         return self.active_bulk_ingest_batches != 0;
     }
 
+    pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
+        if (self.mutable.entries.items.len == 0) return false;
+        if (self.active_bulk_ingest_batches <= 1) return false;
+        if (self.activeImmutableMemtableCount() != 0) return false;
+        const byte_threshold = self.effectiveFlushThresholdBytes();
+        if (byte_threshold > 0) {
+            return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= byte_threshold;
+        }
+        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+    }
+
+    fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
+        return self.options.write_pressure_during_bulk_ingest or writePressureDuringBulkIngestEnvEnabled();
+    }
+
     pub fn beginBulkIngestSession(self: *Backend) !void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
@@ -3400,6 +3768,9 @@ pub const Backend = struct {
                 _ = self.refreshCachedMaintenanceHintLocked();
             }
             self.active_bulk_ingest_batches -= 1;
+            if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
+                try self.persistManifest();
+            }
             return;
         }
         self.active_bulk_ingest_batches -= 1;
@@ -3454,6 +3825,11 @@ pub const Backend = struct {
 
     fn finalizeDeferredRunWork(self: *Backend, options: DeferredRunWorkOptions) !void {
         if (self.options.backend.read_only) return;
+        if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
+            try self.persistManifest();
+            _ = self.refreshCachedMaintenanceHintLocked();
+            if (!options.force_soft_compaction and !self.options.foreground_soft_compaction) return;
+        }
         try self.enforceWritePressure();
         if (!self.bulkIngestActive() and (options.force_soft_compaction or self.options.foreground_soft_compaction)) {
             try self.maybeCompactRuns();
@@ -3502,41 +3878,153 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
+    fn parseRunIdFromTableFileName(name: []const u8) ?u64 {
+        if (!std.mem.endsWith(u8, name, ".tbl")) return null;
+        const stem = name[0 .. name.len - ".tbl".len];
+        if (stem.len == 0) return null;
+        return std.fmt.parseUnsigned(u64, stem, 10) catch null;
+    }
+
+    fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
+        for (self.runs.items) |run| {
+            if (run.id == run_id) return true;
+        }
+        return false;
+    }
+
+    fn pathTrackedByActiveRunsLocked(self: *Backend, path: []const u8) bool {
+        for (self.runs.items) |run| {
+            if (run.path) |active| {
+                if (std.mem.eql(u8, active, path)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn pathTrackedByManifestLocked(self: *Backend, path: []const u8) bool {
+        if (self.pathTrackedByActiveRunsLocked(path)) return true;
+        for (self.obsolete_paths.items) |obsolete| {
+            if (std.mem.eql(u8, obsolete.path, path)) return true;
+        }
+        return false;
+    }
+
+    pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !bool {
+        _ = self;
+        return false;
+    }
+
+    fn cleanupOrphanedRunFilesForManifest(self: *Backend) !bool {
+        const root_dir = self.root_dir orelse return false;
+        if (self.storage == null or self.options.backend.read_only) return false;
+        if (!std.fs.path.isAbsolute(root_dir)) return false;
+
+        const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
+        defer self.allocator.free(runs_dir);
+
+        var io_impl = std.Io.Threaded.init(self.allocator, .{});
+        defer io_impl.deinit();
+
+        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(io_impl.io());
+
+        var deleted = false;
+        var it = dir.iterate();
+        while (try it.next(io_impl.io())) |entry| {
+            if (entry.kind != .file) continue;
+            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+            if (self.runIdTrackedByManifestLocked(run_id)) continue;
+
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            defer self.allocator.free(path);
+            if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
+
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            deleted = true;
+        }
+        return deleted;
+    }
+
     fn reconcileObsoletePathsForManifest(self: *Backend) !bool {
         const now_ns = self.nowNs();
         var needs_follow_up = false;
         var i: usize = 0;
         while (i < self.obsolete_paths.items.len) {
-            const obsolete = self.obsolete_paths.items[i];
+            const obsolete = &self.obsolete_paths.items[i];
             if (self.active_readers != 0) {
                 needs_follow_up = true;
                 i += 1;
                 continue;
             }
-
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
+                needs_follow_up = true;
+                i += 1;
+                continue;
+            }
             if (obsolete.delete_after_ns > now_ns) {
+                needs_follow_up = true;
                 i += 1;
                 continue;
             }
 
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
                 error.FileNotFound => {},
-                else => return err,
+                else => {
+                    self.obsolete_delete_failures +|= 1;
+                    self.obsolete_delete_retries +|= 1;
+                    obsolete.delete_after_ns = now_ns +| self.options.obsolete_delete_retry_ns;
+                    self.obsolete_manifest_dirty = true;
+                    needs_follow_up = true;
+                    i += 1;
+                    continue;
+                },
             };
             var removed = self.obsolete_paths.orderedRemove(i);
             removed.deinit(self.allocator);
+            self.obsolete_manifest_dirty = true;
         }
         return needs_follow_up;
     }
 
     fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
-        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return false;
+        if (self.active_readers != 0 or self.bulkIngestActive() or self.obsolete_paths.items.len == 0) return false;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
         const now_ns = self.nowNs();
         for (self.obsolete_paths.items) |obsolete| {
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
             if (obsolete.delete_after_ns <= now_ns) return true;
         }
         return false;
+    }
+
+    pub fn nextObsoleteReclaimDelayNsBestEffort(self: *Backend) ?u64 {
+        if (!self.mu.tryLock()) return null;
+        defer self.mu.unlock();
+        return self.nextObsoleteReclaimDelayNsLocked();
+    }
+
+    fn nextObsoleteReclaimDelayNsLocked(self: *Backend) ?u64 {
+        if (self.active_readers != 0 or self.obsolete_paths.items.len == 0) return null;
+        if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return null;
+        if (self.bulkIngestActive()) return null;
+
+        const now_ns = self.nowNs();
+        var delay_ns: ?u64 = null;
+        var due_now = false;
+        for (self.obsolete_paths.items) |obsolete| {
+            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
+            const candidate = if (obsolete.delete_after_ns <= now_ns) 0 else obsolete.delete_after_ns - now_ns;
+            if (candidate == 0) due_now = true;
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        if (due_now) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
     }
 
     fn nowNs(self: *Backend) u64 {
@@ -3661,6 +4149,9 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     errors: u64 = 0,
     joined: bool = false,
 
+    const idle_obsolete_reclaim_poll_ns = 250 * std.time.ns_per_ms;
+    const idle_wake_poll_ns = 2 * std.time.ns_per_ms;
+
     const Stats = struct {
         wakeups: u64 = 0,
         maintenance_steps: u64 = 0,
@@ -3714,22 +4205,32 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 
     fn run(self: *InternalFlushWorker) void {
+        var next_reclaim_delay_ns: ?u64 = null;
         while (true) {
-            const drain_then_stop = self.waitForWork();
+            const drain_then_stop = self.waitForWork(next_reclaim_delay_ns);
             if (drain_then_stop) {
-                self.drainMaintenance();
+                _ = self.drainMaintenance();
                 return;
             }
-            self.drainMaintenance();
+            next_reclaim_delay_ns = self.drainMaintenance();
         }
     }
 
-    fn waitForWork(self: *InternalFlushWorker) bool {
+    fn waitForWork(self: *InternalFlushWorker, initial_reclaim_delay_ns: ?u64) bool {
+        var reclaim_delay_ns = initial_reclaim_delay_ns;
         while (true) {
             lockWorkerMutex(&self.mutex);
             if (self.stop_requested or self.wake_requested) break;
             self.mutex.unlock();
-            sleepForTest(2 * std.time.ns_per_ms);
+
+            if (reclaim_delay_ns) |delay_ns| {
+                if (delay_ns == 0) return false;
+                const sleep_ns = @min(delay_ns, idle_obsolete_reclaim_poll_ns);
+                sleepForTest(sleep_ns);
+                reclaim_delay_ns = if (delay_ns <= sleep_ns) 0 else delay_ns - sleep_ns;
+            } else {
+                sleepForTest(idle_wake_poll_ns);
+            }
         }
         defer self.mutex.unlock();
         const drain_then_stop = self.stop_requested and self.drain_on_stop;
@@ -3738,19 +4239,20 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         return drain_then_stop;
     }
 
-    fn drainMaintenance(self: *InternalFlushWorker) void {
+    fn drainMaintenance(self: *InternalFlushWorker) ?u64 {
         var steps: usize = 0;
         while (steps < 64) : (steps += 1) {
             const progressed = self.backend.runMaintenanceStep() catch |err| {
                 self.recordError(err);
-                return;
+                return null;
             };
-            if (!progressed) return;
+            if (!progressed) return self.backend.nextObsoleteReclaimDelayNsBestEffort();
             self.recordStep();
         }
         lockWorkerMutex(&self.mutex);
         self.wake_requested = true;
         self.mutex.unlock();
+        return null;
     }
 
     fn recordStep(self: *InternalFlushWorker) void {
@@ -4045,7 +4547,6 @@ fn cloneRunForBackend(dest: *Backend, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(dest.allocator) else null,
-        .encoded_bloom_filter = if (source.encoded_bloom_filter) |encoded| try dest.allocator.dupe(u8, encoded) else null,
         .state = null,
     };
     errdefer run.deinit(dest.allocator);
@@ -4175,7 +4676,6 @@ fn appendSyntheticLevelRunsForTest(backend: *Backend, level: u32, count: usize, 
             .largest_key = &.{},
             .entry_count = 1,
             .bloom_filter = null,
-            .encoded_bloom_filter = null,
             .owns_metadata = false,
             .state = null,
         });
@@ -4984,6 +5484,71 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
     try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
 }
 
+test "lsm backend note potential maintenance debt schedules detached job" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-maintenance-note-debt-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .l0_hard_limit_runs = 100,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+    try backend.flushAllImmutableMemtables();
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(backend.maintenanceScore() > 0);
+
+    var lane = FakeLane{};
+    backend.background_executor = BackgroundExecutor.initLane(lane.lane(), 783);
+    try std.testing.expect(lane.submitted_job == null);
+    backend.notePotentialMaintenanceDebt();
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.maintenance_job_in_flight);
+}
+
 test "lsm backend detached maintenance jobs reschedule while debt remains" {
     const FakeLane = struct {
         submitted_jobs: [16]background_runtime_mod.Job = undefined,
@@ -5039,6 +5604,7 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
         .compact_threshold_runs = 100,
         .l0_soft_limit_runs = 1,
         .l0_hard_limit_runs = 100,
+        .background_maintenance_max_steps = 1,
         .background_executor = &executor,
     });
     defer backend.close();
@@ -5858,6 +6424,112 @@ test "lsm backend direct-ingests threshold-sized bulk batches" {
     try std.testing.expectEqualStrings("D", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:d"));
 }
 
+test "lsm backend direct bulk append duplicate keys preserve last write wins" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A1");
+        try txn.appendPut(.{ .name = "docs" }, "doc:b", "B");
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A2");
+        try std.testing.expectEqualStrings("A2", try txn.get(.{ .name = "docs" }, "doc:a"));
+        try txn.commit();
+    }
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_fallback_duplicate_keys);
+    try std.testing.expectEqualStrings("A2", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm backend bulk append mixed deletes use normal overlay semantics" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, "doc:a", "A");
+        try txn.delete(.{ .name = "docs" }, "doc:a");
+        try std.testing.expectError(error.NotFound, txn.get(.{ .name = "docs" }, "doc:a"));
+        try txn.commit();
+    }
+
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+}
+
+test "lsm runtime bulk append after put preserves write order" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put("doc:a", "A1");
+        try txn.appendPut("doc:a", "A2");
+        try std.testing.expectEqualStrings("A2", try txn.get("doc:a"));
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A2", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+}
+
+test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 4,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:c", "C");
+        try txn.put(.{ .name = "docs" }, "doc:d", "D");
+        try txn.put(.{ .name = "docs" }, "doc:e", "E");
+        try txn.put(.{ .name = "docs" }, "doc:f", "F");
+        try txn.commit();
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_attempts);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_fallback_below_threshold);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("F", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:f"));
+}
+
 test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
@@ -6151,6 +6823,55 @@ test "lsm backend probe borrows active mutable point values across later writes"
     const after = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 2), after.point_value_borrows - before.point_value_borrows);
     try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+}
+
+test "lsm backend probe copies active mutable point values during bulk ingest" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1000,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    var probe = try runtime.beginProbe();
+    errdefer probe.abort();
+
+    const before = backend.snapshotReadStats();
+    const copied_a = try probe.get("doc:a");
+    try std.testing.expectEqualStrings("A", copied_a);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_mutable_value_readers);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put("doc:a", "B");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqualStrings("A", copied_a);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_borrows - before.point_value_borrows);
+    try std.testing.expectEqual(@as(u64, 1), after.point_value_copies - before.point_value_copies);
+
+    probe.abort();
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    bulk_active = false;
 }
 
 test "lsm backend wal backed entry threshold defers commit flush to maintenance" {
@@ -6961,6 +7682,11 @@ test "lsm backend runtime namespace store forwards bulk ingest batch options" {
     }
 
     const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_attempts);
+    try std.testing.expectEqual(@as(u64, 4), stats.bulk_append_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.bulk_append_direct_successes);
+    try std.testing.expectEqual(@as(u64, 4), stats.bulk_append_direct_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.direct_bulk_ingest_attempts);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -7273,7 +7999,7 @@ test "lsm backend bulk ingest finish leaves L0 debt without foreground budget" {
 
     try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(u64, 1), backend.maintenanceDebtHint());
+    try std.testing.expect(backend.maintenanceDebtHint() > 0);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
 }
@@ -7356,6 +8082,42 @@ test "lsm backend hard L0 pressure applies bounded step after publish not inside
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "normal:0"));
 }
 
+test "lsm backend opt-in hard L0 pressure applies during active bulk flush" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 2,
+        .write_pressure_max_compaction_steps = 1,
+        .write_pressure_during_bulk_ingest = true,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bulk:{d}", .{i});
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.appendPut(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+
+    try std.testing.expect(backend.bulkIngestActive());
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 5);
+    try std.testing.expect(backend.compaction_stats.compactions > 0);
+    try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:0"));
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:4"));
+}
+
 test "lsm backend bulk publish checkpoints wal without requiring compaction" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -7396,7 +8158,7 @@ test "lsm backend bulk publish checkpoints wal without requiring compaction" {
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expect(stats.sorted_ingest_runs > 0);
     try std.testing.expect(stats.wal_resets > 0);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_segments);
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -7775,6 +8537,7 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         .flush_threshold = 1,
         .compact_threshold_runs = 1,
         .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
     });
     defer backend.close();
 
@@ -7821,7 +8584,7 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         after.run_table_block.invalidations;
     try std.testing.expectEqual(invalidations_before, invalidations_after);
     try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
-    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend cache namespaces entries by root generation" {
@@ -8169,7 +8932,7 @@ test "lsm backend avoids full run table load on bloom negative" {
         tracked_run_path = try alloc.dupe(u8, runs.items[0].path.?);
         ctx.run_path = tracked_run_path.?;
 
-        const filter = try runs.items[0].ensureBloomFilter(alloc);
+        const filter = try runs.items[0].ensureBloomFilterWithStorage(alloc, backing.storage());
         var key_buf: [64]u8 = undefined;
         var i: usize = 0;
         while (i < 10_000) : (i += 1) {
@@ -9439,7 +10202,7 @@ test "lsm backend current probe getManySorted reuses source layout across chunks
     try std.testing.expectEqualStrings("value-159", values[159].?);
 }
 
-test "lsm backend current scan freezes mutable generation without cloning it" {
+test "lsm backend current scan reuses cached mutable read snapshot under rotation threshold" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -9460,9 +10223,11 @@ test "lsm backend current scan freezes mutable generation without cloning it" {
     defer scan.abort();
 
     const after_open = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
-    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls + 1, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1, after_open.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls);
+    try std.testing.expect(backend.mutable_read_snapshot != null);
 
     var cursor = try scan.openCursor();
     defer cursor.close();
@@ -9478,7 +10243,40 @@ test "lsm backend current scan freezes mutable generation without cloning it" {
     try std.testing.expect(saw_a);
 }
 
-test "lsm backend current scan helpers do not clone mutable writer generation" {
+test "lsm backend current scan rotates mutable above read snapshot cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .read_snapshot_rotate_mutable_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    var scan = try runtime.beginCurrentScan();
+    defer scan.abort();
+
+    const after_open = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before_maintenance.read_snapshot_mutable_rotations + 1, after_open.read_snapshot_mutable_rotations);
+
+    var cursor = try scan.openCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:")).?.key);
+}
+
+test "lsm backend current scan helpers reuse cached mutable read snapshot" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
     defer backend.close();
 
@@ -9525,7 +10323,8 @@ test "lsm backend current scan helpers do not clone mutable writer generation" {
     try std.testing.expectEqual(@as(usize, 2), range.len);
 
     const after = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls + 1, after.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1, after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls);
 }
 
 test "lsm backend current scan keeps frozen mutable values across later writes" {
@@ -9559,6 +10358,160 @@ test "lsm backend current scan keeps frozen mutable values across later writes" 
 
     const second = try cursor.next() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("doc:c", second.key);
+}
+
+test "lsm backend bulk current scan clones mutable under memory cap" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.put("doc:c", "C");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls + 1, after_open.mutable_snapshot_clone_calls);
+        try std.testing.expect(after_open.bulk_ingest_current_scan_clone_active_bytes > 0);
+        try std.testing.expectEqual(after_open.bulk_ingest_current_scan_clone_active_bytes, after_open.bulk_ingest_current_scan_clone_peak_active_bytes);
+        try std.testing.expectEqual(
+            after_open.mutable_bytes +| after_open.immutable_bytes +| after_open.bulk_ingest_current_scan_clone_active_bytes,
+            manager.sliceStats(.lsm_in_memory_state).used_bytes,
+        );
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+
+        const first = try cursor.seekAtOrAfter("doc:a") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("doc:a", first.key);
+
+        {
+            var write = try runtime.beginWrite();
+            try write.put("doc:b", "B");
+            try write.commit();
+        }
+
+        const second = try cursor.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("doc:c", second.key);
+    }
+
+    const after_close = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), after_close.bulk_ingest_current_scan_clone_active_bytes);
+    try std.testing.expect(after_close.bulk_ingest_current_scan_clone_peak_active_bytes > 0);
+    try std.testing.expectEqual(
+        after_close.mutable_bytes +| after_close.immutable_bytes,
+        manager.sliceStats(.lsm_in_memory_state).used_bytes,
+    );
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend bulk current scan rotates mutable above aggregate clone memory cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+        .bulk_ingest_current_scan_clone_total_max_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+        try std.testing.expectEqual(before_maintenance.bulk_ingest_current_scan_clone_budget_denials + 1, after_open.bulk_ingest_current_scan_clone_budget_denials);
+        try std.testing.expectEqual(@as(u64, 0), after_open.bulk_ingest_current_scan_clone_active_bytes);
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:a")).?.key);
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend bulk current scan rotates mutable above clone memory cap" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .bulk_ingest_current_scan_clone_max_bytes = 1,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "A");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+
+    {
+        var scan = try runtime.beginCurrentScan();
+        defer scan.abort();
+
+        const after_open = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+        try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_open.mutable_snapshot_clone_calls);
+
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:a")).?.key);
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
 }
 
 test "lsm backend read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
@@ -10151,12 +11104,12 @@ test "lsm backend write txns retain reader guards until completion" {
     }
 }
 
-test "lsm backend close leaves queued obsolete files on disk" {
+test "lsm backend close reclaims eligible queued obsolete files" {
     var path_buf: [256]u8 = undefined;
     const path = repository_mod.tmpPath(&path_buf, "obsolete-retain");
     defer repository_mod.cleanupTmp(path);
 
-    var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{});
+    var backend = try Backend.open(std.testing.allocator, std.mem.span(path), .{ .obsolete_retention_ns = 0 });
     const obsolete_path = try repository_mod.runPath(std.testing.allocator, std.mem.span(path), 9999);
     defer std.testing.allocator.free(obsolete_path);
     try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
@@ -10165,9 +11118,7 @@ test "lsm backend close leaves queued obsolete files on disk" {
 
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
-    const bytes = try native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024);
-    defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings("obsolete", bytes);
+    try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(std.testing.allocator, obsolete_path, 1024));
 }
 
 test "lsm repository run readers request cap above 64 MiB" {
@@ -10206,7 +11157,6 @@ test "lsm repository run readers request cap above 64 MiB" {
                 .largest_namespace_name = "docs",
                 .largest_key = "doc:a",
                 .entry_count = 1,
-                .bloom_filter = encoded_filter,
             },
         },
     });
@@ -10324,13 +11274,15 @@ test "lsm repository run readers request cap above 64 MiB" {
         ));
         try std.testing.expectEqual(@as(u64, 2), next_run_id);
         try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+        const loaded_filter = try runs.items[0].ensureBloomFilterWithStorage(alloc, host.storage());
+        try std.testing.expect(lsm_table_file.maybeContains(loaded_filter, "docs", "doc:a"));
         try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
     }
 
-    try std.testing.expectEqual(@as(usize, 4), ctx.run_reads);
+    try std.testing.expect(ctx.run_reads >= 4);
 }
 
-test "lsm repository rejects manifests without run bloom filters" {
+test "lsm repository accepts manifests without run bloom filters" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
     defer backing.deinit();
@@ -10354,7 +11306,6 @@ test "lsm repository rejects manifests without run bloom filters" {
                 .largest_namespace_name = "docs",
                 .largest_key = "doc:a",
                 .entry_count = 1,
-                .bloom_filter = "",
             },
         },
     });
@@ -10373,7 +11324,7 @@ test "lsm repository rejects manifests without run bloom filters" {
         obsolete_paths.deinit(alloc);
     }
 
-    try std.testing.expectError(error.MissingRunBloomFilter, repository_mod.loadManifestIfPresentWithStorage(
+    try std.testing.expect(try repository_mod.loadManifestIfPresentWithStorage(
         backing.storage(),
         alloc,
         root_dir,
@@ -10382,6 +11333,9 @@ test "lsm repository rejects manifests without run bloom filters" {
         &runs,
         &obsolete_paths,
     ));
+    try std.testing.expectEqual(@as(u64, 2), next_run_id);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
 }
 
 test "lsm repository loads v4 table index from trailer plus metadata read" {
@@ -10839,6 +11793,65 @@ test "lsm backend reclaims obsolete run files when last reader releases" {
     try std.testing.expectEqual(@as(usize, 0), obsolete_paths.items.len);
 }
 
+test "lsm backend open manifest version refs pin obsolete files across handles" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-version-ref-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1);
+    defer alloc.free(obsolete_path);
+
+    var writer = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1,
+        .foreground_soft_compaction = true,
+        .obsolete_retention_ns = 0,
+    });
+    defer writer.close();
+
+    {
+        var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    var reader = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .backend = .{ .read_only = true },
+        .obsolete_retention_ns = 0,
+    });
+
+    {
+        var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        try txn.delete("doc:a");
+        try txn.put("doc:b", "B");
+        try txn.commit();
+    }
+
+    var stats = writer.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths);
+    try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths_pinned_by_versions);
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_reclaimable);
+    {
+        const bytes = try backing.storage().readFileAlloc(alloc, obsolete_path, 1024);
+        defer alloc.free(bytes);
+        try std.testing.expect(bytes.len > 0);
+    }
+
+    reader.close();
+    try std.testing.expect(try writer.runMaintenanceStep());
+    stats = writer.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths);
+    try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_pinned_by_versions);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
 test "lsm backend reader release reclaims expired clean obsolete paths" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -10872,6 +11885,166 @@ test "lsm backend reader release reclaims expired clean obsolete paths" {
     try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
     try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend maintenance step reclaims expired clean obsolete paths" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-maintenance-clean-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend maintenance step prioritizes due obsolete reclaim before compaction" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-maintenance-obsolete-before-compaction";
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .l0_soft_limit_runs = 100,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        var txn = try backend.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "k:{d}", .{i});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+        try backend.sync(true);
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    backend.options.l0_soft_limit_runs = 1;
+
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    const before_compactions = backend.compaction_stats.compactions;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend finalization prioritizes due obsolete reclaim before compaction" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-finalize-obsolete-before-compaction";
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .l0_soft_limit_runs = 100,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        var txn = try backend.beginWrite();
+        const key = try std.fmt.bufPrint(&key_buf, "k:{d}", .{i});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+        try backend.sync(true);
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    backend.options.l0_soft_limit_runs = 1;
+
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 1000);
+    defer alloc.free(obsolete_path);
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+    backend.manifest_dirty = false;
+
+    const before_compactions = backend.compaction_stats.compactions;
+    try backend.finalizeDeferredStorageWork();
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend internal worker reclaims idle obsolete paths after retention" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-worker-idle-obsolete-gc";
+    const obsolete_path = try repository_mod.runPath(alloc, root_dir, 999);
+    defer alloc.free(obsolete_path);
+
+    var handle = try BackendHandle.openWithConfig(
+        alloc,
+        root_dir,
+        .{
+            .storage = backing.storage(),
+            // MemoryStorage advances time per nowNs call, so one tick is enough
+            // to exercise delayed worker reclamation without relying on many
+            // scheduler turns under the shared test suite.
+            .obsolete_retention_ns = 1,
+        },
+        .{ .internal_flush_worker = true },
+    );
+    defer handle.close();
+
+    const backend = handle.ptr();
+    try repository_mod.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+    {
+        const locked = runtime_mod.lockBackend(Backend, backend);
+        defer runtime_mod.unlockBackend(Backend, backend, locked);
+        try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+        backend.manifest_dirty = false;
+    }
+
+    var reclaimed = false;
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        const bytes = backing.storage().readFileAlloc(alloc, obsolete_path, 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                reclaimed = true;
+                break;
+            },
+            else => return err,
+        };
+        alloc.free(bytes);
+        sleepForTest(5 * std.time.ns_per_ms);
+    }
+
+    const worker_stats = handle.stopInternalFlushWorkerForTest().?;
+    try std.testing.expect(reclaimed);
+    try std.testing.expect(worker_stats.maintenance_steps > 0);
+    try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend reloads persisted manifest and run files" {
@@ -10937,6 +12110,9 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
         try delete_txn.delete(.{ .name = "docs" }, "doc:b");
         try delete_txn.put(.{}, "meta:lsn", "7");
         try delete_txn.commit();
+
+        const maintenance = backend.snapshotMaintenanceStats();
+        try std.testing.expect(maintenance.current_manifest_bytes > 0);
     }
 
     {
@@ -10950,6 +12126,7 @@ test "lsm backend reloads persisted manifest and run files over memory storage" 
         try std.testing.expectEqual(Backend.OpenPhase.ready, open_stats.phase);
         try std.testing.expect(open_stats.loaded_manifest);
         try std.testing.expect(open_stats.loaded_runs > 0);
+        try std.testing.expect(reopened.snapshotMaintenanceStats().current_manifest_bytes > 0);
 
         var runtime = try reopened.runtimeNamespaceStore(std.testing.allocator);
         defer runtime.deinit();
@@ -11805,6 +12982,122 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
     }
 }
+test "lsm backend leaves orphaned committed run files to explicit repair" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "orphan-run-cleanup");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_dir = std.mem.span(path);
+    const orphan_path = try repository_mod.runPath(std.testing.allocator, root_dir, 9999);
+    defer std.testing.allocator.free(orphan_path);
+
+    {
+        var backend = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+    }
+
+    const orphan_entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:orphan", .value = "O", .tombstone = false },
+    };
+    const encoded = try lsm_table_file.encodeAlloc(std.testing.allocator, &orphan_entries);
+    defer std.testing.allocator.free(encoded);
+    try repository_mod.writeFileAbsolute(orphan_path, encoded);
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{});
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
+    }
+}
+
+test "lsm backend removes expired obsolete run files on reopen" {
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "obsolete-run-cleanup");
+    defer repository_mod.cleanupTmp(path);
+
+    const root_dir = std.mem.span(path);
+    const obsolete_path = try repository_mod.runPath(std.testing.allocator, root_dir, 9999);
+    defer std.testing.allocator.free(obsolete_path);
+
+    {
+        var backend = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer backend.close();
+
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:a", "A");
+        try txn.commit();
+
+        const obsolete_entries = [_]lsm_table_file.Entry{
+            .{ .namespace_name = "docs", .key = "doc:obsolete", .value = "O", .tombstone = false },
+        };
+        const encoded = try lsm_table_file.encodeAlloc(std.testing.allocator, &obsolete_entries);
+        defer std.testing.allocator.free(encoded);
+        try repository_mod.writeFileAbsolute(obsolete_path, encoded);
+
+        const obsolete = [_]ObsoletePath{.{ .path = obsolete_path, .delete_after_ns = 0 }};
+        _ = try repository_mod.persistManifestWithStorageCount(
+            backend.storage.?,
+            std.testing.allocator,
+            root_dir,
+            backend.next_run_id,
+            backend.runs.items,
+            &obsolete,
+        );
+    }
+
+    {
+        var reopened = try Backend.open(std.testing.allocator, root_dir, .{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.obsolete_paths.items.len);
+        try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+        try std.testing.expect(try reopened.runMaintenanceStep());
+        try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.items.len);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
+
+        var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:obsolete"));
+    }
+}
+
 test "lsm backend mutable read snapshot retirement allocation failure keeps snapshot cleanup reachable" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();

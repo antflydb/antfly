@@ -1704,7 +1704,7 @@ pub fn searchProfiledRequest(
     };
     const search_width = req.search_width orelse self.config.search_width;
     const epsilon = req.epsilon orelse self.config.epsilon;
-    const rerank_factor: usize = search_mod.rerankFactor(epsilon);
+    const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
@@ -2098,6 +2098,14 @@ fn scoreLeafMemberIds(
             }
             profile.approx_vectors_scored += count;
             return;
+        }
+    }
+
+    if (self.config.use_quantization) {
+        if (!leaf_has_fresh_stored_payload) {
+            profile.leaf_payload_stale += 1;
+        } else {
+            profile.leaf_payload_missing += 1;
         }
     }
 
@@ -3660,7 +3668,17 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
         const group = prepared.items[group_start..group_end];
         const leaf_id = group[0].leaf_id;
 
-        var leaf = try loadNode(self, txn, leaf_id);
+        var leaf = loadNode(self, txn, leaf_id) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            // Stale vec→leaf mappings into a deleted node: the vectors are
+            // unreachable by search, so drop their keys instead of failing
+            // the whole batch, and flag a repair sweep.
+            noteTreeLinkInconsistencyIfSupported(self);
+            for (group) |entry| deleteVectorKeys(self, txn, entry.vector_id);
+            self.metadata.active_count -|= @intCast(group.len);
+            group_start = group_end;
+            continue;
+        };
         defer leaf.deinit(self.alloc);
         try leaf.ensureUnbacked(self.alloc);
 
@@ -3682,47 +3700,381 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
         }
 
         if (leaf.members.len == 0 and leaf.parent != 0) {
-            var parent = try loadNode(self, txn, leaf.parent);
-            defer parent.deinit(self.alloc);
-            try parent.ensureUnbacked(self.alloc);
-            var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-            var wi_child: usize = 0;
-            for (parent.children) |cid| {
-                if (cid == leaf_id) continue;
-                new_children[wi_child] = cid;
-                wi_child += 1;
+            unlink: {
+                var parent = loadNode(self, txn, leaf.parent) catch |err| {
+                    if (!isNotFoundGeneric(err)) return err;
+                    // Dangling parent pointer: delete the empty leaf and let
+                    // the repair sweep clear whatever still references it.
+                    noteTreeLinkInconsistencyIfSupported(self);
+                    try deleteNode(self, txn, leaf_id);
+                    break :unlink;
+                };
+                defer parent.deinit(self.alloc);
+                try parent.ensureUnbacked(self.alloc);
+                if (try removeChildLink(self, &parent, leaf_id)) {
+                    try recomputeInternalCentroid(self, txn, &parent);
+                    try self.saveNode(txn, &parent);
+                    try deleteNode(self, txn, leaf_id);
+                    try collapseSingleChildParents(self, txn, leaf.parent);
+                } else {
+                    try deleteNode(self, txn, leaf_id);
+                }
             }
-            self.alloc.free(parent.children);
-            parent.children = new_children;
-            try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNode(txn, &parent);
-            try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
         } else {
             try self.saveNode(txn, &leaf);
         }
 
-        var vkey_buf: [10]u8 = undefined;
-        for (group) |entry| {
-            self.deleteNamespaced(txn, .vecs, hbc.encodeVecKey(&vkey_buf, entry.vector_id)) catch {};
-            self.deleteNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&vkey_buf, entry.vector_id)) catch {};
-            self.deleteNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&vkey_buf, entry.vector_id)) catch {};
-            self.invalidateVectorCache(entry.vector_id);
-            self.invalidateMetadataCache(entry.vector_id);
-        }
+        for (group) |entry| deleteVectorKeys(self, txn, entry.vector_id);
         self.metadata.active_count -|= @intCast(removed_count);
         group_start = group_end;
     }
 }
 
+/// Removes leaf_id from parent.children, replacing the slice. Returns false
+/// — leaving the parent untouched — when the recorded parent does not
+/// actually reference the leaf. That happens when a stale parent link
+/// survives tree maintenance; rebuilding children with len-1 in that state
+/// used to overrun the new array and panic the whole process. When this
+/// fires, some OTHER node may still list leaf_id as a child, so the index
+/// is flagged for a repairTreeLinks sweep that clears the dangling
+/// reference instead of leaving it latent.
+fn removeChildLink(self: anytype, parent: anytype, leaf_id: u64) !bool {
+    var match_count: usize = 0;
+    for (parent.children) |cid| {
+        if (cid == leaf_id) match_count += 1;
+    }
+    if (match_count == 0) {
+        std.log.warn("hbc: leaf {d} not referenced by its recorded parent; skipping unlink", .{leaf_id});
+        noteTreeLinkInconsistencyIfSupported(self);
+        return false;
+    }
+    if (match_count > 1) {
+        // Duplicate links to the same child are corruption. The leaf is
+        // being unlinked for deletion, so drop every occurrence — sizing
+        // the new array by the exact match count, or the skip loop below
+        // would underfill it and persist an uninitialized child id — and
+        // flag a repair sweep for the rest of the tree.
+        std.log.warn("hbc: leaf {d} referenced {d} times by its parent; removing all links", .{ leaf_id, match_count });
+        noteTreeLinkInconsistencyIfSupported(self);
+    }
+    var new_children = try self.alloc.alloc(u64, parent.children.len - match_count);
+    errdefer self.alloc.free(new_children);
+    var wi_child: usize = 0;
+    for (parent.children) |cid| {
+        if (cid == leaf_id) continue;
+        new_children[wi_child] = cid;
+        wi_child += 1;
+    }
+    self.alloc.free(parent.children);
+    parent.children = new_children;
+    return true;
+}
+
+/// Signals the concrete index (when it supports it) that a tree-link
+/// inconsistency was observed, so background maintenance schedules a
+/// repairTreeLinks sweep.
+fn noteTreeLinkInconsistencyIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "noteTreeLinkInconsistency")) {
+        self.noteTreeLinkInconsistency();
+    }
+}
+
+pub const TreeLinkReport = struct {
+    nodes_visited: u64 = 0,
+    /// Child ids referenced by an internal node whose node record is gone,
+    /// plus duplicate references to an already-visited node.
+    dangling_children: u64 = 0,
+    /// Nodes whose recorded parent differs from the node that references them.
+    parent_mismatches: u64 = 0,
+    /// Internal nodes with zero children.
+    empty_internal_nodes: u64 = 0,
+    /// Leaf members whose vec→leaf mapping is missing or points elsewhere.
+    vec_leaf_mismatches: u64 = 0,
+
+    pub fn consistent(self: TreeLinkReport) bool {
+        return self.dangling_children == 0 and
+            self.parent_mismatches == 0 and
+            self.empty_internal_nodes == 0 and
+            self.vec_leaf_mismatches == 0;
+    }
+};
+
+/// Walks the tree from the root and checks the structural invariants that
+/// maintenance must preserve: every referenced child exists, every node's
+/// recorded parent is the node that references it, internal nodes are
+/// non-empty, and every leaf member's vec→leaf mapping points back at its
+/// leaf. Read-only; usable with a read transaction. Intended for tests and
+/// debugging — it visits every node and every member mapping.
+pub fn verifyTreeLinks(self: anytype, txn: anytype) !TreeLinkReport {
+    var report: TreeLinkReport = .{};
+    const QueueItem = struct { id: u64, parent: u64 };
+    var queue = std.ArrayListUnmanaged(QueueItem).empty;
+    defer queue.deinit(self.alloc);
+    var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen.deinit(self.alloc);
+
+    try queue.append(self.alloc, .{ .id = self.metadata.root_node, .parent = 0 });
+    try seen.put(self.alloc, self.metadata.root_node, {});
+
+    var qi: usize = 0;
+    while (qi < queue.items.len) : (qi += 1) {
+        const item = queue.items[qi];
+        var node = loadNode(self, txn, item.id) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            report.dangling_children += 1;
+            continue;
+        };
+        defer node.deinit(self.alloc);
+        report.nodes_visited += 1;
+        if (node.parent != item.parent) report.parent_mismatches += 1;
+        if (node.is_leaf) {
+            for (node.members) |member_id| {
+                const mapped = self.getVecLeaf(txn, member_id) catch |err| {
+                    if (!isNotFoundGeneric(err)) return err;
+                    report.vec_leaf_mismatches += 1;
+                    continue;
+                };
+                if (mapped != item.id) report.vec_leaf_mismatches += 1;
+            }
+            continue;
+        }
+        if (node.children.len == 0) report.empty_internal_nodes += 1;
+        for (node.children) |child_id| {
+            const gop = try seen.getOrPut(self.alloc, child_id);
+            if (gop.found_existing) {
+                // The same node is referenced from two places (duplicate
+                // link or cycle); count it without re-walking.
+                report.dangling_children += 1;
+                continue;
+            }
+            try queue.append(self.alloc, .{ .id = child_id, .parent = item.id });
+        }
+    }
+    return report;
+}
+
+pub const TreeLinkRepairReport = struct {
+    nodes_visited: u64 = 0,
+    dangling_children_removed: u64 = 0,
+    duplicate_children_removed: u64 = 0,
+    parent_pointers_fixed: u64 = 0,
+    empty_nodes_removed: u64 = 0,
+    vec_leaf_mappings_fixed: u64 = 0,
+    /// False when the node budget ran out before the walk finished; call
+    /// again to continue (repairs already made are persisted).
+    completed: bool = true,
+
+    pub fn repaired(self: TreeLinkRepairReport) u64 {
+        return self.dangling_children_removed +
+            self.duplicate_children_removed +
+            self.parent_pointers_fixed +
+            self.empty_nodes_removed +
+            self.vec_leaf_mappings_fixed;
+    }
+};
+
+/// Repairs the invariants verifyTreeLinks checks, treating the reachable
+/// children lists as authoritative:
+///   - a child id whose node record is gone is dropped from its parent;
+///   - a child referenced both here and by its recorded parent keeps the
+///     recorded link and loses the duplicate;
+///   - a child whose recorded parent is stale (gone, or not referencing it)
+///     is repointed at the node that actually references it;
+///   - an internal node left with zero children is unlinked and deleted
+///     (the root is converted back to an empty leaf instead);
+///   - leaf members' vec→leaf mappings are repointed at the leaf that
+///     actually holds them.
+/// Bounded by `max_nodes` per call; repairs are persisted as the walk goes,
+/// so a budget-exhausted sweep (`completed == false`) resumes safely on the
+/// next call. Must run inside a write transaction; single-writer, like all
+/// HBC maintenance.
+pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkRepairReport {
+    try self.bindTxnLike(txn);
+    var report: TreeLinkRepairReport = .{};
+    var queue = std.ArrayListUnmanaged(u64).empty;
+    defer queue.deinit(self.alloc);
+    var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen.deinit(self.alloc);
+
+    try queue.append(self.alloc, self.metadata.root_node);
+    try seen.put(self.alloc, self.metadata.root_node, {});
+
+    var qi: usize = 0;
+    while (qi < queue.items.len) : (qi += 1) {
+        if (report.nodes_visited >= max_nodes) {
+            report.completed = false;
+            break;
+        }
+        const node_id = queue.items[qi];
+        var node = loadNode(self, txn, node_id) catch |err| {
+            // A node can disappear mid-sweep when pruning an empty parent
+            // collapses part of the tree we already queued.
+            if (!isNotFoundGeneric(err)) return err;
+            continue;
+        };
+        defer node.deinit(self.alloc);
+        report.nodes_visited += 1;
+
+        if (node.is_leaf) {
+            for (node.members) |member_id| {
+                const mapped: ?u64 = self.getVecLeaf(txn, member_id) catch |err| blk: {
+                    if (!isNotFoundGeneric(err)) return err;
+                    break :blk null;
+                };
+                if (mapped == null or mapped.? != node_id) {
+                    try self.putVecLeaf(txn, member_id, node_id);
+                    report.vec_leaf_mappings_fixed += 1;
+                }
+            }
+            continue;
+        }
+
+        try node.ensureUnbacked(self.alloc);
+        var kept = std.ArrayListUnmanaged(u64).empty;
+        defer kept.deinit(self.alloc);
+        try kept.ensureTotalCapacity(self.alloc, node.children.len);
+        var pruned = false;
+        for (node.children) |child_id| {
+            const child_parent: ?u64 = loadNodeParent(self, txn, child_id) catch |err| blk: {
+                if (!isNotFoundGeneric(err)) return err;
+                break :blk null;
+            };
+            if (child_parent == null) {
+                report.dangling_children_removed += 1;
+                pruned = true;
+                continue;
+            }
+            if (child_parent.? != node_id) {
+                if (try nodeReferencesChild(self, txn, child_parent.?, child_id)) {
+                    // The recorded parent also references this child: keep
+                    // that link, drop this duplicate.
+                    report.duplicate_children_removed += 1;
+                    pruned = true;
+                    continue;
+                }
+                // Recorded parent is stale; this node actually holds the
+                // child, so repoint the child here.
+                var child = try loadNode(self, txn, child_id);
+                defer child.deinit(self.alloc);
+                try child.ensureUnbacked(self.alloc);
+                child.parent = node_id;
+                try self.saveNode(txn, &child);
+                report.parent_pointers_fixed += 1;
+            }
+            const gop = try seen.getOrPut(self.alloc, child_id);
+            if (gop.found_existing) {
+                // Second reference to a node we already kept — either a
+                // duplicate within this children list or another visited
+                // parent legitimately holds it. Drop this occurrence.
+                report.duplicate_children_removed += 1;
+                pruned = true;
+                continue;
+            }
+            kept.appendAssumeCapacity(child_id);
+            try queue.append(self.alloc, child_id);
+        }
+
+        if (kept.items.len == 0) {
+            if (node_id == self.metadata.root_node) {
+                // Convert an emptied root back into an empty leaf, mirroring
+                // a freshly created index.
+                node.is_leaf = true;
+                node.level = 0;
+                self.alloc.free(node.children);
+                node.children = &.{};
+                @memset(node.centroid, 0);
+                try self.saveNode(txn, &node);
+            } else {
+                const parent_id = node.parent;
+                try deleteNode(self, txn, node_id);
+                report.empty_nodes_removed += 1;
+                var parent = loadNode(self, txn, parent_id) catch |err| {
+                    if (!isNotFoundGeneric(err)) return err;
+                    continue;
+                };
+                defer parent.deinit(self.alloc);
+                try parent.ensureUnbacked(self.alloc);
+                if (try removeChildLink(self, &parent, node_id)) {
+                    try recomputeInternalCentroid(self, txn, &parent);
+                    try self.saveNode(txn, &parent);
+                    try collapseSingleChildParents(self, txn, parent_id);
+                }
+            }
+            continue;
+        }
+
+        if (pruned) {
+            const new_children = try self.alloc.dupe(u64, kept.items);
+            self.alloc.free(node.children);
+            node.children = new_children;
+            try recomputeInternalCentroid(self, txn, &node);
+            try self.saveNode(txn, &node);
+        }
+
+    }
+    return report;
+}
+
+/// Standalone repairTreeLinks: opens its own write transaction, flushes
+/// metadata (the sweep can change root/node bookkeeping via collapse), and
+/// republishes search state — mirroring delete()/batchDelete().
+pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
+    var txn = try self.beginRuntimeWriteTxn();
+    errdefer txn.abort();
+    const report = try repairTreeLinks(self, &txn, max_nodes);
+    try self.flushMetadata(&txn);
+    try txn.commit();
+    publishSearchStateIfSupported(self);
+    return report;
+}
+
+fn nodeReferencesChild(self: anytype, txn: anytype, parent_id: u64, child_id: u64) !bool {
+    if (parent_id == 0) return false;
+    var parent = loadNode(self, txn, parent_id) catch |err| {
+        if (!isNotFoundGeneric(err)) return err;
+        return false;
+    };
+    defer parent.deinit(self.alloc);
+    if (parent.is_leaf) return false;
+    for (parent.children) |cid| {
+        if (cid == child_id) return true;
+    }
+    return false;
+}
+
+/// Drops a vector's storage keys (raw vector, vec→leaf mapping, metadata)
+/// and invalidates its cache entries. Key deletes are best-effort.
+fn deleteVectorKeys(self: anytype, txn: anytype, vector_id: u64) void {
+    var vkey_buf: [10]u8 = undefined;
+    self.deleteNamespaced(txn, .vecs, hbc.encodeVecKey(&vkey_buf, vector_id)) catch {};
+    self.deleteNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&vkey_buf, vector_id)) catch {};
+    self.deleteNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&vkey_buf, vector_id)) catch {};
+    self.invalidateVectorCache(vector_id);
+    self.invalidateMetadataCache(vector_id);
+}
+
 pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
     try self.bindTxnLike(txn);
-    const leaf_id = self.getVecLeaf(txn, vector_id) catch |err| blk: {
+    var leaf_id = self.getVecLeaf(txn, vector_id) catch |err| blk: {
         if (!isNotFoundGeneric(err)) return err;
         break :blk (try findLeafContainingMember(self, txn, self.metadata.root_node, vector_id)) orelse return error.NotFound;
     };
 
-    var leaf = try loadNode(self, txn, leaf_id);
+    var leaf = loadNode(self, txn, leaf_id) catch |err| blk: {
+        if (!isNotFoundGeneric(err)) return err;
+        // Stale vec→leaf mapping into a deleted node. Fall back to a scan;
+        // if no reachable leaf holds the vector, it is unreachable garbage —
+        // drop its keys instead of failing the delete, and flag a repair.
+        noteTreeLinkInconsistencyIfSupported(self);
+        const scanned = (try findLeafContainingMember(self, txn, self.metadata.root_node, vector_id)) orelse {
+            deleteVectorKeys(self, txn, vector_id);
+            self.metadata.active_count -|= 1;
+            return;
+        };
+        leaf_id = scanned;
+        break :blk try loadNode(self, txn, scanned);
+    };
     defer leaf.deinit(self.alloc);
     try leaf.ensureUnbacked(self.alloc);
 
@@ -3737,34 +4089,49 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
     }
 
     if (leaf.members.len == 0 and leaf.parent != 0) {
-        var parent = try loadNode(self, txn, leaf.parent);
+        var parent = loadNode(self, txn, leaf.parent) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            // Dangling parent pointer: delete the empty leaf and let the
+            // repair sweep clear whichever node still references it.
+            noteTreeLinkInconsistencyIfSupported(self);
+            try deleteNode(self, txn, leaf_id);
+            deleteVectorKeys(self, txn, vector_id);
+            self.metadata.active_count -|= 1;
+            return;
+        };
         defer parent.deinit(self.alloc);
         try parent.ensureUnbacked(self.alloc);
-        var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-        var wi_child: usize = 0;
-        for (parent.children) |cid| {
-            if (cid == leaf_id) continue;
-            new_children[wi_child] = cid;
-            wi_child += 1;
+        if (try removeChildLink(self, &parent, leaf_id)) {
+            try recomputeInternalCentroid(self, txn, &parent);
+            try self.saveNode(txn, &parent);
+            try deleteNode(self, txn, leaf_id);
+            try collapseSingleChildParents(self, txn, leaf.parent);
+        } else {
+            try deleteNode(self, txn, leaf_id);
         }
-        self.alloc.free(parent.children);
-        parent.children = new_children;
-        try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNode(txn, &parent);
-        try deleteNode(self, txn, leaf_id);
-        try collapseSingleChildParents(self, txn, leaf.parent);
     } else {
         try self.saveNode(txn, &leaf);
 
-        if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) {
-            var parent = try loadNode(self, txn, leaf.parent);
+        if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
+            var parent = loadNode(self, txn, leaf.parent) catch |err| {
+                if (!isNotFoundGeneric(err)) return err;
+                // Dangling parent pointer: the leaf is already saved; skip
+                // the merge attempt and flag a repair.
+                noteTreeLinkInconsistencyIfSupported(self);
+                break :skip_merge;
+            };
             defer parent.deinit(self.alloc);
             try parent.ensureUnbacked(self.alloc);
             var best_sibling_id: u64 = 0;
             var best_dist: f32 = std.math.inf(f32);
             for (parent.children) |cid| {
                 if (cid == leaf_id) continue;
-                var sibling = try loadNode(self, txn, cid);
+                var sibling = loadNode(self, txn, cid) catch |err| {
+                    if (!isNotFoundGeneric(err)) return err;
+                    // Dangling sibling reference; skip it and flag a repair.
+                    noteTreeLinkInconsistencyIfSupported(self);
+                    continue;
+                };
                 defer sibling.deinit(self.alloc);
                 if (!sibling.is_leaf) continue;
                 if (sibling.members.len + leaf.members.len > self.config.leaf_size) continue;
@@ -3789,29 +4156,19 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
                 try self.saveNode(txn, &sibling);
                 for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-                var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-                var wi_child: usize = 0;
-                for (parent.children) |cid| {
-                    if (cid == leaf_id) continue;
-                    new_children[wi_child] = cid;
-                    wi_child += 1;
+                if (try removeChildLink(self, &parent, leaf_id)) {
+                    try recomputeInternalCentroid(self, txn, &parent);
+                    try self.saveNode(txn, &parent);
+                    try deleteNode(self, txn, leaf_id);
+                    try collapseSingleChildParents(self, txn, leaf.parent);
+                } else {
+                    try deleteNode(self, txn, leaf_id);
                 }
-                self.alloc.free(parent.children);
-                parent.children = new_children;
-                try recomputeInternalCentroid(self, txn, &parent);
-                try self.saveNode(txn, &parent);
-                try deleteNode(self, txn, leaf_id);
-                try collapseSingleChildParents(self, txn, leaf.parent);
             }
         }
     }
 
-    var vkey_buf: [10]u8 = undefined;
-    self.deleteNamespaced(txn, .vecs, hbc.encodeVecKey(&vkey_buf, vector_id)) catch {};
-    self.deleteNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&vkey_buf, vector_id)) catch {};
-    self.deleteNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&vkey_buf, vector_id)) catch {};
-    self.invalidateVectorCache(vector_id);
-    self.invalidateMetadataCache(vector_id);
+    deleteVectorKeys(self, txn, vector_id);
     self.metadata.active_count -= 1;
 }
 
@@ -4277,37 +4634,49 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
     }
 
     if (leaf.members.len == 0 and leaf.parent != 0) {
-        var parent = try loadNode(self, txn, leaf.parent);
+        var parent = loadNode(self, txn, leaf.parent) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            // Dangling parent pointer: delete the empty leaf and let the
+            // repair sweep clear whatever still references it.
+            noteTreeLinkInconsistencyIfSupported(self);
+            try deleteNode(self, txn, leaf_id);
+            return;
+        };
         defer parent.deinit(self.alloc);
         try parent.ensureUnbacked(self.alloc);
-        var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-        errdefer self.alloc.free(new_children);
-        var wi_child: usize = 0;
-        for (parent.children) |cid| {
-            if (cid == leaf_id) continue;
-            new_children[wi_child] = cid;
-            wi_child += 1;
+        if (try removeChildLink(self, &parent, leaf_id)) {
+            try recomputeInternalCentroid(self, txn, &parent);
+            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+            try deleteNode(self, txn, leaf_id);
+            try collapseSingleChildParents(self, txn, leaf.parent);
+        } else {
+            try deleteNode(self, txn, leaf_id);
         }
-        self.alloc.free(parent.children);
-        parent.children = new_children;
-        try recomputeInternalCentroid(self, txn, &parent);
-        try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
-        try deleteNode(self, txn, leaf_id);
-        try collapseSingleChildParents(self, txn, leaf.parent);
         return;
     }
 
     try self.saveNodeWithOptionsMode(txn, &leaf, .{}, false);
 
     if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) {
-        var parent = try loadNode(self, txn, leaf.parent);
+        var parent = loadNode(self, txn, leaf.parent) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            // Dangling parent pointer: the leaf is already saved; skip the
+            // merge attempt and flag a repair.
+            noteTreeLinkInconsistencyIfSupported(self);
+            return;
+        };
         defer parent.deinit(self.alloc);
         try parent.ensureUnbacked(self.alloc);
         var best_sibling_id: u64 = 0;
         var best_dist: f32 = std.math.inf(f32);
         for (parent.children) |cid| {
             if (cid == leaf_id) continue;
-            var sibling = try loadNode(self, txn, cid);
+            var sibling = loadNode(self, txn, cid) catch |err| {
+                if (!isNotFoundGeneric(err)) return err;
+                // Dangling sibling reference; skip it and flag a repair.
+                noteTreeLinkInconsistencyIfSupported(self);
+                continue;
+            };
             defer sibling.deinit(self.alloc);
             if (!sibling.is_leaf) continue;
             if (sibling.members.len + leaf.members.len > self.config.leaf_size) continue;
@@ -4333,20 +4702,14 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-            var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-            errdefer self.alloc.free(new_children);
-            var wi_child: usize = 0;
-            for (parent.children) |cid| {
-                if (cid == leaf_id) continue;
-                new_children[wi_child] = cid;
-                wi_child += 1;
+            if (try removeChildLink(self, &parent, leaf_id)) {
+                try recomputeInternalCentroid(self, txn, &parent);
+                try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+                try deleteNode(self, txn, leaf_id);
+                try collapseSingleChildParents(self, txn, leaf.parent);
+            } else {
+                try deleteNode(self, txn, leaf_id);
             }
-            self.alloc.free(parent.children);
-            parent.children = new_children;
-            try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
-            try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
         }
     }
 }

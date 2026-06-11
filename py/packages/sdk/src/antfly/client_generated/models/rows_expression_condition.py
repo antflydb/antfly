@@ -26,7 +26,7 @@ class RowsExpressionCondition:
             node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`,
             `greatest`, `least`, numeric
             `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.
@@ -37,7 +37,7 @@ class RowsExpressionCondition:
             AST. A node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`,
             `greatest`, `least`, numeric
             `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.

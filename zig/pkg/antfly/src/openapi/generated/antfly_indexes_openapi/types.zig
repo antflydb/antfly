@@ -818,6 +818,8 @@ pub const GraphResultNode = struct {
     provenance: ?[]const []const u8 = null,
     /// Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node.
     metrics: ?std.json.Value = null,
+    /// Parsed evidence envelope for provenance labels and edge metadata
+    evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
 };

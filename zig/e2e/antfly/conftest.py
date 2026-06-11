@@ -109,7 +109,7 @@ def antfly_public_api_url(base_url: str, *, binary: str | None = None, root: str
 
 
 def lookup_key_path(table_name: str, key: str) -> str:
-    return f"/tables/{table_name}/lookup/{quote(key, safe='')}"
+    return f"/tables/{table_name}/documents/{quote(key, safe='')}"
 
 
 def antfly_internal_api_path(path: str) -> str:

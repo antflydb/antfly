@@ -18,6 +18,7 @@ const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const lsm_table_file = @import("../../storage/lsm/table_file.zig");
+const portable_backup = @import("../../storage/portable_backup.zig");
 
 pub const RestoreSource = struct {
     backup_id: []const u8,
@@ -169,6 +170,11 @@ fn applyRestoreSnapshot(
         break :blk shard.snapshot_path;
     };
 
+    if (std.mem.endsWith(u8, snapshot_path, ".afb")) {
+        try applyPortableRestore(alloc, path, group_id, restore, snapshot_path, &manifest, options);
+        return;
+    }
+
     const snapshot_root = try stageRestoreSnapshot(alloc, path, &location, snapshot_path);
     defer switch (location) {
         .file => alloc.free(snapshot_root),
@@ -197,6 +203,18 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
     var location = try backups_api.openBackupLocation(alloc, restore.location);
     defer location.deinit(alloc);
 
+    if (std.mem.endsWith(u8, restore.snapshot_path, ".afb")) {
+        const afb_path = try stageRestoreFile(alloc, "", &location, restore.snapshot_path);
+        defer switch (location) {
+            .file => alloc.free(afb_path),
+            .remote => {
+                if (std.fs.path.dirname(afb_path)) |staging_dir| destroyPathIfExists(staging_dir);
+                alloc.free(afb_path);
+            },
+        };
+        return try portableSnapshotDocCount(alloc, afb_path);
+    }
+
     const snapshot_root = try stageRestoreSnapshot(alloc, "", &location, restore.snapshot_path);
     defer switch (location) {
         .file => alloc.free(snapshot_root),
@@ -219,6 +237,130 @@ fn restoreSnapshotDocCount(alloc: std.mem.Allocator, restore: RestoreSource) !u6
     return @intCast(decoded.entries.len);
 }
 
+fn applyPortableRestore(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+    snapshot_path: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
+    options: RestoreOptions,
+) !void {
+    const embedding_source_fields = try portableEmbeddingSourceFieldsFromIndexesJson(alloc, manifest.indexes_json);
+    defer freePortableEmbeddingSourceFields(alloc, embedding_source_fields);
+    var location = try backups_api.openBackupLocation(alloc, restore.location);
+    defer location.deinit(alloc);
+    const afb_path = try stageRestoreFile(alloc, path, &location, snapshot_path);
+    defer switch (location) {
+        .file => alloc.free(afb_path),
+        .remote => {
+            destroyPathIfExists(afb_path);
+            alloc.free(afb_path);
+        },
+    };
+
+    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
+    defer alloc.free(afb_data);
+
+    try resetLocalTablePath(path);
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = options.expected_identity_namespace,
+        .start_index_workers = false,
+    });
+    var db_closed = false;
+    defer if (!db_closed) db.close();
+    try portable_backup.importPortableWithOptions(alloc, db.core.store, afb_data, .{
+        .identity_namespace = options.expected_identity_namespace,
+        .prefer_existing_identity_namespace = true,
+        .import_derived_indexes = true,
+        .embedding_source_fields = embedding_source_fields,
+    });
+    // Go portable AFBs may contain portable logical artifacts (for example
+    // embedding batches) as well as old on-disk index directories. Keep the
+    // logical artifacts in the DocStore, but drop runtime index directories so
+    // configured indexes are rebuilt by Zig.
+    const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
+    defer alloc.free(indexes_path);
+    db.close();
+    db_closed = true;
+    destroyPathIfExists(indexes_path);
+    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, path, restore.backup_id, restore.location, snapshot_path, group_id);
+}
+
+fn portableEmbeddingSourceFieldsFromIndexesJson(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+) ![]portable_backup.ImportOptions.EmbeddingSourceField {
+    if (indexes_json.len == 0) return &.{};
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return &.{},
+    };
+
+    var fields = std.ArrayListUnmanaged(portable_backup.ImportOptions.EmbeddingSourceField).empty;
+    errdefer {
+        for (fields.items) |field| {
+            alloc.free(field.index_name);
+            alloc.free(field.field_name);
+        }
+        fields.deinit(alloc);
+    }
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const cfg = switch (entry.value_ptr.*) {
+            .object => |cfg| cfg,
+            else => continue,
+        };
+        const type_value = cfg.get("type") orelse continue;
+        if (type_value != .string) continue;
+        if (!std.mem.eql(u8, type_value.string, "embeddings") and !std.mem.eql(u8, type_value.string, "dense_vector")) continue;
+        const field_value = cfg.get("field") orelse continue;
+        if (field_value != .string or field_value.string.len == 0) continue;
+        try fields.append(alloc, .{
+            .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+            .field_name = try alloc.dupe(u8, field_value.string),
+        });
+    }
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn freePortableEmbeddingSourceFields(
+    alloc: std.mem.Allocator,
+    fields: []const portable_backup.ImportOptions.EmbeddingSourceField,
+) void {
+    for (fields) |field| {
+        alloc.free(field.index_name);
+        alloc.free(field.field_name);
+    }
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn portableSnapshotDocCount(alloc: std.mem.Allocator, afb_path: []const u8) !u64 {
+    const afb_data = try readFileAlloc(alloc, afb_path, 16 * 1024 * 1024 * 1024);
+    defer alloc.free(afb_data);
+    var reader = @import("../../storage/backup_codec.zig").SliceReader.init(afb_data);
+    _ = try reader.readHeader();
+    var count: u64 = 0;
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type == .document_batch) {
+            const entries = try @import("../../storage/backup_codec.zig").decodeDocumentBatch(alloc, block.payload);
+            defer {
+                for (entries) |entry| {
+                    alloc.free(entry.key);
+                    alloc.free(entry.value);
+                }
+                alloc.free(entries);
+            }
+            count += @intCast(entries.len);
+        }
+    }
+    return count;
+}
+
 fn stageRestoreSnapshot(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -233,6 +375,26 @@ fn stageRestoreSnapshot(
             destroyPathIfExists(staging_root);
             try backups_api.copyDirectoryFromLocation(alloc, location, snapshot_path, staging_root);
             break :blk staging_root;
+        },
+    };
+}
+
+fn stageRestoreFile(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    location: *backups_api.BackupLocation,
+    snapshot_path: []const u8,
+) ![]u8 {
+    return switch (location.*) {
+        .file => |backup_root| try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path }),
+        .remote => blk: {
+            const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-staging/{s}", .{ path, std.fs.path.basename(snapshot_path) });
+            errdefer alloc.free(staging_path);
+            const staging_dir = std.fs.path.dirname(staging_path) orelse return error.InvalidBackupRequest;
+            destroyPathIfExists(staging_dir);
+            try ensureDirPath(staging_dir);
+            try backups_api.copyFileFromLocation(alloc, location, snapshot_path, staging_path);
+            break :blk staging_path;
         },
     };
 }
@@ -336,13 +498,20 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
             },
         }
 
-        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        const config_json = extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*) catch |err| {
+            std.log.warn("restore skipped index config index={s} err={}", .{ entry.key_ptr.*, err });
+            continue;
+        };
         defer alloc.free(config_json);
-        try db.addIndex(.{
+        db.addIndex(.{
             .name = entry.key_ptr.*,
             .kind = kind,
             .config_json = config_json,
-        });
+        }) catch |err| {
+            _ = db.deleteIndex(entry.key_ptr.*) catch false;
+            std.log.warn("restore skipped index create index={s} err={}", .{ entry.key_ptr.*, err });
+            continue;
+        };
         added += 1;
     }
     return added;

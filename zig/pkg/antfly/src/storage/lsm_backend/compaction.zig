@@ -604,7 +604,11 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     backend.next_run_id +|= reserved_run_ids;
     const reserved_run_id_end = backend.next_run_id;
 
-    backend.retainReader();
+    if (@hasDecl(BackendType, "retainReaderKind")) {
+        backend.retainReaderKind(.compaction);
+    } else {
+        backend.retainReader();
+    }
     runtime_mod.unlockBackend(BackendType, backend, true);
 
     var build_result: std.ArrayListUnmanaged(Run) = .empty;
@@ -628,14 +632,14 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     const relocked = runtime_mod.lockBackend(BackendType, backend);
     std.debug.assert(relocked);
     var reader_retained = true;
-    errdefer if (reader_retained) backend.releaseReader();
+    errdefer if (reader_retained) if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
     errdefer if (build_result_valid) discardOutputRuns(BackendType, backend, &build_result);
     if (build_err) |err| {
         return err;
     }
 
     if (!planRunIdsStillMatch(backend.runs.items, plan, selected_run_ids)) {
-        backend.releaseReader();
+        if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
         deinitRunList(backend.allocator, &selected_runs);
@@ -651,7 +655,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         start_ns,
         &build_result,
     );
-    backend.releaseReader();
+    if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
     reader_retained = false;
     deinitRunList(backend.allocator, &selected_runs);
 }
@@ -1365,7 +1369,6 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
         .largest_key = @constCast(largest_key),
         .entry_count = 1,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = false,
         .state = null,
@@ -1513,9 +1516,10 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
     var consumed_entries: usize = 0;
     var emitted_entries: usize = 0;
 
-    while (true) {
-        const candidate_source = try bestCursorSourceIndex(cursors[0..initialized_cursors]) orelse break;
-        const winner_source = try newestCursorSourceAtKey(cursors[0..initialized_cursors], candidate_source);
+    var heap = try PersistedRunMergeHeap.init(allocator, cursors[0..initialized_cursors]);
+    defer heap.deinit();
+
+    while (heap.peekSource()) |winner_source| {
         const winner = (try cursors[winner_source].currentEntry()) orelse return error.InvalidTableFile;
         const entry_bytes = tableEntryLogicalBytes(winner);
         if (output_active) {
@@ -1538,7 +1542,7 @@ fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *Backe
         }
         try output.appendEntry(winner, entry_bytes);
         emitted_entries += 1;
-        consumed_entries += try advanceCursorsAtKey(cursors[0..initialized_cursors], winner);
+        consumed_entries += try heap.advanceTopSourcesAtKey(winner);
 
         if (output_active) {
             if (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes >= target_bytes) {
@@ -1616,19 +1620,38 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
         }
 
         fn appendEntry(self: *Self, entry: lsm_table_file.Entry, entry_bytes: usize) !void {
+            var new_smallest_namespace_name: ?[]u8 = null;
+            var new_smallest_key: []u8 = &.{};
+            var new_largest_namespace_name: ?[]u8 = null;
+            var new_largest_key: []u8 = &.{};
+            errdefer {
+                if (new_smallest_namespace_name) |name| self.backend.allocator.free(name);
+                if (new_smallest_key.len > 0) self.backend.allocator.free(new_smallest_key);
+                if (new_largest_namespace_name) |name| self.backend.allocator.free(name);
+                if (new_largest_key.len > 0) self.backend.allocator.free(new_largest_key);
+            }
+
             if (self.entry_count == 0) {
-                self.smallest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
-                errdefer if (self.smallest_namespace_name) |name| self.backend.allocator.free(name);
-                self.smallest_key = try self.backend.allocator.dupe(u8, entry.key);
-                errdefer self.backend.allocator.free(self.smallest_key);
+                new_smallest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
+                new_smallest_key = try self.backend.allocator.dupe(u8, entry.key);
+            }
+            new_largest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
+            new_largest_key = try self.backend.allocator.dupe(u8, entry.key);
+
+            try self.writer.appendEntry(entry);
+
+            if (self.entry_count == 0) {
+                self.smallest_namespace_name = new_smallest_namespace_name;
+                new_smallest_namespace_name = null;
+                self.smallest_key = new_smallest_key;
+                new_smallest_key = &.{};
             }
             if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
             if (self.largest_key.len > 0) self.backend.allocator.free(self.largest_key);
-            self.largest_namespace_name = if (entry.namespace_name) |name| try self.backend.allocator.dupe(u8, name) else null;
-            errdefer if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
-            self.largest_key = try self.backend.allocator.dupe(u8, entry.key);
-
-            try self.writer.appendEntry(entry);
+            self.largest_namespace_name = new_largest_namespace_name;
+            new_largest_namespace_name = null;
+            self.largest_key = new_largest_key;
+            new_largest_key = &.{};
             self.entry_count += 1;
             self.logical_bytes += entry_bytes;
         }
@@ -1669,7 +1692,6 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 .largest_key = largest_key,
                 .entry_count = @intCast(persisted.entry_count),
                 .bloom_filter = persisted.filter,
-                .encoded_bloom_filter = null,
                 .state = null,
             };
         }
@@ -1749,44 +1771,113 @@ const PersistedRunCursor = struct {
     }
 };
 
-fn bestCursorSourceIndex(cursors: []PersistedRunCursor) !?usize {
-    var best: ?usize = null;
-    for (cursors, 0..) |*cursor, i| {
-        const candidate = (try cursor.currentEntry()) orelse continue;
-        if (best == null) {
-            best = i;
-            continue;
-        }
-        const incumbent = (try cursors[best.?].currentEntry()) orelse {
-            best = i;
-            continue;
+const PersistedRunMergeHeap = struct {
+    allocator: std.mem.Allocator,
+    cursors: []PersistedRunCursor,
+    sources: []usize,
+    advanced_sources: []usize,
+    len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, cursors: []PersistedRunCursor) !PersistedRunMergeHeap {
+        const sources = try allocator.alloc(usize, cursors.len);
+        errdefer allocator.free(sources);
+        const advanced_sources = try allocator.alloc(usize, cursors.len);
+        errdefer allocator.free(advanced_sources);
+
+        var heap = PersistedRunMergeHeap{
+            .allocator = allocator,
+            .cursors = cursors,
+            .sources = sources,
+            .advanced_sources = advanced_sources,
         };
-        if (compareTableEntry(candidate, incumbent) == .lt) best = i;
-    }
-    return best;
-}
+        errdefer heap.deinit();
 
-fn newestCursorSourceAtKey(cursors: []PersistedRunCursor, candidate_source: usize) !usize {
-    var winner = candidate_source;
-    const winner_entry = (try cursors[winner].currentEntry()) orelse return error.InvalidTableFile;
-    for (cursors, 0..) |*cursor, i| {
-        const entry = (try cursor.currentEntry()) orelse continue;
-        if (compareTableEntry(entry, winner_entry) != .eq) continue;
-        if (i < winner) winner = i;
+        for (cursors, 0..) |*cursor, source| {
+            if (cursor.position != null) try heap.pushSource(source);
+        }
+        return heap;
     }
-    return winner;
-}
 
-fn advanceCursorsAtKey(cursors: []PersistedRunCursor, key_entry: lsm_table_file.Entry) !usize {
-    var advanced: usize = 0;
-    for (cursors) |*cursor| {
-        const entry = (try cursor.currentEntry()) orelse continue;
-        if (compareTableEntry(entry, key_entry) != .eq) continue;
-        cursor.advance();
-        advanced += 1;
+    fn deinit(self: *PersistedRunMergeHeap) void {
+        self.allocator.free(self.sources);
+        self.allocator.free(self.advanced_sources);
+        self.* = undefined;
     }
-    return advanced;
-}
+
+    fn peekSource(self: *const PersistedRunMergeHeap) ?usize {
+        if (self.len == 0) return null;
+        return self.sources[0];
+    }
+
+    fn advanceTopSourcesAtKey(self: *PersistedRunMergeHeap, key_entry: lsm_table_file.Entry) !usize {
+        var advanced_len: usize = 0;
+        while (self.peekSource()) |source| {
+            const entry = (try self.cursors[source].currentEntry()) orelse return error.InvalidTableFile;
+            if (compareTableEntry(entry, key_entry) != .eq) break;
+            _ = try self.popSource();
+            self.cursors[source].advance();
+            self.advanced_sources[advanced_len] = source;
+            advanced_len += 1;
+        }
+
+        for (self.advanced_sources[0..advanced_len]) |source| {
+            if (self.cursors[source].position != null) try self.pushSource(source);
+        }
+        return advanced_len;
+    }
+
+    fn pushSource(self: *PersistedRunMergeHeap, source: usize) !void {
+        std.debug.assert(self.len < self.sources.len);
+        self.sources[self.len] = source;
+        self.len += 1;
+        try self.siftUp(self.len - 1);
+    }
+
+    fn popSource(self: *PersistedRunMergeHeap) !usize {
+        if (self.len == 0) return error.InvalidTableFile;
+        const source = self.sources[0];
+        self.len -= 1;
+        if (self.len > 0) {
+            self.sources[0] = self.sources[self.len];
+            try self.siftDown(0);
+        }
+        return source;
+    }
+
+    fn siftUp(self: *PersistedRunMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!try self.sourceLess(self.sources[index], self.sources[parent])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[parent]);
+            index = parent;
+        }
+    }
+
+    fn siftDown(self: *PersistedRunMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.len) break;
+            const right = left + 1;
+            var child = left;
+            if (right < self.len and try self.sourceLess(self.sources[right], self.sources[left])) {
+                child = right;
+            }
+            if (!try self.sourceLess(self.sources[child], self.sources[index])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[child]);
+            index = child;
+        }
+    }
+
+    fn sourceLess(self: *PersistedRunMergeHeap, lhs_source: usize, rhs_source: usize) !bool {
+        const lhs = (try self.cursors[lhs_source].currentEntry()) orelse return error.InvalidTableFile;
+        const rhs = (try self.cursors[rhs_source].currentEntry()) orelse return error.InvalidTableFile;
+        const order = compareTableEntry(lhs, rhs);
+        if (order != .eq) return order == .lt;
+        return lhs_source < rhs_source;
+    }
+};
 
 fn tableEntryLogicalBytes(entry: lsm_table_file.Entry) usize {
     return 1 + (3 * @sizeOf(u32)) +
@@ -1977,7 +2068,6 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
             &state,
             backend.options.bloom,
         ),
-        .encoded_bloom_filter = null,
         .state = state,
     };
     errdefer if (run.bloom_filter) |*filter| filter.deinit(backend.allocator);
@@ -2065,7 +2155,6 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .largest_key = largest_key,
         .entry_count = @intCast(persisted.entry_count),
         .bloom_filter = persisted.filter,
-        .encoded_bloom_filter = null,
         .state = null,
     };
 }
@@ -2140,7 +2229,6 @@ fn disarmRun(run: *Run) void {
         .largest_key = &.{},
         .entry_count = 0,
         .bloom_filter = null,
-        .encoded_bloom_filter = null,
         .owns_metadata = false,
         .owns_bloom_filter = false,
         .cached_state_index = null,

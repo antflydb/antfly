@@ -59,6 +59,10 @@ const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
+const tabular_registry_mod = @import("../tabular/registry.zig");
+const tabular_discovery_mod = @import("../tabular/discovery.zig");
+const tabular_http_mod = @import("../tabular/http.zig");
+const ml_tabular = @import("ml_tabular");
 const c_file = @import("../util/c_file.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
@@ -73,6 +77,30 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+// ---------------------------------------------------------------------------
+// Tabular predictor helpers shared by the /ml/v1/predict handler on Node.
+// ---------------------------------------------------------------------------
+
+fn taskTypeToApi(t: ml_tabular.ir.TaskType) api.PredictorTask {
+    return switch (t) {
+        .regression => .regression,
+        .binary_classification => .binary_classification,
+        .multiclass => .multiclass,
+        .ranking => .ranking,
+    };
+}
+
+fn mapTabularHttpErrorPredict(ctx: *httpx.Context, err: tabular_http_mod.HttpError) !httpx.Response {
+    return switch (err) {
+        error.InvalidJson => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "malformed predict body" }),
+        error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "no predictor by that name" }),
+        error.BatchTooLarge => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "max batch size is 10000" }),
+        error.FeatureMismatch => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature-count mismatch" }),
+        error.LoadFailed => ctx.status(500).json(.{ .@"error" = "LOAD_FAILED", .message = "predictor failed to load" }),
+        error.OutOfMemory => ctx.status(500).json(.{ .@"error" = "OOM" }),
+    };
+}
 
 pub const BudgetOverrides = struct {
     host_limit_bytes: usize = 0,
@@ -94,6 +122,7 @@ pub const BudgetOverrides = struct {
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
+    ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     allow_downloads: bool = true,
@@ -105,6 +134,7 @@ pub const NodeConfig = struct {
 };
 
 pub const public_api_prefix = "/ai/v1";
+pub const public_ml_api_prefix = "/ml/v1";
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -184,6 +214,14 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     const now = embedTimingNowNs();
     const elapsed_us = if (now > start_ns) @divTrunc(now - start_ns, 1000) else 0;
     std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
+}
+
+fn elapsedNsSince(start_ns: u128) u64 {
+    if (start_ns == 0) return 0;
+    const now = embedTimingNowNs();
+    if (now <= start_ns) return 0;
+    const elapsed = now - start_ns;
+    return @intCast(@min(elapsed, @as(u128, std.math.maxInt(u64))));
 }
 
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
@@ -385,6 +423,56 @@ fn deinitDiscoveredModelListings(allocator: std.mem.Allocator, listings: []Disco
     allocator.free(listings);
 }
 
+fn appendLoadedAliasModelListings(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayListUnmanaged(u8),
+    openai_data: *std.ArrayListUnmanaged(u8),
+    openai_data_count: *usize,
+    model_count: *usize,
+    task: []const u8,
+    list_created: i64,
+    discovered: []const registry_mod.ModelEntry,
+    model_manager: *model_manager_mod.ModelManager,
+) !void {
+    // Loaded model cache keys include backend variants such as
+    // "<absolute path>\nbackend=onnx"; only public aliases belong in listings.
+    var it = model_manager.loaded_aliases.iterator();
+    while (it.next()) |entry| {
+        const model = entry.value_ptr.*;
+        const model_task = @tagName(model.manifest.model_type);
+        if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+
+        var already_listed = false;
+        for (discovered) |d| {
+            if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
+                already_listed = true;
+                break;
+            }
+        }
+        if (already_listed) continue;
+
+        if (model_count.* > 0) try body.append(allocator, ',');
+        try jsonEncodeString(body, allocator, entry.key_ptr.*);
+        try body.append(allocator, ':');
+        try appendModelInfo(
+            body,
+            allocator,
+            model_task,
+            model.manifest.gliner_model_type,
+            model.manifest.capabilities,
+            model.manifest.inputs,
+            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+        );
+        if (isOpenAiListTask(task)) {
+            if (openai_data_count.* > 0) try openai_data.append(allocator, ',');
+            try appendOpenAiModelEntry(openai_data, allocator, entry.key_ptr.*, list_created);
+            openai_data_count.* += 1;
+        }
+        model_count.* += 1;
+    }
+}
+
 const ModelCounts = struct {
     embedders: usize = 0,
     rerankers: usize = 0,
@@ -491,6 +579,7 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    tabular_registry: tabular_registry_mod.Registry,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -504,6 +593,7 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .tabular_registry = tabular_registry_mod.Registry.init(allocator),
         };
     }
 
@@ -511,6 +601,23 @@ pub const Node = struct {
         self.model_manager.deinit();
         self.registry.deinit();
         self.embed_cache.deinit();
+        self.tabular_registry.deinit();
+    }
+
+    /// Convenience for callers that want to seed the builtin iris classifier
+    /// and scan the Traditional ML directory at startup.
+    pub fn seedAndDiscoverPredictors(self: *Node, io: std.Io) void {
+        std.Io.Dir.cwd().createDirPath(io, self.config.ml_dir) catch {};
+        tabular_discovery_mod.seedBuiltins(io, self.config.ml_dir) catch {};
+        self.discoverPredictorsIn(self.config.ml_dir, io);
+    }
+
+    fn discoverPredictors(self: *Node, io: std.Io) void {
+        self.discoverPredictorsIn(self.config.ml_dir, io);
+    }
+
+    fn discoverPredictorsIn(self: *Node, predictors_dir: []const u8, io: std.Io) void {
+        _ = tabular_discovery_mod.discover(io, self.allocator, &self.tabular_registry, predictors_dir) catch 0;
     }
 
     pub fn embedDenseTextsDirect(
@@ -535,6 +642,38 @@ pub const Node = struct {
 
         var pipeline = model.embeddingPipeline(allocator);
         return try pipeline.embed(texts);
+    }
+
+    pub fn embedDenseJsonInputDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("embed.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        var inputs = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
+        defer inputs.deinit(allocator);
+        if (inputs.total_count == 0) return error.EmptyEmbeddingResponse;
+
+        try model.ensureEmbeddingAssets(
+            inputs.texts.items.len > 0,
+            inputs.images.items.len > 0,
+            inputs.audio.items.len > 0,
+        );
+
+        var pipeline = model.embeddingPipeline(allocator);
+        return try embedDenseInputs(allocator, &pipeline, &inputs);
     }
 
     pub fn embedSparseTextsDirect(
@@ -582,6 +721,8 @@ pub const Node = struct {
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
         const model = try self.model_manager.loadFromDir(model_path);
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(allocator);
         return try pipeline.rerank(query, documents);
     }
@@ -1452,8 +1593,10 @@ pub const Node = struct {
                 .tok = model.getTokenizer(),
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
+            const sparse_pipeline_start = embedTimingNowNs();
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            self.metrics.recordEmbedBatch(sparse_texts.len, totalTextBytes(sparse_texts), elapsedNsSince(sparse_pipeline_start));
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -1492,10 +1635,11 @@ pub const Node = struct {
                 .message = embedRequestOptionErrorMessage(err),
             });
         };
-        const pipeline_start = embedTimingStart();
+        const pipeline_start = embedTimingNowNs();
         const embeddings = embedDenseInputs(ctx.allocator, &pipeline, &inputs) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
-        logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+        self.metrics.recordEmbedBatch(inputs.total_count, denseEmbedInputBytes(&inputs), elapsedNsSince(pipeline_start));
+        logEmbedTiming("embed.pipeline", inputs.total_count, if (embedTimingEnabled()) pipeline_start else 0);
         defer {
             for (embeddings) |e| ctx.allocator.free(e);
             ctx.allocator.free(embeddings);
@@ -1521,6 +1665,51 @@ pub const Node = struct {
         const http_response = try ctx.json(response);
         logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
         return http_response;
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabular predictors (POST /ml/v1/predict).
+    // -----------------------------------------------------------------------
+
+    pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+
+        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+
+        self.metrics.incRequest("predict");
+        defer self.metrics.decActive();
+
+        const req: tabular_http_mod.PredictRequest = .{
+            .model = body.model,
+            .input = body.input,
+        };
+        const result = tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |err| switch (err) {
+            error.ModelNotFound => blk: {
+                self.discoverPredictors(ctx.io);
+                break :blk tabular_http_mod.predict(ctx.io, ctx.allocator, &self.tabular_registry, req) catch |retry_err| {
+                    self.metrics.incPredictError();
+                    self.metrics.incError();
+                    return mapTabularHttpErrorPredict(ctx, retry_err);
+                };
+            },
+            else => {
+                self.metrics.incPredictError();
+                self.metrics.incError();
+                return mapTabularHttpErrorPredict(ctx, err);
+            },
+        };
+
+        const task = taskTypeToApi(result.task);
+        return ctx.json(api.PredictResponse{
+            .model = result.model,
+            .task = task,
+            .predictions = result.predictions,
+        });
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -1691,6 +1880,8 @@ pub const Node = struct {
         const model = self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
 
+        model.lockRerankingSession();
+        defer model.unlockRerankingSession();
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1749,6 +1940,8 @@ pub const Node = struct {
             defer ctx.allocator.free(flat_texts);
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
 
+            model.lockRerankingSession();
+            defer model.unlockRerankingSession();
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
@@ -1802,9 +1995,13 @@ pub const Node = struct {
 
         for (parsed_docs.items, 0..) |doc, idx| {
             if (doc.images.len == 0) {
-                var text_pipeline = model.rerankingPipeline(ctx.allocator);
-                const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                model.lockRerankingSession();
+                const text_scores = blk: {
+                    defer model.unlockRerankingSession();
+                    var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                    break :blk text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                };
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;
@@ -4615,46 +4812,11 @@ pub const Node = struct {
                 model_count += 1;
             }
 
-            // Add loaded models not yet listed (loaded by path, not discovered by name)
-            var it = self.model_manager.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
-                const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
-
-                // Skip if already listed from discovery
-                var already_listed = false;
-                for (discovered) |d| {
-                    if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                        already_listed = true;
-                        break;
-                    }
-                }
-                if (!already_listed) {
-                    if (model_count > 0) try body.append(a, ',');
-                    try jsonEncodeString(&body, a, entry.key_ptr.*);
-                    try body.append(a, ':');
-                    try appendModelInfo(
-                        &body,
-                        a,
-                        model_task,
-                        model.manifest.gliner_model_type,
-                        model.manifest.capabilities,
-                        model.manifest.inputs,
-                        model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                        model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    );
-                    if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
-                    }
-                    model_count += 1;
-                }
-            }
+            try appendLoadedAliasModelListings(a, &body, &openai_data, &openai_data_count, &model_count, task, list_created, discovered, &self.model_manager);
 
             try body.append(a, '}');
         }
+
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
         try buf.appendSlice(a, "],\"allow_downloads\":");
@@ -4676,6 +4838,55 @@ pub const Node = struct {
         try buf.appendSlice(a, if (build_options.enable_wasm) "true" else "false");
         try buf.appendSlice(a, "},");
         try buf.appendSlice(a, body.items);
+        try buf.append(a, '}');
+
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(buf.items);
+        return ctx.response.build();
+    }
+
+    fn appendPredictorCatalog(self: *Node, io: std.Io, a: std.mem.Allocator, body: *std.ArrayListUnmanaged(u8)) !void {
+        self.discoverPredictors(io);
+        try body.appendSlice(a, "\"predictors\":{");
+        const predictor_infos = try self.tabular_registry.list(a);
+        defer a.free(predictor_infos);
+        for (predictor_infos, 0..) |info, i| {
+            if (i > 0) try body.append(a, ',');
+            try jsonEncodeString(body, a, info.name);
+            try body.appendSlice(a, ":{\"task\":\"");
+            try body.appendSlice(a, ml_tabular.ir.taskTypeToString(info.task));
+            try body.appendSlice(a, "\",\"num_features\":");
+            const nf_str = try std.fmt.allocPrint(a, "{d}", .{info.num_features});
+            defer a.free(nf_str);
+            try body.appendSlice(a, nf_str);
+            try body.appendSlice(a, ",\"num_outputs\":");
+            const no_str = try std.fmt.allocPrint(a, "{d}", .{info.num_outputs});
+            defer a.free(no_str);
+            try body.appendSlice(a, no_str);
+            if (info.source_framework.len > 0) {
+                try body.appendSlice(a, ",\"source_framework\":");
+                try jsonEncodeString(body, a, info.source_framework);
+            }
+            if (info.feature_names.len > 0) {
+                try body.appendSlice(a, ",\"feature_names\":[");
+                for (info.feature_names, 0..) |feature_name, feature_idx| {
+                    if (feature_idx > 0) try body.append(a, ',');
+                    try jsonEncodeString(body, a, feature_name);
+                }
+                try body.append(a, ']');
+            }
+            try body.append(a, '}');
+        }
+        try body.append(a, '}');
+    }
+
+    pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const a = ctx.allocator;
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        defer buf.deinit(a);
+
+        try buf.appendSlice(a, "{\"object\":\"list\",");
+        try self.appendPredictorCatalog(ctx.io, a, &buf);
         try buf.append(a, '}');
 
         try ctx.setHeader("content-type", "application/json");
@@ -5901,11 +6112,19 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predict"))) {
+                try self.inner.post(public_ml_api_prefix ++ path, handler);
+            } else {
+                try self.inner.post(prefix ++ path, handler);
+            }
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler);
+            if (comptime (std.mem.eql(u8, prefix, public_api_prefix) and std.mem.eql(u8, path, "/predictors"))) {
+                try self.inner.get(public_ml_api_prefix ++ "/models", handler);
+            } else {
+                try self.inner.get(prefix ++ path, handler);
+            }
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -6010,7 +6229,13 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
 
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, public_ml_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/upload"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/predict/convert"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_ml_api_prefix ++ "/models"));
+    try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/predictors"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
@@ -6067,7 +6292,9 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
 
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/predict"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
+    try std.testing.expect(server.hasRoute(.get, "/custom/v9/predictors"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 
@@ -6215,11 +6442,50 @@ test "download remote content accepts data uri" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     var downloaded = try downloadRemoteContent(&node, alloc, "data:text/plain;base64,aGVsbG8=");
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "model listing emits loaded aliases instead of backend variant cache keys" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const alloc = arena_impl.allocator();
+
+    var manager = model_manager_mod.ModelManager.init(alloc, backends_mod.SessionManager.init(alloc));
+    const model = try alloc.create(model_manager_mod.LoadedModel);
+    model.* = .{
+        .manifest = .{
+            .allocator = alloc,
+            .model_type = .embedder,
+        },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = undefined,
+        .session_manager = &manager.session_manager,
+        .model_dir = "/tmp/models/owner/model",
+        .allocator = alloc,
+    };
+
+    try manager.loaded.put(alloc, "/tmp/models/owner/model\nbackend=onnx", model);
+    try manager.loaded_aliases.put(alloc, "owner/model", model);
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    var openai_data = std.ArrayListUnmanaged(u8).empty;
+    var openai_count: usize = 0;
+    var model_count: usize = 0;
+    try appendLoadedAliasModelListings(alloc, &body, &openai_data, &openai_count, &model_count, "embedders", 123, &.{}, &manager);
+
+    try std.testing.expectEqual(@as(usize, 1), model_count);
+    try std.testing.expectEqual(@as(usize, 1), openai_count);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "\"owner/model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openai_data.items, "\"id\":\"owner/model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "backend=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, openai_data.items, "backend=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body.items, "/tmp/models/owner/model") == null);
 }
 
 test "download remote content blocks private ip urls when configured" {
@@ -6233,6 +6499,7 @@ test "download remote content blocks private ip urls when configured" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.PrivateIpBlocked, downloadRemoteContent(&node, alloc, "http://127.0.0.1/test.png"));
 }
@@ -6249,6 +6516,7 @@ test "download remote content blocks hosts outside allowlist" {
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
+        .tabular_registry = undefined,
     };
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
@@ -6679,6 +6947,20 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.UnknownContentPartType => "unsupported content part type",
         else => "invalid embedding input",
     };
+}
+
+fn totalTextBytes(texts: []const []const u8) usize {
+    var total: usize = 0;
+    for (texts) |text| total += text.len;
+    return total;
+}
+
+fn denseEmbedInputBytes(inputs: *const ParsedDenseEmbedInputs) usize {
+    var total: usize = 0;
+    for (inputs.texts.items) |item| total += item.text.len;
+    for (inputs.images.items) |item| total += item.bytes.len;
+    for (inputs.audio.items) |item| total += item.bytes.len;
+    return total;
 }
 
 fn embedDenseInputs(

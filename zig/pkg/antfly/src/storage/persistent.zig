@@ -1091,6 +1091,13 @@ pub const PersistentIndex = struct {
         };
     }
 
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
+        return switch (self.main_store_owner) {
+            .lmdb, .mem => null,
+            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
             .lmdb, .mem => {},
@@ -1716,7 +1723,7 @@ pub const PersistentIndex = struct {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = seg.deleted,
+                .deleted = seg.shared.deleted,
             };
         }
 

@@ -52,6 +52,79 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Parsed child-range descriptor from a derived document artifact manifest.
+pub const DocumentArtifactChildRange = struct {
+    /// Stable range identifier within the artifact manifest generation.
+    range_id: []const u8,
+    /// Kind of children covered by this range, such as unit or chunk.
+    range_kind: []const u8,
+    /// Artifact namespace covered by this range.
+    artifact_name: []const u8,
+    /// Logical boundary used for splitting this range.
+    split_boundary: []const u8,
+    /// Current placement summary for the range.
+    placement: []const u8,
+    /// Owner group for this child artifact range, when assigned.
+    owner_group_id: ?i64 = null,
+    /// Placement generation for range ownership metadata.
+    placement_generation: ?i64 = null,
+    /// Current routing status for child writes in this range.
+    route_status: ?[]const u8 = null,
+    /// Whether this range may split at its configured split boundary.
+    split_eligible: ?bool = null,
+    /// Inclusive first internal child key covered by this range.
+    start_key: []const u8,
+    /// Exclusive end internal child key, or empty for the final range.
+    end_key_exclusive: []const u8,
+    /// Inclusive last internal child key covered by this range.
+    last_key: []const u8,
+    /// Number of child records covered by this range.
+    child_count: i64,
+    /// Approximate extracted text bytes covered by this range when available.
+    text_bytes: ?i64 = null,
+};
+
+pub const DocumentArtifactReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    /// Source document key that failed during reprocessing.
+    key: []const u8,
+    /// Stable error code for the failed document reprocess attempt.
+    error_code: []const u8,
+};
+
+pub const DocumentArtifactReprocessShardCursor = struct {
+    /// Physical table group that produced this cursor, when known.
+    group_id: ?i64 = null,
+    /// Source key cursor for resuming this shard-local repair pass.
+    next_key: []const u8,
+    /// Number of source rows scanned by this shard-local pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed by this shard-local pass.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass.
+    skipped: i64,
+    /// Number of scanned source rows that failed in this shard-local pass.
+    failed: i64,
+    /// Effective scan limit used by this shard-local pass.
+    limit: i64,
+};
+
+/// Request to create a durable table artifact reprocess job.
+pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// Exclusive lower bound source document key.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// When true, immediately runs the first bounded pass before returning the job state.
+    advance: ?bool = null,
+};
+
 pub const ClusterDataNodeStatus = struct {
     data_id: i64,
     node_id: i64,
@@ -462,9 +535,88 @@ pub const LsmStorageStatus = struct {
     run_bytes: ?i64 = null,
     l0_run_count: ?i64 = null,
     l0_bytes: ?i64 = null,
+    lower_level_run_count: ?i64 = null,
+    lower_level_bytes: ?i64 = null,
+    max_level: ?i64 = null,
+    compactable_l0_run_count: ?i64 = null,
+    overlapping_l0_run_count: ?i64 = null,
+    soft_limit_l0_run_count: ?i64 = null,
+    hard_limit_l0_run_count: ?i64 = null,
+    write_stall_l0_run_debt: ?i64 = null,
+    soft_limit_l0_bytes: ?i64 = null,
+    hard_limit_l0_bytes: ?i64 = null,
+    write_stall_l0_byte_debt: ?i64 = null,
+    level_overflow_run_count: ?i64 = null,
+    level_overflow_bytes: ?i64 = null,
+    obsolete_path_count: ?i64 = null,
+    obsolete_paths_pinned_by_readers: ?i64 = null,
+    obsolete_paths_pinned_by_versions: ?i64 = null,
+    obsolete_paths_waiting_for_retry: ?i64 = null,
+    obsolete_paths_reclaimable: ?i64 = null,
+    obsolete_delete_failures: ?i64 = null,
+    obsolete_delete_retries: ?i64 = null,
+    current_manifest_bytes: ?i64 = null,
+    mutable_entry_count: ?i64 = null,
+    mutable_bytes: ?i64 = null,
+    immutable_memtable_count: ?i64 = null,
+    immutable_entry_count: ?i64 = null,
+    immutable_bytes: ?i64 = null,
+    mutable_snapshot_clone_count: ?i64 = null,
+    mutable_snapshot_clone_bytes: ?i64 = null,
+    mutable_snapshot_clone_peak_bytes: ?i64 = null,
+    read_snapshot_mutable_rotation_count: ?i64 = null,
+    read_snapshot_mutable_rotation_bytes: ?i64 = null,
     wal_retained_bytes: ?i64 = null,
     compaction_backlog_bytes: ?i64 = null,
     active_readers: ?i64 = null,
+    active_readers_bound_read_txn: ?i64 = null,
+    active_readers_namespace_read_txn: ?i64 = null,
+    active_readers_probe_txn: ?i64 = null,
+    active_readers_current_scan: ?i64 = null,
+    active_readers_write_txn: ?i64 = null,
+    active_readers_compaction: ?i64 = null,
+    active_readers_other: ?i64 = null,
+    obsolete_paths_pinned_by_reader_bound_read_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_namespace_read_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_probe_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_current_scan: ?i64 = null,
+    obsolete_paths_pinned_by_reader_write_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_compaction: ?i64 = null,
+    obsolete_paths_pinned_by_reader_other: ?i64 = null,
+    active_bulk_ingest_batches: ?i64 = null,
+    manifest_dirty: ?bool = null,
+    obsolete_manifest_dirty: ?bool = null,
+    maintenance_score: ?i64 = null,
+    maintenance_debt_hint: ?i64 = null,
+    flush_count: ?i64 = null,
+    flush_output_run_count: ?i64 = null,
+    flush_output_bytes: ?i64 = null,
+    sorted_ingest_run_count: ?i64 = null,
+    sorted_ingest_bytes: ?i64 = null,
+    manifest_write_count: ?i64 = null,
+    manifest_bytes: ?i64 = null,
+    write_pressure_event_count: ?i64 = null,
+    write_pressure_compaction_count: ?i64 = null,
+    write_pressure_compaction_step_count: ?i64 = null,
+    write_pressure_overload_count: ?i64 = null,
+    write_pressure_overload_l0_run_debt: ?i64 = null,
+    immutable_rotation_count: ?i64 = null,
+    immutable_flush_count: ?i64 = null,
+    direct_bulk_ingest_attempt_count: ?i64 = null,
+    direct_bulk_ingest_success_count: ?i64 = null,
+    direct_bulk_ingest_entry_count: ?i64 = null,
+    bulk_append_attempt_count: ?i64 = null,
+    bulk_append_entry_count: ?i64 = null,
+    bulk_append_direct_success_count: ?i64 = null,
+    bulk_append_direct_entry_count: ?i64 = null,
+    bulk_append_fallback_backend_pending_count: ?i64 = null,
+    bulk_append_fallback_below_threshold_count: ?i64 = null,
+    bulk_append_fallback_duplicate_key_count: ?i64 = null,
+    bulk_append_fallback_to_mutable_entry_count: ?i64 = null,
+    direct_bulk_ingest_direct_entry_count: ?i64 = null,
+    direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
+    direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
+    direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
 };
 
 /// MongoDB-style update operator
@@ -1641,6 +1793,137 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+/// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
+pub const DocumentArtifactManifest = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    /// Name of the derived artifact.
+    artifact_name: []const u8,
+    /// Stable identity of this artifact under the document.
+    artifact_id: []const u8,
+    /// Version of the opaque manifest payload schema.
+    manifest_version: i64,
+    /// Monotonic generation for the current artifact state.
+    generation: i64,
+    /// Source URL or source identifier used to derive this artifact.
+    source_url: []const u8,
+    /// Fingerprint of the source bytes and extractor configuration.
+    source_fingerprint: []const u8,
+    /// Effective source content type selected during extraction.
+    content_type: []const u8,
+    /// Producer route selected for the source content.
+    route_type: []const u8,
+    /// Reason extraction was skipped, when the source type is unsupported.
+    unsupported_reason: ?[]const u8 = null,
+    /// Number of extracted document units.
+    unit_count: i64,
+    /// Number of indexable chunks derived from the units.
+    chunk_count: i64,
+    /// Parsed child range descriptors for this artifact generation.
+    child_ranges: []const DocumentArtifactChildRange,
+    /// Number of storage child ranges used by this artifact.
+    child_range_count: i64,
+    /// Current materialization or merge status.
+    merge_status: []const u8,
+    /// Previous artifact generation used by the current merge plan.
+    merge_from_generation: i64,
+    /// Target artifact generation produced by the current merge plan.
+    merge_to_generation: i64,
+    /// Granularity used when computing merge-plan operations.
+    merge_operation_granularity: []const u8,
+    /// Number of merge operations recorded for this artifact.
+    merge_operation_count: i64,
+    /// Last extraction or materialization error code, when the current artifact generation failed.
+    last_error_code: ?[]const u8 = null,
+    /// Human-readable last extraction or materialization error summary, when available.
+    last_error_message: ?[]const u8 = null,
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    manifest_json: ?[]const u8 = null,
+    /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
+    state_json: ?[]const u8 = null,
+};
+
+/// Bounded request for reprocessing a derived artifact across source rows in key order.
+pub const DocumentArtifactTableReprocessRequest = struct {
+    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
+};
+
+pub const DocumentArtifactTableReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+    reprocess_status: []const u8,
+    /// Name of the derived artifact that was reprocessed.
+    artifact_name: []const u8,
+    /// Number of source rows scanned by this bounded pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document.
+    skipped: i64,
+    /// Number of scanned source rows that failed before recording a normal artifact manifest.
+    failed: i64,
+    /// Effective scan limit used by the bounded pass.
+    limit: i64,
+    /// Source key cursor for the next bounded pass, when more rows may remain.
+    next_key: ?[]const u8 = null,
+    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
+    pending_shards: i64,
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+};
+
+pub const DocumentArtifactReprocessJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Table containing the source documents being repaired.
+    table_name: []const u8,
+    /// Name of the derived artifact being repaired.
+    artifact_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing completion status derived from the phase and remaining cursors.
+    reprocess_status: []const u8,
+    /// Original exclusive lower bound for the job.
+    from_key: []const u8,
+    /// Original inclusive upper bound for the job, or empty for the end of the table/range.
+    to_key: []const u8,
+    /// Current per-shard bounded pass limit.
+    limit: i64,
+    /// Single-shard continuation key when no shard cursors are present.
+    next_key: ?[]const u8 = null,
+    /// Cumulative source rows scanned by completed passes.
+    scanned: i64,
+    /// Cumulative source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Cumulative source rows skipped by completed passes.
+    skipped: i64,
+    /// Cumulative source rows that failed during completed passes.
+    failed: i64,
+    /// Number of shard-local continuations still pending.
+    pending_shards: i64,
+    /// Failures from the most recent completed pass.
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors to resume on the next advance operation.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+    /// Last terminal or transient job error, when available.
+    last_error: ?[]const u8 = null,
+    /// Monotonic server timestamp when the job was created.
+    created_at_millis: i64,
+    /// Monotonic server timestamp when the job was last updated.
+    last_updated_at_millis: i64,
+    /// Monotonic server timestamp after which the retained job status may be removed.
+    expires_at_millis: i64,
+};
+
 /// Typed Zig status view for table data topology and range placement.
 pub const ClusterDataStatus = struct {
     nodes: ?[]const ClusterDataNodeStatus = null,
@@ -2093,6 +2376,13 @@ pub const Permission = struct {
     type: PermissionType,
 };
 
+/// Available derived document artifact manifests for a source document.
+pub const DocumentArtifactManifestList = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifest,
+};
+
 pub const ClusterTopology = struct {
     health: ClusterHealth,
     /// Optional message providing details about the health status
@@ -2254,6 +2544,8 @@ pub const QueryHit = struct {
     /// Optional explain-style score provenance for score features applied to this hit.
     _score_details: ?QueryScoreDetails = null,
     _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    hierarchy: ?std.json.Value = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
     _sort: ?[]const []const u8 = null,
 };
@@ -2986,7 +3278,7 @@ pub const RowsQueryOrderExpression = struct {
     direction: ?[]const u8 = null,
 };
 
-/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`, `greatest`, `least`, numeric `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`, `greatest`, `least`, numeric `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
 pub const RowsExpression = union(enum) {
     rows_expression_operator: *RowsExpressionOperator,
     rows_expression_field: *RowsExpressionField,

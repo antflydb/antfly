@@ -490,7 +490,7 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_query(auth_api: AuthApi):
     visible = _wait_until(lambda: _try_lookup(auth_api, "docs", "doc:gold"))
     assert visible["title"] == "gold doc"
 
-    hidden_lookup = auth_api.s.get(f"{auth_api.url}/tables/docs/lookup/doc:silver", timeout=30)
+    hidden_lookup = auth_api.s.get(f"{auth_api.url}/tables/docs/documents/doc:silver", timeout=30)
     assert hidden_lookup.status_code == 404
 
     scan_result = _wait_until(
@@ -626,7 +626,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_query(stateful_auth_ap
     assert visible is not None
     assert visible["title"] == "gold doc"
 
-    hidden_lookup = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables/docs/lookup/doc:silver", timeout=30)
+    hidden_lookup = stateful_auth_api.s.get(f"{stateful_auth_api.url}/tables/docs/documents/doc:silver", timeout=30)
     assert hidden_lookup.status_code == 404
 
     scan_result = _wait_until(

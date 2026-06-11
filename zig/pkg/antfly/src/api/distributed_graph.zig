@@ -972,6 +972,7 @@ fn convertPatternMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(path);
         }
@@ -2419,6 +2420,7 @@ fn dupPathEdgesFromGraphPath(
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
         initialized += 1;
     }
@@ -2474,6 +2476,7 @@ fn joinDistributedPaths(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
     }
@@ -2483,6 +2486,7 @@ fn joinDistributedPaths(
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
         edge_initialized += 1;
     }
@@ -2492,6 +2496,7 @@ fn joinDistributedPaths(
             .target = try alloc.dupe(u8, edge.target),
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
+            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
         };
         edge_initialized += 1;
     }
@@ -4931,6 +4936,7 @@ fn clonePathEdge(
         .target = try alloc.dupe(u8, edge.target),
         .edge_type = try alloc.dupe(u8, edge.edge_type),
         .weight = edge.weight,
+        .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
     };
 }
 
@@ -4938,6 +4944,7 @@ fn freeOwnedPathEdge(alloc: std.mem.Allocator, edge: graph_query_mod.PathEdgeInf
     alloc.free(edge.source);
     alloc.free(edge.target);
     alloc.free(edge.edge_type);
+    if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
 fn findHit(hits: []const db_mod.types.SearchHit, key: []const u8) ?db_mod.types.SearchHit {

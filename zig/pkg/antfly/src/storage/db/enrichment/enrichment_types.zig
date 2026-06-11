@@ -15,6 +15,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Process-wide count of query-time embeds currently executing (a public
+/// query whose text is being embedded into a vector right now). The query
+/// layers increment it around the embed call itself — not the whole query —
+/// so BM25-only traffic never sets it. The enrichment embed loop briefly
+/// defers the next embed batch while it is non-zero so interactive embeds
+/// get the embedder first. Lives here so the embed loop has no dependency
+/// on HTTP wiring.
+pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub const GeneratedEnrichmentKind = enum {
     dense_embedding,
     sparse_embedding,

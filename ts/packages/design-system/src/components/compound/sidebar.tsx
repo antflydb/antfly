@@ -240,7 +240,7 @@ function Sidebar({
           // Adjust the padding for floating and inset variants.
           variant === "floating" || variant === "inset"
             ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
-            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[collapsible=icon]:group-data-[side=left]:border-r-[1.5px] group-data-[collapsible=icon]:group-data-[side=left]:border-border-strong group-data-[collapsible=icon]:group-data-[side=right]:border-l-[1.5px] group-data-[collapsible=icon]:group-data-[side=right]:border-border-strong",
+            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[collapsible=icon]:group-data-[side=left]:border-r-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=left]:border-border group-data-[collapsible=icon]:group-data-[side=right]:border-l-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=right]:border-border",
           className
         )}
         {...props}
@@ -248,7 +248,7 @@ function Sidebar({
         <div
           data-sidebar="sidebar"
           data-slot="sidebar-inner"
-          className="bg-sidebar-expanded group-data-[collapsible=icon]:bg-sidebar transition-colors duration-300 ease-in-out flex h-full w-full flex-col group-data-[variant=floating]:rounded-none group-data-[variant=floating]:border-[1.5px] group-data-[variant=floating]:border-border-strong"
+          className="bg-sidebar-expanded group-data-[collapsible=icon]:bg-sidebar transition-colors duration-300 ease-in-out flex h-full w-full flex-col group-data-[variant=floating]:rounded-none group-data-[variant=floating]:border-(length:--border-width) group-data-[variant=floating]:border-border"
         >
           {children}
         </div>
@@ -310,7 +310,7 @@ function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
       data-slot="sidebar-inset"
       className={cn(
         "bg-background relative flex w-full min-w-0 flex-1 flex-col h-screen overflow-y-auto",
-        "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:border-[1.5px] md:peer-data-[variant=inset]:border-border-strong md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
+        "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:border-(length:--border-width) md:peer-data-[variant=inset]:border-border md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
         className
       )}
       {...props}
@@ -401,7 +401,7 @@ function SidebarGroupLabel({
       className={cn(
         // mono kicker — matches form labels, table headers, dropdown labels
         "ring-sidebar-ring flex h-8 shrink-0 items-center rounded-none px-2",
-        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
         "outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
         className
@@ -491,11 +491,11 @@ const sidebarMenuButtonVariants = cva(
       variant: {
         default: "",
         outline:
-          "bg-background border-[1.5px] border-border-strong hover:bg-sidebar-accent hover:text-foreground",
+          "bg-background border-(length:--border-width) border-input hover:bg-sidebar-accent hover:text-foreground",
       },
       size: {
         default: "h-8 text-[13px]",
-        sm: "h-7 text-[12px]",
+        sm: "h-7 text-[13px]",
         lg: "h-12 text-[13px] group-data-[collapsible=icon]:!h-12 group-data-[collapsible=icon]:!w-12 group-data-[collapsible=icon]:!px-0",
       },
     },
@@ -596,9 +596,9 @@ function SidebarMenuBadge({ className, ...props }: React.ComponentProps<"div">) 
       className={cn(
         // mono uppercase pill — matches Badge outline treatment
         "text-muted-foreground pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center px-1.5 select-none",
-        "font-mono uppercase tracking-[0.05em] text-[10px] font-medium tabular-nums",
-        "border-[1.5px] border-border-strong rounded-none",
-        "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground peer-data-[active=true]/menu-button:border-amber-500 peer-data-[active=true]/menu-button:text-amber-600 dark:peer-data-[active=true]/menu-button:text-amber-400",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium tabular-nums",
+        "border-(length:--border-width) border-border rounded-none",
+        "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground",
         "peer-data-[size=sm]/menu-button:top-1",
         "peer-data-[size=default]/menu-button:top-1.5",
         "peer-data-[size=lg]/menu-button:top-2.5",
@@ -697,7 +697,7 @@ function SidebarMenuSubButton({
         "[&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0",
         "data-[active=true]:text-foreground data-[active=true]:bg-sidebar-accent",
         size === "sm" && "text-[11px]",
-        size === "md" && "text-[12px]",
+        size === "md" && "text-[13px]",
         "group-data-[collapsible=icon]:hidden",
         className
       )}

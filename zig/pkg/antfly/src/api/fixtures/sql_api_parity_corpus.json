@@ -1069,6 +1069,22 @@
       ]
     },
     {
+      "name": "single table replace predicate fixture",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "sql": "SELECT replace(status, '-', ' ') AS status_words FROM usage_records WHERE replace(status, '-', ' ') = $1 ORDER BY replace(status, '-', ' ') ASC LIMIT 5",
+      "params": [
+        { "string": "active user" }
+      ]
+    },
+    {
       "name": "single table nested case-fold text expression fixture",
       "family": "query",
       "summary": {
@@ -2826,6 +2842,27 @@
         "{\"id\":\"u1\",\"status\":\"ACTIVE\"}"
       ],
       "sql": "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', ' ACTIVE ') ON CONFLICT (email) DO UPDATE SET status = trim(excluded.next_status) RETURNING id, status"
+    },
+    {
+      "name": "conflict replace excluded update fixture",
+      "family": "insert",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1
+      },
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "apply_setup_sql": [
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, next_status text);",
+        "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
+        "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"
+      ],
+      "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\"}",
+      "resolver_version": 17,
+      "returning_rows": [
+        "{\"id\":\"u1\",\"status\":\"ACTIVE-USER\"}"
+      ],
+      "sql": "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER') ON CONFLICT (email) DO UPDATE SET status = replace(excluded.next_status, '_', '-') RETURNING id, status"
     },
     {
       "name": "conflict nested case-fold length update fixture",

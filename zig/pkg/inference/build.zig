@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
@@ -182,7 +183,17 @@ fn configureNativeTool(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
+    // link against the host distro's crt startup objects. Newer glibc/binutils
+    // builds may include .sframe sections with relocation types that Zig's
+    // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
+    // target keeps user-supplied -Dtarget overrides intact while making the
+    // no-argument path use Zig's bundled libc startup objects.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const shared_lib_root = resolveSharedLibRoot(b);
 
@@ -332,6 +343,28 @@ pub fn build(b: *std.Build) void {
         "Run the local Metal Gemma4 staged-vs-full-prefill-block parity diagnostic",
     );
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
+
+    const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_tool_calling.sh",
+    });
+    metal_gemma4_tool_calling_test.step.dependOn(b.getInstallStep());
+    const metal_gemma4_tool_calling_test_step = b.step(
+        "test-metal-gemma4-tool-calling",
+        "Run the local Metal Gemma4 server tool-calling smoke test",
+    );
+    metal_gemma4_tool_calling_test_step.dependOn(&metal_gemma4_tool_calling_test.step);
+
+    const metal_gemma4_cli_tool_calling_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_cli_tool_calling.sh",
+    });
+    metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
+    const metal_gemma4_cli_tool_calling_test_step = b.step(
+        "test-metal-gemma4-cli-tool-calling",
+        "Run the local Metal Gemma4 CLI tool-calling smoke test",
+    );
+    metal_gemma4_cli_tool_calling_test_step.dependOn(&metal_gemma4_cli_tool_calling_test.step);
 
     const metal_prefill_bucket_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-prefill-buckets-bench",
@@ -613,6 +646,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
     tests.root_module.addImport("antfly_image", antfly_image_mod);
     tests.root_module.addImport("ml", ml_mod);
+    tests.root_module.addImport("ml_tabular", runtime_graph.ml_tabular_mod);
     tests.root_module.addImport("onnx_graph", onnx_graph_mod);
     tests.root_module.addImport("pjrt", pjrt_mod);
     tests.root_module.addImport("prometheus", prometheus_mod);
