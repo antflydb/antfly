@@ -126,6 +126,7 @@ const text_backfill_batch_size: usize = 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
+pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -1625,6 +1626,27 @@ pub const IndexManager = struct {
     /// Quarantine an index whose persisted artifacts could not be opened:
     /// keep its config visible (catalog persistence, status, drop/recreate)
     /// while the runtime index stays absent, and record the load error.
+    /// Errors from an index open that indicate a transient read race rather
+    /// than persistent artifact damage: a read-only replica open can race
+    /// the writer's obsolete-run reclaim (FileNotFound after the manifest
+    /// load), or table churn can invalidate the open mid-flight. On
+    /// read-only opens these must propagate instead of quarantining — the
+    /// query layer reopens against a fresh manifest and retries
+    /// (queryWithTransientReadRetry), whereas a quarantined replica would
+    /// serve IndexUnavailable until the read cache next invalidates it: the
+    /// quarantine retry worker only runs on the writer. Writer opens keep
+    /// quarantining everything — the writer cannot race its own (not yet
+    /// started) reclaim, so FileNotFound there is persistent damage, and
+    /// the writer's self-heal worker covers the unlikely transient case.
+    /// Only meaningful now that the LSM run-table loader classifies
+    /// FileNotFound separately from UnsupportedVersion.
+    fn indexOpenErrorIsTransientRead(err: anyerror) bool {
+        return switch (err) {
+            error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
+            else => false,
+        };
+    }
+
     fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
         if (self.loadFailure(cfg.name) != null) return;
         var cloned = try types.IndexConfig.clone(self.alloc, cfg);
@@ -2475,6 +2497,7 @@ pub const IndexManager = struct {
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) {
             for (configs) |cfg| {
                 self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                    if (read_only and indexOpenErrorIsTransientRead(err)) return err;
                     std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                         cfg.name,
                         @tagName(cfg.kind),
@@ -2488,6 +2511,7 @@ pub const IndexManager = struct {
             if (parallelism <= 1) {
                 for (configs) |cfg| {
                     self.openConfiguredIndex(store, cfg, allow_backfill, read_only) catch |err| {
+                        if (read_only and indexOpenErrorIsTransientRead(err)) return err;
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             cfg.name,
                             @tagName(cfg.kind),
@@ -2627,8 +2651,11 @@ pub const IndexManager = struct {
         // A failed index load quarantines that index instead of failing the
         // whole table open; the other indexes stay usable and the failure is
         // reported via loadFailure()/status so clients can drop+recreate.
+        // Transient read races on read-only opens propagate instead (the
+        // deferred results cleanup releases any other opened indexes).
         for (results, 0..) |*result, i| {
             if (result.err) |err| {
+                if (read_only and indexOpenErrorIsTransientRead(err)) return err;
                 try self.recordFailedIndexLoad(configs[i], err);
             }
         }
@@ -5600,13 +5627,42 @@ pub const IndexManager = struct {
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         if (try self.configRequiresEnrichmentReplay(cfg)) return;
         if (try self.configHasPendingSparseEmbeddingArtifactReplay(store, cfg)) return;
+        // Backfill rebuilds the index from the full store contents, so it is
+        // current through the store's durable per-kind latest replay marker
+        // even when the replay records themselves have already been pruned.
+        // On a fresh instance with pruned records lastReplaySequence(0) is 0;
+        // saving that alone regresses the checkpoint below the marker and
+        // traps startup catch-up in a permanent-debt loop that re-backfills
+        // and re-regresses forever.
+        var backfilled_sequence = store.lastReplaySequence(0);
+        if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
+            backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
+        }
         try apply_state.saveAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
             self.applied_sequence_checkpoint_path,
             cfg.name,
-            store.lastReplaySequence(0),
+            backfilled_sequence,
         );
+    }
+
+    fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .pointer => |ptr| @hasDecl(ptr.child, "latestReplaySequenceForHint"),
+            .@"struct" => @hasDecl(T, "latestReplaySequenceForHint"),
+            else => false,
+        };
+    }
+
+    fn replayHintForIndexKind(kind: types.IndexKind) change_journal_mod.TargetHint {
+        return switch (kind) {
+            .full_text => .full_text,
+            .dense_vector => .dense_vector,
+            .sparse_vector => .sparse_vector,
+            .graph => .graph,
+            .algebraic => .algebraic,
+        };
     }
 
     fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {
@@ -5693,6 +5749,7 @@ pub const IndexManager = struct {
     }
 
     fn openConfiguredIndexDetached(self: *IndexManager, store: anytype, cfg: types.IndexConfig, allow_backfill: bool, read_only: bool) !OpenedIndex {
+        if (test_inject_index_open_error) |err| return err;
         try self.ensureConfiguredIndexDir(cfg);
         switch (cfg.kind) {
             .full_text => {
