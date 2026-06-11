@@ -705,7 +705,12 @@ pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    // Cache as a side effect only. The cache's internal copy must NOT be
+    // returned: it is unpinned, and any later vector load may evict the entry
+    // and free it while the caller still holds the view (callers batch views
+    // before consuming them, e.g. split vector-matrix loads).
+    _ = try self.cacheVector(vector_id, view);
+    return view;
 }
 
 pub fn getVectorViewOrScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -726,7 +731,10 @@ pub fn getVectorViewOrScratchWithCursor(self: anytype, cursor: anytype, vector_i
     const entry = (try cursor.seekAtOrAfter(key)) orelse return error.NotFound;
     if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
     const view = try vectorViewFromRaw(entry.value, scratch);
-    return try self.cacheVector(vector_id, view);
+    // Cache as a side effect only; never return the cache's unpinned copy
+    // (see getVectorInto).
+    _ = try self.cacheVector(vector_id, view);
+    return view;
 }
 
 pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -741,7 +749,10 @@ pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    // Cache as a side effect only; never return the cache's unpinned copy
+    // (see getVectorInto).
+    _ = try self.cacheVector(vector_id, view);
+    return view;
 }
 
 pub fn vectorViewFromRaw(data: []const u8, scratch: []f32) ![]const f32 {

@@ -30,6 +30,7 @@ const internal_keys = @import("../internal_keys.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
+const index_mod = @import("../../index.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
@@ -8027,12 +8028,16 @@ pub const DB = struct {
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         if (index_manager.textIndex(index_name)) |entry| {
-            const text_snapshot = entry.snapshot();
-            const term_count = textIndexTermCount(entry);
+            // This runs on the applied-sequence persist path concurrently with
+            // segment publishes (merge finish swaps the writer snapshot and
+            // releases the old one), so the raw snapshot() pointer can be freed
+            // mid-read. Hold a refcounted snapshot for every field we read.
+            const text_snapshot = entry.acquireSnapshot();
+            defer text_snapshot.release();
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.global_doc_count,
-                .term_count = term_count,
+                .term_count = textIndexTermCount(text_snapshot),
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -8068,9 +8073,8 @@ pub const DB = struct {
         return null;
     }
 
-    fn textIndexTermCount(entry: anytype) u64 {
-        const snap = entry.acquireSnapshot();
-        defer snap.release();
+    /// `snap` must be held via acquireSnapshot() by the caller.
+    fn textIndexTermCount(snap: *const index_mod.IndexSnapshot) u64 {
         var terms: u64 = 0;
         for (snap.segments) |*seg| {
             const layout = seg.layoutStats(true);
@@ -8504,9 +8508,12 @@ pub const DB = struct {
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        // Stats reporting runs concurrently with segment
+                        // publishes; hold a refcounted snapshot while reading.
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
-                        item.term_count = textIndexTermCount(entry);
+                        item.term_count = textIndexTermCount(text_snapshot);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
