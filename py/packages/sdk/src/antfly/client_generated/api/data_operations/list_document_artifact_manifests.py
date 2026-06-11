@@ -6,8 +6,9 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.document_artifact_manifest_list import DocumentArtifactManifestList
 from ...models.error import Error
-from ...models.lookup_key_response_200 import LookupKeyResponse200
+from ...models.list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from ...types import UNSET, Response, Unset
 
 
@@ -15,18 +16,22 @@ def _get_kwargs(
     table_name: str,
     key: str,
     *,
-    fields: str | Unset = UNSET,
+    detail: ListDocumentArtifactManifestsDetail | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
-    params["fields"] = fields
+    json_detail: str | Unset = UNSET
+    if not isinstance(detail, Unset):
+        json_detail = detail.value
+
+    params["detail"] = json_detail
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/db/v1/tables/{table_name}/documents/{key}".format(
+        "url": "/db/v1/tables/{table_name}/documents/{key}/artifacts".format(
             table_name=quote(str(table_name), safe=""),
             key=quote(str(key), safe=""),
         ),
@@ -38,26 +43,31 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | LookupKeyResponse200 | None:
+) -> DocumentArtifactManifestList | Error | None:
     if response.status_code == 200:
-        response_200 = LookupKeyResponse200.from_dict(response.json())
+        response_200 = DocumentArtifactManifestList.from_dict(response.json())
 
         return response_200
-
-    if response.status_code == 400:
-        response_400 = Error.from_dict(response.json())
-
-        return response_400
 
     if response.status_code == 404:
         response_404 = Error.from_dict(response.json())
 
         return response_404
 
+    if response.status_code == 405:
+        response_405 = Error.from_dict(response.json())
+
+        return response_405
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
         return response_500
+
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -67,7 +77,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | LookupKeyResponse200]:
+) -> Response[DocumentArtifactManifestList | Error]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -81,27 +91,31 @@ def sync_detailed(
     key: str,
     *,
     client: AuthenticatedClient,
-    fields: str | Unset = UNSET,
-) -> Response[Error | LookupKeyResponse200]:
-    """Retrieve a document by key
+    detail: ListDocumentArtifactManifestsDetail | Unset = UNSET,
+) -> Response[DocumentArtifactManifestList | Error]:
+    """List derived document artifact manifests
+
+     Returns the derived document artifact manifests currently available for
+    a source document. This lets clients discover artifact names before
+    inspecting a single manifest or triggering reprocessing.
 
     Args:
         table_name (str):
         key (str):
-        fields (str | Unset):
+        detail (ListDocumentArtifactManifestsDetail | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | LookupKeyResponse200]
+        Response[DocumentArtifactManifestList | Error]
     """
 
     kwargs = _get_kwargs(
         table_name=table_name,
         key=key,
-        fields=fields,
+        detail=detail,
     )
 
     response = client.get_httpx_client().request(
@@ -116,28 +130,32 @@ def sync(
     key: str,
     *,
     client: AuthenticatedClient,
-    fields: str | Unset = UNSET,
-) -> Error | LookupKeyResponse200 | None:
-    """Retrieve a document by key
+    detail: ListDocumentArtifactManifestsDetail | Unset = UNSET,
+) -> DocumentArtifactManifestList | Error | None:
+    """List derived document artifact manifests
+
+     Returns the derived document artifact manifests currently available for
+    a source document. This lets clients discover artifact names before
+    inspecting a single manifest or triggering reprocessing.
 
     Args:
         table_name (str):
         key (str):
-        fields (str | Unset):
+        detail (ListDocumentArtifactManifestsDetail | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | LookupKeyResponse200
+        DocumentArtifactManifestList | Error
     """
 
     return sync_detailed(
         table_name=table_name,
         key=key,
         client=client,
-        fields=fields,
+        detail=detail,
     ).parsed
 
 
@@ -146,27 +164,31 @@ async def asyncio_detailed(
     key: str,
     *,
     client: AuthenticatedClient,
-    fields: str | Unset = UNSET,
-) -> Response[Error | LookupKeyResponse200]:
-    """Retrieve a document by key
+    detail: ListDocumentArtifactManifestsDetail | Unset = UNSET,
+) -> Response[DocumentArtifactManifestList | Error]:
+    """List derived document artifact manifests
+
+     Returns the derived document artifact manifests currently available for
+    a source document. This lets clients discover artifact names before
+    inspecting a single manifest or triggering reprocessing.
 
     Args:
         table_name (str):
         key (str):
-        fields (str | Unset):
+        detail (ListDocumentArtifactManifestsDetail | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | LookupKeyResponse200]
+        Response[DocumentArtifactManifestList | Error]
     """
 
     kwargs = _get_kwargs(
         table_name=table_name,
         key=key,
-        fields=fields,
+        detail=detail,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -179,21 +201,25 @@ async def asyncio(
     key: str,
     *,
     client: AuthenticatedClient,
-    fields: str | Unset = UNSET,
-) -> Error | LookupKeyResponse200 | None:
-    """Retrieve a document by key
+    detail: ListDocumentArtifactManifestsDetail | Unset = UNSET,
+) -> DocumentArtifactManifestList | Error | None:
+    """List derived document artifact manifests
+
+     Returns the derived document artifact manifests currently available for
+    a source document. This lets clients discover artifact names before
+    inspecting a single manifest or triggering reprocessing.
 
     Args:
         table_name (str):
         key (str):
-        fields (str | Unset):
+        detail (ListDocumentArtifactManifestsDetail | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | LookupKeyResponse200
+        DocumentArtifactManifestList | Error
     """
 
     return (
@@ -201,6 +227,6 @@ async def asyncio(
             table_name=table_name,
             key=key,
             client=client,
-            fields=fields,
+            detail=detail,
         )
     ).parsed
