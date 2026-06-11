@@ -3,7 +3,6 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
-  GraphPaperBg,
 } from "@antfly/design-system";
 import type { IndexConfig } from "@antfly/sdk";
 import type React from "react";
@@ -48,7 +47,6 @@ const CreateTablePage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Create New Table</DashboardPageTitle>

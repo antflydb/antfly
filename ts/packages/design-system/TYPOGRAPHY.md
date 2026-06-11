@@ -7,6 +7,8 @@ Antfly's voice in three registers. Pick the right one with one question:
 
 **Chrome beats content shape.** When the element is part of the instrument chassis (a menu item, accordion trigger, button, list selector), use mono even if the text is sentence-shaped. The chassis voice wins. Inter is reserved for content that's *read* as a phrase (Card/Dialog/Sheet titles, page headings, paragraphs).
 
+**…but what the user types is theirs.** Free-text entry (`<Input>`, `<Textarea>`, `<InputGroupTextarea>` — chat prompts, search boxes, descriptions) defaults to the body voice (Inter, `text-sm`): the user is writing a phrase, not reading an instrument. Selects stay mono — their values are system-supplied. Fields whose content is genuinely an identifier (table names, IDs, query DSL) opt back in with `font-mono`.
+
 ## The three registers
 
 | Register | Font | What it says |
@@ -52,7 +54,7 @@ Mono has three sub-modes — same font, different shapes for different jobs:
 
 Quiet section labels and form field names. Subdued by design.
 
-- Tracking: **0.08–0.1em**
+- Tracking: **0.08em** (the single label tracking)
 - Size: **11px**
 - Weight: **500** (medium)
 - Color: `text-muted-foreground`
@@ -66,16 +68,18 @@ Quiet section labels and form field names. Subdued by design.
 - Tab labels (`<TabsTrigger>`)
 - Top nav items
 
-**Tailwind shorthand:** `font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground`
+**Tailwind shorthand:** `font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground`
 
 ### Mono callout (UPPERCASE · tracked · proud)
 
 Loud kind-of-thing labels — short, important, often colored. Shorter content than a kicker, more presence.
 
-- Tracking: **0.05–0.06em**
-- Size: **11–12px**
-- Weight: **500–700**
-- Color: usually semantic (destructive, success, warning, info) or amber accent
+- Tracking: **0.08em** (same as kicker — one label tracking)
+- Size: **11px** (the single label size)
+- Weight: **500** (the casing and tracking carry the presence; bold is reserved for rare emphasis)
+- Color: ink by default — one signal per emphasis. Semantic/amber color is for the few
+  deliberately-colored chips (Badge primary/destructive); alert titles stay ink and let the
+  icon carry the state.
 
 **Use for:**
 - `<Badge>` (all variants)
@@ -166,8 +170,7 @@ If you ever want a kicker register on a dialog (e.g., "DESTRUCTIVE ACTION" above
 | Where | Tracking |
 | --- | --- |
 | Buttons (mono) | **0** — no letter-spacing |
-| Mono kickers (uppercase) | 0.08–0.1em |
-| Mono callouts — badges, alert titles (uppercase, shorter) | 0.05–0.06em |
+| Mono labels — kickers, callouts, badges, alert titles (uppercase) | 0.08em |
 | Mono readouts (sentence-case) | 0 or 0.02em |
 | Inter headings | normal or -0.01em |
 | Inter body | normal |
@@ -179,7 +182,7 @@ Buttons deliberately have **no tracking** — earlier prototypes felt exaggerate
 ## Weight conventions
 
 - **Aeonik:** regular (400) or medium (500). Avoid bold — the size carries the moment.
-- **Mono:** regular (400) for readouts, medium (500) for labels and buttons, bold (600–700) for callouts.
+- **Mono:** regular (400) for readouts, medium (500) for labels, buttons, and callouts. Bold callouts are the exception, not the rule.
 - **Inter:** regular (400) for body, **medium (500) for headings**. Avoid semibold — restraint is part of the voice.
 
 ---
@@ -193,8 +196,8 @@ Is this a brand moment (hero, marketing, wordmark)?
 
 Is this part of the instrument chassis (menu, accordion, button, list, tab, badge, toolbar)?
   └── yes → Mono
-  │     ├── short uppercase label?   → Mono kicker (tracked 0.1em)
-  │     ├── short uppercase kind?    → Mono callout (tracked 0.05em)
+  │     ├── short uppercase label?   → Mono kicker (tracked 0.08em)
+  │     ├── short uppercase kind?    → Mono callout (tracked 0.08em)
   │     └── item / readout / value?  → Mono readout (no tracking)
   └── no ↓
 
@@ -222,6 +225,7 @@ Is this a phrase or sentence?
 | `<AlertTitle>` | Mono callout | Kind of message |
 | `<Button>` | Mono readout | Action label, tight |
 | `<DropdownMenuItem>` / `<SelectItem>` | Mono readout | List item, name-like |
+| `<Input>` / `<Textarea>` | Inter body | User-typed phrase (opt into mono for identifiers) |
 | `<TooltipContent>` | Mono readout | Instrument readout |
 | `<TabsTrigger>` | Mono kicker | Nav-style label, active gets amber underline |
 | `<AccordionTrigger>` | Mono readout | Instrument-style expandable, sentence-case |

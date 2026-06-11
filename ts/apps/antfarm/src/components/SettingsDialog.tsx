@@ -31,8 +31,14 @@ interface SettingsFormValues {
 }
 
 export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
-  const { apiUrl, setApiUrl, resetToDefault, inferenceApiUrl, setInferenceApiUrl, resetInferenceApiUrl } =
-    useApiConfig();
+  const {
+    apiUrl,
+    setApiUrl,
+    resetToDefault,
+    inferenceApiUrl,
+    setInferenceApiUrl,
+    resetInferenceApiUrl,
+  } = useApiConfig();
   const [isOpen, setIsOpen] = useState(false);
   const effectiveInferenceApiUrl = inferenceApiUrl || "same origin (/ai/v1)";
 

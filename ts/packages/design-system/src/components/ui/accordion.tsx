@@ -17,8 +17,8 @@ function AccordionItem({
   return (
     <AccordionPrimitive.Item
       data-slot="accordion-item"
-      // subtle 1.5px row separator — matches table tbody row treatment
-      className={cn("border-b-[1.5px] border-border last:border-b-0", className)}
+      // subtle token-width row separator — matches table tbody row treatment
+      className={cn("border-b-(length:--border-width) border-border last:border-b-0", className)}
       {...props}
     />
   );

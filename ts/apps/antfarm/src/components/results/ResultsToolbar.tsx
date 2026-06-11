@@ -91,21 +91,19 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
         {/* Stats */}
         <div className="flex items-center gap-2 flex-wrap">
           {totalHits !== undefined && (
-            <Badge variant="secondary" className="font-mono">
+            <Badge className="font-mono">
               {totalHits.toLocaleString()} {totalHits === 1 ? "hit" : "hits"}
             </Badge>
           )}
           {queryTime !== undefined && (
-            <Badge variant="outline" className="font-mono text-xs">
-              {formatQueryTime(queryTime)}
-            </Badge>
+            <Badge className="font-mono text-xs">{formatQueryTime(queryTime)}</Badge>
           )}
         </div>
 
         {/* View Mode Toggle */}
         <div className="flex items-center gap-1 bg-background rounded-none border p-1">
           <Button
-            variant={viewMode === "cards" ? "secondary" : "ghost"}
+            variant={viewMode === "cards" ? "outline" : "ghost"}
             size="sm"
             onClick={() => onViewModeChange("cards")}
             className="h-7 px-2"
@@ -114,7 +112,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
             <LayoutGrid className="h-4 w-4" />
           </Button>
           <Button
-            variant={viewMode === "table" ? "secondary" : "ghost"}
+            variant={viewMode === "table" ? "outline" : "ghost"}
             size="sm"
             onClick={() => onViewModeChange("table")}
             className="h-7 px-2"
@@ -123,7 +121,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
             <Table2 className="h-4 w-4" />
           </Button>
           <Button
-            variant={viewMode === "json" ? "secondary" : "ghost"}
+            variant={viewMode === "json" ? "outline" : "ghost"}
             size="sm"
             onClick={() => onViewModeChange("json")}
             className="h-7 px-2"
@@ -143,7 +141,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="sm" className="h-8">
                   Fields
-                  <Badge variant="secondary" className="ml-2 h-5 px-1.5 text-xs">
+                  <Badge className="ml-2 h-5 px-1.5 text-xs">
                     {visibleFields.size}/{availableFields.length}
                   </Badge>
                 </Button>

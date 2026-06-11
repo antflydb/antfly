@@ -117,12 +117,12 @@ function RankDelta({ change }: { change: number }) {
   }
   if (change > 0) {
     return (
-      <span className="text-xs text-success-600 dark:text-success-400 font-mono font-medium">
+      <span className="text-xs text-success dark:text-success font-mono font-medium">
         +{change}
       </span>
     );
   }
-  return <span className="text-xs text-danger-500 font-mono font-medium">{change}</span>;
+  return <span className="text-xs text-destructive font-mono font-medium">{change}</span>;
 }
 
 const AntflyRerankingPlaygroundPage: React.FC = () => {
@@ -439,24 +439,24 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       {/* Results Stats + Rerank Button */}
       {searchResults && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {searchResults.length} results
           </Badge>
           {searchTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               Search: {searchTime.toFixed(0)}ms
             </Badge>
           )}
           {rerankTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               Rerank: {rerankTime.toFixed(0)}ms
             </Badge>
           )}
           {rerankedResults && (
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Zap className="h-3 w-3" />
               {selectedModel}
             </Badge>
@@ -496,9 +496,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
             <CardHeader className="pb-3">
               <div className="flex items-center gap-2">
                 <CardTitle className="text-lg">Search Results</CardTitle>
-                <Badge variant="outline" className="text-xs">
-                  {selectedIndex || "BM25"}
-                </Badge>
+                <Badge className="text-xs">{selectedIndex || "BM25"}</Badge>
               </div>
             </CardHeader>
             <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">
@@ -532,9 +530,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               <CardHeader className="pb-3">
                 <div className="flex items-center gap-2">
                   <CardTitle className="text-lg">Reranked Results</CardTitle>
-                  <Badge variant="outline" className="text-xs">
-                    {selectedModel}
-                  </Badge>
+                  <Badge className="text-xs">{selectedModel}</Badge>
                 </div>
               </CardHeader>
               <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">

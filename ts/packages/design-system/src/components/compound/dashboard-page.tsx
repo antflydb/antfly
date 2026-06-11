@@ -5,7 +5,7 @@ function DashboardPage({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dashboard-page"
-      className={cn("flex min-w-0 flex-col gap-4", className)}
+      className={cn("flex min-w-0 flex-col gap-8", className)}
       {...props}
     />
   );
@@ -38,7 +38,7 @@ function DashboardPageDescription({ className, ...props }: React.ComponentProps<
   return (
     <p
       data-slot="dashboard-page-description"
-      className={cn("max-w-2xl text-sm text-muted-foreground md:text-base", className)}
+      className={cn("max-w-2xl text-sm leading-relaxed text-muted-foreground md:text-base", className)}
       {...props}
     />
   );
@@ -59,7 +59,8 @@ function DashboardToolbar({ className, ...props }: React.ComponentProps<"div">) 
     <div
       data-slot="dashboard-toolbar"
       className={cn(
-        "flex flex-col gap-3 rounded-[var(--radius)] border bg-card p-3 md:flex-row md:items-end",
+        // borderless row — filters and chips float on the page, no chassis
+        "flex flex-col gap-3 md:flex-row md:items-end",
         className
       )}
       {...props}

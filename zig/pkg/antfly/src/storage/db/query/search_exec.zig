@@ -3816,7 +3816,7 @@ fn textDocNumsForDocIdsAlloc(
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
             const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.deleted) |deleted| {
+            if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
             const stored = seg.reader.storedDoc(local_doc) orelse continue;
@@ -3975,7 +3975,7 @@ fn collectFilteredExplicitTextStats(
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
             const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.deleted) |deleted| {
+            if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
             const doc_id = doc_offset + local_doc;

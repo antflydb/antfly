@@ -375,7 +375,7 @@ const RagPlaygroundPage: React.FC = () => {
         {/* Stats Bar */}
         {pipeline.overallStatus !== "idle" && (
           <div className="flex flex-wrap gap-2">
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Zap className="h-3 w-3" />
               {formatGeneratorSummary(
                 generationData?.provider && generationData?.model
@@ -387,14 +387,13 @@ const RagPlaygroundPage: React.FC = () => {
               )}
             </Badge>
             {(searchData?.hits?.length ?? 0) > 0 && (
-              <Badge variant="outline" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <BookOpen className="h-3 w-3" />
                 {searchData?.hits.length} docs
               </Badge>
             )}
             {confidenceData && (
               <Badge
-                variant="outline"
                 className={cn(
                   "gap-1.5",
                   confidenceData.generation > 0.7
@@ -522,9 +521,7 @@ const RagPlaygroundPage: React.FC = () => {
                   <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
                     <div className="flex items-center justify-between">
                       <span className="font-medium">{hit._id}</span>
-                      <Badge variant="secondary" className="text-xs">
-                        {hit._score?.toFixed(3)}
-                      </Badge>
+                      <Badge className="text-xs">{hit._score?.toFixed(3)}</Badge>
                     </div>
                     {hit._source && (
                       <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap">
@@ -591,8 +588,8 @@ const RagPlaygroundPage: React.FC = () => {
         {/* Active Table/Index Indicator */}
         {selectedTable ? (
           <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-            <Badge variant="secondary">{selectedTable}</Badge>
-            {selectedIndex && <Badge variant="outline">{selectedIndex}</Badge>}
+            <Badge>{selectedTable}</Badge>
+            {selectedIndex && <Badge>{selectedIndex}</Badge>}
           </DashboardToolbar>
         ) : (
           <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
@@ -862,7 +859,7 @@ const RagPlaygroundPage: React.FC = () => {
               <div className="flex items-center justify-between">
                 <CardTitle className="text-lg">Results</CardTitle>
                 {processingTime && (
-                  <Badge variant="outline" className="gap-1.5">
+                  <Badge className="gap-1.5">
                     <Clock className="h-3 w-3" />
                     {(processingTime / 1000).toFixed(1)}s
                   </Badge>

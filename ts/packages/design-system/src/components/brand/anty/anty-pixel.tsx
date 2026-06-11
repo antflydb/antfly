@@ -15,13 +15,18 @@ const sizePx: Record<AntyPixelSize, number> = {
   xl: 192,
 };
 
-export interface AntyPixelProps extends Omit<React.HTMLAttributes<HTMLSpanElement>, "children"> {
+export interface AntyPixelProps extends Omit<
+  React.HTMLAttributes<HTMLSpanElement>,
+  "children"
+> {
   /**
-   * Notch geometry.
-   * - `"square"` — 12×12, blocky square-cut notches at top-right and bottom-left.
-   * - `"diagonal"` — 24×24, stair-stepped diagonal slot (slope −1) at top-right and
-   *   bottom-left, with parallel staircases on both adjacent body edges to match
-   *   the canonical mark's tail direction.
+   * Pixel resolution of the mark.
+   * - `"diagonal"` — 24×24, the high-fidelity Anty silhouette: rounded top-left and
+   *   bottom-right corners with thin slope−1 ("/") slits at the top-right and
+   *   bottom-left, splitting the ring into two interlocking brackets.
+   * - `"square"` — 12×12, a simplified low-res mark: a square ring with a single
+   *   diagonal corner notch at the top-left and a mirrored one at the bottom-right
+   *   (the slits don't read cleanly at this resolution).
    * @default "diagonal"
    */
   variant?: AntyPixelVariant;
@@ -55,7 +60,7 @@ export const AntyPixel = React.forwardRef<HTMLSpanElement, AntyPixelProps>(
       style,
       ...props
     },
-    ref
+    ref,
   ) => {
     const px = sizePx[size];
     const viewBox = variant === "square" ? "0 0 12 12" : "0 0 24 24";
@@ -92,19 +97,25 @@ export const AntyPixel = React.forwardRef<HTMLSpanElement, AntyPixelProps>(
         </svg>
       </span>
     );
-  }
+  },
 );
 AntyPixel.displayName = "AntyPixel";
 
-/* ---------- 12×12 · square-cut notches at TR and BL ---------- */
+/* ----- 12×12 · simplified for the low-res grid: a square ring with a single
+ * diagonal corner notch at the top-left and a mirrored one at the bottom-right.
+ * (The diagonal variant's TR/BL slits don't read cleanly at this resolution.) ----- */
 function PixelSquareFrame({ blink }: { blink: boolean }) {
   return (
     <>
       <g fill="currentColor">
-        <rect x="1" y="1" width="8" height="2" />
-        <rect x="1" y="1" width="2" height="8" />
-        <rect x="9" y="3" width="2" height="8" />
-        <rect x="3" y="9" width="8" height="2" />
+        {/* top + bottom edges, notched at the TL and BR corners */}
+        <rect x="3" y="1" width="8" height="1" />
+        <rect x="2" y="2" width="9" height="1" />
+        {/* left + right bars */}
+        <rect x="1" y="3" width="2" height="6" />
+        <rect x="9" y="3" width="2" height="6" />
+        <rect x="1" y="9" width="9" height="1" />
+        <rect x="1" y="10" width="8" height="1" />
       </g>
       <g fill="currentColor" className={blink ? "anty-pixel-eye" : undefined}>
         <rect x="4" y="5" width="1" height="2" />
@@ -114,39 +125,75 @@ function PixelSquareFrame({ blink }: { blink: boolean }) {
   );
 }
 
-/* ---------- 24×24 · stair-step diagonal slot, slope −1, parallel edges ---------- */
+/* ----- 24×24 · two interlocking brackets: rounded TL/BR corners, /-slits at TR/BL -----
+ *
+ * Faithful to the canonical Anty mark: a ring split into a top-left bracket
+ * (top + left bars, joined by a big rounded top-left corner) and a bottom-right
+ * bracket (bottom + right bars, rounded bottom-right corner). The two brackets
+ * are divided by thin slope−1 ("/") slits running inward from the top-right and
+ * bottom-left corners. Rects are emitted as per-row horizontal runs.
+ */
 function PixelDiagonalFrame({ blink }: { blink: boolean }) {
   return (
     <>
       <g fill="currentColor">
-        {/* TR notch: top edge staircase */}
-        <rect x="2" y="2" width="19" height="1" />
-        <rect x="2" y="3" width="18" height="1" />
-        <rect x="2" y="4" width="17" height="1" />
-        <rect x="2" y="5" width="16" height="1" />
-        {/* TR notch: right edge widening to full bar (parallel staircase) */}
-        <rect x="21" y="6" width="1" height="1" />
-        <rect x="20" y="7" width="2" height="1" />
-        <rect x="19" y="8" width="3" height="1" />
-        <rect x="18" y="9" width="4" height="1" />
-        {/* left bar full, y=6..13 */}
-        <rect x="2" y="6" width="4" height="8" />
-        {/* right bar full, y=10..17 */}
-        <rect x="18" y="10" width="4" height="8" />
-        {/* BL notch: left edge narrowing from full bar (parallel staircase) */}
+        {/* top-left bracket — top bar + left bar, rounded top-left corner.
+            Top/left bars stop 2px short of the TR/BL slits (2px-wide slits). */}
+        <rect x="6" y="2" width="14" height="1" />
+        <rect x="4" y="3" width="15" height="1" />
+        <rect x="3" y="4" width="15" height="1" />
+        <rect x="3" y="5" width="14" height="1" />
+        <rect x="2" y="6" width="5" height="1" />
+        <rect x="2" y="7" width="4" height="1" />
+        <rect x="2" y="8" width="4" height="1" />
+        <rect x="2" y="9" width="4" height="1" />
+        <rect x="2" y="10" width="4" height="1" />
+        <rect x="2" y="11" width="4" height="1" />
+        <rect x="2" y="12" width="4" height="1" />
+        <rect x="2" y="13" width="4" height="1" />
         <rect x="2" y="14" width="4" height="1" />
-        <rect x="2" y="15" width="3" height="1" />
-        <rect x="2" y="16" width="2" height="1" />
-        <rect x="2" y="17" width="1" height="1" />
-        {/* BL notch: bottom edge staircase */}
-        <rect x="6" y="18" width="16" height="1" />
-        <rect x="5" y="19" width="17" height="1" />
-        <rect x="4" y="20" width="18" height="1" />
-        <rect x="3" y="21" width="19" height="1" />
+        <rect x="2" y="15" width="4" height="1" />
+        <rect x="2" y="16" width="4" height="1" />
+        <rect x="2" y="17" width="3" height="1" />
+        <rect x="2" y="18" width="2" height="1" />
+        <rect x="2" y="19" width="1" height="1" />
+        {/* bottom-right bracket — exact 180° point-reflection of the top-left
+            bracket above (each rect mirrored through the center (11.5, 11.5)),
+            so the rounded BR corner reflects the rounded TL corner. */}
+        <rect x="21" y="4" width="1" height="1" />
+        <rect x="20" y="5" width="2" height="1" />
+        <rect x="19" y="6" width="3" height="1" />
+        <rect x="18" y="7" width="4" height="1" />
+        <rect x="18" y="8" width="4" height="1" />
+        <rect x="18" y="9" width="4" height="1" />
+        <rect x="18" y="10" width="4" height="1" />
+        <rect x="18" y="11" width="4" height="1" />
+        <rect x="18" y="12" width="4" height="1" />
+        <rect x="18" y="13" width="4" height="1" />
+        <rect x="18" y="14" width="4" height="1" />
+        <rect x="18" y="15" width="4" height="1" />
+        <rect x="18" y="16" width="4" height="1" />
+        <rect x="17" y="17" width="5" height="1" />
+        <rect x="7" y="18" width="14" height="1" />
+        <rect x="6" y="19" width="15" height="1" />
+        <rect x="5" y="20" width="15" height="1" />
+        <rect x="4" y="21" width="14" height="1" />
       </g>
+      {/* Eyes: triangles pointing inward (apex toward center), echoing the
+          logo's converging arrowheads — see Anty's OFF_LEFT/OFF_RIGHT shapes. */}
       <g fill="currentColor" className={blink ? "anty-pixel-eye" : undefined}>
-        <rect x="8" y="10" width="2" height="4" />
-        <rect x="14" y="10" width="2" height="4" />
+        {/* left eye — base at x8, apex right at x10 */}
+        <rect x="8" y="9" width="1" height="1" />
+        <rect x="8" y="10" width="2" height="1" />
+        <rect x="8" y="11" width="3" height="1" />
+        <rect x="8" y="12" width="2" height="1" />
+        <rect x="8" y="13" width="1" height="1" />
+        {/* right eye — base at x15, apex left at x13 (mirror of left) */}
+        <rect x="15" y="9" width="1" height="1" />
+        <rect x="14" y="10" width="2" height="1" />
+        <rect x="13" y="11" width="3" height="1" />
+        <rect x="14" y="12" width="2" height="1" />
+        <rect x="15" y="13" width="1" height="1" />
       </g>
     </>
   );

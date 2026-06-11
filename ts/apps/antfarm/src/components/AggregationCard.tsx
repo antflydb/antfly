@@ -57,9 +57,7 @@ const AggregationCard: React.FC<AggregationCardProps> = ({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <span className="font-medium text-sm truncate">{name}</span>
-          <Badge variant="outline" className={`text-[10px] border ${colorClass}`}>
-            {type}
-          </Badge>
+          <Badge className={`text-[10px] border ${colorClass}`}>{type}</Badge>
         </div>
         <div className="text-xs text-muted-foreground flex items-center gap-1.5">
           <code className="bg-muted px-1 py-0.5 rounded-none">{aggregation.field || "none"}</code>

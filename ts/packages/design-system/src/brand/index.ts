@@ -1,7 +1,6 @@
 export * from "../components/brand/anty";
 export * from "../components/brand/cta";
 export * from "../components/brand/feature-grid";
-export * from "../components/brand/graph-paper-bg";
 export * from "../components/brand/heading";
 export * from "../components/brand/hero";
 export * from "../components/brand/highlight";

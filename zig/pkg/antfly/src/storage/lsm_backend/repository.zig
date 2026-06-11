@@ -556,21 +556,18 @@ pub fn loadRunTableIndexAllocWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.TableIndex {
-    const footer_bytes = storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len) catch |err| switch (err) {
-        error.EndOfStream, error.FileNotFound => blk: {
-            break :blk null;
-        },
-        else => return err,
-    };
-    defer if (footer_bytes) |bytes| allocator.free(bytes);
+    // A missing or truncated run file usually means a concurrent writer
+    // obsoleted and reclaimed it after this reader loaded the manifest;
+    // propagate the transient error so callers can retry against a fresh
+    // manifest instead of misreporting a format mismatch.
+    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
+    defer allocator.free(footer_bytes);
 
-    if (footer_bytes) |bytes| {
-        if (lsm_table_file.hasFooterMagic(bytes)) {
-            const footer = try lsm_table_file.decodeFooterBytes(bytes);
-            const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-            defer allocator.free(metadata_bytes);
-            return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
-        }
+    if (lsm_table_file.hasFooterMagic(footer_bytes)) {
+        const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+        const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+        defer allocator.free(metadata_bytes);
+        return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
     }
     return error.UnsupportedVersion;
 }
@@ -1023,6 +1020,20 @@ test "repository manifest persist omits run bloom filters" {
     const raw = try storage.storage().readFileAlloc(allocator, manifest_path, 1024);
     defer allocator.free(raw);
     try std.testing.expect(raw.len < 512);
+}
+
+test "repository run table index load surfaces missing run file" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const missing_path = try runPath(allocator, "/repository-missing-run", 7);
+    defer allocator.free(missing_path);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
+    );
 }
 
 test "repository streams state run publication through table builder accounting" {

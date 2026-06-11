@@ -8,7 +8,6 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
-  GraphPaperBg,
   Select,
   SelectContent,
   SelectItem,
@@ -258,9 +257,7 @@ function NodeCard({ store, shardCount }: { store: StoreInfo; shardCount: number 
         <div className="text-[11px] text-muted-foreground font-mono truncate">{apiHost}</div>
         <div className="flex items-center justify-between text-[11px]">
           <span className="text-muted-foreground">{timeAgo(store.last_seen)}</span>
-          <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-            {shardCount} shards
-          </Badge>
+          <Badge className="text-[10px] px-1.5 py-0">{shardCount} shards</Badge>
         </div>
       </CardContent>
     </Card>
@@ -362,7 +359,6 @@ const ClusterPage: React.FC = () => {
     <DashboardPage>
       {/* Section A: Cluster Health Header */}
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <div className="flex items-center gap-3">

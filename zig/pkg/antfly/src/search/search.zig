@@ -1405,7 +1405,7 @@ fn scoreFastTerm(state: FastTermState, hit: inverted.PostingsIterator.Hit, globa
 }
 
 fn isSegmentDocDeleted(seg: *const index_mod.SegmentEntry, doc_id: u32) bool {
-    if (seg.deleted) |deleted| return deleted.contains(doc_id);
+    if (seg.shared.deleted) |deleted| return deleted.contains(doc_id);
     return false;
 }
 

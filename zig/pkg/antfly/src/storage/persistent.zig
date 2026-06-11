@@ -1723,7 +1723,7 @@ pub const PersistentIndex = struct {
             const seg = &snap.segments[seg_idx];
             inputs[i] = .{
                 .reader = &seg.reader,
-                .deleted = seg.deleted,
+                .deleted = seg.shared.deleted,
             };
         }
 

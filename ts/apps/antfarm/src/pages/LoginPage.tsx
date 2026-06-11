@@ -8,7 +8,6 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-  GraphPaperBg,
   Input,
   Label,
 } from "@antfly/design-system";
@@ -52,7 +51,6 @@ export function LoginPage() {
 
   return (
     <AuthShell>
-      <GraphPaperBg className="absolute inset-0 -z-10" />
       <div className="flex flex-col items-center gap-4">
         <Anty size={64} expression="excited" float={false} showGlow />
       </div>
