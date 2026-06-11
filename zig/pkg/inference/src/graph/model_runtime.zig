@@ -379,6 +379,7 @@ pub const PrefillRequest = struct {
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
+    force_host_logits: bool = false,
 };
 
 pub const DecodeRequest = struct {

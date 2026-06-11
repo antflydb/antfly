@@ -2807,6 +2807,7 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
+        "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data public API listener uses public API request body limit",
