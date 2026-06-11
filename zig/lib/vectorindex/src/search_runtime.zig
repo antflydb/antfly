@@ -22,6 +22,11 @@ const search_types = @import("search_types.zig");
 const posting_member_cache_miss_count_limit: usize = 256;
 const posting_member_cache_reuse_admit_count: u8 = 2;
 const posting_delta_tail_cache_slot_count: usize = 4;
+const posting_delta_tail_prefetch_min: usize = 0;
+const posting_delta_tail_prefetch_default: usize = 3;
+const posting_delta_tail_prefetch_max: usize = 8;
+const posting_base_header_cache_slot_count: usize = 8;
+const posting_base_header_cache_max_header_bytes: usize = 32;
 
 pub const RerankLookup = struct {
     item_index: usize,
@@ -33,6 +38,7 @@ pub const PostingMemberCacheEntry = struct {
     posting_id: u64,
     mutation_version: u64,
     members: []u64,
+    score: u32 = 1,
 };
 
 pub const PostingMemberCacheResult = struct {
@@ -46,6 +52,43 @@ pub const PostingDeltaTailCacheView = struct {
     sequences: []const u64,
     ids: []const u64,
     ops: []const u8,
+};
+
+pub const PostingBaseHeaderCacheView = struct {
+    generation: u64,
+    member_count: usize,
+};
+
+const PostingBaseHeaderCacheEntry = struct {
+    posting_id: u64 = 0,
+    valid: bool = false,
+    header_len: usize = 0,
+    header_bytes: [posting_base_header_cache_max_header_bytes]u8 = undefined,
+    generation: u64 = 0,
+    member_count: usize = 0,
+
+    fn matches(self: *const PostingBaseHeaderCacheEntry, posting_id: u64, header_bytes: []const u8) bool {
+        return self.valid and
+            self.posting_id == posting_id and
+            self.header_len == header_bytes.len and
+            std.mem.eql(u8, self.header_bytes[0..self.header_len], header_bytes);
+    }
+
+    fn set(self: *PostingBaseHeaderCacheEntry, posting_id: u64, header_bytes: []const u8, generation: u64, member_count: usize) void {
+        self.posting_id = posting_id;
+        self.valid = true;
+        self.header_len = header_bytes.len;
+        @memcpy(self.header_bytes[0..header_bytes.len], header_bytes);
+        self.generation = generation;
+        self.member_count = member_count;
+    }
+
+    fn view(self: *const PostingBaseHeaderCacheEntry) PostingBaseHeaderCacheView {
+        return .{
+            .generation = self.generation,
+            .member_count = self.member_count,
+        };
+    }
 };
 
 const PostingDeltaTailCacheEntry = struct {
@@ -128,6 +171,12 @@ pub const SearchScratch = struct {
     posting_delta_tail_cache: [posting_delta_tail_cache_slot_count]PostingDeltaTailCacheEntry = [_]PostingDeltaTailCacheEntry{.{}} ** posting_delta_tail_cache_slot_count,
     posting_delta_tail_cache_active_slot: usize = 0,
     posting_delta_tail_cache_next_slot: usize = 0,
+    posting_delta_tail_prefetch_limit: usize = posting_delta_tail_prefetch_default,
+    posting_delta_tail_prefetch_hits: u32 = 0,
+    posting_delta_tail_prefetch_misses: u32 = 0,
+    posting_delta_tail_prefetch_decoded_bytes: u64 = 0,
+    posting_base_header_cache: [posting_base_header_cache_slot_count]PostingBaseHeaderCacheEntry = [_]PostingBaseHeaderCacheEntry{.{}} ** posting_base_header_cache_slot_count,
+    posting_base_header_cache_next_slot: usize = 0,
 
     pub fn init(
         alloc: Allocator,
@@ -267,6 +316,36 @@ pub const SearchScratch = struct {
         return null;
     }
 
+    pub fn postingDeltaTailPrefetchLimit(self: *const SearchScratch) usize {
+        return self.posting_delta_tail_prefetch_limit;
+    }
+
+    pub fn notePostingDeltaTailCacheHit(self: *SearchScratch) void {
+        self.posting_delta_tail_prefetch_hits +|= 1;
+        self.tunePostingDeltaTailPrefetch();
+    }
+
+    pub fn notePostingDeltaTailCacheMiss(self: *SearchScratch) void {
+        self.posting_delta_tail_prefetch_misses +|= 1;
+        self.tunePostingDeltaTailPrefetch();
+    }
+
+    pub fn notePostingDeltaTailPrefetchDecodedBytes(self: *SearchScratch, byte_count: usize) void {
+        self.posting_delta_tail_prefetch_decoded_bytes +|= @intCast(byte_count);
+    }
+
+    fn tunePostingDeltaTailPrefetch(self: *SearchScratch) void {
+        const total = self.posting_delta_tail_prefetch_hits + self.posting_delta_tail_prefetch_misses;
+        if (total < 8) return;
+        if (self.posting_delta_tail_prefetch_hits * 2 >= self.posting_delta_tail_prefetch_misses and self.posting_delta_tail_prefetch_limit < posting_delta_tail_prefetch_max) {
+            self.posting_delta_tail_prefetch_limit += 1;
+        } else if (self.posting_delta_tail_prefetch_misses > self.posting_delta_tail_prefetch_hits * 3 and self.posting_delta_tail_prefetch_limit > posting_delta_tail_prefetch_min) {
+            self.posting_delta_tail_prefetch_limit -= 1;
+        }
+        self.posting_delta_tail_prefetch_hits /= 2;
+        self.posting_delta_tail_prefetch_misses /= 2;
+    }
+
     pub fn beginPostingDeltaTailCache(self: *SearchScratch, posting_id: u64) void {
         if (self.findPostingDeltaTailCacheSlot(posting_id)) |slot| {
             self.posting_delta_tail_cache_active_slot = slot;
@@ -292,6 +371,21 @@ pub const SearchScratch = struct {
             if (entry.valid and entry.posting_id == posting_id) return i;
         }
         return null;
+    }
+
+    pub fn cachedPostingBaseHeader(self: *SearchScratch, posting_id: u64, header_bytes: []const u8) ?PostingBaseHeaderCacheView {
+        if (header_bytes.len > posting_base_header_cache_max_header_bytes) return null;
+        for (&self.posting_base_header_cache) |*entry| {
+            if (entry.matches(posting_id, header_bytes)) return entry.view();
+        }
+        return null;
+    }
+
+    pub fn cachePostingBaseHeader(self: *SearchScratch, posting_id: u64, header_bytes: []const u8, generation: u64, member_count: usize) void {
+        if (header_bytes.len > posting_base_header_cache_max_header_bytes) return;
+        const slot = self.posting_base_header_cache_next_slot;
+        self.posting_base_header_cache_next_slot = (self.posting_base_header_cache_next_slot + 1) % self.posting_base_header_cache.len;
+        self.posting_base_header_cache[slot].set(posting_id, header_bytes, generation, member_count);
     }
 
     pub fn setPostingMemberCacheAdmissionEnabled(self: *SearchScratch, enabled: bool) void {
@@ -328,6 +422,7 @@ pub const SearchScratch = struct {
         const slot = self.posting_member_cache_slots.get(posting_id) orelse return null;
         if (slot >= self.posting_member_cache.items.len) return null;
         if (self.posting_member_cache.items[slot].mutation_version != mutation_version) return null;
+        self.posting_member_cache.items[slot].score = self.posting_member_cache.items[slot].score +| 4;
         const last = self.posting_member_cache.items.len - 1;
         if (slot != last) {
             std.mem.swap(PostingMemberCacheEntry, &self.posting_member_cache.items[slot], &self.posting_member_cache.items[last]);
@@ -353,6 +448,7 @@ pub const SearchScratch = struct {
         const would_evict = self.posting_member_cache_bytes + member_bytes > self.max_posting_member_cache_bytes and self.posting_member_cache.items.len != 0;
         const large_entry = member_bytes > self.max_posting_member_cache_bytes / 2;
         const miss_count = self.posting_member_cache_miss_counts.get(posting_id) orelse 0;
+        const candidate_score: u32 = @max(@as(u32, 1), miss_count);
         if (would_evict and large_entry and miss_count < posting_member_cache_reuse_admit_count) {
             result.admission_skips += 1;
             result.member_bytes = self.posting_member_cache_bytes;
@@ -360,6 +456,11 @@ pub const SearchScratch = struct {
         }
         var evictions: u64 = 0;
         while (self.max_posting_member_cache_bytes != 0 and self.posting_member_cache_bytes + member_bytes > self.max_posting_member_cache_bytes and self.posting_member_cache.items.len != 0) {
+            if (!postingMemberCacheCandidateBeatsVictim(candidate_score, members.len, member_bytes, self.posting_member_cache.items[0])) {
+                result.admission_skips += 1;
+                result.member_bytes = self.posting_member_cache_bytes;
+                return result;
+            }
             self.evictPostingMemberCacheEntry(alloc, 0);
             evictions += 1;
         }
@@ -368,6 +469,7 @@ pub const SearchScratch = struct {
             .posting_id = posting_id,
             .mutation_version = mutation_version,
             .members = try alloc.dupe(u64, members),
+            .score = candidate_score,
         });
         self.posting_member_cache_slots.putAssumeCapacity(posting_id, self.posting_member_cache.items.len - 1);
         _ = self.posting_member_cache_miss_counts.remove(posting_id);
@@ -392,9 +494,32 @@ pub const SearchScratch = struct {
     }
 
     pub fn trimVectorBatchForRetention(self: *SearchScratch, alloc: Allocator, max_retained_bytes: u64) bool {
-        if (max_retained_bytes == 0 or self.bytes() <= max_retained_bytes or self.vector_batch.len == 0) return false;
-        alloc.free(self.vector_batch);
-        self.vector_batch = &.{};
+        return self.trimColdScratchForRetention(alloc, max_retained_bytes);
+    }
+
+    pub fn trimColdScratchForRetention(self: *SearchScratch, alloc: Allocator, max_retained_bytes: u64) bool {
+        var trimmed = false;
+        if (max_retained_bytes == 0 or self.bytes() <= max_retained_bytes) return false;
+        if (self.vector_batch.len != 0) {
+            alloc.free(self.vector_batch);
+            self.vector_batch = &.{};
+            trimmed = true;
+        }
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        for (&self.posting_delta_tail_cache) |*entry| {
+            entry.deinit(alloc);
+            trimmed = true;
+        }
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        self.posting_overlay_removed_members.deinit(alloc);
+        self.posting_overlay_removed_members = .empty;
+        self.posting_overlay_appended_positions.deinit(alloc);
+        self.posting_overlay_appended_positions = .empty;
+        alloc.free(self.posting_overlay_appended_ids);
+        self.posting_overlay_appended_ids = &.{};
+        alloc.free(self.posting_overlay_appended_live);
+        self.posting_overlay_appended_live = &.{};
+        self.posting_overlay_appended_count = 0;
         return true;
     }
 
@@ -541,6 +666,14 @@ fn byteLen(values: anytype) u64 {
 fn approximateHashMapBytes(capacity: usize, comptime key_size: usize, comptime value_size: usize) u64 {
     if (capacity == 0) return 0;
     return @intCast(capacity * (key_size + value_size + 2));
+}
+
+fn postingMemberCacheCandidateBeatsVictim(candidate_score: u32, candidate_members: usize, candidate_bytes: u64, victim: PostingMemberCacheEntry) bool {
+    if (candidate_score >= victim.score) return true;
+    const candidate_saved = @as(u128, candidate_score) * @as(u128, candidate_members + 16);
+    const victim_saved = @as(u128, victim.score) * @as(u128, victim.members.len + 16);
+    const victim_bytes = @as(u128, byteLen(victim.members));
+    return candidate_saved * victim_bytes > victim_saved * @as(u128, candidate_bytes);
 }
 
 test "SearchScratch grows error bounds with vector fetch capacity" {
