@@ -83,7 +83,6 @@ import {
   DropdownMenuTrigger,
   EmptyState,
   FeatureGrid,
-  GraphPaperBg,
   Hero,
   HoverCard,
   HoverCardContent,
@@ -1233,25 +1232,6 @@ demoCategories.brand.demos = [
           </h3>
         </div>
       </div>
-    ),
-  },
-  {
-    slug: "graph-paper-bg",
-    name: "GraphPaperBg",
-    description:
-      "Subtle hexagonal honeycomb texture. Drop behind hero content to anchor it without ornament.",
-    render: () => (
-      <GraphPaperBg className="rounded-lg border border-border">
-        <div className="p-12">
-          <MonoLabel className="mb-4 block">Example</MonoLabel>
-          <p className="font-display text-2xl font-bold">
-            Content sits on top of a subtle hex grid.
-          </p>
-          <p className="mt-2 text-muted-foreground">
-            Used on www-antfly's hero to give presence without gradients.
-          </p>
-        </div>
-      </GraphPaperBg>
     ),
   },
   {

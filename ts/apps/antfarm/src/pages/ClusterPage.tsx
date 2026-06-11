@@ -8,7 +8,6 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
-  GraphPaperBg,
   Select,
   SelectContent,
   SelectItem,
@@ -360,7 +359,6 @@ const ClusterPage: React.FC = () => {
     <DashboardPage>
       {/* Section A: Cluster Health Header */}
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <div className="flex items-center gap-3">

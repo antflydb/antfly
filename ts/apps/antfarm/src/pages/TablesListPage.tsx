@@ -15,7 +15,6 @@ import {
   DialogDescription,
   DialogTitle,
   DialogTrigger,
-  GraphPaperBg,
 } from "@antfly/design-system";
 import type { Table as AntflyTable, TableStatus } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -181,7 +180,6 @@ const TablesListPage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>

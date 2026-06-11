@@ -6,7 +6,6 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-  GraphPaperBg,
   Highlight,
   Kicker,
   Lockup,
@@ -745,28 +744,6 @@ export default function FoundationsPage() {
             </div>
           </div>
         </div>
-      </section>
-
-      <Separator />
-
-      {/* Graph paper ----------------------------------------------------- */}
-      <section className="space-y-6">
-        <SectionHeading
-          eyebrow="Textures"
-          title="Graph paper"
-          file="src/styles.css :: .grid-paper"
-        />
-        <GraphPaperBg className="border-[1.5px] border-border-strong">
-          <div className="p-12 text-center">
-            <Kicker>--grid-color · --grid-size</Kicker>
-            <p className="mt-3 font-display text-xl font-bold">
-              Subtle hex honeycomb behind hero content.
-            </p>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Stroke color swaps automatically between light and dark modes.
-            </p>
-          </div>
-        </GraphPaperBg>
       </section>
 
       <Separator />

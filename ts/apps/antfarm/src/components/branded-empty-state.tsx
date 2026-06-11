@@ -16,7 +16,8 @@ export function AntyEmptyState({ title, description, action, className }: AntyEm
           <Anty
             size={56}
             expression="idle"
-            float
+            pixelated
+            float={false}
             blink
             showShadow={false}
             showGlow

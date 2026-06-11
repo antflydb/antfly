@@ -9,7 +9,6 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
-  GraphPaperBg,
   Input,
   MonoLabel,
   Sheet,
@@ -845,7 +844,6 @@ const TypeContextBanner: React.FC<{
 
   return (
     <div className="relative isolate mb-8 rounded-none border border-border overflow-hidden">
-      <GraphPaperBg className="absolute inset-0 -z-10" />
       <div className="p-5">
         <div className="flex items-start gap-4">
           <div className="flex items-center justify-center w-9 h-9 rounded-none bg-muted shrink-0">
