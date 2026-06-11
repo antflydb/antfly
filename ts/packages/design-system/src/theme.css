@@ -146,6 +146,10 @@
   --radius-lg: var(--radius-lg);
   --radius-xl: var(--radius-xl);
 
+  /* 11px mono-label size — the kicker/badge register */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+
   --font-sans: var(--font-sans);
   --font-display: var(--font-display);
   --font-mono: var(--font-mono);
