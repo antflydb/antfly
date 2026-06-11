@@ -3719,6 +3719,37 @@ pub const ApiHttpServer = struct {
         return group_ids;
     }
 
+    fn restoreManifestGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+    ) ![]u64 {
+        _ = self;
+        var manifest = try backups_api.readManifestFromLocation(alloc, backup_location, backup_id);
+        defer manifest.deinit(alloc);
+        const group_ids = try alloc.alloc(u64, manifest.shards.len);
+        for (manifest.shards, 0..) |shard, i| group_ids[i] = shard.group_id;
+        return group_ids;
+    }
+
+    fn overwriteRestoreDropGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        table_name: []const u8,
+        backup_id: []const u8,
+    ) ![]u64 {
+        if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const group_ids = try tableGroupIdsFromSnapshot(alloc, &snapshot, table_name);
+            if (group_ids.len > 0) return group_ids;
+            alloc.free(group_ids);
+        }
+        return try self.restoreManifestGroupIdsAlloc(alloc, backup_location, backup_id);
+    }
+
     pub fn loadOwnedTableRecord(self: *ApiHttpServer, table_name: []const u8) !?metadata_table_manager.TableRecord {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -5692,22 +5723,20 @@ pub const ApiHttpServer = struct {
                 const exists = self.tableExists(table_name) catch return error.InternalFailure;
                 if (!exists) continue;
 
+                const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
                 var local_drop_group_ids: ?[]u64 = null;
                 defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
                 if (self.table_writes != null) {
-                    if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
-                        var snapshot = snapshot_value;
-                        defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = tableGroupIdsFromSnapshot(alloc, &snapshot, table_name) catch return error.InternalFailure;
-                    }
+                    local_drop_group_ids = self.overwriteRestoreDropGroupIdsAlloc(alloc, location, table_name, table_backup_id) catch return error.InternalFailure;
                 }
 
                 self.source.dropTable(alloc, table_name) catch |err| {
                     statuses[i].@"error" = switch (err) {
+                        error.TableNotFound => null,
                         error.UnsupportedOperation => "method not allowed",
                         else => "failed to remove existing table",
                     };
-                    continue;
+                    if (statuses[i].@"error" != null) continue;
                 };
                 if (self.table_writes) |write_source| {
                     const group_ids = local_drop_group_ids orelse &.{};
@@ -16692,6 +16721,210 @@ test "api http server table restore is triggered when read path is still empty" 
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     try std.testing.expect(write_source.restored);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"triggered\"") != null);
+}
+
+test "api http server cluster overwrite restore tolerates already absent metadata drop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-overwrite", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    const table_backup_id = try backups_api.clusterTableBackupId(alloc, "snap-cluster", "docs");
+    defer alloc.free(table_backup_id);
+
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = 42,
+        .start_key = try alloc.dupe(u8, ""),
+        .end_key = null,
+        .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, table_backup_id, 42),
+    };
+    defer freeBackupShards(alloc, shards);
+
+    var table_manifest = try backups_api.createManifest(alloc, table_backup_id, &.{
+        .table_id = 1,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer table_manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root_abs, &table_manifest);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, table_backup_id),
+    };
+    defer cluster_entry.deinit(alloc);
+    var cluster_manifest = try backups_api.createClusterManifest(alloc, "snap-cluster", location_uri, &.{cluster_entry});
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        present: bool = true,
+        restored: bool = false,
+        local_drop_used_manifest_group: bool = false,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = if (self.state.present)
+                @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..])
+            else
+                @constCast((&[_]metadata_table_manager.TableRecord{})[0..]);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = true;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = false;
+            return error.TableNotFound;
+        }
+    };
+
+    const FakeReads = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            const body = if (self.state.restored) "{\"_id\":\"doc:1\"}\n" else "";
+            return .{ .ndjson = try inner_alloc.dupe(u8, body) };
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    const FakeWrites = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .drop_table = dropTable,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), group_ids.len);
+            try std.testing.expectEqual(@as(u64, 42), group_ids[0]);
+            self.state.local_drop_used_manifest_group = true;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            self.state.restored = true;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var read_source = FakeReads{ .state = &state };
+    var write_source = FakeWrites{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"restore_mode\":\"overwrite\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(state.local_drop_used_manifest_group);
+    try std.testing.expect(state.restored);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"triggered\"") != null);
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {
