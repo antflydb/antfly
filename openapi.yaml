@@ -3871,7 +3871,11 @@ paths:
 
         across source rows in key order. Use `next_key` from the response as
 
-        the next request's `from_key` to continue a large table repair.
+        the next request's `from_key` for simple single-cursor continuation.
+
+        Distributed repair controllers should persist `shard_cursors` and
+
+        resume each shard independently when scanning large sharded tables.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifactRange
@@ -6253,6 +6257,41 @@ components:
         error_code:
           type: string
           description: Stable error code for the failed document reprocess attempt.
+    DocumentArtifactReprocessShardCursor:
+      type: object
+      required:
+        - next_key
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - limit
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Physical table group that produced this cursor, when known.
+        next_key:
+          type: string
+          description: Source key cursor for resuming this shard-local repair pass.
+        scanned:
+          type: integer
+          description: Number of source rows scanned by this shard-local pass.
+        reprocessed:
+          type: integer
+          description: Number of source rows whose artifact was reprocessed by this shard-local pass.
+        skipped:
+          type: integer
+          description: Number of scanned source rows that no longer had a reprocessable source document
+            in this shard-local pass.
+        failed:
+          type: integer
+          description: Number of scanned source rows that failed in this shard-local pass.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective scan limit used by this shard-local pass.
     DocumentArtifactTableReprocessResponse:
       type: object
       required:
@@ -6264,6 +6303,7 @@ components:
         - failed
         - limit
         - failures
+        - shard_cursors
       properties:
         reprocess:
           type: string
@@ -6297,6 +6337,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DocumentArtifactReprocessFailure'
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors for distributed repairs. Durable background repair
+            jobs should persist and resume these independently instead of collapsing progress into a single
+            global cursor.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessShardCursor'
     ClusterDataNodeStatus:
       type: object
       required:

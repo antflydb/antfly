@@ -17,6 +17,7 @@ pub const DocumentArtifactManifestList = types.DocumentArtifactManifestList;
 pub const DocumentArtifactReprocessResponse = types.DocumentArtifactReprocessResponse;
 pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableReprocessRequest;
 pub const DocumentArtifactReprocessFailure = types.DocumentArtifactReprocessFailure;
+pub const DocumentArtifactReprocessShardCursor = types.DocumentArtifactReprocessShardCursor;
 pub const DocumentArtifactTableReprocessResponse = types.DocumentArtifactTableReprocessResponse;
 pub const ClusterDataNodeStatus = types.ClusterDataNodeStatus;
 pub const ClusterDataRangeStatus = types.ClusterDataRangeStatus;

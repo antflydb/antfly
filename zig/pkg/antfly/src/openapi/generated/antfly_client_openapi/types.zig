@@ -107,6 +107,23 @@ pub const DocumentArtifactReprocessFailure = struct {
     error_code: []const u8,
 };
 
+pub const DocumentArtifactReprocessShardCursor = struct {
+    /// Physical table group that produced this cursor, when known.
+    group_id: ?i64 = null,
+    /// Source key cursor for resuming this shard-local repair pass.
+    next_key: []const u8,
+    /// Number of source rows scanned by this shard-local pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed by this shard-local pass.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass.
+    skipped: i64,
+    /// Number of scanned source rows that failed in this shard-local pass.
+    failed: i64,
+    /// Effective scan limit used by this shard-local pass.
+    limit: i64,
+};
+
 pub const ClusterDataNodeStatus = struct {
     data_id: i64,
     node_id: i64,
@@ -3313,6 +3330,8 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     /// Source key cursor for the next bounded pass, when more rows may remain.
     next_key: ?[]const u8 = null,
     failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
 /// Typed Zig status view for table data topology and range placement.

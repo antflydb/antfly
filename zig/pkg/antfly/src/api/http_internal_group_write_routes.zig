@@ -258,6 +258,15 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             key: []const u8,
             error_code: []const u8,
         };
+        const ShardCursorResponse = struct {
+            group_id: ?u64,
+            next_key: []const u8,
+            scanned: usize,
+            reprocessed: usize,
+            skipped: usize,
+            failed: usize,
+            limit: u32,
+        };
         const Response = struct {
             reprocess: []const u8,
             artifact_name: []const u8,
@@ -268,6 +277,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             limit: u32,
             next_key: ?[]const u8,
             failures: []const FailureResponse,
+            shard_cursors: []const ShardCursorResponse,
         };
         const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, artifact_route.artifact_name);
         defer ctx.alloc.free(decoded_artifact_name);
@@ -298,6 +308,19 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         for (result.failures, failures) |failure, *out| {
             out.* = .{ .key = failure.key, .error_code = failure.error_code };
         }
+        const shard_cursors = try ctx.alloc.alloc(ShardCursorResponse, result.shard_cursors.len);
+        defer ctx.alloc.free(shard_cursors);
+        for (result.shard_cursors, shard_cursors) |cursor, *out| {
+            out.* = .{
+                .group_id = cursor.group_id,
+                .next_key = cursor.next_key,
+                .scanned = cursor.scanned,
+                .reprocessed = cursor.reprocessed,
+                .skipped = cursor.skipped,
+                .failed = cursor.failed,
+                .limit = cursor.limit,
+            };
+        }
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, Response{
             .reprocess = "triggered",
             .artifact_name = decoded_artifact_name,
@@ -308,6 +331,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             .limit = result.limit,
             .next_key = result.next_key,
             .failures = failures,
+            .shard_cursors = shard_cursors,
         });
     }
     if (routes.Routes.matchGroupDocumentArtifactPlacementUpdate(path)) |artifact_route| {

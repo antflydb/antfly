@@ -940,6 +940,21 @@ pub const DocumentArtifactReprocessFailure = struct {
     }
 };
 
+pub const DocumentArtifactReprocessShardCursor = struct {
+    group_id: ?u64 = null,
+    next_key: []u8,
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+
+    pub fn deinit(self: *DocumentArtifactReprocessShardCursor, alloc: Allocator) void {
+        alloc.free(self.next_key);
+        self.* = undefined;
+    }
+};
+
 pub const DocumentArtifactTableReprocessResult = struct {
     scanned: usize = 0,
     reprocessed: usize = 0,
@@ -948,11 +963,14 @@ pub const DocumentArtifactTableReprocessResult = struct {
     limit: u32 = 0,
     next_key: ?[]u8 = null,
     failures: []DocumentArtifactReprocessFailure = &.{},
+    shard_cursors: []DocumentArtifactReprocessShardCursor = &.{},
 
     pub fn deinit(self: *DocumentArtifactTableReprocessResult, alloc: Allocator) void {
         if (self.next_key) |value| alloc.free(value);
         for (self.failures) |*failure| failure.deinit(alloc);
         if (self.failures.len > 0) alloc.free(self.failures);
+        for (self.shard_cursors) |*cursor| cursor.deinit(alloc);
+        if (self.shard_cursors.len > 0) alloc.free(self.shard_cursors);
         self.* = undefined;
     }
 };

@@ -889,6 +889,15 @@ pub fn handleReprocessDocumentArtifactRange(
         key: []const u8,
         error_code: []const u8,
     };
+    const ShardCursorResponse = struct {
+        group_id: ?u64,
+        next_key: []const u8,
+        scanned: usize,
+        reprocessed: usize,
+        skipped: usize,
+        failed: usize,
+        limit: u32,
+    };
     const Response = struct {
         reprocess: []const u8,
         artifact_name: []const u8,
@@ -899,6 +908,7 @@ pub fn handleReprocessDocumentArtifactRange(
         limit: u32,
         next_key: ?[]const u8,
         failures: []const FailureResponse,
+        shard_cursors: []const ShardCursorResponse,
     };
 
     var parsed = std.json.parseFromSlice(Request, alloc, if (body.len > 0) body else "{}", .{}) catch {
@@ -927,6 +937,19 @@ pub fn handleReprocessDocumentArtifactRange(
             .error_code = failure.error_code,
         };
     }
+    const shard_cursors = try alloc.alloc(ShardCursorResponse, result.shard_cursors.len);
+    defer alloc.free(shard_cursors);
+    for (result.shard_cursors, shard_cursors) |cursor, *out| {
+        out.* = .{
+            .group_id = cursor.group_id,
+            .next_key = cursor.next_key,
+            .scanned = cursor.scanned,
+            .reprocessed = cursor.reprocessed,
+            .skipped = cursor.skipped,
+            .failed = cursor.failed,
+            .limit = cursor.limit,
+        };
+    }
 
     return .{
         .status = 202,
@@ -940,6 +963,7 @@ pub fn handleReprocessDocumentArtifactRange(
             .limit = result.limit,
             .next_key = result.next_key,
             .failures = failures,
+            .shard_cursors = shard_cursors,
         }, .{}),
     };
 }
@@ -1775,6 +1799,16 @@ test "public document artifact range reprocess handler returns bounded summary" 
                 .key = try alloc.dupe(u8, "doc:b"),
                 .error_code = try alloc.dupe(u8, "InvalidDataUri"),
             };
+            const shard_cursors = try alloc.alloc(db_mod.types.DocumentArtifactReprocessShardCursor, 1);
+            shard_cursors[0] = .{
+                .group_id = 42,
+                .next_key = try alloc.dupe(u8, "doc:b"),
+                .scanned = 2,
+                .reprocessed = 1,
+                .skipped = 0,
+                .failed = 1,
+                .limit = 10,
+            };
             return .{
                 .scanned = 2,
                 .reprocessed = 1,
@@ -1783,6 +1817,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
                 .limit = 10,
                 .next_key = try alloc.dupe(u8, "doc:b"),
                 .failures = failures,
+                .shard_cursors = shard_cursors,
             };
         }
     };
@@ -1807,6 +1842,14 @@ test "public document artifact range reprocess handler returns bounded summary" 
             key: []const u8,
             error_code: []const u8,
         },
+        shard_cursors: []const struct {
+            group_id: ?u64,
+            next_key: []const u8,
+            scanned: usize,
+            reprocessed: usize,
+            failed: usize,
+            limit: u32,
+        },
     };
     var parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, resp.body, .{
         .ignore_unknown_fields = true,
@@ -1823,4 +1866,11 @@ test "public document artifact range reprocess handler returns bounded summary" 
     try std.testing.expectEqual(@as(usize, 1), parsed.value.failures.len);
     try std.testing.expectEqualStrings("doc:b", parsed.value.failures[0].key);
     try std.testing.expectEqualStrings("InvalidDataUri", parsed.value.failures[0].error_code);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors.len);
+    try std.testing.expectEqual(@as(?u64, 42), parsed.value.shard_cursors[0].group_id);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.shard_cursors[0].next_key);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.shard_cursors[0].scanned);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].reprocessed);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].failed);
+    try std.testing.expectEqual(@as(u32, 10), parsed.value.shard_cursors[0].limit);
 }

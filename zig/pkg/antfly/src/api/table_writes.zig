@@ -168,6 +168,8 @@ fn mergeDocumentArtifactTableReprocessResult(
     alloc: std.mem.Allocator,
     dst: *db_mod.types.DocumentArtifactTableReprocessResult,
     dst_failures: *std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure),
+    dst_shard_cursors: *std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor),
+    group_id: ?u64,
     src: db_mod.types.DocumentArtifactTableReprocessResult,
 ) !void {
     dst.scanned += src.scanned;
@@ -177,6 +179,33 @@ fn mergeDocumentArtifactTableReprocessResult(
     dst.limit += src.limit;
     if (dst.next_key == null) {
         if (src.next_key) |next_key| dst.next_key = try alloc.dupe(u8, next_key);
+    }
+    if (src.shard_cursors.len > 0) {
+        for (src.shard_cursors) |cursor| {
+            const next_key_copy = try alloc.dupe(u8, cursor.next_key);
+            errdefer alloc.free(next_key_copy);
+            try dst_shard_cursors.append(alloc, .{
+                .group_id = cursor.group_id orelse group_id,
+                .next_key = next_key_copy,
+                .scanned = cursor.scanned,
+                .reprocessed = cursor.reprocessed,
+                .skipped = cursor.skipped,
+                .failed = cursor.failed,
+                .limit = cursor.limit,
+            });
+        }
+    } else if (src.next_key) |next_key| {
+        const next_key_copy = try alloc.dupe(u8, next_key);
+        errdefer alloc.free(next_key_copy);
+        try dst_shard_cursors.append(alloc, .{
+            .group_id = group_id,
+            .next_key = next_key_copy,
+            .scanned = src.scanned,
+            .reprocessed = src.reprocessed,
+            .skipped = src.skipped,
+            .failed = src.failed,
+            .limit = src.limit,
+        });
     }
     for (src.failures) |failure| {
         {
@@ -197,6 +226,15 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
         key: []const u8,
         error_code: []const u8,
     };
+    const RemoteShardCursor = struct {
+        group_id: ?u64 = null,
+        next_key: []const u8,
+        scanned: usize = 0,
+        reprocessed: usize = 0,
+        skipped: usize = 0,
+        failed: usize = 0,
+        limit: u32 = 0,
+    };
     const RemoteResult = struct {
         scanned: usize = 0,
         reprocessed: usize = 0,
@@ -205,6 +243,7 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
         limit: u32 = 0,
         next_key: ?[]const u8 = null,
         failures: []const RemoteFailure = &.{},
+        shard_cursors: []const RemoteShardCursor = &.{},
     };
 
     var parsed = try std.json.parseFromSlice(RemoteResult, alloc, body, .{});
@@ -223,6 +262,24 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
         };
         initialized += 1;
     }
+    var shard_cursors = try alloc.alloc(db_mod.types.DocumentArtifactReprocessShardCursor, parsed.value.shard_cursors.len);
+    var initialized_cursors: usize = 0;
+    errdefer {
+        for (shard_cursors[0..initialized_cursors]) |*cursor| cursor.deinit(alloc);
+        if (shard_cursors.len > 0) alloc.free(shard_cursors);
+    }
+    for (parsed.value.shard_cursors, shard_cursors) |remote, *out| {
+        out.* = .{
+            .group_id = remote.group_id,
+            .next_key = try alloc.dupe(u8, remote.next_key),
+            .scanned = remote.scanned,
+            .reprocessed = remote.reprocessed,
+            .skipped = remote.skipped,
+            .failed = remote.failed,
+            .limit = remote.limit,
+        };
+        initialized_cursors += 1;
+    }
 
     return .{
         .scanned = parsed.value.scanned,
@@ -232,6 +289,7 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
         .limit = parsed.value.limit,
         .next_key = if (parsed.value.next_key) |value| try alloc.dupe(u8, value) else null,
         .failures = failures,
+        .shard_cursors = shard_cursors,
     };
 }
 
@@ -6708,9 +6766,12 @@ pub const ProvisionedTableWriteSource = struct {
         var result = db_mod.types.DocumentArtifactTableReprocessResult{};
         errdefer result.deinit(alloc);
         var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
+        var shard_cursors = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor).empty;
         errdefer {
             for (failures.items) |*failure| failure.deinit(alloc);
             failures.deinit(alloc);
+            for (shard_cursors.items) |*cursor| cursor.deinit(alloc);
+            shard_cursors.deinit(alloc);
         }
 
         var handled_any = false;
@@ -6718,10 +6779,11 @@ pub const ProvisionedTableWriteSource = struct {
             var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
             defer group_result.deinit(alloc);
             handled_any = true;
-            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, group_result);
+            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
         }
         if (!handled_any) return null;
         result.failures = try failures.toOwnedSlice(alloc);
+        result.shard_cursors = try shard_cursors.toOwnedSlice(alloc);
         return result;
     }
 
@@ -7670,9 +7732,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         var result = db_mod.types.DocumentArtifactTableReprocessResult{};
         errdefer result.deinit(alloc);
         var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
+        var shard_cursors = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessShardCursor).empty;
         errdefer {
             for (failures.items) |*failure| failure.deinit(alloc);
             failures.deinit(alloc);
+            for (shard_cursors.items) |*cursor| cursor.deinit(alloc);
+            shard_cursors.deinit(alloc);
         }
 
         var handled_any = false;
@@ -7694,16 +7759,17 @@ pub const HostedProvisionedTableWriteSource = struct {
                 };
                 defer group_result.deinit(alloc);
                 handled_any = true;
-                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, group_result);
+                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
                 continue;
             }
             var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
             defer group_result.deinit(alloc);
             handled_any = true;
-            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, group_result);
+            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
         }
         if (!handled_any) return null;
         result.failures = try failures.toOwnedSlice(alloc);
+        result.shard_cursors = try shard_cursors.toOwnedSlice(alloc);
         return result;
     }
 
