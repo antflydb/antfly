@@ -26,6 +26,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_mod = @import("../raft/mod.zig");
+const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -3369,7 +3370,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .status_only => .status_only,
                 },
                 .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
-                .start_index_workers = if (mode == .startup_catch_up or mode == .query_readonly) false else true,
+                .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
                 .start_optional_runtimes = mode != .startup_catch_up and mode != .query_readonly,
                 .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
                 .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
@@ -5982,57 +5983,49 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableRestorePlan,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (plan.manifest.shards.len != 1) return error.UnsupportedBackupFormat;
+        if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
 
-        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, plan.manifest.shards[0].snapshot_path });
-        defer alloc.free(snapshot_root);
+        const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
+        defer alloc.free(local_location);
+
         self.beginLocalRestoreMutation(table_name);
         errdefer self.abortLocalRestoreMutation(table_name);
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
 
-        const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-        while (true) {
-            if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
-            if (platform_time.monotonicNs() >= ready_deadline_ns) break;
-            sleepNs(50 * std.time.ns_per_ms);
-        }
+        for (plan.manifest.shards) |shard| {
+            const group_id = shard.group_id;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
 
-        runTestBeforeRestoreWorkHook();
-        try prepareLocalTablePathForRestore(alloc, path);
-        db_mod.DB.restoreSnapshotToDeferredRuntimeRepair(alloc, snapshot_root, path, .{
-            .identity_namespace = identity_namespace,
-        }, .{
-            .backup_id = plan.manifest.backup_id,
-            .location = plan.backup_root,
-            .snapshot_path = plan.manifest.shards[0].snapshot_path,
-            .group_id = group_id,
-        }) catch |err| {
-            if (err == error.IdentityNamespaceMismatch) {
-                std.log.warn("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_root={s} err={}", .{
-                    table_name,
-                    group_id,
-                    path,
-                    snapshot_root,
-                    err,
-                });
-            } else {
-                std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_root={s} err={}", .{
-                    table_name,
-                    group_id,
-                    path,
-                    snapshot_root,
-                    err,
-                });
+            const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
+                if (platform_time.monotonicNs() >= ready_deadline_ns) break;
+                sleepNs(50 * std.time.ns_per_ms);
             }
-            return err;
-        };
 
-        try self.repairRestoredTableRuntimeStateBlocking(alloc, path, group_id, table_name);
+            runTestBeforeRestoreWorkHook();
+            backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
+                .backup_id = plan.manifest.backup_id,
+                .location = local_location,
+                .snapshot_path = shard.snapshot_path,
+            }, .{
+                .expected_table_name = table_name,
+                .expected_identity_namespace = identity_namespace,
+            }) catch |err| {
+                std.log.err("provisioned restoreTable failed table={s} group_id={d} path={s} snapshot_path={s} err={}", .{
+                    table_name,
+                    group_id,
+                    path,
+                    shard.snapshot_path,
+                    err,
+                });
+                return err;
+            };
+            self.requestRestoreRepairCatchUp(table_name, group_id);
+        }
 
         self.finishLocalRestoreMutation(table_name);
         self.notifyLocalChange(table_name, .structural);
@@ -8440,7 +8433,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
                         .open_mode = .writer_no_replay,
-                        .start_index_workers = true,
+                        .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
@@ -8457,7 +8450,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .open_mode = .writer_no_replay,
-                        .start_index_workers = true,
+                        .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
