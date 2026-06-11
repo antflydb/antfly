@@ -74,7 +74,7 @@ Loud kind-of-thing labels — short, important, often colored. Shorter content t
 
 - Tracking: **0.05–0.06em**
 - Size: **11–12px**
-- Weight: **500–700**
+- Weight: **500** (the casing and tracking carry the presence; bold is reserved for rare emphasis)
 - Color: usually semantic (destructive, success, warning, info) or amber accent
 
 **Use for:**
@@ -179,7 +179,7 @@ Buttons deliberately have **no tracking** — earlier prototypes felt exaggerate
 ## Weight conventions
 
 - **Aeonik:** regular (400) or medium (500). Avoid bold — the size carries the moment.
-- **Mono:** regular (400) for readouts, medium (500) for labels and buttons, bold (600–700) for callouts.
+- **Mono:** regular (400) for readouts, medium (500) for labels, buttons, and callouts. Bold callouts are the exception, not the rule.
 - **Inter:** regular (400) for body, **medium (500) for headings**. Avoid semibold — restraint is part of the voice.
 
 ---
