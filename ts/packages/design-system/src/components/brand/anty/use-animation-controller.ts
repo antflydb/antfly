@@ -163,6 +163,8 @@ export function useAnimationController(
   const shadowTrackerRef = useRef<ShadowTrackerControls | null>(null);
   const glowSystemRef = useRef<GlowSystemControls | null>(null);
   const pixelateSystemRef = useRef<PixelateSystemControls | null>(null);
+  /** Intent recorded before the pixelate system exists; replayed on creation. */
+  const pendingPixelateRef = useRef<{ form: "pixel"; opts?: PixelateOptions } | null>(null);
   const reducedMotionRef = useRef(reducedMotion);
   reducedMotionRef.current = reducedMotion;
 
@@ -295,6 +297,11 @@ export function useAnimationController(
           sizePx
         );
         pixelateSystemRef.current.setReducedMotion(reducedMotionRef.current);
+        const pending = pendingPixelateRef.current;
+        if (pending) {
+          pendingPixelateRef.current = null;
+          pixelateSystemRef.current.pixelate(pending.opts);
+        }
       }
     }
   }, [elements, isOff, logoMode, activeScale, sizeScale, offScale, eyeStyle, sizePx]);
@@ -663,11 +670,18 @@ export function useAnimationController(
     return controllerRef.current.getDebugInfo();
   }, []);
 
+  // The pixelate system is created one commit AFTER mount effects run (its
+  // canvas/vector elements register via callback refs into `elements` state),
+  // so a pixelate()/depixelate() called from a mount effect — e.g. the
+  // declarative `pixelated` prop — would land on null and be silently
+  // dropped. Queue the intent and replay it when the system is created.
   const pixelate = useCallback((opts?: PixelateOptions) => {
-    pixelateSystemRef.current?.pixelate(opts);
+    if (pixelateSystemRef.current) pixelateSystemRef.current.pixelate(opts);
+    else pendingPixelateRef.current = { form: "pixel", opts };
   }, []);
   const depixelate = useCallback((opts?: PixelateOptions) => {
-    pixelateSystemRef.current?.depixelate(opts);
+    if (pixelateSystemRef.current) pixelateSystemRef.current.depixelate(opts);
+    else pendingPixelateRef.current = null;
   }, []);
   const togglePixelate = useCallback((opts?: PixelateOptions) => {
     pixelateSystemRef.current?.toggle(opts);
