@@ -1,37 +1,6 @@
-import { Anty, Button, EmptyState } from "@antfly/design-system";
-import type { ReactNode } from "react";
+import { AntyEmptyState, Button } from "@antfly/design-system";
 
-interface AntyEmptyStateProps {
-  title: string;
-  description?: string;
-  action?: ReactNode;
-  className?: string;
-}
-
-export function AntyEmptyState({ title, description, action, className }: AntyEmptyStateProps) {
-  return (
-    <EmptyState
-      icon={
-        <div className="grid size-16 place-items-center">
-          <Anty
-            size={56}
-            expression="idle"
-            pixelated
-            float={false}
-            blink
-            showShadow={false}
-            showGlow
-            eyeStyle="alive"
-          />
-        </div>
-      }
-      title={title}
-      description={description}
-      action={action}
-      className={className}
-    />
-  );
-}
+export { AntyEmptyState };
 
 export function NoTablesState({ onCreate }: { onCreate?: () => void }) {
   return (

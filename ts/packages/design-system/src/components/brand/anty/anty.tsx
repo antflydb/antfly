@@ -616,16 +616,15 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
   }, [expression, isOff, animationController.playEmotion, animationController.isReady]);
 
   // Declarative pixelation: ripple in/out when the `pixelated` prop flips.
+  // No isReady gate: isReady is a ref snapshotted into the memoized controller
+  // object, so it reads as a stale `false` on mount and never re-fires the
+  // effect (refs don't re-render). Callback refs create the pixelate system
+  // before effects run, and pixelate/depixelate are idempotent no-ops until it
+  // exists, so calling directly is safe — and makes `pixelated` work at mount.
   useEffect(() => {
-    if (!animationController.isReady) return;
     if (pixelated) animationController.pixelate();
     else animationController.depixelate();
-  }, [
-    pixelated,
-    animationController.isReady,
-    animationController.pixelate,
-    animationController.depixelate,
-  ]);
+  }, [pixelated, animationController.pixelate, animationController.depixelate]);
 
   // Shadow/glow elements are always rendered so the tracker/glow system can
   // attach once. When neither is visible, the outer container collapses to a

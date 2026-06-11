@@ -1,4 +1,5 @@
 import type * as React from "react";
+import { Anty } from "@/components/brand/anty";
 import { cn } from "@/lib/utils";
 
 interface EmptyStateProps extends Omit<React.HTMLAttributes<HTMLDivElement>, "title"> {
@@ -35,5 +36,38 @@ export function EmptyState({
       ) : null}
       {action ? <div className="mt-6">{action}</div> : null}
     </div>
+  );
+}
+
+type AntyEmptyStateProps = Omit<EmptyStateProps, "icon">;
+
+/**
+ * Branded empty state — Anty held statically in its pixelated form (no
+ * float), a quiet pixel brand moment. Eyes use the `original` style so the
+ * vector↔pixel cross-fade matches the logo texture.
+ */
+export function AntyEmptyState({ title, description, action, className, ...props }: AntyEmptyStateProps) {
+  return (
+    <EmptyState
+      icon={
+        <div className="grid size-16 place-items-center">
+          <Anty
+            size={56}
+            expression="idle"
+            pixelated
+            float={false}
+            blink
+            showShadow={false}
+            showGlow
+            eyeStyle="original"
+          />
+        </div>
+      }
+      title={title}
+      description={description}
+      action={action}
+      className={className}
+      {...props}
+    />
   );
 }

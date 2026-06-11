@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
   AlertTitle,
+  AntyEmptyState,
   AspectRatio,
   Avatar,
   AvatarFallback,
@@ -1176,6 +1177,18 @@ demoCategories.compound.demos = [
         title="No clusters yet"
         description="Provision your first cluster to start indexing documents and running queries."
         action={<Button>Create cluster</Button>}
+      />
+    ),
+  },
+  {
+    slug: "anty-empty-state",
+    name: "AntyEmptyState",
+    description: "Branded empty state — Anty held in its static pixelated form.",
+    render: () => (
+      <AntyEmptyState
+        title="No tables yet"
+        description="Create your first table to start indexing and searching your data."
+        action={<Button variant="brand">Create Table</Button>}
       />
     ),
   },
