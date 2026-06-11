@@ -112,6 +112,18 @@ pub const DocumentArtifactReprocessShardCursor = struct {
     limit: i64,
 };
 
+/// Request to create a durable table artifact reprocess job.
+pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// Exclusive lower bound source document key.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// When true, immediately runs the first bounded pass before returning the job state.
+    advance: ?bool = null,
+};
+
 pub const ClusterDataNodeStatus = struct {
     data_id: i64,
     node_id: i64,
@@ -1427,6 +1439,49 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     failures: []const DocumentArtifactReprocessFailure,
     /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
+};
+
+pub const DocumentArtifactReprocessJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Table containing the source documents being repaired.
+    table_name: []const u8,
+    /// Name of the derived artifact being repaired.
+    artifact_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing completion status derived from the phase and remaining cursors.
+    reprocess_status: []const u8,
+    /// Original exclusive lower bound for the job.
+    from_key: []const u8,
+    /// Original inclusive upper bound for the job, or empty for the end of the table/range.
+    to_key: []const u8,
+    /// Current per-shard bounded pass limit.
+    limit: i64,
+    /// Single-shard continuation key when no shard cursors are present.
+    next_key: ?[]const u8 = null,
+    /// Cumulative source rows scanned by completed passes.
+    scanned: i64,
+    /// Cumulative source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Cumulative source rows skipped by completed passes.
+    skipped: i64,
+    /// Cumulative source rows that failed during completed passes.
+    failed: i64,
+    /// Number of shard-local continuations still pending.
+    pending_shards: i64,
+    /// Failures from the most recent completed pass.
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors to resume on the next advance operation.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+    /// Last terminal or transient job error, when available.
+    last_error: ?[]const u8 = null,
+    /// Monotonic server timestamp when the job was created.
+    created_at_millis: i64,
+    /// Monotonic server timestamp when the job was last updated.
+    last_updated_at_millis: i64,
+    /// Monotonic server timestamp after which the retained job status may be removed.
+    expires_at_millis: i64,
 };
 
 /// Typed Zig status view for table data topology and range placement.

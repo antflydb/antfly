@@ -89,6 +89,10 @@ pub const Routes = struct {
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const reprocess_suffix = ":reprocess";
+    pub const reprocess_jobs_suffix = "/reprocess-jobs";
+    pub const reprocess_jobs_marker = "/reprocess-jobs/";
+    pub const advance_suffix = ":advance";
+    pub const cancel_suffix = ":cancel";
     pub const placement_update_suffix = ":placement";
     pub const child_range_batch_suffix = ":child-range-batch";
 
@@ -329,6 +333,17 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const TableArtifactReprocessJobs = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const TableArtifactReprocessJob = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    };
+
     pub const TransactionSession = struct {
         txn_id: []const u8,
     };
@@ -459,6 +474,59 @@ pub const Routes = struct {
         return .{
             .table_name = table_name,
             .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactReprocessJobs(path: []const u8) ?TableArtifactReprocessJobs {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, reprocess_jobs_suffix)) return null;
+        const effective_path = path[0 .. path.len - reprocess_jobs_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactReprocessJob(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, "");
+    }
+
+    pub fn matchTableArtifactReprocessJobAdvance(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, advance_suffix);
+    }
+
+    pub fn matchTableArtifactReprocessJobCancel(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, cancel_suffix);
+    }
+
+    fn matchTableArtifactReprocessJobWithSuffix(path: []const u8, suffix: []const u8) ?TableArtifactReprocessJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (suffix.len > 0 and !std.mem.endsWith(u8, path, suffix)) return null;
+        const effective_path = if (suffix.len > 0) path[0 .. path.len - suffix.len] else path;
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_rest = rest[artifacts_index + artifacts_marker.len ..];
+        const jobs_index = std.mem.indexOf(u8, artifact_rest, reprocess_jobs_marker) orelse return null;
+        const artifact_name = artifact_rest[0..jobs_index];
+        const job_id = artifact_rest[jobs_index + reprocess_jobs_marker.len ..];
+        if (artifact_name.len == 0 or job_id.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        if (suffix.len == 0 and (std.mem.endsWith(u8, job_id, advance_suffix) or std.mem.endsWith(u8, job_id, cancel_suffix))) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+            .job_id = job_id,
         };
     }
 
@@ -1072,6 +1140,16 @@ test "public api routes compile" {
     const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1:reprocess").?;
     try std.testing.expectEqualStrings("docs", table_reprocess.table_name);
     try std.testing.expectEqualStrings("document_units_v1", table_reprocess.artifact_name);
+    const table_reprocess_jobs = Routes.matchTableArtifactReprocessJobs("/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
+    try std.testing.expectEqualStrings("docs", table_reprocess_jobs.table_name);
+    try std.testing.expectEqualStrings("document_units_v1", table_reprocess_jobs.artifact_name);
+    const table_reprocess_job = Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job.job_id);
+    const table_reprocess_job_advance = Routes.matchTableArtifactReprocessJobAdvance("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job_advance.job_id);
+    const table_reprocess_job_cancel = Routes.matchTableArtifactReprocessJobCancel("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:cancel").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job_cancel.job_id);
+    try std.testing.expect(Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance") == null);
     try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);

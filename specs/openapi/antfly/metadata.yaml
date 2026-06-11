@@ -1836,6 +1836,130 @@ components:
           description: Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
           items:
             $ref: "#/components/schemas/DocumentArtifactReprocessShardCursor"
+    DocumentArtifactReprocessJobStartRequest:
+      type: object
+      description: Request to create a durable table artifact reprocess job.
+      properties:
+        from_key:
+          type: string
+          description: Exclusive lower bound source document key.
+          default: ""
+        to_key:
+          type: string
+          description: Inclusive upper bound source document key, or empty for the end of the table/range.
+          default: ""
+        limit:
+          type: integer
+          format: uint32
+          description: Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+          default: 100
+        advance:
+          type: boolean
+          description: When true, immediately runs the first bounded pass before returning the job state.
+          default: true
+    DocumentArtifactReprocessJob:
+      type: object
+      required:
+        - job_id
+        - table_name
+        - artifact_name
+        - phase
+        - reprocess_status
+        - from_key
+        - to_key
+        - limit
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - pending_shards
+        - failures
+        - shard_cursors
+        - created_at_millis
+        - last_updated_at_millis
+        - expires_at_millis
+      properties:
+        job_id:
+          type: integer
+          format: uint64
+          description: Server-assigned durable repair job identifier.
+        table_name:
+          type: string
+          description: Table containing the source documents being repaired.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact being repaired.
+        phase:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - cancelled
+          description: Lifecycle phase of the repair job.
+        reprocess_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+            - stopped
+          description: User-facing completion status derived from the phase and remaining cursors.
+        from_key:
+          type: string
+          description: Original exclusive lower bound for the job.
+        to_key:
+          type: string
+          description: Original inclusive upper bound for the job, or empty for the end of the table/range.
+        limit:
+          type: integer
+          format: uint32
+          description: Current per-shard bounded pass limit.
+        next_key:
+          type: string
+          nullable: true
+          description: Single-shard continuation key when no shard cursors are present.
+        scanned:
+          type: integer
+          description: Cumulative source rows scanned by completed passes.
+        reprocessed:
+          type: integer
+          description: Cumulative source rows whose artifact was reprocessed.
+        skipped:
+          type: integer
+          description: Cumulative source rows skipped by completed passes.
+        failed:
+          type: integer
+          description: Cumulative source rows that failed during completed passes.
+        pending_shards:
+          type: integer
+          description: Number of shard-local continuations still pending.
+        failures:
+          type: array
+          description: Failures from the most recent completed pass.
+          items:
+            $ref: "#/components/schemas/DocumentArtifactReprocessFailure"
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors to resume on the next advance operation.
+          items:
+            $ref: "#/components/schemas/DocumentArtifactReprocessShardCursor"
+        last_error:
+          type: string
+          nullable: true
+          description: Last terminal or transient job error, when available.
+        created_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp when the job was created.
+        last_updated_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp when the job was last updated.
+        expires_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp after which the retained job status may be removed.
     ClusterDataNodeStatus:
       type: object
       required:
@@ -7363,6 +7487,179 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Create a derived document artifact reprocess job
+      description: |
+        Creates a durable user-facing repair job for a derived document
+        artifact. The job advances through the same bounded per-shard repair
+        primitive used by `:reprocess`, and stores returned continuation
+        cursors so hosted controllers can resume large sharded table repairs
+        without collapsing progress into a single global key cursor.
+      tags:
+        - data_operations
+      operationId: startDocumentArtifactReprocessJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DocumentArtifactReprocessJobStartRequest"
+      responses:
+        "202":
+          description: Reprocess job was created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get derived document artifact reprocess job status
+      tags:
+        - data_operations
+      operationId: getDocumentArtifactReprocessJob
+      responses:
+        "200":
+          description: Reprocess job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a derived document artifact reprocess job
+      description: Runs one bounded repair pass and persists the resulting job state.
+      tags:
+        - data_operations
+      operationId: advanceDocumentArtifactReprocessJob
+      responses:
+        "202":
+          description: Reprocess job advanced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "200":
+          description: Reprocess job was already terminal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a derived document artifact reprocess job
+      tags:
+        - data_operations
+      operationId: cancelDocumentArtifactReprocessJob
+      responses:
+        "200":
+          description: Reprocess job was cancelled or already terminal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentArtifactReprocessJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/documents/{key}/artifacts/{artifactName}:

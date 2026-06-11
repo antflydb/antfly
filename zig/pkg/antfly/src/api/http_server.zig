@@ -52,6 +52,7 @@ const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -254,6 +255,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
+    artifact_reprocess_job_store_path: ?[]const u8 = null,
+    artifact_reprocess_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -866,6 +869,7 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
+    artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
 
@@ -903,6 +907,10 @@ pub const ApiHttpServer = struct {
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
+            }),
+            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(alloc, .{
+                .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
+                .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -957,6 +965,17 @@ pub const ApiHttpServer = struct {
             opened.* = try distributed_join.OpenedJoinJobStore.open(alloc, join_job_path);
             server.join_job_store.opened_join_job_store = opened;
         }
+        if (cfg.artifact_reprocess_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.artifact_reprocess_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.artifact_reprocess_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(artifact_reprocess_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, job_path);
+            server.artifact_reprocess_job_store.opened_store = opened;
+        }
         return server;
     }
 
@@ -987,6 +1006,7 @@ pub const ApiHttpServer = struct {
             self.alloc.destroy(opened);
         }
         self.join_job_store.deinit();
+        self.artifact_reprocess_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
@@ -1080,6 +1100,7 @@ pub const ApiHttpServer = struct {
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
+        self.artifact_reprocess_job_store.cleanupExpiredJobs();
     }
 
     fn localTableRuntimeStatuses(
@@ -3123,6 +3144,15 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
+                return try self.handlePublicStartDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
+                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
+                return try self.handlePublicCancelDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
             if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
                 return try self.handlePublicReprocessDocumentArtifactRange(artifact_route.table_name, artifact_route.artifact_name, req.body);
             }
@@ -3346,6 +3376,11 @@ pub const ApiHttpServer = struct {
                         .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
                     },
                 });
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
+                return try self.handlePublicDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
             }
         }
         if (req.method == .GET) {
@@ -5864,6 +5899,146 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try textResponse(self.alloc, 400, "invalid request");
+        };
+        defer parsed.deinit();
+
+        const encoded = try self.artifact_reprocess_job_store.startJob(self.alloc, table_name, artifact_name, parsed.value);
+        defer self.alloc.free(encoded);
+        if (parsed.value.advance) {
+            var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+    }
+
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+    }
+
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
+    }
+
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        defer self.alloc.free(cancelled);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+    }
+
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+        if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+
+        const running = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .running, null);
+        defer self.alloc.free(running);
+
+        const source = self.table_writes orelse {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        };
+
+        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, state.shard_cursors.len);
+        defer self.alloc.free(shard_resumes);
+        for (state.shard_cursors, shard_resumes) |cursor, *out_resume| {
+            out_resume.* = .{
+                .group_id = cursor.group_id,
+                .next_key = cursor.next_key,
+                .limit = cursor.limit,
+            };
+        }
+        const req = db_mod.types.DocumentArtifactTableReprocessRequest{
+            .from_key = if (shard_resumes.len > 0) "" else (state.next_key orelse state.from_key),
+            .to_key = state.to_key,
+            .limit = state.limit,
+            .shard_cursors = shard_resumes,
+        };
+        const result = source.reprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 503, "doc identity unavailable");
+            },
+            error.InvalidArgument => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 400, "invalid request");
+            },
+            error.NotFound => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            else => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, state.job_id, err });
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            },
+        };
+        if (result == null) {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        }
+        var pass = result.?;
+        defer pass.deinit(self.alloc);
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, state, pass);
+        defer self.alloc.free(updated);
+        return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
+    }
+
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableBackup(self.alloc, table_name, body, self.tableApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
@@ -6203,6 +6378,11 @@ pub const RequiredPermission = struct {
     permission_type: usermgr.PermissionType,
 };
 
+fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
+    if (encoded_job_id.len == 0) return error.InvalidJobId;
+    return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
+}
+
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
@@ -6239,6 +6419,38 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         },
     };
     if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .admin,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return .{
         .resource_type = .table,
         .resource = artifact.table_name,
         .permission_type = switch (method) {
