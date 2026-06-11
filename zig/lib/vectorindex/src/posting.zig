@@ -1281,6 +1281,7 @@ pub const PostingBacklogStats = struct {
 pub const PostingStore = struct {
     const overlay_plan_min_delta_records: usize = 8;
     const compact_sorted_delta_max_records: usize = 64;
+    const delta_tail_prefetch_posting_count: usize = 3;
 
     const OwnedMemberScratch = struct {
         member_ids: []VectorId = &.{},
@@ -2060,46 +2061,10 @@ pub const PostingStore = struct {
             else => @TypeOf(scratch),
         };
         if (comptime @hasDecl(Scratch, "cachedPostingDeltaTail")) {
-            if (scratch.cachedPostingDeltaTail(posting_id, base_generation)) |cached| {
-                var applied: usize = 0;
-                var use_overlay_plan = false;
-                var buffered: [overlay_plan_min_delta_records]PostingDeltaRecord = undefined;
-                var buffered_count: usize = 0;
-                var i: usize = 0;
-                while (i < cached.ids.len) : (i += 1) {
-                    const record = PostingDeltaRecord{
-                        .sequence = 0,
-                        .op = try cachedPostingDeltaOp(cached.ops[i]),
-                        .vector_id = cached.ids[i],
-                    };
-                    applied += 1;
-                    if (use_overlay_plan) {
-                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
-                    } else if (buffered_count < buffered.len) {
-                        buffered[buffered_count] = record;
-                        buffered_count += 1;
-                    } else {
-                        use_overlay_plan = true;
-                        var buffered_index: usize = 0;
-                        while (buffered_index < buffered_count) : (buffered_index += 1) {
-                            try PostingFormat.applyPostingOverlayRecord(alloc, scratch, buffered[buffered_index]);
-                        }
-                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
-                    }
-                }
-                if (use_overlay_plan) {
-                    member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
-                } else {
-                    try scratch.ensureMemberIdCapacity(alloc, member_count.* + buffered_count);
-                    for (buffered[0..buffered_count]) |record| {
-                        PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
-                    }
-                }
-                return applied;
-            }
+            if (scratch.cachedPostingDeltaTail(posting_id)) |cached| return try applyCachedDeltaTailIntoScratch(alloc, scratch, member_count, base_generation, cached);
         }
         if (comptime @hasDecl(Scratch, "beginPostingDeltaTailCache")) {
-            scratch.beginPostingDeltaTailCache(posting_id, base_generation);
+            scratch.beginPostingDeltaTailCache(posting_id);
             errdefer scratch.invalidatePostingDeltaTailCache();
         }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
@@ -2117,11 +2082,11 @@ pub const PostingStore = struct {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
+                if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
+                    try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+                }
                 if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 applied += 1;
-                if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
-                    try scratch.appendPostingDeltaTailCacheRecord(alloc, record.vector_id, @intFromEnum(record.op));
-                }
                 if (use_overlay_plan) {
                     try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
                 } else if (buffered_count < buffered.len) {
@@ -2138,6 +2103,9 @@ pub const PostingStore = struct {
             }
             maybe_entry = try cursor.next();
         }
+        if (comptime @hasDecl(Scratch, "beginPostingDeltaTailCache")) {
+            try prefetchNearbyDeltaTails(alloc, scratch, &cursor, maybe_entry, posting_id);
+        }
         if (use_overlay_plan) {
             member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
         } else {
@@ -2149,6 +2117,79 @@ pub const PostingStore = struct {
         return applied;
     }
 
+    fn applyCachedDeltaTailIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+        cached: anytype,
+    ) !usize {
+        var applied: usize = 0;
+        var use_overlay_plan = false;
+        var buffered: [overlay_plan_min_delta_records]PostingDeltaRecord = undefined;
+        var buffered_count: usize = 0;
+        var i: usize = 0;
+        while (i < cached.ids.len) : (i += 1) {
+            if (PostingFormat.deltaSequenceGeneration(cached.sequences[i]) <= base_generation) continue;
+            const record = PostingDeltaRecord{
+                .sequence = cached.sequences[i],
+                .op = try cachedPostingDeltaOp(cached.ops[i]),
+                .vector_id = cached.ids[i],
+            };
+            applied += 1;
+            if (use_overlay_plan) {
+                try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+            } else if (buffered_count < buffered.len) {
+                buffered[buffered_count] = record;
+                buffered_count += 1;
+            } else {
+                use_overlay_plan = true;
+                var buffered_index: usize = 0;
+                while (buffered_index < buffered_count) : (buffered_index += 1) {
+                    try PostingFormat.applyPostingOverlayRecord(alloc, scratch, buffered[buffered_index]);
+                }
+                try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+            }
+        }
+        if (use_overlay_plan) {
+            member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
+        } else {
+            try scratch.ensureMemberIdCapacity(alloc, member_count.* + buffered_count);
+            for (buffered[0..buffered_count]) |record| {
+                PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
+            }
+        }
+        return applied;
+    }
+
+    fn prefetchNearbyDeltaTails(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        cursor: *vector_store.Cursor,
+        first_entry: ?vector_store.Entry,
+        current_posting_id: PostingId,
+    ) !void {
+        var maybe_entry = first_entry;
+        var cached_postings: usize = 0;
+        var active_posting_id: ?PostingId = null;
+        while (maybe_entry) |entry| {
+            const next_posting_id = postingDeltaKeyPostingId(entry.key) orelse break;
+            if (next_posting_id <= current_posting_id) break;
+            if (active_posting_id == null or active_posting_id.? != next_posting_id) {
+                if (cached_postings >= delta_tail_prefetch_posting_count) break;
+                scratch.beginPostingDeltaTailCache(next_posting_id);
+                errdefer scratch.invalidatePostingDeltaTailCache();
+                active_posting_id = next_posting_id;
+                cached_postings += 1;
+            }
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            while (try iterator.next()) |record| {
+                try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
+            }
+            maybe_entry = try cursor.next();
+        }
+    }
+
     fn cachedPostingDeltaOp(raw: u8) !PostingDeltaOp {
         return switch (raw) {
             @intFromEnum(PostingDeltaOp.insert) => .insert,
@@ -2156,6 +2197,11 @@ pub const PostingStore = struct {
             @intFromEnum(PostingDeltaOp.replace) => .replace,
             else => error.Corrupted,
         };
+    }
+
+    fn postingDeltaKeyPostingId(key: []const u8) ?PostingId {
+        if (key.len != 18 or key[0] != 'P' or key[1] != 'D') return null;
+        return std.mem.readInt(u64, key[2..10], .big);
     }
 
     pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {

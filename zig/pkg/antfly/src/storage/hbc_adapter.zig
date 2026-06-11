@@ -5857,7 +5857,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn repairDirtyPostingsWithOptions(self: *HBCIndex, options: PostingMaintenanceOptions) !PostingMaintenanceResult {
-        var txn = try self.beginRuntimeWriteTxn();
+        var txn = try self.beginRuntimeBatchTxn();
         errdefer txn.abort();
         const result = try vectorindex_hbc_index.repairDirtyPostingsTxnWithOptions(self, &txn, options);
         try self.flushMetadata(&txn);
