@@ -29,8 +29,8 @@ export const InputGroupTextarea = forwardRef<HTMLTextAreaElement, InputGroupText
     <textarea
       ref={ref}
       className={cn(
-        // mono "instrument readout" voice — matches Input
-        "w-full resize-none border-0 bg-transparent px-3 py-2 font-mono text-[13px] text-foreground",
+        // body voice — matches Input; the prompt the user types is a phrase
+        "w-full resize-none border-0 bg-transparent px-3 py-2 font-sans text-sm text-foreground",
         "placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50",
         className
       )}

@@ -8,8 +8,9 @@ function Input({ className, type, ...props }: React.ComponentProps<"input">) {
       type={type}
       data-slot="input"
       className={cn(
-        // mono "instrument readout" voice
-        "font-mono text-[13px] text-foreground placeholder:text-muted-foreground",
+        // body voice — what the user types is a phrase, not an instrument
+        // readout. Identifier-ish fields can opt back in with font-mono.
+        "font-sans text-sm text-foreground placeholder:text-muted-foreground",
         // structure: square, deliberate token-width (--border-width) border, no shadow
         "h-9 w-full min-w-0 rounded-none border-(length:--border-width) border-input bg-transparent",
         "px-3 py-1.5",

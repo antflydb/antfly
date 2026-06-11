@@ -7,6 +7,8 @@ Antfly's voice in three registers. Pick the right one with one question:
 
 **Chrome beats content shape.** When the element is part of the instrument chassis (a menu item, accordion trigger, button, list selector), use mono even if the text is sentence-shaped. The chassis voice wins. Inter is reserved for content that's *read* as a phrase (Card/Dialog/Sheet titles, page headings, paragraphs).
 
+**…but what the user types is theirs.** Free-text entry (`<Input>`, `<Textarea>`, `<InputGroupTextarea>` — chat prompts, search boxes, descriptions) defaults to the body voice (Inter, `text-sm`): the user is writing a phrase, not reading an instrument. Selects stay mono — their values are system-supplied. Fields whose content is genuinely an identifier (table names, IDs, query DSL) opt back in with `font-mono`.
+
 ## The three registers
 
 | Register | Font | What it says |
@@ -223,6 +225,7 @@ Is this a phrase or sentence?
 | `<AlertTitle>` | Mono callout | Kind of message |
 | `<Button>` | Mono readout | Action label, tight |
 | `<DropdownMenuItem>` / `<SelectItem>` | Mono readout | List item, name-like |
+| `<Input>` / `<Textarea>` | Inter body | User-typed phrase (opt into mono for identifiers) |
 | `<TooltipContent>` | Mono readout | Instrument readout |
 | `<TabsTrigger>` | Mono kicker | Nav-style label, active gets amber underline |
 | `<AccordionTrigger>` | Mono readout | Instrument-style expandable, sentence-case |
