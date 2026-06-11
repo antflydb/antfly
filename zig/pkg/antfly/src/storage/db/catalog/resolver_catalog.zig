@@ -153,6 +153,22 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
+        if (self.name.len == 0 or
+            self.table.len == 0 or
+            self.source_artifact.len == 0 or
+            self.resolution_artifact.len == 0 or
+            self.key_template.len == 0)
+        {
+            return error.InvalidResolverConfig;
+        }
+        if (std.mem.eql(u8, self.source_artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
+        if (self.candidate_search.len > 0 and
+            !std.mem.eql(u8, self.candidate_search, "exact_key") and
+            !std.mem.eql(u8, self.candidate_search, "prefix") and
+            !std.mem.eql(u8, self.candidate_search, "ann"))
+        {
+            return error.InvalidResolverConfig;
+        }
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
@@ -321,4 +337,61 @@ test "resolver config validates fusion strategy and folds confidence into the we
     bad_prior.fusion_combine = "max";
     bad_prior.fusion_prior = 1.5;
     try std.testing.expectError(error.InvalidResolverConfig, bad_prior.validate());
+}
+
+test "resolver config validates required references and candidate mode" {
+    const base = ResolverConfig{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ _entity.text }}",
+    };
+
+    try base.validate();
+
+    var missing_name = base;
+    missing_name.name = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_name.validate());
+
+    var missing_table = base;
+    missing_table.table = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_table.validate());
+
+    var missing_source = base;
+    missing_source.source_artifact = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_source.validate());
+
+    var missing_resolution = base;
+    missing_resolution.resolution_artifact = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_resolution.validate());
+
+    var missing_key_template = base;
+    missing_key_template.key_template = "";
+    try std.testing.expectError(error.InvalidResolverConfig, missing_key_template.validate());
+
+    var recursive_artifact = base;
+    recursive_artifact.resolution_artifact = recursive_artifact.source_artifact;
+    try std.testing.expectError(error.InvalidResolverConfig, recursive_artifact.validate());
+
+    var bad_candidate_mode = base;
+    bad_candidate_mode.candidate_search = "nearest";
+    try std.testing.expectError(error.InvalidResolverConfig, bad_candidate_mode.validate());
+
+    var exact_key = base;
+    exact_key.candidate_search = "exact_key";
+    try exact_key.validate();
+
+    var prefix = base;
+    prefix.candidate_search = "prefix";
+    try prefix.validate();
+
+    var ann_missing_reference = base;
+    ann_missing_reference.candidate_search = "ann";
+    try std.testing.expectError(error.InvalidResolverConfig, ann_missing_reference.validate());
+
+    var ann_with_index = base;
+    ann_with_index.candidate_search = "ann";
+    ann_with_index.candidate_ann_index = "entity_name_embedding";
+    try ann_with_index.validate();
 }
