@@ -9,7 +9,9 @@ import { cn } from "@/lib/utils";
  *   - Mono "instrument" voice (Roboto Mono, 13px, weight 500, 0.03em tracking)
  *   - Square corners (rounded-none)
  *   - token-width (--border-width) borders on outlined variants — the visual language is borders, not shadows
- *   - Amber primary fill with ink text (no contrast border); amber-300 hover
+ *   - Ink fill is the everyday primary; the amber `brand` fill is reserved
+ *     for special, infrequent actions (create a table — not apply a filter)
+ *     and appears at most once per screen
  *   - Snappy/linear motion (no spring easing)
  */
 const buttonVariants = cva(
@@ -29,9 +31,13 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Primary — amber fill, ink text, lighter amber hover; the fill alone
-        // carries the weight (no contrast border)
+        // Everyday primary — ink fill that contrasts the theme (dark on
+        // light, light on dark); full weight without spending the accent
         default:
+          "bg-foreground text-background border-(length:--border-width) border-transparent hover:bg-foreground/85",
+        // Brand — the amber fill. Special, infrequent actions only;
+        // at most one per screen
+        brand:
           "bg-primary text-primary-foreground border-(length:--border-width) border-transparent hover:bg-amber-300",
         // Destructive — red ink on a normal chassis; one signal, no shouting
         destructive:

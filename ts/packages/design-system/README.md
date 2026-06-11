@@ -83,9 +83,11 @@ Every component chassis routes its border width through `--border-width`
   outline Buttons) use `--input`, a step firmer than `--border`, so controls
   read as affordances while chrome melts away.
 
-The primary Button is a borderless amber fill, and the default Badge is a
-quiet hairline chip — use `<Badge variant="primary">` when you deliberately
-want the solid amber fill.
+The default Button is an ink fill that contrasts the theme (dark on light,
+light on dark) — the everyday primary. The amber fill lives on
+`variant="brand"` (Button and Badge alike) and is reserved for special,
+infrequent actions — creating a table, not applying a filter — at most once
+per screen. The default Badge is a quiet hairline chip.
 
 ## Layout
 

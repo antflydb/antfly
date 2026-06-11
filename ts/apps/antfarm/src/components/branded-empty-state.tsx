@@ -37,7 +37,13 @@ export function NoTablesState({ onCreate }: { onCreate?: () => void }) {
     <AntyEmptyState
       title="No tables yet"
       description="Create your first table to start indexing and searching your data."
-      action={onCreate ? <Button onClick={onCreate}>Create Table</Button> : undefined}
+      action={
+        onCreate ? (
+          <Button variant="brand" onClick={onCreate}>
+            Create Table
+          </Button>
+        ) : undefined
+      }
     />
   );
 }

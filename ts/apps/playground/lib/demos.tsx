@@ -219,10 +219,11 @@ demoCategories.primitives.demos = [
   {
     slug: "button",
     name: "Button",
-    description: "Clickable trigger. Five variants × four sizes.",
+    description: "Clickable trigger. Ink is the everyday primary; brand (amber) is for special, infrequent actions.",
     render: () => (
       <div className="flex flex-wrap gap-3">
         <Button>Primary</Button>
+        <Button variant="brand">Brand</Button>
         <Button variant="outline">Outline</Button>
         <Button variant="ghost">Ghost</Button>
         <Button variant="link">Link</Button>
@@ -243,7 +244,7 @@ demoCategories.primitives.demos = [
     render: () => (
       <div className="flex flex-wrap gap-2">
         <Badge>Default</Badge>
-        <Badge variant="primary">Primary</Badge>
+        <Badge variant="brand">Brand</Badge>
         <Badge variant="destructive">Destructive</Badge>
       </div>
     ),

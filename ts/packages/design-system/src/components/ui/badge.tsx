@@ -20,7 +20,7 @@ const badgeVariants = cva(
         // quiet outline — the workhorse default: hairline border, muted ink
         default: "bg-transparent border-border text-muted-foreground [a&]:hover:text-foreground",
         // solid amber fill — deliberate brand moments only
-        primary: "bg-primary text-primary-foreground border-transparent [a&]:hover:bg-amber-300",
+        brand: "bg-primary text-primary-foreground border-transparent [a&]:hover:bg-amber-300",
         // semantic destructive — red ink, quiet chassis
         destructive:
           "bg-transparent border-border text-destructive [a&]:hover:bg-destructive/10",
