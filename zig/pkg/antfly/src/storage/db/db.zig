@@ -13622,6 +13622,7 @@ fn documentGeneratedTextPartsJsonAlloc(
         .page_label = unit.page_label,
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
+        .text_regions = unit.text_regions,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
         .ocr_confidence = unit.ocr_confidence,
@@ -14145,6 +14146,17 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         std.mem.writeInt(i32, &buf, rotation, .big);
         hasher.update(&buf);
     }
+    for (unit.text_regions) |region| {
+        for (region.span) |span| {
+            var buf: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &buf, span, .big);
+            hasher.update(&buf);
+        }
+        for (region.bbox) |coord| {
+            var coord_value = coord;
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
     if (unit.char_start) |char_start| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, char_start, .big);
@@ -14329,6 +14341,7 @@ fn documentUnitPayloadAlloc(
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
             .page_rotation = unit.page_rotation,
+            .text_regions = unit.text_regions,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
@@ -14352,6 +14365,7 @@ fn documentUnitPayloadAlloc(
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,
                 .page_rotation = unit.page_rotation,
+                .text_regions = unit.text_regions,
             },
         },
     }, .{});
@@ -30347,6 +30361,10 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
 
 test "db document unit payload preserves pdf page provenance" {
     const alloc = std.testing.allocator;
+    const text_regions = [_]document_extraction_mod.TextRegion{.{
+        .span = .{ 0, 5 },
+        .bbox = .{ 72, 700, 120, 712 },
+    }};
     const unit = document_extraction_mod.Unit{
         .unit_id = @constCast("page:000001"),
         .unit_type = @constCast("page"),
@@ -30356,6 +30374,7 @@ test "db document unit payload preserves pdf page provenance" {
         .page_label = @constCast("i"),
         .page_bbox = .{ 0, 0, 612, 792 },
         .page_rotation = 90,
+        .text_regions = text_regions[0..],
         .char_start = 0,
         .char_end = 5,
     };
@@ -30382,6 +30401,13 @@ test "db document unit payload preserves pdf page provenance" {
     try std.testing.expectEqualStrings("source_page_points", format_provenance.get("coordinate_system").?.string);
     try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
     try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
+    const regions = format_provenance.get("text_regions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), regions.len);
+    const region = regions[0].object;
+    try std.testing.expectEqual(@as(i64, 0), region.get("span").?.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 5), region.get("span").?.array.items[1].integer);
+    try std.testing.expectEqual(@as(f64, 72), region.get("bbox").?.array.items[0].float);
+    try std.testing.expectEqual(@as(f64, 712), region.get("bbox").?.array.items[3].float);
 }
 
 test "db document unit payload marks scanned pdf pages as pending OCR" {

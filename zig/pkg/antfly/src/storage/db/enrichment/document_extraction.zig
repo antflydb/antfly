@@ -32,16 +32,47 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
                     return error.PdfExtractionUnavailable;
                 }
 
+                pub fn extractPageTextRunsAlloc(_: *const Reader, _: usize) ![]TextRun {
+                    return error.PdfExtractionUnavailable;
+                }
+
                 pub fn extractPageBox(_: *Reader, _: usize) !struct { min_x: f64, min_y: f64, max_x: f64, max_y: f64 } {
                     return error.PdfExtractionUnavailable;
                 }
             };
+
+            pub const TextRun = struct {
+                text: []const u8,
+                x: f64 = 0,
+                y: f64 = 0,
+                font_size: f64 = 0,
+                a: f64 = 1,
+                b: f64 = 0,
+                c: f64 = 0,
+                d: f64 = 1,
+                advance_width: f64 = 0,
+                ascent: f64 = 0,
+                descent: f64 = 0,
+
+                pub fn deinit(_: *TextRun, _: Allocator) void {}
+            };
+        };
+
+        pub const render = struct {
+            pub fn textRunBounds(_: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+                return .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+            }
         };
     }
 else
     @import("antfly_pdf");
 
 const Allocator = std.mem.Allocator;
+
+pub const TextRegion = struct {
+    span: [2]u32,
+    bbox: [4]f64,
+};
 
 pub const Unit = struct {
     unit_id: []u8,
@@ -62,6 +93,7 @@ pub const Unit = struct {
     page_label: ?[]u8 = null,
     page_bbox: ?[4]f64 = null,
     page_rotation: ?i32 = null,
+    text_regions: []TextRegion = &.{},
     char_start: ?u32 = null,
     char_end: ?u32 = null,
 
@@ -75,6 +107,7 @@ pub const Unit = struct {
         if (self.source_sha256) |value| alloc.free(value);
         if (self.extraction_warning) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
+        if (self.text_regions.len > 0) alloc.free(self.text_regions);
         self.* = undefined;
     }
 };
@@ -503,6 +536,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     while (page_num <= page_count) : (page_num += 1) {
         const text = try parsed.extractPageTextAlloc(page_num);
         errdefer alloc.free(text);
+        const text_regions = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + text.len);
@@ -527,6 +562,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
+            .text_regions = text_regions,
             .char_start = char_start,
             .char_end = char_end,
         };
@@ -544,6 +580,38 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         .route_type = try alloc.dupe(u8, "pdf"),
         .units = units,
     };
+}
+
+fn extractPdfTextRegionsAlloc(
+    alloc: Allocator,
+    parsed: *const pdf.reader.Reader,
+    page_num: usize,
+    page_text: []const u8,
+) ![]TextRegion {
+    if (page_text.len == 0) return &.{};
+    const runs = try parsed.extractPageTextRunsAlloc(page_num);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        if (runs.len > 0) alloc.free(runs);
+    }
+
+    var regions = std.ArrayListUnmanaged(TextRegion).empty;
+    defer regions.deinit(alloc);
+    var search_from: usize = 0;
+    for (runs) |run| {
+        if (run.text.len == 0) continue;
+        const start = std.mem.indexOfPos(u8, page_text, search_from, run.text) orelse continue;
+        const end = start + run.text.len;
+        const span_start = std.math.cast(u32, start) orelse continue;
+        const span_end = std.math.cast(u32, end) orelse continue;
+        const bounds = pdf.render.textRunBounds(run);
+        try regions.append(alloc, .{
+            .span = .{ span_start, span_end },
+            .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
+        });
+        search_from = end;
+    }
+    return try regions.toOwnedSlice(alloc);
 }
 
 fn extractSingleTextUnitAlloc(

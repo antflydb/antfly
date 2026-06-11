@@ -1639,7 +1639,7 @@ fn estimatedRunCodepointAdvance(run: reader.TextRun, cp: u21, advance_scale: f64
     return baseRunCodepointAdvance(run, cp) * advance_scale;
 }
 
-fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
     const width_est = estimateRunWidth(run);
     const corners = [_][2]f64{
         .{ run.x - run.c * run.descent, run.y - run.d * run.descent },

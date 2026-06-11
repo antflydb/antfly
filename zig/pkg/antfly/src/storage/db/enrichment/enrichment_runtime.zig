@@ -2125,6 +2125,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .page_label = unit.page_label,
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
+        .text_regions = unit.text_regions,
         .byte_length = unit.byte_length,
         .source_sha256 = unit.source_sha256,
         .ocr_confidence = unit.ocr_confidence,
@@ -4143,6 +4144,17 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         std.mem.writeInt(i32, &buf, rotation, .big);
         hasher.update(&buf);
     }
+    for (unit.text_regions) |region| {
+        for (region.span) |span| {
+            var buf: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &buf, span, .big);
+            hasher.update(&buf);
+        }
+        for (region.bbox) |coord| {
+            const coord_value: u64 = @bitCast(coord);
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
     if (unit.char_start) |char_start| {
         var buf: [@sizeOf(u32)]u8 = undefined;
         std.mem.writeInt(u32, &buf, char_start, .big);
@@ -4342,6 +4354,7 @@ fn documentUnitPayloadAlloc(
             .page_label = unit.page_label,
             .page_bbox = unit.page_bbox,
             .page_rotation = unit.page_rotation,
+            .text_regions = unit.text_regions,
             .char_start = unit.char_start,
             .char_end = unit.char_end,
             .source_content_type = content_type,
@@ -4365,6 +4378,7 @@ fn documentUnitPayloadAlloc(
                 .page_label = unit.page_label,
                 .page_bbox = unit.page_bbox,
                 .page_rotation = unit.page_rotation,
+                .text_regions = unit.text_regions,
             },
         },
     }, .{});
