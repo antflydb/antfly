@@ -638,6 +638,141 @@ components:
                 result_nodes:
                   type: integer
                   format: uint64
+        graph_metric_runtime:
+          x-go-type-skip-optional-pointer: true
+          $ref: "#/components/schemas/GraphMetricRuntimeStats"
+    GraphMetricRuntimeStats:
+      type: object
+      description: "Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers."
+      properties:
+        enabled:
+          type: boolean
+        role:
+          type: string
+          enum:
+            - combined
+            - coordinator
+            - worker
+            - worker_pool
+        runtime_id_hash:
+          type: integer
+          format: uint64
+        owner_id_hash:
+          type: integer
+          format: uint64
+        lease_key_hash:
+          type: integer
+          format: uint64
+        worker_id_hash:
+          type: integer
+          format: uint64
+        worker_count:
+          type: integer
+          format: uint64
+        lease_owned:
+          type: boolean
+        has_lease:
+          type: boolean
+        acquisition_count:
+          type: integer
+          format: uint64
+        takeover_count:
+          type: integer
+          format: uint64
+        lease_acquire_failures:
+          type: integer
+          format: uint64
+        lost_leases:
+          type: integer
+          format: uint64
+        last_acquired_ms:
+          type: integer
+          format: uint64
+        started:
+          type: boolean
+        shutdown:
+          type: boolean
+        notified:
+          type: boolean
+        ticks_started:
+          type: integer
+          format: uint64
+        ticks_completed:
+          type: integer
+          format: uint64
+        durable_progress_ticks:
+          type: integer
+          format: uint64
+        idle_ticks:
+          type: integer
+          format: uint64
+        error_ticks:
+          type: integer
+          format: uint64
+        last_error_name:
+          type: string
+        total_metrics_scanned:
+          type: integer
+          format: uint64
+        total_active_builds:
+          type: integer
+          format: uint64
+        total_builds_started:
+          type: integer
+          format: uint64
+        total_worker_steps:
+          type: integer
+          format: uint64
+        total_coordinator_steps:
+          type: integer
+          format: uint64
+        total_pages_claimed:
+          type: integer
+          format: uint64
+        total_pages_completed:
+          type: integer
+          format: uint64
+        total_phases_advanced:
+          type: integer
+          format: uint64
+        total_published:
+          type: integer
+          format: uint64
+        total_failed_builds:
+          type: integer
+          format: uint64
+        last_metrics_scanned:
+          type: integer
+          format: uint64
+        last_active_builds:
+          type: integer
+          format: uint64
+        last_builds_started:
+          type: integer
+          format: uint64
+        last_worker_steps:
+          type: integer
+          format: uint64
+        last_coordinator_steps:
+          type: integer
+          format: uint64
+        last_pages_claimed:
+          type: integer
+          format: uint64
+        last_pages_completed:
+          type: integer
+          format: uint64
+        last_phases_advanced:
+          type: integer
+          format: uint64
+        last_published:
+          type: integer
+          format: uint64
+        last_failed_builds:
+          type: integer
+          format: uint64
+        last_budget_exhausted:
+          type: boolean
     Edge:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -1295,6 +1430,8 @@ components:
             - initialize_ranks
             - iterate_contributions
             - reduce_ranks
+            - hits_hub_contributions
+            - hits_hub_reduce_ranks
             - check_convergence
             - publish_generation
             - cleanup_old_generations
@@ -1303,7 +1440,7 @@ components:
         metadata_version:
           type: integer
           format: int64
-          description: "Version of the published graph metric metadata schema. Legacy unversioned materializations report 0."
+          description: "Version of the published graph metric metadata schema."
         maintenance_paused:
           type: boolean
         build_queued:
@@ -1356,6 +1493,14 @@ components:
           type: integer
           format: int64
           description: "Estimated total work units for the active graph metric build, or 0 when idle or unknown."
+        build_pages:
+          type: array
+          description: "Active leased or failed build pages for the current build phase, capped and ordered by durable page key."
+          items:
+            $ref: '#/components/schemas/GraphMetricBuildPageStatus'
+        build_pages_truncated:
+          type: boolean
+          description: "Whether build_pages was capped before every active page could be included."
         retry_count:
           type: integer
           format: int64
@@ -1385,6 +1530,64 @@ components:
           description: "Recent graph metric events, newest first."
           items:
             $ref: '#/components/schemas/GraphMetricEvent'
+    GraphMetricBuildPageStatus:
+      type: object
+      required:
+        - phase
+        - iteration
+        - page_id
+        - state
+        - range_kind
+      properties:
+        phase:
+          type: string
+        iteration:
+          type: integer
+          format: int64
+        page_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum:
+            - pending
+            - leased
+            - complete
+            - failed
+        range_kind:
+          type: string
+          enum:
+            - full
+            - reverse_edges
+            - nodes
+            - scores
+            - contributions
+            - job_control
+        worker_id:
+          type: string
+          description: "Worker id that owns or last failed this page."
+        lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: "Unix epoch milliseconds when the page lease expires, or 0 when not leased."
+        attempt:
+          type: integer
+          format: int64
+          description: "Current attempt number for this page."
+        cursor:
+          type: string
+          description: "Opaque resumable cursor for this page."
+        completed_units:
+          type: integer
+          format: int64
+          description: "Completed work units for this page."
+        total_units:
+          type: integer
+          format: int64
+          description: "Estimated total work units for this page."
+        last_error:
+          type: string
+          description: "Last page-level error."
     GraphMetricEvent:
       type: object
       required:

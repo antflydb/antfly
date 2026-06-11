@@ -278,6 +278,7 @@ pub const UniqueConstraint = struct {
 
 pub const UniqueExpressionOp = enum {
     lower,
+    upper,
 };
 
 pub const UniqueExpression = struct {
@@ -335,6 +336,7 @@ pub const RelationalCheckValidationState = enum {
 
 pub const RelationalGeneratedOp = enum {
     lower,
+    upper,
     concat,
 };
 
@@ -463,6 +465,7 @@ pub const DocumentProperty = struct {
     antfly_index: ?bool = null,
     index_lifecycle: ?RelationalIndexLifecycle = null,
     index_generation: ?u64 = null,
+    index_name: ?[]const u8 = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
     allows_null: bool = false,
@@ -521,6 +524,7 @@ pub const DocumentProperty = struct {
         for (self.antfly_types) |antfly_type| alloc.free(antfly_type);
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.index_name) |index_name| alloc.free(index_name);
         if (self.format) |format| alloc.free(format);
         if (self.const_value) |const_value| alloc.free(const_value);
         if (self.pattern) |pattern| alloc.free(pattern);
@@ -1137,7 +1141,7 @@ fn validateUniqueExpressionArray(value: std.json.Value) !void {
         }
         const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
         const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
-        if (op != .string or !enumTokenEql(op.string, "lower")) return error.InvalidSchemaUpdateRequest;
+        if (op != .string or (!enumTokenEql(op.string, "lower") and !enumTokenEql(op.string, "upper"))) return error.InvalidSchemaUpdateRequest;
         if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
     }
 }
@@ -1481,6 +1485,10 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-index-generation")) |index_generation| {
         if (index_generation != .null and index_generation != .integer) return error.InvalidSchemaUpdateRequest;
         if (index_generation == .integer and index_generation.integer <= 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-name")) |index_name| {
+        if (index_name != .null and index_name != .string) return error.InvalidSchemaUpdateRequest;
+        if (index_name == .string and index_name.string.len == 0) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-index-where")) |index_where| {
         if (index_where != .null) try validateUniquePredicateDefinition(index_where);
@@ -2210,7 +2218,7 @@ fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
 fn validateRelationalUniqueConstraintExpression(schema: TableSchema, expression: UniqueExpression) !void {
     const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
     switch (expression.op) {
-        .lower => {
+        .lower, .upper => {
             const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
             if (!std.mem.eql(u8, field_type, "keyword") and
                 !std.mem.eql(u8, field_type, "link") and
@@ -2262,7 +2270,7 @@ fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: Doc
     if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
     if (requiredFieldsContain(document_schema.required_fields, property.name)) return error.InvalidSchemaUpdateRequest;
     switch (generated.op) {
-        .lower => {
+        .lower, .upper => {
             const source_name = generated.field orelse return error.InvalidSchemaUpdateRequest;
             if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
             const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
@@ -2287,6 +2295,10 @@ fn validateRelationalPartialIndexProperty(schema: TableSchema, property: Documen
         if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
     }
     if (property.index_generation != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_name != null) {
         if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
         if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
     }
@@ -2710,6 +2722,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
+    const index_name = if (object.get("x-antfly-index-name")) |index_name_value|
+        switch (index_name_value) {
+            .string => |value| try alloc.dupe(u8, value),
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    errdefer if (index_name) |value| alloc.free(value);
     const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
@@ -3008,6 +3029,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .antfly_index = antfly_index,
         .index_lifecycle = index_lifecycle,
         .index_generation = index_generation,
+        .index_name = index_name,
         .integer_only = type_spec.integer_only,
         .format = format,
         .allows_null = allows_null,
@@ -3531,11 +3553,11 @@ fn parseRelationalGeneratedValue(alloc: std.mem.Allocator, value: std.json.Value
     const op_value = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
     if (op_value != .string) return error.InvalidSchemaUpdateRequest;
     const op_text = op_value.string;
-    if (enumTokenEql(op_text, "lower")) {
+    if (enumTokenEql(op_text, "lower") or enumTokenEql(op_text, "upper")) {
         const field_value = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
         if (field_value != .string or field_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
         return .{
-            .op = .lower,
+            .op = if (enumTokenEql(op_text, "lower")) .lower else .upper,
             .field = try alloc.dupe(u8, field_value.string),
             .separator = try alloc.dupe(u8, ""),
         };
@@ -3640,7 +3662,7 @@ fn parseUniqueExpressions(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
         const object = item.object;
         const op = object.get("op").?.string;
         out[initialized] = .{
-            .op = if (enumTokenEql(op, "lower")) .lower else return error.InvalidSchemaUpdateRequest,
+            .op = if (enumTokenEql(op, "lower")) .lower else if (enumTokenEql(op, "upper")) .upper else return error.InvalidSchemaUpdateRequest,
             .field = try alloc.dupe(u8, object.get("field").?.string),
         };
         initialized += 1;
@@ -5167,10 +5189,10 @@ test "relational schema rejects unsupported unique constraint shapes" {
     );
     var parsed_partial = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]}]}",
     );
     defer parsed_partial.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed_partial.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, parsed_partial.unique_constraints[0].where[0].op);
@@ -5178,8 +5200,12 @@ test "relational schema rejects unsupported unique constraint shapes" {
     try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[1].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.lower, parsed_partial.unique_constraints[1].expressions[0].op);
     try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[1].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[2].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.upper, parsed_partial.unique_constraints[2].expressions[0].op);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[2].expressions[0].field);
     try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[0].validation_state);
     try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, parsed_partial.unique_constraints[1].validation_state);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[2].validation_state);
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(

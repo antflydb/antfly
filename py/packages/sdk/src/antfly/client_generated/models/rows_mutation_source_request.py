@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.rows_mutation_source_request_op import RowsMutationSourceRequestOp
 from ..types import UNSET, Unset
@@ -62,7 +61,6 @@ class RowsMutationSourceRequest:
     array_update: list[RowsArrayUpdateTransform] | Unset = UNSET
     returning: list[str] | Unset = UNSET
     returning_expressions: list[RowsExpressionProjection] | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         op = self.op.value
@@ -111,7 +109,7 @@ class RowsMutationSourceRequest:
                 returning_expressions.append(returning_expressions_item)
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "op": op,
@@ -222,21 +220,4 @@ class RowsMutationSourceRequest:
             returning_expressions=returning_expressions,
         )
 
-        rows_mutation_source_request.additional_properties = d
         return rows_mutation_source_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

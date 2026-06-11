@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.row_selector import RowSelector
     from ..models.rows_get_result_row import RowsGetResultRow
 
 
@@ -20,9 +19,10 @@ T = TypeVar("T", bound="RowsGetResult")
 class RowsGetResult:
     """
     Attributes:
-        identity (RowSelector | Unset): Structured row selector. `primary` addresses declared primary-key
+        identity (Any | Unset): Structured row selector. `primary` addresses declared primary-key
             tables directly. `unique` addresses a declared unique constraint through
-            durable unique-owner rows.
+            durable unique-owner rows. The selector is exact and accepts exactly one
+            of `primary` or `unique`.
         found (bool | Unset):
         row (RowsGetResultRow | Unset):
         version (int | Unset):
@@ -30,7 +30,7 @@ class RowsGetResult:
             resolve. Do not persist as public row identity.
     """
 
-    identity: RowSelector | Unset = UNSET
+    identity: Any | Unset = UNSET
     found: bool | Unset = UNSET
     row: RowsGetResultRow | Unset = UNSET
     version: int | Unset = UNSET
@@ -38,9 +38,11 @@ class RowsGetResult:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        identity: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.identity, Unset):
-            identity = self.identity.to_dict()
+        identity: Any | Unset
+        if isinstance(self.identity, Unset):
+            identity = UNSET
+        else:
+            identity = self.identity
 
         found = self.found
 
@@ -74,16 +76,16 @@ class RowsGetResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.row_selector import RowSelector
         from ..models.rows_get_result_row import RowsGetResultRow
 
         d = dict(src_dict)
-        _identity = d.pop("identity", UNSET)
-        identity: RowSelector | Unset
-        if isinstance(_identity, Unset):
-            identity = UNSET
-        else:
-            identity = RowSelector.from_dict(_identity)
+
+        def _parse_identity(data: object) -> Any | Unset:
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | Unset, data)
+
+        identity = _parse_identity(d.pop("identity", UNSET))
 
         found = d.pop("found", UNSET)
 

@@ -243,7 +243,8 @@ pub const ColumnIndexPolicy = struct {
     pub fn columnForRebuild(self: ColumnIndexPolicy, index_name: []const u8, index_generation: u64) !schema_mod.RelationalColumn {
         if (!self.restrict_to_catalog) return error.RelationalIndexCatalogRequired;
         for (self.columns) |column| {
-            if (!std.mem.eql(u8, column.path, index_name) and !std.mem.eql(u8, column.name, index_name)) continue;
+            const declared_index_name = column.index_name orelse column.name;
+            if (!std.mem.eql(u8, declared_index_name, index_name) and !std.mem.eql(u8, column.path, index_name) and !std.mem.eql(u8, column.name, index_name)) continue;
             if (!column.indexed) return error.RelationalIndexNotFound;
             if (column.index_lifecycle != .building) return error.RelationalIndexNotBuilding;
             if (column.index_generation != index_generation) return error.RelationalIndexGenerationMismatch;
@@ -1821,17 +1822,22 @@ fn uniqueConstraintColumnValueAlloc(alloc: Allocator, row_value: []const u8, col
 
 fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8, expression: schema_mod.UniqueExpression) !?[]u8 {
     return switch (expression.op) {
-        .lower => blk: {
+        .lower, .upper => blk: {
             const cell = (try relational_row_codec.findCellByPath(row_value, expression.field)) orelse return null;
             if (cell.is_json) return error.InvalidColumnValue;
             const bytes = switch (cell.value) {
                 .bytes_val => |value| value,
                 else => return error.InvalidColumnValue,
             };
-            const lowered = try alloc.alloc(u8, bytes.len + 1);
-            lowered[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
-            for (bytes, 0..) |ch, i| lowered[i + 1] = std.ascii.toLower(ch);
-            break :blk lowered;
+            const folded = try alloc.alloc(u8, bytes.len + 1);
+            folded[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
+            for (bytes, 0..) |ch, i| {
+                folded[i + 1] = switch (expression.op) {
+                    .lower => std.ascii.toLower(ch),
+                    .upper => std.ascii.toUpper(ch),
+                };
+            }
+            break :blk folded;
         },
     };
 }
@@ -4934,6 +4940,62 @@ test "relational write participant defers no action parent delete until final st
     const child_after = (try getMaterializedAlloc(alloc, &store, "order:deferred-delete")) orelse return error.TestExpectedEqual;
     defer alloc.free(child_after);
     try std.testing.expectEqualStrings("{}", child_after);
+}
+
+test "relational write participant ignores unvalidated foreign keys for write enforcement" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "row",
+        .parent_columns = &.{"_id"},
+        .validation_state = .unvalidated,
+    }};
+
+    const child_row = try relational_row_codec.serialize(alloc, &.{.{
+        .path = "customer_id",
+        .value_type = .bytes_val,
+        .value = .{ .bytes_val = "customer:missing" },
+    }});
+    defer alloc.free(child_row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    var participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    participant.configureForeignKeys("row", foreign_keys[0..], &.{});
+    try participant.prepareUpsert("row", "order:unvalidated", child_row, null);
+    try participant.commit(null, 1);
+    try store.putBatch(writes.items, deletes.items);
+
+    const stored_child = (try getRawAlloc(alloc, &store, "order:unvalidated")) orelse return error.TestExpectedEqual;
+    alloc.free(stored_child);
+
+    const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(alloc, "orders_customer_id_fkey", "row", "customer:missing");
+    defer alloc.free(prefix);
+    const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(alloc, "orders_customer_id_fkey", "row", "customer:missing");
+    defer if (upper) |buf| alloc.free(buf);
+    const refs = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, refs);
+    try std.testing.expectEqual(@as(usize, 0), refs.len);
 }
 
 test "relational write participant can force deferred no action constraint immediate" {

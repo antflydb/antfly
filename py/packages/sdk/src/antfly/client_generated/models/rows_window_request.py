@@ -4,12 +4,12 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.rows_query_order import RowsQueryOrder
+    from ..models.rows_query_order_expression import RowsQueryOrderExpression
+    from ..models.rows_query_order_field import RowsQueryOrderField
     from ..models.rows_query_request import RowsQueryRequest
     from ..models.rows_window_spec import RowsWindowSpec
 
@@ -26,7 +26,7 @@ class RowsWindowRequest:
             native request shape.
         windows (list[RowsWindowSpec]):
         select (list[str] | Unset):
-        order_by (list[RowsQueryOrder] | Unset):
+        order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
         limit (int | Unset):
         offset (int | Unset):
     """
@@ -34,12 +34,13 @@ class RowsWindowRequest:
     source: RowsQueryRequest
     windows: list[RowsWindowSpec]
     select: list[str] | Unset = UNSET
-    order_by: list[RowsQueryOrder] | Unset = UNSET
+    order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.rows_query_order_field import RowsQueryOrderField
+
         source = self.source.to_dict()
 
         windows = []
@@ -55,7 +56,12 @@ class RowsWindowRequest:
         if not isinstance(self.order_by, Unset):
             order_by = []
             for order_by_item_data in self.order_by:
-                order_by_item = order_by_item_data.to_dict()
+                order_by_item: dict[str, Any]
+                if isinstance(order_by_item_data, RowsQueryOrderField):
+                    order_by_item = order_by_item_data.to_dict()
+                else:
+                    order_by_item = order_by_item_data.to_dict()
+
                 order_by.append(order_by_item)
 
         limit = self.limit
@@ -63,7 +69,7 @@ class RowsWindowRequest:
         offset = self.offset
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "source": source,
@@ -83,7 +89,8 @@ class RowsWindowRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rows_query_order import RowsQueryOrder
+        from ..models.rows_query_order_expression import RowsQueryOrderExpression
+        from ..models.rows_query_order_field import RowsQueryOrderField
         from ..models.rows_query_request import RowsQueryRequest
         from ..models.rows_window_spec import RowsWindowSpec
 
@@ -100,11 +107,27 @@ class RowsWindowRequest:
         select = cast(list[str], d.pop("select", UNSET))
 
         _order_by = d.pop("order_by", UNSET)
-        order_by: list[RowsQueryOrder] | Unset = UNSET
+        order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
         if _order_by is not UNSET:
             order_by = []
             for order_by_item_data in _order_by:
-                order_by_item = RowsQueryOrder.from_dict(order_by_item_data)
+
+                def _parse_order_by_item(data: object) -> RowsQueryOrderExpression | RowsQueryOrderField:
+                    try:
+                        if not isinstance(data, dict):
+                            raise TypeError()
+                        componentsschemas_rows_query_order_type_0 = RowsQueryOrderField.from_dict(data)
+
+                        return componentsschemas_rows_query_order_type_0
+                    except (TypeError, ValueError, AttributeError, KeyError):
+                        pass
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_rows_query_order_type_1 = RowsQueryOrderExpression.from_dict(data)
+
+                    return componentsschemas_rows_query_order_type_1
+
+                order_by_item = _parse_order_by_item(order_by_item_data)
 
                 order_by.append(order_by_item)
 
@@ -121,21 +144,4 @@ class RowsWindowRequest:
             offset=offset,
         )
 
-        rows_window_request.additional_properties = d
         return rows_window_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

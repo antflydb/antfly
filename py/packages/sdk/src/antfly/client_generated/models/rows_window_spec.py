@@ -4,13 +4,16 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.rows_expression import RowsExpression
-    from ..models.rows_query_order import RowsQueryOrder
+    from ..models.rows_expression_field import RowsExpressionField
+    from ..models.rows_expression_operator import RowsExpressionOperator
+    from ..models.rows_expression_value import RowsExpressionValue
+    from ..models.rows_query_order_expression import RowsQueryOrderExpression
+    from ..models.rows_query_order_field import RowsQueryOrderField
+    from ..models.rows_window_frame import RowsWindowFrame
 
 
 T = TypeVar("T", bound="RowsWindowSpec")
@@ -21,59 +24,78 @@ class RowsWindowSpec:
     """
     Attributes:
         as_ (str):
-        function (str):
-        order_by (list[RowsQueryOrder]):
+        function (str): Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`,
+            `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and
+            `max`.
+        order_by (list[RowsQueryOrderExpression | RowsQueryOrderField]):
         partition_by (list[str] | Unset):
-        field (str | Unset):
-        expression (RowsExpression | Unset): Shared typed row-expression AST. A node is exactly one of `{ "field":
-            "name" }`,
+        expr (RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset): Shared typed row-expression
+            AST. A node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
-            `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            `greatest`, `least`, numeric
+            `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.
             Mutation expressions may set `source` to `existing` or `proposed`; query
             expressions use the default row source.
         offset (int | Unset):
         default (Any | Unset):
+        frame (RowsWindowFrame | Unset):
     """
 
     as_: str
     function: str
-    order_by: list[RowsQueryOrder]
+    order_by: list[RowsQueryOrderExpression | RowsQueryOrderField]
     partition_by: list[str] | Unset = UNSET
-    field: str | Unset = UNSET
-    expression: RowsExpression | Unset = UNSET
+    expr: RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset = UNSET
     offset: int | Unset = UNSET
     default: Any | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    frame: RowsWindowFrame | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_value import RowsExpressionValue
+        from ..models.rows_query_order_field import RowsQueryOrderField
+
         as_ = self.as_
 
         function = self.function
 
         order_by = []
         for order_by_item_data in self.order_by:
-            order_by_item = order_by_item_data.to_dict()
+            order_by_item: dict[str, Any]
+            if isinstance(order_by_item_data, RowsQueryOrderField):
+                order_by_item = order_by_item_data.to_dict()
+            else:
+                order_by_item = order_by_item_data.to_dict()
+
             order_by.append(order_by_item)
 
         partition_by: list[str] | Unset = UNSET
         if not isinstance(self.partition_by, Unset):
             partition_by = self.partition_by
 
-        field = self.field
-
-        expression: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.expression, Unset):
-            expression = self.expression.to_dict()
+        expr: dict[str, Any] | Unset
+        if isinstance(self.expr, Unset):
+            expr = UNSET
+        elif isinstance(self.expr, RowsExpressionField):
+            expr = self.expr.to_dict()
+        elif isinstance(self.expr, RowsExpressionValue):
+            expr = self.expr.to_dict()
+        else:
+            expr = self.expr.to_dict()
 
         offset = self.offset
 
         default = self.default
 
+        frame: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.frame, Unset):
+            frame = self.frame.to_dict()
+
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "as": as_,
@@ -83,21 +105,25 @@ class RowsWindowSpec:
         )
         if partition_by is not UNSET:
             field_dict["partition_by"] = partition_by
-        if field is not UNSET:
-            field_dict["field"] = field
-        if expression is not UNSET:
-            field_dict["expression"] = expression
+        if expr is not UNSET:
+            field_dict["expr"] = expr
         if offset is not UNSET:
             field_dict["offset"] = offset
         if default is not UNSET:
             field_dict["default"] = default
+        if frame is not UNSET:
+            field_dict["frame"] = frame
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rows_expression import RowsExpression
-        from ..models.rows_query_order import RowsQueryOrder
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_operator import RowsExpressionOperator
+        from ..models.rows_expression_value import RowsExpressionValue
+        from ..models.rows_query_order_expression import RowsQueryOrderExpression
+        from ..models.rows_query_order_field import RowsQueryOrderField
+        from ..models.rows_window_frame import RowsWindowFrame
 
         d = dict(src_dict)
         as_ = d.pop("as")
@@ -107,51 +133,75 @@ class RowsWindowSpec:
         order_by = []
         _order_by = d.pop("order_by")
         for order_by_item_data in _order_by:
-            order_by_item = RowsQueryOrder.from_dict(order_by_item_data)
+
+            def _parse_order_by_item(data: object) -> RowsQueryOrderExpression | RowsQueryOrderField:
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_rows_query_order_type_0 = RowsQueryOrderField.from_dict(data)
+
+                    return componentsschemas_rows_query_order_type_0
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_query_order_type_1 = RowsQueryOrderExpression.from_dict(data)
+
+                return componentsschemas_rows_query_order_type_1
+
+            order_by_item = _parse_order_by_item(order_by_item_data)
 
             order_by.append(order_by_item)
 
         partition_by = cast(list[str], d.pop("partition_by", UNSET))
 
-        field = d.pop("field", UNSET)
+        def _parse_expr(data: object) -> RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset:
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_0 = RowsExpressionField.from_dict(data)
 
-        _expression = d.pop("expression", UNSET)
-        expression: RowsExpression | Unset
-        if isinstance(_expression, Unset):
-            expression = UNSET
-        else:
-            expression = RowsExpression.from_dict(_expression)
+                return componentsschemas_rows_expression_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_1 = RowsExpressionValue.from_dict(data)
+
+                return componentsschemas_rows_expression_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_rows_expression_type_2 = RowsExpressionOperator.from_dict(data)
+
+            return componentsschemas_rows_expression_type_2
+
+        expr = _parse_expr(d.pop("expr", UNSET))
 
         offset = d.pop("offset", UNSET)
 
         default = d.pop("default", UNSET)
+
+        _frame = d.pop("frame", UNSET)
+        frame: RowsWindowFrame | Unset
+        if isinstance(_frame, Unset):
+            frame = UNSET
+        else:
+            frame = RowsWindowFrame.from_dict(_frame)
 
         rows_window_spec = cls(
             as_=as_,
             function=function,
             order_by=order_by,
             partition_by=partition_by,
-            field=field,
-            expression=expression,
+            expr=expr,
             offset=offset,
             default=default,
+            frame=frame,
         )
 
-        rows_window_spec.additional_properties = d
         return rows_window_spec
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

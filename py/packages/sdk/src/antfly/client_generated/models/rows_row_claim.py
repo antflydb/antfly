@@ -16,7 +16,7 @@ class RowsRowClaim:
     """Lockable base-row claim metadata. Public row-plan endpoints reject this
     field; it is only accepted by `rows:mutation-source` lockable base-row
     sources and internal/coordinator execution paths. `transaction_id` is
-    the canonical field name; `txn_id` is accepted as an adapter alias.
+    the canonical field name.
 
         Attributes:
             mode (RowsRowClaimMode | Unset):  Default: RowsRowClaimMode.FOR_UPDATE.
@@ -24,7 +24,6 @@ class RowsRowClaim:
             lease_ms (int | Unset):  Default: 30000.
             owner_id (str | Unset):
             transaction_id (str | Unset): Canonical 16-byte transaction id encoded as 32 hex characters.
-            txn_id (str | Unset): Alias for `transaction_id`.
     """
 
     mode: RowsRowClaimMode | Unset = RowsRowClaimMode.FOR_UPDATE
@@ -32,7 +31,6 @@ class RowsRowClaim:
     lease_ms: int | Unset = 30000
     owner_id: str | Unset = UNSET
     transaction_id: str | Unset = UNSET
-    txn_id: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         mode: str | Unset = UNSET
@@ -47,8 +45,6 @@ class RowsRowClaim:
 
         transaction_id = self.transaction_id
 
-        txn_id = self.txn_id
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -62,8 +58,6 @@ class RowsRowClaim:
             field_dict["owner_id"] = owner_id
         if transaction_id is not UNSET:
             field_dict["transaction_id"] = transaction_id
-        if txn_id is not UNSET:
-            field_dict["txn_id"] = txn_id
 
         return field_dict
 
@@ -85,15 +79,12 @@ class RowsRowClaim:
 
         transaction_id = d.pop("transaction_id", UNSET)
 
-        txn_id = d.pop("txn_id", UNSET)
-
         rows_row_claim = cls(
             mode=mode,
             skip_locked=skip_locked,
             lease_ms=lease_ms,
             owner_id=owner_id,
             transaction_id=transaction_id,
-            txn_id=txn_id,
         )
 
         return rows_row_claim

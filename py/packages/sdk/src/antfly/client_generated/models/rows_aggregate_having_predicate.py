@@ -13,10 +13,11 @@ T = TypeVar("T", bound="RowsAggregateHavingPredicate")
 
 @_attrs_define
 class RowsAggregateHavingPredicate:
-    """Predicate over aggregate output fields, evaluated after grouping.
+    """Predicate over emitted aggregate output fields, evaluated after grouping.
 
     Attributes:
-        field (str): Aggregate output field name, usually an aggregation `name` or group key.
+        field (str): Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group
+            alias.
         op (RowsAggregateHavingPredicateOp):
         value (Any | Unset): Comparison value. Omit for `is_null` and `is_not_null`.
     """

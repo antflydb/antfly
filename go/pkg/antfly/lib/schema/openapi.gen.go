@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/oapi-codegen/runtime"
 )
 
 // Defines values for AntflyType.
@@ -39,6 +41,34 @@ const (
 	DynamicTemplateMatchMappingTypeNumber  DynamicTemplateMatchMappingType = "number"
 	DynamicTemplateMatchMappingTypeObject  DynamicTemplateMatchMappingType = "object"
 	DynamicTemplateMatchMappingTypeString  DynamicTemplateMatchMappingType = "string"
+)
+
+// Defines values for ForeignKeyMatch.
+const (
+	ForeignKeyMatchFull   ForeignKeyMatch = "full"
+	ForeignKeyMatchSimple ForeignKeyMatch = "simple"
+)
+
+// Defines values for ForeignKeyOnDelete.
+const (
+	ForeignKeyOnDeleteCascade  ForeignKeyOnDelete = "cascade"
+	ForeignKeyOnDeleteNoAction ForeignKeyOnDelete = "no_action"
+	ForeignKeyOnDeleteRestrict ForeignKeyOnDelete = "restrict"
+	ForeignKeyOnDeleteSetNull  ForeignKeyOnDelete = "set_null"
+)
+
+// Defines values for ForeignKeyOnUpdate.
+const (
+	ForeignKeyOnUpdateCascade  ForeignKeyOnUpdate = "cascade"
+	ForeignKeyOnUpdateNoAction ForeignKeyOnUpdate = "no_action"
+	ForeignKeyOnUpdateRestrict ForeignKeyOnUpdate = "restrict"
+	ForeignKeyOnUpdateSetNull  ForeignKeyOnUpdate = "set_null"
+)
+
+// Defines values for ForeignKeyValidationState.
+const (
+	ForeignKeyValidationStateEnforced    ForeignKeyValidationState = "enforced"
+	ForeignKeyValidationStateUnvalidated ForeignKeyValidationState = "unvalidated"
 )
 
 // Defines values for TableSchemaStorageMode.
@@ -91,6 +121,74 @@ type DynamicTemplate struct {
 // DynamicTemplateMatchMappingType Filter by detected JSON type
 type DynamicTemplateMatchMappingType string
 
+// ForeignKey Relational foreign-key constraint.
+type ForeignKey struct {
+	// Columns Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Deferrable Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+	Deferrable ForeignKey_Deferrable `json:"deferrable,omitempty,omitzero"`
+
+	// Match Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+	Match ForeignKeyMatch `json:"match,omitempty,omitzero"`
+
+	// Name Constraint name, unique within the table schema.
+	Name string `json:"name,omitempty,omitzero"`
+
+	// OnDelete Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+	OnDelete ForeignKeyOnDelete `json:"on_delete,omitempty,omitzero"`
+
+	// OnUpdate Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+	OnUpdate ForeignKeyOnUpdate `json:"on_update,omitempty,omitzero"`
+
+	// References Parent side of a relational foreign-key constraint.
+	References ForeignKeyReference `json:"references,omitempty,omitzero"`
+
+	// Timing Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
+	Timing string `json:"timing,omitempty,omitzero"`
+
+	// ValidationState Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+	ValidationState ForeignKeyValidationState `json:"validation_state,omitempty,omitzero"`
+}
+
+// ForeignKeyDeferrable0 defines model for .
+type ForeignKeyDeferrable0 = bool
+
+// ForeignKeyDeferrable1 defines model for .
+type ForeignKeyDeferrable1 = string
+
+// ForeignKey_Deferrable Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+type ForeignKey_Deferrable struct {
+	union json.RawMessage
+}
+
+// ForeignKeyMatch Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+type ForeignKeyMatch string
+
+// ForeignKeyOnDelete Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+type ForeignKeyOnDelete string
+
+// ForeignKeyOnUpdate Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+type ForeignKeyOnUpdate string
+
+// ForeignKeyValidationState Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+type ForeignKeyValidationState string
+
+// ForeignKeyReference Parent side of a relational foreign-key constraint.
+type ForeignKeyReference struct {
+	// Columns Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Table Referenced relational table name.
+	Table string `json:"table,omitempty,omitzero"`
+}
+
+// PrimaryKey Relational primary-key constraint.
+type PrimaryKey struct {
+	// Columns Primary-key columns. One or more ordered required non-json relational columns are supported.
+	Columns []string `json:"columns,omitempty,omitzero"`
+}
+
 // TableSchema Schema definition for a table with multiple document types
 type TableSchema struct {
 	// DefaultType Default type to use from the document_types.
@@ -107,6 +205,24 @@ type TableSchema struct {
 	// EnforceTypes Whether to enforce that documents must match one of the provided document types.
 	// If false, documents not matching any type will be accepted but not indexed.
 	EnforceTypes bool `json:"enforce_types,omitempty,omitzero"`
+
+	// ForeignKeys Relational-mode referential constraints. Supported targets are a
+	// parent table's `_id` document key or a same-table declared unique
+	// parent column tuple with `on_delete: "restrict"` /
+	// `on_delete: "no_action"` or bounded local nullable-column
+	// `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`.
+	// `on_update: "restrict"` and `on_update: "no_action"` are accepted
+	// as parent-key update checks, and mutating `set_null`/`cascade`
+	// update actions are supported where owner topology is configured.
+	// `match: "simple"` is the default; `full` is accepted for composite
+	// nullable references, and `partial` is rejected until row-subset
+	// parent matching is implemented.
+	// Cross-table unique targets require routed parent-table unique participants.
+	// Unsupported shapes are rejected during schema validation.
+	ForeignKeys []ForeignKey `json:"foreign_keys,omitempty,omitzero"`
+
+	// PrimaryKey Relational primary-key constraint.
+	PrimaryKey PrimaryKey `json:"primary_key,omitempty,omitzero"`
 
 	// StorageMode Storage profile for the table.
 	// - "document" (default): schemaless JSON documents with optional,
@@ -126,11 +242,24 @@ type TableSchema struct {
 	// Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
 	TtlField string `json:"ttl_field,omitempty,omitzero"`
 
+	// UniqueConstraints Relational-mode unique constraints over one or more ordered declared
+	// non-json relational columns. Present scalar tuples are enforced by
+	// committed integrity rows; rows with any absent nullable component do
+	// not create unique rows.
+	UniqueConstraints []UniqueConstraint `json:"unique_constraints,omitempty,omitzero"`
+
 	// Version Version of the schema. Used for migrations.
 	Version uint32 `json:"version,omitempty,omitzero"`
 }
 
 // TableSchemaStorageMode Storage profile for the table.
+//   - "document" (default): schemaless JSON documents with optional,
+//     soft schema validation. All indexes are derived from the document.
+//   - "relational": required closed schema with typed columns. Documents
+//     must match a declared type; declared scalar properties are stored
+//     as typed columns for columnar predicate pushdown and aggregation.
+//     A field typed "json" stores a subtree that is still indexed like a
+//     document. Implies enforce_types and closed document types.
 type TableSchemaStorageMode string
 
 // TemplateFieldMapping Field mapping to apply when a dynamic template matches
@@ -155,36 +284,133 @@ type TemplateFieldMapping struct {
 	Type AntflyType `json:"type,omitempty,omitzero"`
 }
 
+// UniqueConstraint Relational unique constraint.
+type UniqueConstraint struct {
+	// Columns Unique columns. One or more ordered non-json relational columns are supported.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Name Constraint name, unique within the table schema.
+	Name string `json:"name,omitempty,omitzero"`
+}
+
+// AsForeignKeyDeferrable0 returns the union data inside the ForeignKey_Deferrable as a ForeignKeyDeferrable0
+func (t ForeignKey_Deferrable) AsForeignKeyDeferrable0() (ForeignKeyDeferrable0, error) {
+	var body ForeignKeyDeferrable0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromForeignKeyDeferrable0 overwrites any union data inside the ForeignKey_Deferrable as the provided ForeignKeyDeferrable0
+func (t *ForeignKey_Deferrable) FromForeignKeyDeferrable0(v ForeignKeyDeferrable0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeForeignKeyDeferrable0 performs a merge with any union data inside the ForeignKey_Deferrable, using the provided ForeignKeyDeferrable0
+func (t *ForeignKey_Deferrable) MergeForeignKeyDeferrable0(v ForeignKeyDeferrable0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsForeignKeyDeferrable1 returns the union data inside the ForeignKey_Deferrable as a ForeignKeyDeferrable1
+func (t ForeignKey_Deferrable) AsForeignKeyDeferrable1() (ForeignKeyDeferrable1, error) {
+	var body ForeignKeyDeferrable1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromForeignKeyDeferrable1 overwrites any union data inside the ForeignKey_Deferrable as the provided ForeignKeyDeferrable1
+func (t *ForeignKey_Deferrable) FromForeignKeyDeferrable1(v ForeignKeyDeferrable1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeForeignKeyDeferrable1 performs a merge with any union data inside the ForeignKey_Deferrable, using the provided ForeignKeyDeferrable1
+func (t *ForeignKey_Deferrable) MergeForeignKeyDeferrable1(v ForeignKeyDeferrable1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ForeignKey_Deferrable) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *ForeignKey_Deferrable) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"5uV/AQAA//+Khc395RAAAA==",
+	"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",
+	"sfqaxXf9jp1QCbr7XwAAAP//4t7eF9olAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

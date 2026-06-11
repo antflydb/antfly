@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
+
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.rows_query_request import RowsQueryRequest
@@ -16,31 +17,44 @@ T = TypeVar("T", bound="RowsCte")
 @_attrs_define
 class RowsCte:
     """Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`.
+    `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce
+    more rows or serialized row bytes than declared.
 
-    Attributes:
-        name (str):
-        query (RowsQueryRequest): Typed relational row-query plan. Predicate and expression arrays carry
-            Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
-            native request shape.
+        Attributes:
+            name (str):
+            query (RowsQueryRequest): Typed relational row-query plan. Predicate and expression arrays carry
+                Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
+                native request shape.
+            max_rows (int | Unset):
+            max_bytes (int | Unset):
     """
 
     name: str
     query: RowsQueryRequest
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    max_rows: int | Unset = UNSET
+    max_bytes: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
 
         query = self.query.to_dict()
 
+        max_rows = self.max_rows
+
+        max_bytes = self.max_bytes
+
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "name": name,
                 "query": query,
             }
         )
+        if max_rows is not UNSET:
+            field_dict["max_rows"] = max_rows
+        if max_bytes is not UNSET:
+            field_dict["max_bytes"] = max_bytes
 
         return field_dict
 
@@ -53,26 +67,15 @@ class RowsCte:
 
         query = RowsQueryRequest.from_dict(d.pop("query"))
 
+        max_rows = d.pop("max_rows", UNSET)
+
+        max_bytes = d.pop("max_bytes", UNSET)
+
         rows_cte = cls(
             name=name,
             query=query,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
         )
 
-        rows_cte.additional_properties = d
         return rows_cte
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

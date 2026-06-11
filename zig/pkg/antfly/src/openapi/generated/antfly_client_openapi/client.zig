@@ -487,7 +487,7 @@ pub const Client = struct {
 
     /// Stage typed relational update/delete operations from a claimed row source
     /// POST /db/v1/tables/{tableName}/rows:mutation-source
-    pub fn rowsMutationSource(self: *@This(), table_name: []const u8, body: types.RowsMutationSourceRequest) !ApiResponse(types.RowsMutationSourceResultSet) {
+    pub fn rowsMutationSource(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(types.RowsMutationSourceResultSet) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:mutation-source", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
@@ -505,6 +505,17 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.RowsGetResultSet).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a typed relational row read plan
+    /// POST /db/v1/tables/{tableName}/rows:plan
+    pub fn rowsPlan(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:plan", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
     /// Execute a typed relational row query plan

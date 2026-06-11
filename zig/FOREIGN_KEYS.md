@@ -283,6 +283,14 @@ For v1:
   boundaries must map
   `restrict` to a statement-time check, while the raw DB transaction API
   prepares row intents at commit.
+- Primary-key identity rewrites are intentionally separate from referenced
+  unique-tuple updates. Changing a row's physical primary key must be a native
+  typed identity-rewrite job that claims the old row, materializes the new row,
+  stages old-key delete plus new-key insert in one 2PC, moves unique-owner rows,
+  moves or rewrites FK reverse-reference rows, executes any parent `on_update`
+  action pages, and replays secondary plus embedded-JSON index maintenance from
+  the new committed row image. Until that operation exists, SQL adapters reject
+  primary-key assignments instead of lowering them into ordinary transforms.
 - `on_delete` supports `restrict`, `no_action`, `set_null`, and `cascade`;
   `no_action` is preserved as a first-class catalog value. `restrict` is never
   relaxed by `timing: "deferred"`; deferred `no_action` validates the final
@@ -2025,7 +2033,7 @@ The major implementation order was:
 
 Production work should continue to harden idempotence/recovery proof tests
 across topology changes and restart boundaries, dead-letter/requeue operator
-policy, and broader SQL-compatibility edge cases. Distributed cascades and
+policy, and broader SQL adapter parity edge cases. Distributed cascades and
 deferred parent-delete constraint sets use full transaction planning across the
 affected owner and child rows, so they should keep receiving the widest
 failure-injection coverage.

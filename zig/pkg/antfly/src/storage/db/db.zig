@@ -110,6 +110,8 @@ const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
+const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const lease_mod = @import("lease.zig");
 const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
@@ -148,6 +150,13 @@ pub const OpenOptions = struct {
         }
     };
 
+    pub const GraphMetricIdleMaintenanceMode = enum {
+        legacy,
+        planned,
+        auto,
+        degree_canary,
+    };
+
     open_mode: OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
@@ -174,6 +183,11 @@ pub const OpenOptions = struct {
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    graph_metric_maintenance: graph_metric_runtime_mod.Config = .{},
+    graph_metric_idle_maintenance: GraphMetricIdleMaintenanceMode = .auto,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions = .{},
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions = .{},
     /// Optional cross-shard candidate source for entity resolution blocking,
     /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
     /// Null means local-only blocking against the worker's own store. Must
@@ -2428,6 +2442,10 @@ pub const DB = struct {
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
+    graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -2446,6 +2464,7 @@ pub const DB = struct {
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    graph_metric_runtime: ?*graph_metric_runtime_mod.GraphMetricRuntime,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -2631,6 +2650,10 @@ pub const DB = struct {
                 .owned_backend_runtime = owned_backend_runtime,
                 .executor = executor,
                 .start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers,
+                .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
+                .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
+                .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
+                .graph_metric_idle_degree_canary_options = opts.graph_metric_idle_degree_canary_options,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
@@ -2646,6 +2669,7 @@ pub const DB = struct {
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
+                .graph_metric_runtime = null,
                 .shadow = null,
             };
             var executor_ready = false;
@@ -3018,6 +3042,24 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = runtime;
     }
 
+    fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+        if (!self.start_index_workers) return;
+        if (!cfg.enabled) return;
+        const resources = self.core.asyncResources();
+        const runtime = try self.runtime_alloc.create(graph_metric_runtime_mod.GraphMetricRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            self.runtime_alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            cfg,
+        );
+        errdefer runtime.deinit();
+        self.graph_metric_runtime = runtime;
+    }
+
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
         // Created before enrichment so the enrichment append context can notify
         // it when extraction artifacts land.
@@ -3039,6 +3081,7 @@ pub const DB = struct {
         }
         try self.initOptionalTextMergeRuntime(opts.text_merge);
         try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
+        try self.initOptionalGraphMetricRuntime(opts.graph_metric_maintenance);
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
@@ -3048,6 +3091,7 @@ pub const DB = struct {
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+        if (self.graph_metric_runtime) |runtime| try runtime.start();
     }
 
     fn hasConfiguredResolvers(self: *const DB) bool {
@@ -3140,6 +3184,10 @@ pub const DB = struct {
         }
         if (self.sparse_compaction_runtime) |runtime| {
             self.async_context.sparse_compaction_runtime = null;
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.graph_metric_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -3661,6 +3709,14 @@ pub const DB = struct {
             &owned_row_claim_predicate_keys,
             effective_req.writes,
             effective_req.deletes,
+        );
+        _ = try reclaimExpiredRowClaimIntentsForMutationKeys(
+            self,
+            effective_req.writes,
+            effective_req.deletes,
+            null,
+            monotonicTimeNs(),
+            true,
         );
 
         if (effective_predicates.items.len > 0) {
@@ -6444,6 +6500,14 @@ pub const DB = struct {
             effective_ops.writes,
             effective_ops.deletes,
         );
+        _ = try reclaimExpiredRowClaimIntentsForMutationKeys(
+            self,
+            effective_ops.writes,
+            effective_ops.deletes,
+            txn_id,
+            monotonicTimeNs(),
+            false,
+        );
         try self.applyForeignKeyParentDeleteActions(
             &intents,
             &owned_fk_action_keys,
@@ -6517,6 +6581,10 @@ pub const DB = struct {
         if (claim.mode != .for_update) return error.InvalidQueryRequest;
         if (row_keys.len == 0) return;
 
+        const claim_now_ns = monotonicTimeNs();
+        const claim_value = try rowClaimIntentValueAlloc(self.alloc, txn_id, claim, claim_now_ns);
+        defer self.alloc.free(claim_value);
+
         var owned_claim_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_claim_keys.items) |key| self.alloc.free(key);
@@ -6534,11 +6602,18 @@ pub const DB = struct {
             claim_key_owned = false;
             try intents.append(self.alloc, .{
                 .key = claim_key,
-                .value = null,
+                .value = claim_value,
             });
         }
 
-        try self.writeIntents(txn_id, intents.items, &.{});
+        self.writeIntents(txn_id, intents.items, &.{}) catch |err| switch (err) {
+            transactions_mod.TxnError.IntentConflict => {
+                const reclaimed = try reclaimExpiredRowClaimIntentsForRows(self, txn_id, row_keys, claim_now_ns);
+                if (reclaimed == 0) return err;
+                try self.writeIntents(txn_id, intents.items, &.{});
+            },
+            else => return err,
+        };
     }
 
     fn tryClaimRowForTransaction(
@@ -8934,6 +9009,7 @@ pub const DB = struct {
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+            .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
         };
     }
 
@@ -9177,7 +9253,39 @@ pub const DB = struct {
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
+        return switch (self.graph_metric_idle_maintenance) {
+            .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
+            .planned => try self.runGraphMetricPlannedMaintenanceForIdleLocked(),
+            .auto => if (try self.core.index_manager.shouldRunGraphMetricPlannedAutoIdle(self.graph_metric_idle_auto_options))
+                try self.runGraphMetricPlannedMaintenanceForIdleLocked()
+            else
+                try self.core.index_manager.runGraphMetricMaintenance(),
+            .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
+        };
+    }
+
+    fn runGraphMetricPlannedMaintenanceForIdleLocked(self: *DB) !usize {
+        const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
+        if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+        return result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+    }
+
+    fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
+        const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
+        if (decision.shouldRunPlanned()) return try self.runGraphMetricPlannedMaintenanceForIdleLocked();
+        if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
+            return error.RunUntilIdleDidNotConverge;
+        }
         return try self.core.index_manager.runGraphMetricMaintenance();
+    }
+
+    pub fn runGraphMetricPlannedMaintenanceForIdle(
+        self: *DB,
+        options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+    ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
     }
 
     pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
@@ -9220,6 +9328,111 @@ pub const DB = struct {
         return try cloneGraphMetricStatusFromGraph(alloc, status);
     }
 
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(
+        self: *DB,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(
+        self: *DB,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(
+        self: *DB,
+        index_name: []const u8,
+        metric_name: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(
+        self: *DB,
+        index_name: []const u8,
+        metric_name: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        err: anyerror,
+    ) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedDrain(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+        options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+    ) !types.GraphMetricStatus {
+        lockApply(self);
+        defer self.core.unlockApply();
+        var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
+        defer status.deinit(self.core.index_manager.alloc);
+        return try cloneGraphMetricStatusFromGraph(alloc, status);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(
+        self: *DB,
+        options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions,
+    ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(
+        self: *DB,
+        options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions,
+    ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
+    }
+
     fn cloneGraphMetricStatusFromGraph(
         alloc: Allocator,
         source: graph_mod.GraphIndex.GraphMetricStatus,
@@ -9245,6 +9458,12 @@ pub const DB = struct {
         const build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
         var build_cursor_moved = false;
         errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
+        const build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, source.build_pages);
+        var build_pages_moved = false;
+        errdefer if (!build_pages_moved) {
+            for (build_pages) |*page| page.deinit(alloc);
+            if (build_pages.len > 0) alloc.free(build_pages);
+        };
         const out = types.GraphMetricStatus{
             .name = name,
             .state = source.state,
@@ -9266,6 +9485,8 @@ pub const DB = struct {
             .build_cursor = build_cursor,
             .build_completed_units = source.build_completed_units,
             .build_total_units = source.build_total_units,
+            .build_pages = build_pages,
+            .build_pages_truncated = source.build_pages_truncated,
             .retry_count = source.retry_count,
             .last_error = last_error,
             .progress = source.progress,
@@ -9282,6 +9503,50 @@ pub const DB = struct {
         last_error_moved = true;
         build_worker_id_moved = true;
         build_cursor_moved = true;
+        build_pages_moved = true;
+        return out;
+    }
+
+    fn cloneGraphMetricBuildPageStatusesFromGraph(
+        alloc: Allocator,
+        source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
+    ) ![]types.GraphMetricBuildPageStatus {
+        if (source.len == 0) return @constCast((&[_]types.GraphMetricBuildPageStatus{})[0..]);
+        const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*page| page.deinit(alloc);
+            alloc.free(out);
+        }
+        for (source, 0..) |page, i| {
+            const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+            var worker_id_moved = false;
+            errdefer if (!worker_id_moved and worker_id.len > 0) alloc.free(worker_id);
+            const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+            var cursor_moved = false;
+            errdefer if (!cursor_moved and cursor.len > 0) alloc.free(cursor);
+            const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+            var last_error_moved = false;
+            errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+            out[i] = .{
+                .phase = page.phase,
+                .iteration = page.iteration,
+                .page_id = page.page_id,
+                .state = page.state,
+                .range_kind = page.range_kind,
+                .worker_id = worker_id,
+                .lease_expires_at_ms = page.lease_expires_at_ms,
+                .attempt = page.attempt,
+                .cursor = cursor,
+                .completed_units = page.completed_units,
+                .total_units = page.total_units,
+                .last_error = last_error,
+            };
+            worker_id_moved = true;
+            cursor_moved = true;
+            last_error_moved = true;
+            initialized += 1;
+        }
         return out;
     }
 
@@ -10533,6 +10798,12 @@ pub const DB = struct {
             const build_cursor = if (status.build_cursor.len > 0) try alloc.dupe(u8, status.build_cursor) else "";
             var build_cursor_moved = false;
             errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
+            const build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, status.build_pages);
+            var build_pages_moved = false;
+            errdefer if (!build_pages_moved) {
+                for (build_pages) |*page| page.deinit(alloc);
+                if (build_pages.len > 0) alloc.free(build_pages);
+            };
             statuses[i] = .{
                 .name = name,
                 .state = status.state,
@@ -10554,6 +10825,8 @@ pub const DB = struct {
                 .build_cursor = build_cursor,
                 .build_completed_units = status.build_completed_units,
                 .build_total_units = status.build_total_units,
+                .build_pages = build_pages,
+                .build_pages_truncated = status.build_pages_truncated,
                 .retry_count = status.retry_count,
                 .last_error = last_error,
                 .progress = status.progress,
@@ -10570,6 +10843,7 @@ pub const DB = struct {
             last_error_moved = true;
             build_worker_id_moved = true;
             build_cursor_moved = true;
+            build_pages_moved = true;
             initialized += 1;
         }
         item.graph_metric_status = statuses;
@@ -10594,6 +10868,7 @@ pub const DB = struct {
         runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
+        runtime_stats.graph_metric_runtime = self.graphMetricRuntimeStats();
 
         const target_sequence = self.core.nextDerivedSequence();
         for (runtime_stats.indexes) |*item| {
@@ -10788,6 +11063,7 @@ pub const DB = struct {
                 .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                .graph_metric_runtime = self.graphMetricRuntimeStats(),
             };
         }
         defer self.core.unlockApplyShared();
@@ -13801,6 +14077,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
             .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
             .async_indexing = async_indexing,
@@ -13971,6 +14248,7 @@ pub const DB = struct {
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .term_doc_freq_cache_hits = blk: {
                 var total: u64 = 0;
                 for (configs) |cfg| {
@@ -14058,7 +14336,70 @@ pub const DB = struct {
             .foreign_keys = self.snapshotForeignKeyStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .graph_metric_runtime = self.graphMetricRuntimeStats(),
             .async_indexing = self.async_context.stats.snapshot(),
+        };
+    }
+
+    fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
+        const runtime = self.graph_metric_runtime orelse return .{};
+        const runtime_snapshot = runtime.stats();
+        const total = runtime_snapshot.total_result;
+        const last = runtime_snapshot.last_result;
+        return .{
+            .enabled = runtime_snapshot.enabled,
+            .role = graphMetricRuntimeRoleToStats(runtime_snapshot.role),
+            .runtime_id_hash = runtime_snapshot.runtime_id_hash,
+            .owner_id_hash = runtime_snapshot.owner_id_hash,
+            .lease_key_hash = runtime_snapshot.lease_key_hash,
+            .worker_id_hash = runtime_snapshot.worker_id_hash,
+            .worker_count = @intCast(runtime_snapshot.worker_count),
+            .lease_owned = runtime_snapshot.lease_owned,
+            .has_lease = runtime_snapshot.has_lease,
+            .acquisition_count = runtime_snapshot.acquisition_count,
+            .takeover_count = runtime_snapshot.takeover_count,
+            .lease_acquire_failures = runtime_snapshot.lease_acquire_failures,
+            .lost_leases = runtime_snapshot.lost_leases,
+            .last_acquired_ms = runtime_snapshot.last_acquired_ms,
+            .started = runtime_snapshot.started,
+            .shutdown = runtime_snapshot.shutdown,
+            .notified = runtime_snapshot.notified,
+            .ticks_started = runtime_snapshot.ticks_started,
+            .ticks_completed = runtime_snapshot.ticks_completed,
+            .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
+            .idle_ticks = runtime_snapshot.idle_ticks,
+            .error_ticks = runtime_snapshot.error_ticks,
+            .last_error_name = runtime_snapshot.last_error_name,
+            .total_metrics_scanned = @intCast(total.metrics_scanned),
+            .total_active_builds = @intCast(total.active_builds),
+            .total_builds_started = @intCast(total.builds_started),
+            .total_worker_steps = @intCast(total.worker_steps),
+            .total_coordinator_steps = @intCast(total.coordinator_steps),
+            .total_pages_claimed = @intCast(total.pages_claimed),
+            .total_pages_completed = @intCast(total.pages_completed),
+            .total_phases_advanced = @intCast(total.phases_advanced),
+            .total_published = @intCast(total.published),
+            .total_failed_builds = @intCast(total.failed_builds),
+            .last_metrics_scanned = @intCast(last.metrics_scanned),
+            .last_active_builds = @intCast(last.active_builds),
+            .last_builds_started = @intCast(last.builds_started),
+            .last_worker_steps = @intCast(last.worker_steps),
+            .last_coordinator_steps = @intCast(last.coordinator_steps),
+            .last_pages_claimed = @intCast(last.pages_claimed),
+            .last_pages_completed = @intCast(last.pages_completed),
+            .last_phases_advanced = @intCast(last.phases_advanced),
+            .last_published = @intCast(last.published),
+            .last_failed_builds = @intCast(last.failed_builds),
+            .last_budget_exhausted = last.budget_exhausted,
+        };
+    }
+
+    fn graphMetricRuntimeRoleToStats(role: graph_metric_runtime_mod.Role) types.GraphMetricRuntimeRole {
+        return switch (role) {
+            .combined => .combined,
+            .coordinator => .coordinator,
+            .worker => .worker,
+            .worker_pool => .worker_pool,
         };
     }
 
@@ -14509,6 +14850,7 @@ pub const DB = struct {
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         if (req.source_cte.len != 0) return error.InvalidQueryRequest;
+        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -14536,6 +14878,11 @@ pub const DB = struct {
         plan: types.RelationalRowsQueryPlan,
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        try validateRelationalRowsQueryPlanRequest(plan);
+        try validateRelationalRowsQueryPlanCteReferences(plan);
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsQueryAgainstPlannedCteOutput(planned_ctes, plan.query);
 
         var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
         defer {
@@ -14543,8 +14890,8 @@ pub const DB = struct {
             materialized_ctes.deinit(alloc);
         }
 
-        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ctes, &materialized_ctes);
-        return try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.query);
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ranges, plan.ctes, &materialized_ctes);
+        return try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.ranges, plan.query);
     }
 
     pub fn mutateRelationalRowsFromSource(
@@ -14553,14 +14900,69 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
-        if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-        const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
-        const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        var plan = try self.planRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req);
+        defer plan.deinit(alloc);
+        return try self.stagePlannedRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req, plan.matched, plan.candidates);
+    }
+
+    pub fn validateRelationalRowsInsertSourceRequest(
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsInsertSourceRequest,
+    ) !void {
+        return validateRelationalRowsInsertSourceRequestWithSchemas(runtime_schema, runtime_schema, req);
+    }
+
+    pub fn validateRelationalRowsInsertSourceRequestWithSchemas(
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsInsertSourceRequest,
+    ) !void {
+        if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+        if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidArgument;
+        if (req.source.row_claim != null) return error.InvalidQueryRequest;
         if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
         if (req.source.doc_key_range != null) return error.UnsupportedQueryRequest;
-        if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0) return error.InvalidQueryRequest;
-        if (req.kind == .delete and (req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0)) return error.InvalidQueryRequest;
+        if (req.source.distinct_on.len != 0) return error.UnsupportedQueryRequest;
+        if (req.assignments.len == 0) return error.InvalidQueryRequest;
+        try validateRelationalRowsBaseQueryRequestAgainstSchema(source_schema, req.source);
+        for (req.assignments, 0..) |assignment, i| {
+            if (assignment.field.len == 0) return error.InvalidQueryRequest;
+            _ = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+            for (req.assignments[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.field, assignment.field)) return error.InvalidQueryRequest;
+            }
+            try validateRelationalRowsInsertSourceExpression(source_schema, assignment.expression);
+        }
+        if (req.on_conflict) |conflict| try validateRelationalRowsOnConflict(target_schema, conflict);
+        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+    }
+
+    pub fn planRelationalRowsMutationSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsMutationSourceRequest,
+    ) !RelationalRowsMutationSourcePlan {
+        var all_candidates = try self.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, runtime_schema, req, null);
+        errdefer {
+            for (all_candidates) |*candidate| candidate.deinit(alloc);
+            if (all_candidates.len > 0) alloc.free(all_candidates);
+        }
+        return try selectPlannedRelationalRowsMutationSourceCandidatesAlloc(alloc, req, &all_candidates);
+    }
+
+    pub fn collectRelationalRowsMutationSourceCandidatesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsMutationSourceRequest,
+        doc_key_range: ?types.RelationalRowsDocKeyRange,
+    ) ![]RelationalRowsMutationSourceCandidate {
+        _ = try validateRelationalRowsMutationSourceRequest(runtime_schema, req);
+        var source_req = req.source;
+        source_req.limit = null;
+        source_req.offset = 0;
+        if (doc_key_range) |range| source_req.doc_key_range = range;
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -14572,28 +14974,109 @@ pub const DB = struct {
             for (rows.items) |*row| row.deinit(alloc);
             rows.deinit(alloc);
         }
-        try self.appendRelationalRowsQueryCandidatesForRequestAlloc(alloc, runtime_schema, req.source, generation, &rows);
+        try self.appendRelationalRowsQueryCandidatesForRequestAlloc(alloc, runtime_schema, source_req, generation, &rows);
 
         self.core.unlockApplyShared();
         apply_shared_held = false;
 
+        var candidates = std.ArrayListUnmanaged(RelationalRowsMutationSourceCandidate).empty;
+        errdefer {
+            for (candidates.items) |*candidate| candidate.deinit(alloc);
+            candidates.deinit(alloc);
+        }
+        try candidates.ensureUnusedCapacity(alloc, rows.items.len);
+        for (rows.items) |*row| {
+            candidates.appendAssumeCapacity(.{
+                .doc_key = row.doc_key,
+                .json = row.json,
+                .version = row.version,
+                .order_keys = row.order_keys,
+                .ordinal = row.ordinal,
+            });
+            row.doc_key = &.{};
+            row.json = &.{};
+            row.order_keys = &.{};
+        }
+        const all_candidates = try candidates.toOwnedSlice(alloc);
+        errdefer {
+            for (all_candidates) |*candidate| candidate.deinit(alloc);
+            if (all_candidates.len > 0) alloc.free(all_candidates);
+        }
+        return all_candidates;
+    }
+
+    pub fn selectPlannedRelationalRowsMutationSourceCandidatesAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsMutationSourceRequest,
+        candidates: *[]RelationalRowsMutationSourceCandidate,
+    ) !RelationalRowsMutationSourcePlan {
+        const items = candidates.*;
         if (req.source.order_by.len > 0) {
-            std.sort.pdq(RelationalRowsQueryCandidate, rows.items, RelationalRowsQuerySortContext{ .order_by = req.source.order_by }, relationalRowsQueryCandidateLessThan);
+            std.sort.pdq(RelationalRowsMutationSourceCandidate, items, RelationalRowsMutationSourceSortContext{ .order_by = req.source.order_by }, relationalRowsMutationSourceCandidateLessThan);
         }
 
-        const matched: u32 = @intCast(rows.items.len);
-        const start = @min(@as(usize, req.source.offset), rows.items.len);
+        const matched: u32 = @intCast(items.len);
+        const start = @min(@as(usize, req.source.offset), items.len);
         const limited_len: usize = if (req.source.limit) |limit|
-            @min(@as(usize, limit), rows.items.len - start)
+            @min(@as(usize, limit), items.len - start)
         else
-            rows.items.len - start;
+            items.len - start;
+
+        const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
+        const scan_end = if (claim.skip_locked) items.len else start + limited_len;
+        var selected = std.ArrayListUnmanaged(RelationalRowsMutationSourceCandidate).empty;
+        errdefer {
+            for (selected.items) |*candidate| candidate.deinit(alloc);
+            selected.deinit(alloc);
+        }
+        try selected.ensureUnusedCapacity(alloc, scan_end - start);
+        for (items[start..scan_end]) |*candidate| {
+            selected.appendAssumeCapacity(candidate.*);
+            candidate.* = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 };
+        }
+        const selected_slice = try selected.toOwnedSlice(alloc);
+        for (items) |*candidate| candidate.deinit(alloc);
+        if (items.len > 0) alloc.free(items);
+        candidates.* = @constCast((&[_]RelationalRowsMutationSourceCandidate{})[0..]);
+        return .{
+            .matched = matched,
+            .candidates = selected_slice,
+        };
+    }
+
+    pub fn stagePlannedRelationalRowsMutationSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsMutationSourceRequest,
+        matched: u32,
+        candidates: []const RelationalRowsMutationSourceCandidate,
+    ) !types.RelationalRowsMutationSourceResult {
+        const claim = try validateRelationalRowsMutationSourceRequest(runtime_schema, req);
+        const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
 
         var selected_indexes = std.ArrayListUnmanaged(usize).empty;
         defer selected_indexes.deinit(alloc);
-        const scan_end = if (claim.skip_locked) rows.items.len else start + limited_len;
-        try selected_indexes.ensureUnusedCapacity(alloc, scan_end - start);
-        for (start..scan_end) |i| selected_indexes.appendAssumeCapacity(i);
-        _ = try self.applyRelationalRowsClaimToSelectedCandidatesAlloc(alloc, rows.items, &selected_indexes, claim, req.source.limit);
+        try selected_indexes.ensureUnusedCapacity(alloc, candidates.len);
+        if (!claim.skip_locked) {
+            var row_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer row_keys.deinit(alloc);
+            try row_keys.ensureUnusedCapacity(alloc, candidates.len);
+            for (candidates, 0..) |candidate, i| {
+                row_keys.appendAssumeCapacity(candidate.doc_key);
+                selected_indexes.appendAssumeCapacity(i);
+            }
+            try self.claimRowsForTransaction(txn_id, row_keys.items, claim);
+        } else {
+            for (candidates, 0..) |candidate, i| {
+                if (req.source.limit) |max_claimed| {
+                    if (selected_indexes.items.len >= @as(usize, max_claimed)) break;
+                }
+                if (try self.tryClaimRowForTransaction(txn_id, candidate.doc_key, claim)) {
+                    selected_indexes.appendAssumeCapacity(i);
+                }
+            }
+        }
 
         var transforms = std.ArrayListUnmanaged(types.DocumentTransform).empty;
         defer {
@@ -14611,7 +15094,7 @@ pub const DB = struct {
         }
 
         for (selected_indexes.items) |row_index| {
-            const row = rows.items[row_index];
+            const row = candidates[row_index];
             if (row.version == 0) return error.InvalidQueryRequest;
             try predicates.append(alloc, .{
                 .key = row.doc_key,
@@ -14667,6 +15150,859 @@ pub const DB = struct {
         };
     }
 
+    pub fn mutateRelationalRowsJoinedSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !types.RelationalRowsMutationSourceResult {
+        var plan = try self.planRelationalRowsJoinedMutationSourceAlloc(alloc, runtime_schema, req);
+        defer plan.deinit(alloc);
+        return try self.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, runtime_schema, req, plan.matched, plan.candidates);
+    }
+
+    pub fn planRelationalRowsJoinedMutationSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !RelationalRowsJoinedMutationSourcePlan {
+        var all_candidates = try self.collectRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, runtime_schema, req);
+        errdefer {
+            for (all_candidates) |*candidate| candidate.deinit(alloc);
+            if (all_candidates.len > 0) alloc.free(all_candidates);
+        }
+        return try selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &all_candidates);
+    }
+
+    pub fn collectRelationalRowsJoinedMutationSourceCandidatesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) ![]RelationalRowsJoinedMutationSourceCandidate {
+        return try self.collectRelationalRowsJoinedMutationSourceCandidatesForTargetRangeAlloc(alloc, runtime_schema, req, null);
+    }
+
+    pub fn collectRelationalRowsJoinedMutationSourceCandidatesForTargetRangeAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        target_doc_key_range: ?types.RelationalRowsDocKeyRange,
+    ) ![]RelationalRowsJoinedMutationSourceCandidate {
+        var target_candidates = try self.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, runtime_schema, req, target_doc_key_range);
+        errdefer {
+            for (target_candidates) |*candidate| candidate.deinit(alloc);
+            if (target_candidates.len > 0) alloc.free(target_candidates);
+        }
+
+        var source_rows = try self.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, runtime_schema, req, null);
+        defer source_rows.deinit(alloc);
+
+        return try buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows.rows);
+    }
+
+    pub fn collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        target_doc_key_range: ?types.RelationalRowsDocKeyRange,
+    ) ![]RelationalRowsMutationSourceCandidate {
+        _ = try validateRelationalRowsJoinedMutationTargetSideRequest(runtime_schema, req);
+
+        var target_source = relationalRowsJoinedMutationTargetSource(req);
+        if (target_doc_key_range) |range| target_source.doc_key_range = range;
+        target_source.order_by = req.join.order_by;
+
+        lockApplyShared(self);
+        var apply_shared_held = true;
+        defer if (apply_shared_held) self.core.unlockApplyShared();
+
+        const generation = self.core.nextDerivedSequence();
+        var target_rows = std.ArrayListUnmanaged(RelationalRowsQueryCandidate).empty;
+        defer {
+            for (target_rows.items) |*row| row.deinit(alloc);
+            target_rows.deinit(alloc);
+        }
+        try self.appendRelationalRowsQueryCandidatesForRequestAlloc(alloc, runtime_schema, target_source, generation, &target_rows);
+
+        self.core.unlockApplyShared();
+        apply_shared_held = false;
+
+        var candidates = std.ArrayListUnmanaged(RelationalRowsMutationSourceCandidate).empty;
+        errdefer {
+            for (candidates.items) |*candidate| candidate.deinit(alloc);
+            candidates.deinit(alloc);
+        }
+        try candidates.ensureUnusedCapacity(alloc, target_rows.items.len);
+        for (target_rows.items) |*target_row| {
+            candidates.appendAssumeCapacity(.{
+                .doc_key = target_row.doc_key,
+                .json = target_row.json,
+                .version = target_row.version,
+                .order_keys = target_row.order_keys,
+                .ordinal = target_row.ordinal,
+                .group_id = 0,
+            });
+            target_row.doc_key = &.{};
+            target_row.json = &.{};
+            target_row.order_keys = &.{};
+        }
+        return try candidates.toOwnedSlice(alloc);
+    }
+
+    fn validateRelationalRowsJoinedMutationTargetSideRequest(
+        target_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !types.RowClaimRequest {
+        if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+        if (req.join.on.len == 0) return error.InvalidQueryRequest;
+        if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+        if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+        const target = relationalRowsJoinedMutationTargetQuery(req);
+        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const claim = target.row_claim orelse return error.InvalidQueryRequest;
+        if (claim.txn_id == null) return error.InvalidQueryRequest;
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (source.row_claim != null) return error.InvalidQueryRequest;
+        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (target.distinct_on.len != 0 or source.distinct_on.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
+        if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0) return error.InvalidQueryRequest;
+        if (req.kind == .delete and (req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, &.{}, req.source_assignments);
+        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+        for (req.source_assignments) |assignment| {
+            if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+            _ = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+        }
+        return claim;
+    }
+
+    pub fn queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        source_doc_key_range: ?types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsQueryResult {
+        _ = try validateRelationalRowsJoinedMutationSourceRequest(runtime_schema, req);
+        return try self.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, runtime_schema, req, source_doc_key_range);
+    }
+
+    pub fn queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(
+        self: *DB,
+        alloc: Allocator,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        source_doc_key_range: ?types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsQueryResult {
+        try validateRelationalRowsJoinedMutationSourceSideRequest(source_schema, req);
+        var source_source = relationalRowsJoinedMutationSourceSide(req);
+        if (source_doc_key_range) |range| source_source.doc_key_range = range;
+        return try self.queryRelationalRows(alloc, source_schema, source_source);
+    }
+
+    fn validateRelationalRowsJoinedMutationSourceSideRequest(
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !void {
+        if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidArgument;
+        if (req.join.on.len == 0) return error.InvalidQueryRequest;
+        if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+        if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+        const target = relationalRowsJoinedMutationTargetQuery(req);
+        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const claim = target.row_claim orelse return error.InvalidQueryRequest;
+        if (claim.txn_id == null) return error.InvalidQueryRequest;
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (source.row_claim != null) return error.InvalidQueryRequest;
+        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (target.distinct_on.len != 0 or source.distinct_on.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0) return error.InvalidQueryRequest;
+        if (req.kind == .delete and (req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, &.{}, req.source_assignments);
+
+        for (req.source_assignments) |assignment| {
+            if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+            _ = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+        }
+    }
+
+    fn validateRelationalRowsJoinedMutationJoinFieldsForSide(
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        side: RelationalRowsJoinSide,
+    ) !void {
+        for (req.join.on) |predicate| {
+            const field = switch (side) {
+                .left => predicate.left_field,
+                .right => predicate.right_field,
+            };
+            _ = relationalRowsFindColumn(runtime_schema.relational_columns, field) orelse return error.InvalidQueryRequest;
+        }
+    }
+
+    pub fn buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        target_candidates: *[]RelationalRowsMutationSourceCandidate,
+        source_rows: []const []const u8,
+    ) ![]RelationalRowsJoinedMutationSourceCandidate {
+        var source_index = std.StringArrayHashMapUnmanaged(RelationalRowsJoinRightList).empty;
+        defer deinitRelationalRowsJoinRightIndex(alloc, &source_index);
+        const source_join_side = relationalRowsJoinedMutationSourceJoinSide(req);
+        for (source_rows, 0..) |source_row, source_index_id| {
+            var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_row, .{}) catch return error.InvalidQueryRequest;
+            defer parsed_source.deinit();
+            if (parsed_source.value != .object) return error.InvalidQueryRequest;
+            const key_json = (try relationalRowsJoinKeyJsonAlloc(alloc, parsed_source.value, req.join.on, source_join_side)) orelse continue;
+            var key_transferred = false;
+            errdefer if (!key_transferred) alloc.free(key_json);
+            const gop = try source_index.getOrPut(alloc, key_json);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = key_json;
+                key_transferred = true;
+                gop.value_ptr.* = .{};
+            }
+            try gop.value_ptr.indexes.append(alloc, source_index_id);
+            if (gop.found_existing) alloc.free(key_json);
+        }
+
+        var candidates = std.ArrayListUnmanaged(RelationalRowsJoinedMutationSourceCandidate).empty;
+        errdefer {
+            for (candidates.items) |*candidate| candidate.deinit(alloc);
+            candidates.deinit(alloc);
+        }
+        const target_join_side = relationalRowsJoinedMutationTargetJoinSide(req);
+        for (target_candidates.*) |*target_row| {
+            var parsed_target = std.json.parseFromSlice(std.json.Value, alloc, target_row.json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed_target.deinit();
+            if (parsed_target.value != .object) return error.InvalidQueryRequest;
+            const key_json = try relationalRowsJoinKeyJsonAlloc(alloc, parsed_target.value, req.join.on, target_join_side);
+            defer if (key_json) |key| alloc.free(key);
+            const key = key_json orelse continue;
+            const source_list = source_index.get(key) orelse continue;
+            if (source_list.indexes.items.len != 1) return error.UnsupportedQueryRequest;
+            if (!(try relationalRowsJoinedMutationMatchPredicatesPass(alloc, parsed_target.value, source_rows[source_list.indexes.items[0]], req))) continue;
+            const source_json = try alloc.dupe(u8, source_rows[source_list.indexes.items[0]]);
+            var source_transferred = false;
+            errdefer if (!source_transferred) alloc.free(source_json);
+            try candidates.append(alloc, .{
+                .target = .{
+                    .doc_key = target_row.doc_key,
+                    .json = target_row.json,
+                    .version = target_row.version,
+                    .order_keys = target_row.order_keys,
+                    .ordinal = target_row.ordinal,
+                    .group_id = 0,
+                },
+                .source_json = source_json,
+            });
+            target_row.doc_key = &.{};
+            target_row.json = &.{};
+            target_row.order_keys = &.{};
+            source_transferred = true;
+        }
+        for (target_candidates.*) |*target_row| target_row.deinit(alloc);
+        if (target_candidates.*.len > 0) alloc.free(target_candidates.*);
+        target_candidates.* = @constCast((&[_]RelationalRowsMutationSourceCandidate{})[0..]);
+        return try candidates.toOwnedSlice(alloc);
+    }
+
+    pub fn selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        candidates: *[]RelationalRowsJoinedMutationSourceCandidate,
+    ) !RelationalRowsJoinedMutationSourcePlan {
+        const items = candidates.*;
+        if (req.join.order_by.len > 0) {
+            std.sort.pdq(RelationalRowsJoinedMutationSourceCandidate, items, RelationalRowsJoinedMutationSourceSortContext{ .order_by = req.join.order_by }, relationalRowsJoinedMutationSourceCandidateLessThan);
+        }
+
+        const matched: u32 = @intCast(items.len);
+        const start = @min(@as(usize, req.join.offset), items.len);
+        const limited_len: usize = if (req.join.limit) |limit|
+            @min(@as(usize, limit), items.len - start)
+        else
+            items.len - start;
+
+        const claim = relationalRowsJoinedMutationClaim(req) orelse return error.InvalidQueryRequest;
+        const scan_end = if (claim.skip_locked) items.len else start + limited_len;
+        var selected = std.ArrayListUnmanaged(RelationalRowsJoinedMutationSourceCandidate).empty;
+        errdefer {
+            for (selected.items) |*candidate| candidate.deinit(alloc);
+            selected.deinit(alloc);
+        }
+        try selected.ensureUnusedCapacity(alloc, scan_end - start);
+        for (items[start..scan_end]) |*candidate| {
+            selected.appendAssumeCapacity(candidate.*);
+            candidate.* = .{};
+        }
+        const selected_slice = try selected.toOwnedSlice(alloc);
+        for (items) |*candidate| candidate.deinit(alloc);
+        if (items.len > 0) alloc.free(items);
+        candidates.* = @constCast((&[_]RelationalRowsJoinedMutationSourceCandidate{})[0..]);
+        return .{
+            .matched = matched,
+            .candidates = selected_slice,
+        };
+    }
+
+    pub fn stagePlannedRelationalRowsJoinedMutationSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        matched: u32,
+        candidates: []const RelationalRowsJoinedMutationSourceCandidate,
+    ) !types.RelationalRowsMutationSourceResult {
+        return try self.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, runtime_schema, runtime_schema, req, matched, candidates);
+    }
+
+    pub fn stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(
+        self: *DB,
+        alloc: Allocator,
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+        matched: u32,
+        candidates: []const RelationalRowsJoinedMutationSourceCandidate,
+    ) !types.RelationalRowsMutationSourceResult {
+        const claim = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(target_schema, source_schema, req);
+        const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+
+        var selected_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer selected_indexes.deinit(alloc);
+        try selected_indexes.ensureUnusedCapacity(alloc, candidates.len);
+        if (!claim.skip_locked) {
+            var row_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer row_keys.deinit(alloc);
+            try row_keys.ensureUnusedCapacity(alloc, candidates.len);
+            for (candidates, 0..) |candidate, i| {
+                row_keys.appendAssumeCapacity(candidate.target.doc_key);
+                selected_indexes.appendAssumeCapacity(i);
+            }
+            try self.claimRowsForTransaction(txn_id, row_keys.items, claim);
+        } else {
+            for (candidates, 0..) |candidate, i| {
+                if (req.join.limit) |max_claimed| {
+                    if (selected_indexes.items.len >= @as(usize, max_claimed)) break;
+                }
+                if (try self.tryClaimRowForTransaction(txn_id, candidate.target.doc_key, claim)) {
+                    selected_indexes.appendAssumeCapacity(i);
+                }
+            }
+        }
+
+        var transforms = std.ArrayListUnmanaged(types.DocumentTransform).empty;
+        defer {
+            for (transforms.items) |transform| relationalRowsFreeTransformOps(alloc, transform.operations);
+            transforms.deinit(alloc);
+        }
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var predicates = std.ArrayListUnmanaged(types.TransactionVersionPredicate).empty;
+        defer predicates.deinit(alloc);
+        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (returning_rows.items) |row| alloc.free(@constCast(row));
+            returning_rows.deinit(alloc);
+        }
+
+        for (selected_indexes.items) |row_index| {
+            const row = candidates[row_index];
+            if (row.target.version == 0) return error.InvalidQueryRequest;
+            try predicates.append(alloc, .{
+                .key = row.target.doc_key,
+                .expected_version = row.target.version,
+            });
+
+            switch (req.kind) {
+                .update => {
+                    const operations = try relationalRowsJoinedMutationSourceOperationsAlloc(alloc, target_schema, source_schema, row.target.json, row.source_json, req);
+                    var operations_transferred = false;
+                    errdefer if (!operations_transferred) relationalRowsFreeTransformOps(alloc, operations);
+                    try transforms.append(alloc, .{
+                        .key = row.target.doc_key,
+                        .operations = operations,
+                    });
+                    operations_transferred = true;
+                    if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
+                        const planned = (try transform_mod.resolveDocumentTransform(alloc, row.target.json, .{
+                            .key = row.target.doc_key,
+                            .operations = operations,
+                        })) orelse return error.InvalidQueryRequest;
+                        defer alloc.free(planned);
+                        const projected = try relationalRowsJoinedMutationReturningJsonAlloc(alloc, planned, row.source_json, req);
+                        var projected_transferred = false;
+                        errdefer if (!projected_transferred) alloc.free(projected);
+                        try returning_rows.append(alloc, projected);
+                        projected_transferred = true;
+                    }
+                },
+                .delete => {
+                    try deletes.append(alloc, row.target.doc_key);
+                    if (req.returning_all or req.returning.len > 0 or req.returning_expressions.len > 0) {
+                        const projected = try relationalRowsJoinedMutationReturningJsonAlloc(alloc, row.target.json, row.source_json, req);
+                        var projected_transferred = false;
+                        errdefer if (!projected_transferred) alloc.free(projected);
+                        try returning_rows.append(alloc, projected);
+                        projected_transferred = true;
+                    }
+                },
+            }
+        }
+
+        try self.writeTransaction(txn_id, .{
+            .deletes = deletes.items,
+            .transforms = transforms.items,
+            .predicates = predicates.items,
+        });
+
+        return .{
+            .matched = matched,
+            .staged = @intCast(selected_indexes.items.len),
+            .returning_rows = try returning_rows.toOwnedSlice(alloc),
+        };
+    }
+
+    fn validateRelationalRowsMutationSourceRequest(
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsMutationSourceRequest,
+    ) !types.RowClaimRequest {
+        if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
+        if (claim.txn_id == null) return error.InvalidQueryRequest;
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        if (req.source.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (req.source.distinct_on.len != 0) return error.UnsupportedQueryRequest;
+        if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+        if (req.kind == .delete and (req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});
+        try validateRelationalRowsMutationReturningRequestOutputs(runtime_schema, req.returning, req.returning_all, req.returning_expressions);
+        return claim;
+    }
+
+    fn validateRelationalRowsJoinedMutationSourceRequest(
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !types.RowClaimRequest {
+        return try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(runtime_schema, runtime_schema, req);
+    }
+
+    fn validateRelationalRowsJoinedMutationSourceRequestWithSchemas(
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !types.RowClaimRequest {
+        if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+        if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidArgument;
+        if (req.join.on.len == 0) return error.InvalidQueryRequest;
+        if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+        if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+        const target = relationalRowsJoinedMutationTargetQuery(req);
+        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const claim = target.row_claim orelse return error.InvalidQueryRequest;
+        if (claim.txn_id == null) return error.InvalidQueryRequest;
+        if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        if (source.row_claim != null) return error.InvalidQueryRequest;
+        if (target.source_cte.len != 0 or source.source_cte.len != 0) return error.UnsupportedQueryRequest;
+        if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (target.distinct_on.len != 0 or source.distinct_on.len != 0) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
+        try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0) return error.InvalidQueryRequest;
+        if (req.kind == .delete and (req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, &.{}, req.source_assignments);
+        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+        try validateRelationalRowsJoinedMutationReturningSources(source_schema, req.returning_expressions);
+        try validateRelationalRowsJoinedMutationMatchExpressions(target_schema, source_schema, req);
+        for (req.source_assignments) |assignment| {
+            if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+            const target_column = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+            const source_column = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+            if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
+        }
+        return claim;
+    }
+
+    fn validateRelationalRowsJoinedMutationMatchExpressions(
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !void {
+        for (req.match_expression_predicates) |condition| {
+            try validateRelationalRowsJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+        }
+        for (req.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| {
+                try validateRelationalRowsJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+            }
+        }
+        for (req.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| {
+                try validateRelationalRowsJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+            }
+        }
+        for (req.match_expression_array_contains) |predicate| {
+            try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, predicate.expression);
+        }
+    }
+
+    fn validateRelationalRowsJoinedMutationMatchExpressionCondition(
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!void {
+        try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, condition.lhs);
+        for (condition.rhs) |rhs| try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, rhs);
+    }
+
+    fn validateRelationalRowsJoinedMutationMatchExpression(
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        expression: types.RelationalRowsExpression,
+    ) anyerror!void {
+        if (expression.kind == .field) {
+            const schema = if (expression.field_source == .source) source_schema else target_schema;
+            _ = relationalRowsFindColumn(schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        }
+        for (expression.operands) |operand| try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsJoinedMutationMatchExpressionCondition(target_schema, source_schema, branch.when);
+            try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, branch.then);
+        }
+        for (expression.case_else) |case_else| try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, case_else);
+    }
+
+    fn validateRelationalRowsMutationReturningRequestOutputs(
+        runtime_schema: schema_mod.TableSchema,
+        fields: []const []const u8,
+        returning_all: bool,
+        expressions: []const types.RelationalRowsExpressionProjection,
+    ) !void {
+        if (returning_all and fields.len != 0) return error.InvalidQueryRequest;
+        for (fields) |field| {
+            if (field.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsMutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
+        }
+        for (expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (returning_all and relationalRowsFindColumn(runtime_schema.relational_columns, projection.output) != null) return error.InvalidQueryRequest;
+            if (relationalRowsMutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn validateRelationalRowsJoinedMutationReturningSources(
+        source_schema: schema_mod.TableSchema,
+        expressions: []const types.RelationalRowsExpressionProjection,
+    ) !void {
+        for (expressions) |projection| {
+            if (!relationalRowsExpressionUsesSourceField(projection.expression)) continue;
+            try validateRelationalRowsJoinedMutationSourceExpression(source_schema, projection.expression);
+        }
+    }
+
+    fn validateRelationalRowsJoinedMutationSourceExpression(
+        source_schema: schema_mod.TableSchema,
+        expression: types.RelationalRowsExpression,
+    ) anyerror!void {
+        if (expression.kind == .field) {
+            if (expression.field_source != .source) return error.UnsupportedQueryRequest;
+            _ = relationalRowsFindColumn(source_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        }
+        for (expression.operands) |operand| try validateRelationalRowsJoinedMutationSourceExpression(source_schema, operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsJoinedMutationSourceExpressionCondition(source_schema, branch.when);
+            try validateRelationalRowsJoinedMutationSourceExpression(source_schema, branch.then);
+        }
+        for (expression.case_else) |case_else| try validateRelationalRowsJoinedMutationSourceExpression(source_schema, case_else);
+    }
+
+    fn validateRelationalRowsJoinedMutationSourceExpressionCondition(
+        source_schema: schema_mod.TableSchema,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!void {
+        try validateRelationalRowsJoinedMutationSourceExpression(source_schema, condition.lhs);
+        for (condition.rhs) |rhs| try validateRelationalRowsJoinedMutationSourceExpression(source_schema, rhs);
+    }
+
+    fn validateRelationalRowsInsertSourceExpression(
+        source_schema: schema_mod.TableSchema,
+        expression: types.RelationalRowsExpression,
+    ) anyerror!void {
+        if (expression.kind == .field) {
+            if (expression.field_source == .existing or expression.field_source == .proposed) return error.InvalidQueryRequest;
+            _ = relationalRowsFindColumn(source_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        }
+        for (expression.operands) |operand| try validateRelationalRowsInsertSourceExpression(source_schema, operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsInsertSourceExpressionCondition(source_schema, branch.when);
+            try validateRelationalRowsInsertSourceExpression(source_schema, branch.then);
+        }
+        for (expression.case_else) |case_else| try validateRelationalRowsInsertSourceExpression(source_schema, case_else);
+    }
+
+    fn validateRelationalRowsInsertSourceExpressionCondition(
+        source_schema: schema_mod.TableSchema,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!void {
+        try validateRelationalRowsInsertSourceExpression(source_schema, condition.lhs);
+        for (condition.rhs) |rhs| try validateRelationalRowsInsertSourceExpression(source_schema, rhs);
+    }
+
+    fn validateRelationalRowsOnConflict(
+        runtime_schema: schema_mod.TableSchema,
+        conflict: types.RelationalRowsOnConflict,
+    ) anyerror!void {
+        switch (conflict.target.kind) {
+            .primary => {
+                if (conflict.target.unique_name.len != 0 or conflict.target.unique_predicates.len != 0) return error.InvalidQueryRequest;
+            },
+            .unique => {
+                if (conflict.target.unique_name.len == 0) return error.InvalidQueryRequest;
+                const constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, conflict.target.unique_name) orelse return error.InvalidQueryRequest;
+                if (constraint.validation_state != .enforced) return error.InvalidQueryRequest;
+                try validateRelationalRowsConflictTargetPredicates(conflict.target.unique_predicates, constraint);
+            },
+        }
+        switch (conflict.action) {
+            .nothing => {
+                if (conflict.operations.len != 0 or conflict.patch_expressions.len != 0 or conflict.increment_expressions.len != 0 or conflict.json_set_expressions.len != 0 or conflict.where_expression != null) return error.InvalidQueryRequest;
+            },
+            .update => {
+                if (conflict.operations.len == 0 and conflict.patch_expressions.len == 0 and conflict.increment_expressions.len == 0 and conflict.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+                try validateRelationalRowsMutationUpdateTargetPaths(conflict.operations, conflict.patch_expressions, conflict.increment_expressions, conflict.json_set_expressions, &.{});
+                for (conflict.patch_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
+                for (conflict.increment_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
+                for (conflict.json_set_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
+                if (conflict.where_expression) |condition| try validateRelationalRowsConflictExpressionCondition(runtime_schema, condition);
+            },
+        }
+    }
+
+    fn validateRelationalRowsConflictExpression(
+        runtime_schema: schema_mod.TableSchema,
+        expression: types.RelationalRowsExpression,
+    ) anyerror!void {
+        if (expression.kind == .field) {
+            if (expression.field_source == .source) return error.InvalidQueryRequest;
+            _ = relationalRowsFindColumn(runtime_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+        }
+        for (expression.operands) |operand| try validateRelationalRowsConflictExpression(runtime_schema, operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsConflictExpressionCondition(runtime_schema, branch.when);
+            try validateRelationalRowsConflictExpression(runtime_schema, branch.then);
+        }
+        for (expression.case_else) |case_else| try validateRelationalRowsConflictExpression(runtime_schema, case_else);
+    }
+
+    fn validateRelationalRowsConflictExpressionCondition(
+        runtime_schema: schema_mod.TableSchema,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!void {
+        try validateRelationalRowsConflictExpression(runtime_schema, condition.lhs);
+        for (condition.rhs) |rhs| try validateRelationalRowsConflictExpression(runtime_schema, rhs);
+    }
+
+    fn validateRelationalRowsConflictTargetPredicates(
+        predicates: []const schema_mod.RelationalCheck,
+        constraint: schema_mod.UniqueConstraint,
+    ) !void {
+        if (predicates.len != constraint.where.len) return error.InvalidQueryRequest;
+        for (predicates, constraint.where) |actual, expected| {
+            if (!std.mem.eql(u8, actual.field, expected.field)) return error.InvalidQueryRequest;
+            if (!relationalRowsUniquePredicateOpMatchesCheck(actual.op, expected.op)) return error.InvalidQueryRequest;
+            if (expected.value_json) |expected_json| {
+                const actual_json = actual.value_json orelse return error.InvalidQueryRequest;
+                if (!std.mem.eql(u8, actual_json, expected_json)) return error.InvalidQueryRequest;
+            } else if (actual.value_json != null) {
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+
+    fn relationalRowsUniquePredicateOpMatchesCheck(actual: schema_mod.RelationalCheckOp, expected: schema_mod.UniquePredicateOp) bool {
+        return switch (expected) {
+            .is_null => actual == .is_null,
+            .is_not_null => actual == .is_not_null,
+            .eq => actual == .eq,
+            .ne => actual == .ne,
+        };
+    }
+
+    fn relationalRowsExpressionUsesSourceField(expression: types.RelationalRowsExpression) bool {
+        if (expression.kind == .field and expression.field_source == .source) return true;
+        for (expression.operands) |operand| {
+            if (relationalRowsExpressionUsesSourceField(operand)) return true;
+        }
+        for (expression.case_branches) |branch| {
+            if (relationalRowsExpressionConditionUsesSourceField(branch.when)) return true;
+            if (relationalRowsExpressionUsesSourceField(branch.then)) return true;
+        }
+        for (expression.case_else) |case_else| {
+            if (relationalRowsExpressionUsesSourceField(case_else)) return true;
+        }
+        return false;
+    }
+
+    fn relationalRowsExpressionConditionUsesSourceField(condition: types.RelationalRowsExpressionCondition) bool {
+        if (relationalRowsExpressionUsesSourceField(condition.lhs)) return true;
+        for (condition.rhs) |rhs| {
+            if (relationalRowsExpressionUsesSourceField(rhs)) return true;
+        }
+        return false;
+    }
+
+    fn validateRelationalRowsMutationUpdateTargetPaths(
+        operations: []const types.TransformOp,
+        patch_expressions: []const types.RelationalRowsExpressionAssignment,
+        increment_expressions: []const types.RelationalRowsExpressionAssignment,
+        json_set_expressions: []const types.RelationalRowsJsonSetExpressionAssignment,
+        source_assignments: []const types.RelationalRowsJoinedMutationFieldAssignment,
+    ) !void {
+        for (operations, 0..) |lhs, i| {
+            for (operations[i + 1 ..]) |rhs| {
+                if (relationalRowsMutationOperationPathsConflict(lhs, rhs)) return error.InvalidQueryRequest;
+            }
+            for (patch_expressions) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
+            }
+            for (increment_expressions) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
+            }
+            for (json_set_expressions) |assignment| {
+                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.path, assignment.field, assignment.path)) return error.InvalidQueryRequest;
+            }
+            for (source_assignments) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
+            }
+        }
+        for (patch_expressions, 0..) |lhs, i| {
+            for (patch_expressions[i + 1 ..]) |rhs| {
+                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
+            }
+            for (increment_expressions) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
+            }
+            for (json_set_expressions) |assignment| {
+                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.field, assignment.field, assignment.path)) return error.InvalidQueryRequest;
+            }
+            for (source_assignments) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
+            }
+        }
+        for (increment_expressions, 0..) |lhs, i| {
+            for (increment_expressions[i + 1 ..]) |rhs| {
+                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
+            }
+            for (json_set_expressions) |assignment| {
+                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.field, assignment.field, assignment.path)) return error.InvalidQueryRequest;
+            }
+            for (source_assignments) |assignment| {
+                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
+            }
+        }
+        for (json_set_expressions, 0..) |lhs, i| {
+            for (json_set_expressions[i + 1 ..]) |rhs| {
+                if (relationalRowsJsonSetPathsConflict(lhs.field, lhs.path, rhs.field, rhs.path)) return error.InvalidQueryRequest;
+            }
+            for (source_assignments) |assignment| {
+                if (relationalRowsDottedPathConflictsJsonSetPath(assignment.field, lhs.field, lhs.path)) return error.InvalidQueryRequest;
+            }
+        }
+        for (source_assignments, 0..) |lhs, i| {
+            for (source_assignments[i + 1 ..]) |rhs| {
+                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
+            }
+        }
+    }
+
+    fn relationalRowsMutationOperationPathsConflict(lhs: types.TransformOp, rhs: types.TransformOp) bool {
+        if (!relationalRowsDottedPathsConflict(lhs.path, rhs.path)) return false;
+        return !(relationalRowsTransformOpIsArrayUpdate(lhs.op) and relationalRowsTransformOpIsArrayUpdate(rhs.op) and std.mem.eql(u8, lhs.path, rhs.path));
+    }
+
+    fn relationalRowsTransformOpIsArrayUpdate(op: types.TransformOpType) bool {
+        return switch (op) {
+            .push, .pull, .add_to_set, .pop => true,
+            else => false,
+        };
+    }
+
+    fn relationalRowsDottedPathsConflict(lhs: []const u8, rhs: []const u8) bool {
+        if (std.mem.eql(u8, lhs, rhs)) return true;
+        return relationalRowsDottedPathIsAncestor(lhs, rhs) or relationalRowsDottedPathIsAncestor(rhs, lhs);
+    }
+
+    fn relationalRowsDottedPathIsAncestor(parent: []const u8, child: []const u8) bool {
+        return parent.len < child.len and
+            std.mem.startsWith(u8, child, parent) and
+            child[parent.len] == '.';
+    }
+
+    fn relationalRowsDottedPathConflictsJsonSetPath(path: []const u8, json_field: []const u8, json_path: []const []const u8) bool {
+        if (relationalRowsDottedPathsConflict(path, json_field)) return true;
+        if (path.len <= json_field.len + 1) return false;
+        if (!std.mem.startsWith(u8, path, json_field) or path[json_field.len] != '.') return false;
+        return relationalRowsJsonSegmentsConflictDottedPath(json_path, path[json_field.len + 1 ..]);
+    }
+
+    fn relationalRowsJsonSetPathsConflict(
+        lhs_field: []const u8,
+        lhs_path: []const []const u8,
+        rhs_field: []const u8,
+        rhs_path: []const []const u8,
+    ) bool {
+        if (!std.mem.eql(u8, lhs_field, rhs_field)) return relationalRowsDottedPathsConflict(lhs_field, rhs_field);
+        const shared = @min(lhs_path.len, rhs_path.len);
+        for (lhs_path[0..shared], rhs_path[0..shared]) |lhs, rhs| {
+            if (!std.mem.eql(u8, lhs, rhs)) return false;
+        }
+        return true;
+    }
+
+    fn relationalRowsJsonSegmentsConflictDottedPath(json_path: []const []const u8, dotted_path: []const u8) bool {
+        if (json_path.len == 0 or dotted_path.len == 0) return false;
+        var offset: usize = 0;
+        for (json_path, 0..) |segment, i| {
+            if (offset >= dotted_path.len) return true;
+            if (!std.mem.startsWith(u8, dotted_path[offset..], segment)) return false;
+            offset += segment.len;
+            const dotted_done = offset == dotted_path.len;
+            const json_done = i + 1 == json_path.len;
+            if (!dotted_done and dotted_path[offset] != '.') return false;
+            if (dotted_done or json_done) return true;
+            offset += 1;
+        }
+        return offset == dotted_path.len;
+    }
+
+    fn relationalRowsMutationReturningOutputCount(
+        fields: []const []const u8,
+        expressions: []const types.RelationalRowsExpressionProjection,
+        output: []const u8,
+    ) usize {
+        var count: usize = 0;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field, output)) count += 1;
+        }
+        for (expressions) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        return count;
+    }
+
     pub fn windowRelationalRowsPlan(
         self: *DB,
         alloc: Allocator,
@@ -14674,6 +16010,12 @@ pub const DB = struct {
         plan: types.RelationalRowsWindowPlan,
     ) !types.RelationalRowsWindowResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        try validateRelationalRowsWindowRequestAlloc(alloc, plan.window);
+        try validateRelationalRowsWindowPlanCteReferences(plan);
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsWindowAgainstPlannedCteOutput(planned_ctes, plan.window);
+        try validateRelationalRowsWindowOutputReferencesAgainstPlannedCtesAlloc(alloc, runtime_schema, planned_ctes, plan.window);
 
         var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
         defer {
@@ -14681,32 +16023,348 @@ pub const DB = struct {
             materialized_ctes.deinit(alloc);
         }
 
-        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ctes, &materialized_ctes);
-        return try self.windowRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.window);
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ranges, plan.ctes, &materialized_ctes);
+        return try self.windowRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.ranges, plan.window);
+    }
+
+    pub fn windowRelationalRowsAcrossRanges(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsWindowRequest,
+        ranges: []const types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsWindowResult {
+        if (req.source.source_cte.len != 0) return error.InvalidQueryRequest;
+        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        defer alloc.free(source_order);
+        try validateRelationalRowsWindowOutputReferencesAlloc(alloc, runtime_schema, &.{}, req);
+
+        const source = relationalRowsWindowSourceQuery(req, source_order);
+        var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
+        defer source_rows.deinit(alloc);
+
+        return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
     }
 
     fn appendRelationalRowsMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
+        ranges: []const types.RelationalRowsDocKeyRange,
         ctes: []const types.RelationalRowsCte,
         materialized_ctes: *std.ArrayListUnmanaged(RelationalRowsMaterializedCte),
     ) !void {
+        try validateRelationalRowsMaterializedCtes(ctes, materialized_ctes.items);
         for (ctes) |cte| {
             if (cte.name.len == 0) return error.InvalidQueryRequest;
             if (findRelationalRowsMaterializedCte(materialized_ctes.items, cte.name) != null) return error.InvalidQueryRequest;
-            if (cte.query.row_claim != null) return error.UnsupportedQueryRequest;
+            if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
 
-            const result = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
+            const result = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, ranges, cte.query);
+            var result_transferred = false;
             errdefer {
-                var mutable = result;
-                mutable.deinit(alloc);
+                if (!result_transferred) {
+                    var mutable = result;
+                    mutable.deinit(alloc);
+                }
             }
+            const limits = types.relationalRowsCteMaterializationLimits(cte);
+            if (result.rows.len > limits.max_rows) return error.UnsupportedQueryRequest;
+            var materialized_bytes: u64 = 0;
+            for (result.rows) |row| {
+                materialized_bytes = std.math.add(u64, materialized_bytes, @intCast(row.len)) catch return error.UnsupportedQueryRequest;
+                if (materialized_bytes > limits.max_bytes) return error.UnsupportedQueryRequest;
+            }
+            const output_fields = try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
+            var output_fields_transferred = false;
+            errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
             try materialized_ctes.append(alloc, .{
                 .name = cte.name,
+                .output_fields = output_fields,
                 .result = result,
             });
+            result_transferred = true;
+            output_fields_transferred = true;
         }
+    }
+
+    fn validateRelationalRowsMaterializedCtes(
+        ctes: []const types.RelationalRowsCte,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+    ) !void {
+        for (ctes, 0..) |cte, idx| {
+            if (cte.name.len == 0) return error.InvalidQueryRequest;
+            if (findRelationalRowsMaterializedCte(materialized_ctes, cte.name) != null) return error.InvalidQueryRequest;
+            for (ctes[0..idx]) |prior| {
+                if (std.mem.eql(u8, prior.name, cte.name)) return error.InvalidQueryRequest;
+            }
+            if (cte.query.source_cte.len != 0 and
+                findRelationalRowsMaterializedCte(materialized_ctes, cte.query.source_cte) == null and
+                !relationalRowsCteNameExists(ctes[0..idx], cte.query.source_cte))
+            {
+                return error.InvalidQueryRequest;
+            }
+            if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
+        }
+    }
+
+    fn validateRelationalRowsQueryPlanCteReferences(plan: types.RelationalRowsQueryPlan) !void {
+        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.query.source_cte);
+    }
+
+    fn validateRelationalRowsQueryPlanRequest(plan: types.RelationalRowsQueryPlan) !void {
+        if (plan.query.row_claim != null or plan.query.doc_key_range != null) return error.UnsupportedQueryRequest;
+    }
+
+    fn validateRelationalRowsAggregatePlanCteReferences(plan: types.RelationalRowsAggregatePlan) !void {
+        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.aggregate.source.source_cte);
+    }
+
+    fn validateRelationalRowsAggregateRequest(req: types.RelationalRowsAggregateRequest) !void {
+        if (req.aggregations.len == 0 and req.group_by.len == 0 and req.group_expressions.len == 0) return error.InvalidArgument;
+        if (req.source.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.source.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsAggregateOutputNames(req);
+    }
+
+    fn validateRelationalRowsAggregateOutputNames(req: types.RelationalRowsAggregateRequest) !void {
+        for (req.group_by) |field| {
+            if (field.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsAggregateOutputNameCount(req, field) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.group_expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsAggregateOutputNameCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.aggregations) |aggregation| {
+            if (aggregation.name.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsAggregateOutputNameCount(req, aggregation.name) > 1) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn relationalRowsAggregateOutputNameCount(
+        req: types.RelationalRowsAggregateRequest,
+        name: []const u8,
+    ) usize {
+        var count: usize = 0;
+        for (req.group_by) |field| {
+            if (std.mem.eql(u8, field, name)) count += 1;
+        }
+        for (req.group_expressions) |projection| {
+            if (std.mem.eql(u8, projection.output, name)) count += 1;
+        }
+        for (req.aggregations) |aggregation| {
+            if (std.mem.eql(u8, aggregation.name, name)) count += 1;
+        }
+        return count;
+    }
+
+    fn validateRelationalRowsWindowPlanCteReferences(plan: types.RelationalRowsWindowPlan) !void {
+        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.window.source.source_cte);
+    }
+
+    fn validateRelationalRowsWindowRequestAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        alloc.free(source_order);
+    }
+
+    fn validateRelationalRowsJoinPlanCteReferences(plan: types.RelationalRowsJoinPlan) !void {
+        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.join.left.source_cte);
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.join.right.source_cte);
+    }
+
+    fn validateRelationalRowsLateralPlanCteReferences(plan: types.RelationalRowsLateralPlan) !void {
+        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.lateral.left.source_cte);
+        try validateRelationalRowsFinalCteReference(plan.ctes, plan.lateral.right.source_cte);
+    }
+
+    fn validateRelationalRowsFinalCteReference(
+        ctes: []const types.RelationalRowsCte,
+        name: []const u8,
+    ) !void {
+        if (name.len != 0 and !relationalRowsCteNameExists(ctes, name)) return error.InvalidQueryRequest;
+    }
+
+    fn relationalRowsCteNameExists(
+        ctes: []const types.RelationalRowsCte,
+        name: []const u8,
+    ) bool {
+        for (ctes) |cte| {
+            if (std.mem.eql(u8, cte.name, name)) return true;
+        }
+        return false;
+    }
+
+    const RelationalRowsPlannedCte = struct {
+        name: []const u8,
+        output_fields: []const []const u8,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            freeOwnedConstStringSlice(alloc, self.output_fields);
+            self.* = undefined;
+        }
+    };
+
+    fn deinitRelationalRowsPlannedCtes(
+        alloc: Allocator,
+        planned_ctes: []RelationalRowsPlannedCte,
+    ) void {
+        for (planned_ctes) |*cte| cte.deinit(alloc);
+        if (planned_ctes.len > 0) alloc.free(planned_ctes);
+    }
+
+    fn planRelationalRowsCteOutputsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        ctes: []const types.RelationalRowsCte,
+    ) ![]RelationalRowsPlannedCte {
+        var planned = std.ArrayListUnmanaged(RelationalRowsPlannedCte).empty;
+        errdefer {
+            for (planned.items) |*cte| cte.deinit(alloc);
+            planned.deinit(alloc);
+        }
+        for (ctes) |cte| {
+            try validateRelationalRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
+            const output_fields = try relationalRowsPlannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
+            errdefer freeOwnedConstStringSlice(alloc, output_fields);
+            try planned.append(alloc, .{
+                .name = cte.name,
+                .output_fields = output_fields,
+            });
+        }
+        return try planned.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsPlannedQueryOutputFieldsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsQueryRequest,
+    ) ![]const []const u8 {
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+
+        if (req.select_all) {
+            if (req.source_cte.len != 0) {
+                const source = findRelationalRowsPlannedCte(planned_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
+                for (source.output_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+            } else {
+                for (runtime_schema.relational_columns) |column| {
+                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
+                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
+                }
+            }
+        } else {
+            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+        }
+        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.expressions) |projection| {
+            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
+            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        }
+        return try fields.toOwnedSlice(alloc);
+    }
+
+    fn findRelationalRowsPlannedCte(
+        planned_ctes: []RelationalRowsPlannedCte,
+        name: []const u8,
+    ) ?*RelationalRowsPlannedCte {
+        for (planned_ctes) |*cte| {
+            if (std.mem.eql(u8, cte.name, name)) return cte;
+        }
+        return null;
+    }
+
+    fn relationalRowsPlannedSourceCteOutputFields(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsQueryRequest,
+    ) ?[]const []const u8 {
+        if (req.source_cte.len == 0) return null;
+        const source = findRelationalRowsPlannedCte(planned_ctes, req.source_cte) orelse return &.{};
+        return source.output_fields;
+    }
+
+    fn validateRelationalRowsQueryAgainstPlannedCteOutput(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsQueryRequest,
+    ) !void {
+        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req) orelse return;
+        try validateRelationalRowsQueryAgainstCteOutput(req, source_output);
+    }
+
+    fn validateRelationalRowsAggregateAgainstPlannedCteOutput(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsAggregateRequest,
+    ) !void {
+        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source) orelse return;
+        try validateRelationalRowsAggregateAgainstOutputFields(source_output, req);
+    }
+
+    fn validateRelationalRowsWindowAgainstPlannedCteOutput(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source) orelse return;
+        try validateRelationalRowsWindowAgainstOutputFields(source_output, req);
+    }
+
+    fn validateRelationalRowsJoinAgainstPlannedCteOutput(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsJoinRequest,
+    ) !void {
+        const left_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.left);
+        const right_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.right);
+        try validateRelationalRowsJoinAgainstOutputFields(left_output, right_output, req);
+    }
+
+    fn validateRelationalRowsLateralAgainstPlannedCteOutput(
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsLateralRequest,
+    ) !void {
+        const left_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.left);
+        const right_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.right);
+        try validateRelationalRowsLateralAgainstOutputFields(left_output, right_output, req);
+    }
+
+    fn validateRelationalRowsWindowOutputReferencesAgainstPlannedCtesAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        planned_ctes: []RelationalRowsPlannedCte,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        var output_fields = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (output_fields.items) |field| alloc.free(@constCast(field));
+            output_fields.deinit(alloc);
+        }
+        if (req.select_all) {
+            if (relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source)) |source_fields| {
+                for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, field);
+            } else {
+                for (runtime_schema.relational_columns) |column| {
+                    try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, column.name);
+                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, column.path);
+                }
+            }
+        } else {
+            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, field);
+        }
+        for (req.windows) |window| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, window.output);
+        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields.items, order);
     }
 
     fn queryRelationalRowsWithMaterializedCtesAlloc(
@@ -14716,11 +16374,510 @@ pub const DB = struct {
         materialized_ctes: []RelationalRowsMaterializedCte,
         req: types.RelationalRowsQueryRequest,
     ) !types.RelationalRowsQueryResult {
+        return try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
+    }
+
+    fn queryRelationalRowsWithMaterializedCtesAndRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        ranges: []const types.RelationalRowsDocKeyRange,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
         if (req.source_cte.len != 0) {
             const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
+            try validateRelationalRowsBaseQueryRequestAgainstOutputFields(source.output_fields, req);
+            try validateRelationalRowsQueryAgainstCteOutput(req, source.output_fields);
             return try self.queryRelationalRowsFromMaterializedCteAlloc(alloc, req.source_cte, source.result.rows, req);
         }
+        if (ranges.len > 0) return try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, req, ranges);
         return try self.queryRelationalRows(alloc, runtime_schema, req);
+    }
+
+    fn relationalRowsQueryOutputFieldsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsQueryRequest,
+    ) ![]const []const u8 {
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+
+        if (req.select_all) {
+            if (req.source_cte.len != 0) {
+                const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
+                for (source.output_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+            } else {
+                for (runtime_schema.relational_columns) |column| {
+                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
+                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
+                }
+            }
+        } else {
+            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+        }
+        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.expressions) |projection| {
+            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
+            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        }
+        return try fields.toOwnedSlice(alloc);
+    }
+
+    fn appendRelationalRowsOutputFieldAlloc(
+        alloc: Allocator,
+        fields: *std.ArrayListUnmanaged([]const u8),
+        field: []const u8,
+    ) !void {
+        if (field.len == 0) return error.InvalidQueryRequest;
+        if (relationalRowsCteOutputCoversField(fields.items, field)) return;
+        const owned = try alloc.dupe(u8, field);
+        errdefer alloc.free(owned);
+        try fields.append(alloc, owned);
+    }
+
+    fn validateRelationalRowsQueryAgainstCteOutput(
+        req: types.RelationalRowsQueryRequest,
+        output_fields: []const []const u8,
+    ) !void {
+        for (req.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.array_any) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.array_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.array_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.in_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.json_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.json_path_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.json_path_exists) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.text_patterns) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.or_predicates) |group| {
+            for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        }
+        for (req.not_predicates) |group| {
+            for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        }
+        for (req.access_or_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstCteOutput(output_fields, group);
+        for (req.access_not_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstCteOutput(output_fields, group);
+        for (req.expression_predicates) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        for (req.expression_or_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        }
+        for (req.expression_not_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        }
+        for (req.expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, predicate.expression);
+        if (!req.select_all) {
+            for (req.select) |field| try validateRelationalRowsCteOutputField(output_fields, field);
+        }
+        for (req.distinct_on) |field| try validateRelationalRowsCteOutputField(output_fields, field);
+        for (req.order_by) |order| {
+            if (order.field.len > 0) try validateRelationalRowsCteOutputField(output_fields, order.field);
+            if (order.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
+        }
+        for (req.json_extract) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
+        for (req.array_length) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
+        for (req.coalesce) |projection| {
+            for (projection.operands) |operand| {
+                if (operand.kind == .field) try validateRelationalRowsCteOutputField(output_fields, operand.field);
+            }
+        }
+        for (req.field_aliases) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
+        for (req.expressions) |projection| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, projection.expression);
+    }
+
+    fn validateRelationalRowsAccessPredicateGroupAgainstCteOutput(
+        output_fields: []const []const u8,
+        group: types.RelationalRowsAccessPredicateGroup,
+    ) !void {
+        for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.array_any) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.array_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.array_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.in_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.json_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.json_path_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.json_path_exists) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (group.text_patterns) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+    }
+
+    fn validateRelationalRowsAggregateAgainstCteOutput(
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsAggregateRequest,
+    ) !void {
+        const source_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.source) orelse return;
+        try validateRelationalRowsAggregateAgainstOutputFields(source_output, req);
+    }
+
+    fn validateRelationalRowsAggregateAgainstOutputFields(
+        source_output: []const []const u8,
+        req: types.RelationalRowsAggregateRequest,
+    ) !void {
+        for (req.group_by) |field| try validateRelationalRowsCteOutputField(source_output, field);
+        for (req.group_expressions) |projection| try validateRelationalRowsExpressionAgainstCteOutput(source_output, projection.expression);
+        for (req.aggregations) |aggregation| {
+            if (aggregation.field) |field| try validateRelationalRowsCteOutputField(source_output, field);
+            if (aggregation.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(source_output, expression);
+            for (aggregation.array_order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(source_output, order);
+            for (aggregation.filter_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_array_any) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_array_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_array_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_in_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_json_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_json_path_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_json_path_exists) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_text_patterns) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
+            for (aggregation.filter_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
+            for (aggregation.filter_expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstCteOutput(source_output, predicate.expression);
+            for (aggregation.filter_any) |group| {
+                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
+            }
+            for (aggregation.filter_not) |group| {
+                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
+            }
+        }
+    }
+
+    fn validateRelationalRowsWindowAgainstCteOutput(
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        const source_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.source) orelse return;
+        try validateRelationalRowsWindowAgainstOutputFields(source_output, req);
+    }
+
+    fn validateRelationalRowsWindowAgainstOutputFields(
+        source_output: []const []const u8,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        for (req.windows) |window| {
+            for (window.partition_by) |field| try validateRelationalRowsCteOutputField(source_output, field);
+            for (window.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(source_output, order);
+            if (window.value_expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(source_output, expression);
+        }
+        if (!req.select_all) {
+            for (req.select) |field| try validateRelationalRowsCteOutputField(source_output, field);
+        }
+    }
+
+    fn validateRelationalRowsJoinAgainstCteOutput(
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsJoinRequest,
+    ) !void {
+        const left_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.left);
+        const right_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.right);
+        try validateRelationalRowsJoinAgainstOutputFields(left_output, right_output, req);
+    }
+
+    fn validateRelationalRowsJoinAgainstOutputFields(
+        left_output: ?[]const []const u8,
+        right_output: ?[]const []const u8,
+        req: types.RelationalRowsJoinRequest,
+    ) !void {
+        for (req.on) |join_on| {
+            if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, join_on.left_field);
+            if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, join_on.right_field);
+        }
+        for (req.select) |projection| switch (projection.side) {
+            .left => if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
+            .right => if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
+        };
+    }
+
+    fn validateRelationalRowsLateralAgainstCteOutput(
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsLateralRequest,
+    ) !void {
+        const left_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.left);
+        const right_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.right);
+        try validateRelationalRowsLateralAgainstOutputFields(left_output, right_output, req);
+    }
+
+    fn validateRelationalRowsLateralAgainstOutputFields(
+        left_output: ?[]const []const u8,
+        right_output: ?[]const []const u8,
+        req: types.RelationalRowsLateralRequest,
+    ) !void {
+        for (req.correlations) |correlation| {
+            if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, correlation.left_field);
+            if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, correlation.right_field);
+        }
+        for (req.select) |projection| switch (projection.side) {
+            .left => if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
+            .right => if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
+        };
+    }
+
+    fn validateRelationalRowsAggregateOutputReferencesAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsAggregateRequest,
+    ) !void {
+        const output_fields = try relationalRowsAggregateOutputFieldsAlloc(alloc, req);
+        defer freeOwnedConstStringSlice(alloc, output_fields);
+        for (req.having_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
+        for (req.having_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        for (req.having_any) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        }
+        for (req.having_not) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
+        }
+        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
+    }
+
+    fn relationalRowsAggregateOutputFieldsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsAggregateRequest,
+    ) ![]const []const u8 {
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+        for (req.group_by) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+        for (req.group_expressions) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.aggregations) |aggregation| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, aggregation.name);
+        return try fields.toOwnedSlice(alloc);
+    }
+
+    fn validateRelationalRowsJoinOutputReferencesAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinRequest,
+    ) !void {
+        const output_fields = try relationalRowsJoinOutputFieldsAlloc(alloc, req.select);
+        defer freeOwnedConstStringSlice(alloc, output_fields);
+        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
+    }
+
+    fn validateRelationalRowsLateralOutputReferencesAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsLateralRequest,
+    ) !void {
+        const output_fields = try relationalRowsJoinOutputFieldsAlloc(alloc, req.select);
+        defer freeOwnedConstStringSlice(alloc, output_fields);
+        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
+    }
+
+    fn relationalRowsJoinOutputFieldsAlloc(
+        alloc: Allocator,
+        select: []const types.RelationalRowsJoinProjection,
+    ) ![]const []const u8 {
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+        if (select.len == 0) {
+            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, "left");
+            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, "right");
+        } else {
+            for (select) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        }
+        return try fields.toOwnedSlice(alloc);
+    }
+
+    fn validateRelationalRowsWindowOutputReferencesAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsWindowRequest,
+    ) !void {
+        const output_fields = try relationalRowsWindowOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes, req);
+        defer freeOwnedConstStringSlice(alloc, output_fields);
+        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
+    }
+
+    fn relationalRowsWindowOutputFieldsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsWindowRequest,
+    ) ![]const []const u8 {
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+        if (req.select_all) {
+            if (relationalRowsSourceCteOutputFields(materialized_ctes, req.source)) |source_fields| {
+                for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+            } else {
+                for (runtime_schema.relational_columns) |column| {
+                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
+                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
+                }
+            }
+        } else {
+            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+        }
+        for (req.windows) |window| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, window.output);
+        return try fields.toOwnedSlice(alloc);
+    }
+
+    fn validateRelationalRowsQueryOrderAgainstCteOutput(
+        output_fields: []const []const u8,
+        order: types.RelationalRowsQueryOrder,
+    ) !void {
+        if (order.field.len > 0) try validateRelationalRowsCteOutputField(output_fields, order.field);
+        if (order.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
+    }
+
+    fn relationalRowsSourceCteOutputFields(
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        req: types.RelationalRowsQueryRequest,
+    ) ?[]const []const u8 {
+        if (req.source_cte.len == 0) return null;
+        const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return &.{};
+        return source.output_fields;
+    }
+
+    fn validateRelationalRowsExpressionConditionAgainstCteOutput(
+        output_fields: []const []const u8,
+        condition: types.RelationalRowsExpressionCondition,
+    ) anyerror!void {
+        try validateRelationalRowsExpressionAgainstCteOutput(output_fields, condition.lhs);
+        for (condition.rhs) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
+    }
+
+    fn validateRelationalRowsExpressionAgainstCteOutput(
+        output_fields: []const []const u8,
+        expression: types.RelationalRowsExpression,
+    ) anyerror!void {
+        if (expression.kind == .field and expression.field_source != .proposed) {
+            try validateRelationalRowsCteOutputField(output_fields, expression.field);
+        }
+        for (expression.operands) |operand| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, branch.when);
+            try validateRelationalRowsExpressionAgainstCteOutput(output_fields, branch.then);
+        }
+        for (expression.case_else) |fallback| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, fallback);
+    }
+
+    fn validateRelationalRowsCteOutputField(output_fields: []const []const u8, field: []const u8) !void {
+        if (field.len == 0 or !relationalRowsCteOutputCoversField(output_fields, field)) return error.InvalidQueryRequest;
+    }
+
+    fn relationalRowsCteOutputCoversField(output_fields: []const []const u8, field: []const u8) bool {
+        for (output_fields) |output| {
+            if (std.mem.eql(u8, output, field)) return true;
+            if (field.len > output.len and std.mem.startsWith(u8, field, output) and field[output.len] == '.') return true;
+        }
+        return false;
+    }
+
+    fn validateRelationalRowsBaseQueryRequest(req: types.RelationalRowsQueryRequest) !void {
+        if (req.distinct_on.len > 0 and req.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.row_claim) |claim| {
+            if (claim.txn_id == null) return error.InvalidQueryRequest;
+            if (claim.mode != .for_update) return error.InvalidQueryRequest;
+        }
+        try validateRelationalRowsQueryProjectionOutputs(req);
+    }
+
+    fn validateRelationalRowsBaseQueryRequestAgainstSchema(
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsQueryRequest,
+    ) !void {
+        try validateRelationalRowsBaseQueryRequest(req);
+        if (!req.select_all) return;
+        for (runtime_schema.relational_columns) |column| {
+            try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, column.name);
+            if (!std.mem.eql(u8, column.path, column.name)) {
+                try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, column.path);
+            }
+        }
+    }
+
+    fn validateRelationalRowsBaseQueryRequestAgainstOutputFields(
+        output_fields: []const []const u8,
+        req: types.RelationalRowsQueryRequest,
+    ) !void {
+        try validateRelationalRowsBaseQueryRequest(req);
+        if (!req.select_all) return;
+        for (output_fields) |field| try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, field);
+    }
+
+    fn validateRelationalRowsQueryProjectionOutputDoesNotCollide(
+        req: types.RelationalRowsQueryRequest,
+        field: []const u8,
+    ) !void {
+        if (field.len == 0) return error.InvalidQueryRequest;
+        for (req.json_extract) |projection| {
+            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
+        }
+        for (req.array_length) |projection| {
+            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
+        }
+        for (req.coalesce) |projection| {
+            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
+        }
+        for (req.field_aliases) |projection| {
+            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
+        }
+        for (req.expressions) |projection| {
+            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn validateRelationalRowsQueryProjectionOutputs(req: types.RelationalRowsQueryRequest) !void {
+        if (!req.select_all) {
+            for (req.select) |field| {
+                if (field.len == 0) return error.InvalidQueryRequest;
+                if (relationalRowsQueryProjectionOutputCount(req, field) > 1) return error.InvalidQueryRequest;
+            }
+        }
+        for (req.json_extract) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.array_length) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.coalesce) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.field_aliases) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+        for (req.expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn relationalRowsQueryProjectionOutputCount(req: types.RelationalRowsQueryRequest, output: []const u8) usize {
+        var count: usize = 0;
+        if (!req.select_all) {
+            for (req.select) |field| {
+                if (std.mem.eql(u8, field, output)) count += 1;
+            }
+        }
+        for (req.json_extract) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        for (req.array_length) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        for (req.coalesce) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        for (req.field_aliases) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        for (req.expressions) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) count += 1;
+        }
+        return count;
     }
 
     pub fn queryRelationalRowsAcrossRanges(
@@ -14731,6 +16888,7 @@ pub const DB = struct {
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
         if (ranges.len == 0) return try self.queryRelationalRows(alloc, runtime_schema, req);
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
         try validateRelationalRowsDocKeyRanges(ranges);
@@ -14799,21 +16957,32 @@ pub const DB = struct {
             std.sort.pdq(RelationalRowsQueryCandidate, rows, RelationalRowsQuerySortContext{ .order_by = req.order_by }, relationalRowsQueryCandidateLessThan);
         }
 
-        const total_before_claim: u32 = @intCast(rows.len);
-        const start = @min(@as(usize, req.offset), rows.len);
+        if (req.distinct_on.len > 0 and req.row_claim != null) return error.UnsupportedQueryRequest;
+
+        var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer candidate_indexes.deinit(alloc);
+        if (req.distinct_on.len > 0) {
+            try appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, req.distinct_on, &candidate_indexes);
+        } else {
+            try candidate_indexes.ensureUnusedCapacity(alloc, rows.len);
+            for (0..rows.len) |i| candidate_indexes.appendAssumeCapacity(i);
+        }
+
+        const total_before_claim: u32 = @intCast(candidate_indexes.items.len);
+        const start = @min(@as(usize, req.offset), candidate_indexes.items.len);
         const limited_len: usize = if (req.limit) |limit|
-            @min(@as(usize, limit), rows.len - start)
+            @min(@as(usize, limit), candidate_indexes.items.len - start)
         else
-            rows.len - start;
+            candidate_indexes.items.len - start;
 
         var selected_indexes = std.ArrayListUnmanaged(usize).empty;
         defer selected_indexes.deinit(alloc);
         const scan_end = if (req.row_claim != null and req.row_claim.?.skip_locked)
-            rows.len
+            candidate_indexes.items.len
         else
             start + limited_len;
         try selected_indexes.ensureUnusedCapacity(alloc, scan_end - start);
-        for (start..scan_end) |i| selected_indexes.appendAssumeCapacity(i);
+        for (candidate_indexes.items[start..scan_end]) |row_index| selected_indexes.appendAssumeCapacity(row_index);
 
         var total = total_before_claim;
         if (req.row_claim) |claim| {
@@ -14842,6 +17011,86 @@ pub const DB = struct {
         };
     }
 
+    fn buildRelationalRowsQueryResultFromCandidatesStaticAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsQueryRequest,
+        rows: []RelationalRowsQueryCandidate,
+    ) !types.RelationalRowsQueryResult {
+        if (req.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.order_by.len > 0) {
+            std.sort.pdq(RelationalRowsQueryCandidate, rows, RelationalRowsQuerySortContext{ .order_by = req.order_by }, relationalRowsQueryCandidateLessThan);
+        }
+
+        var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer candidate_indexes.deinit(alloc);
+        if (req.distinct_on.len > 0) {
+            try appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, req.distinct_on, &candidate_indexes);
+        } else {
+            try candidate_indexes.ensureUnusedCapacity(alloc, rows.len);
+            for (0..rows.len) |i| candidate_indexes.appendAssumeCapacity(i);
+        }
+
+        const total: u32 = @intCast(candidate_indexes.items.len);
+        const start = @min(@as(usize, req.offset), candidate_indexes.items.len);
+        const limited_len: usize = if (req.limit) |limit|
+            @min(@as(usize, limit), candidate_indexes.items.len - start)
+        else
+            candidate_indexes.items.len - start;
+
+        var out_rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (out_rows.items) |row| alloc.free(@constCast(row));
+            out_rows.deinit(alloc);
+        }
+        for (candidate_indexes.items[start .. start + limited_len]) |row_index| {
+            const row = rows[row_index];
+            const projected = try projectRelationalRowsQueryCandidateStaticAlloc(alloc, row.doc_key, row.json, req);
+            var projected_transferred = false;
+            errdefer if (!projected_transferred) alloc.free(projected);
+            try out_rows.append(alloc, projected);
+            projected_transferred = true;
+        }
+
+        return .{
+            .rows = try out_rows.toOwnedSlice(alloc),
+            .total = total,
+        };
+    }
+
+    fn appendRelationalRowsDistinctOnIndexesAlloc(
+        alloc: Allocator,
+        rows: []const RelationalRowsQueryCandidate,
+        distinct_on: []const []const u8,
+        out: *std.ArrayListUnmanaged(usize),
+    ) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var keys = seen.keyIterator();
+            while (keys.next()) |key| alloc.free(@constCast(key.*));
+            seen.deinit(alloc);
+        }
+
+        for (rows, 0..) |row, i| {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row.json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            const key = try relationalRowsWindowPartitionKeyJsonAlloc(alloc, parsed.value, distinct_on);
+            var key_transferred = false;
+            errdefer if (!key_transferred) alloc.free(key);
+            if (seen.contains(key)) {
+                alloc.free(key);
+                continue;
+            }
+            const gop = try seen.getOrPut(alloc, key);
+            if (gop.found_existing) {
+                alloc.free(key);
+                continue;
+            }
+            key_transferred = true;
+            try out.append(alloc, i);
+        }
+    }
+
     fn queryRelationalRowsFromMaterializedCteAlloc(
         self: *DB,
         alloc: Allocator,
@@ -14851,6 +17100,7 @@ pub const DB = struct {
     ) !types.RelationalRowsQueryResult {
         if (req.row_claim != null) return error.UnsupportedQueryRequest;
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsBaseQueryRequest(req);
 
         var local_req = req;
         local_req.source_cte = "";
@@ -14870,6 +17120,43 @@ pub const DB = struct {
         return try self.buildRelationalRowsQueryResultFromCandidatesAlloc(alloc, local_req, rows.items);
     }
 
+    pub fn queryRelationalRowsFromSourceRowsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        source_name: []const u8,
+        source_rows: []const []const u8,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        if (req.source_cte.len != 0) return error.InvalidQueryRequest;
+        return try self.queryRelationalRowsFromMaterializedCteAlloc(alloc, source_name, source_rows, req);
+    }
+
+    pub fn queryRelationalRowsFromSourceRowsStaticAlloc(
+        alloc: Allocator,
+        source_name: []const u8,
+        source_rows: []const []const u8,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        if (req.source_cte.len != 0) return error.InvalidQueryRequest;
+        if (req.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsBaseQueryRequest(req);
+
+        var rows = std.ArrayListUnmanaged(RelationalRowsQueryCandidate).empty;
+        defer {
+            for (rows.items) |*row| row.deinit(alloc);
+            rows.deinit(alloc);
+        }
+
+        for (source_rows, 0..) |row_json, ordinal| {
+            const synthetic_key = try std.fmt.allocPrint(alloc, "\x00antfly-rel-source:{s}:{d}", .{ source_name, ordinal });
+            defer alloc.free(synthetic_key);
+            try appendRelationalRowsQueryCandidateFromJsonStaticAlloc(alloc, req, &rows, synthetic_key, row_json, 0);
+        }
+
+        return try buildRelationalRowsQueryResultFromCandidatesStaticAlloc(alloc, req, rows.items);
+    }
+
     fn windowRelationalRowsWithMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
@@ -14877,26 +17164,139 @@ pub const DB = struct {
         materialized_ctes: []RelationalRowsMaterializedCte,
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
+        return try self.windowRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
+    }
+
+    fn windowRelationalRowsWithMaterializedCtesAndRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        ranges: []const types.RelationalRowsDocKeyRange,
+        req: types.RelationalRowsWindowRequest,
+    ) !types.RelationalRowsWindowResult {
+        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        defer alloc.free(source_order);
+        try validateRelationalRowsWindowAgainstCteOutput(materialized_ctes, req);
+        try validateRelationalRowsWindowOutputReferencesAlloc(alloc, runtime_schema, materialized_ctes, req);
+
+        const source = relationalRowsWindowSourceQuery(req, source_order);
+        var source_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, ranges, source);
+        defer source_rows.deinit(alloc);
+
+        return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
+    }
+
+    pub fn windowRelationalRowsFromUnorderedSourceRowsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        source_name: []const u8,
+        source_rows: []const []const u8,
+        req: types.RelationalRowsWindowRequest,
+    ) !types.RelationalRowsWindowResult {
+        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        defer alloc.free(source_order);
+
+        const source = relationalRowsWindowSourceQuery(req, source_order);
+        var ordered_source_rows = try self.queryRelationalRowsFromSourceRowsAlloc(alloc, source_name, source_rows, source);
+        defer ordered_source_rows.deinit(alloc);
+
+        return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, ordered_source_rows.rows);
+    }
+
+    pub fn windowRelationalRowsFromUnorderedSourceRowsStaticAlloc(
+        alloc: Allocator,
+        source_name: []const u8,
+        source_rows: []const []const u8,
+        req: types.RelationalRowsWindowRequest,
+    ) !types.RelationalRowsWindowResult {
+        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        defer alloc.free(source_order);
+
+        const source = relationalRowsWindowSourceQuery(req, source_order);
+        var ordered_source_rows = try queryRelationalRowsFromSourceRowsStaticAlloc(alloc, source_name, source_rows, source);
+        defer ordered_source_rows.deinit(alloc);
+
+        return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, ordered_source_rows.rows);
+    }
+
+    fn validateRelationalRowsWindowRequestAndSourceOrderAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsWindowRequest,
+    ) ![]types.RelationalRowsQueryOrder {
         if (req.windows.len == 0) return error.InvalidQueryRequest;
         if (req.source.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.source.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsWindowOutputNames(req);
         const first_window = req.windows[0];
         if (first_window.order_by.len == 0) return error.InvalidQueryRequest;
         for (req.windows) |window| {
             if (window.output.len == 0) return error.InvalidQueryRequest;
             switch (window.function) {
-                .row_number, .rank, .dense_rank => {
+                .row_number, .rank, .dense_rank, .percent_rank, .cume_dist => {
                     if (window.value_expression != null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .ntile => {
+                    if (window.value_expression != null or window.offset == 0 or window.default_json.len > 0) return error.InvalidQueryRequest;
                 },
                 .lag, .lead => {
                     if (window.value_expression == null or window.offset == 0) return error.InvalidQueryRequest;
+                },
+                .first_value => {
+                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .last_value => {
+                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .nth_value => {
+                    if (window.value_expression == null or window.offset == 0 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .count => {
+                    if (window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
+                },
+                .sum, .avg, .min, .max => {
+                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
                 },
             }
             if (!relationalRowsWindowSpecsShareOrder(first_window, window)) return error.UnsupportedQueryRequest;
         }
 
-        const source_order = try relationalRowsWindowSourceOrderAlloc(alloc, first_window);
-        defer alloc.free(source_order);
+        return try relationalRowsWindowSourceOrderAlloc(alloc, first_window);
+    }
 
+    fn validateRelationalRowsWindowOutputNames(req: types.RelationalRowsWindowRequest) !void {
+        if (!req.select_all) {
+            for (req.select) |field| {
+                if (field.len == 0) return error.InvalidQueryRequest;
+                if (relationalRowsWindowExplicitOutputNameCount(req, field) > 1) return error.InvalidQueryRequest;
+            }
+        }
+        for (req.windows) |window| {
+            if (window.output.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsWindowExplicitOutputNameCount(req, window.output) > 1) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn relationalRowsWindowExplicitOutputNameCount(
+        req: types.RelationalRowsWindowRequest,
+        name: []const u8,
+    ) usize {
+        var count: usize = 0;
+        if (!req.select_all) {
+            for (req.select) |field| {
+                if (std.mem.eql(u8, field, name)) count += 1;
+            }
+        }
+        for (req.windows) |window| {
+            if (std.mem.eql(u8, window.output, name)) count += 1;
+        }
+        return count;
+    }
+
+    fn relationalRowsWindowSourceQuery(
+        req: types.RelationalRowsWindowRequest,
+        source_order: []const types.RelationalRowsQueryOrder,
+    ) types.RelationalRowsQueryRequest {
         var source = req.source;
         source.select = &.{};
         source.json_extract = &.{};
@@ -14908,23 +17308,28 @@ pub const DB = struct {
         source.limit = null;
         source.offset = 0;
         source.row_claim = null;
+        return source;
+    }
 
-        var source_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, source);
-        defer source_rows.deinit(alloc);
-
-        const partition_keys = try alloc.alloc([]u8, source_rows.rows.len);
+    fn windowRelationalRowsFromSourceRowsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsWindowRequest,
+        source_rows: []const []const u8,
+    ) !types.RelationalRowsWindowResult {
+        const first_window = req.windows[0];
+        const partition_keys = try alloc.alloc([]u8, source_rows.len);
         var partition_keys_initialized: usize = 0;
         defer {
             for (partition_keys[0..partition_keys_initialized]) |key| alloc.free(key);
             alloc.free(partition_keys);
         }
-        const order_keys = try alloc.alloc([]RelationalRowsQueryOrderKey, source_rows.rows.len);
+        const order_keys = try alloc.alloc([]RelationalRowsQueryOrderKey, source_rows.len);
         var order_keys_initialized: usize = 0;
         defer {
             for (order_keys[0..order_keys_initialized]) |keys| freeRelationalRowsQueryOrderKeySlice(alloc, keys);
             alloc.free(order_keys);
         }
-        for (source_rows.rows, 0..) |row_json, i| {
+        for (source_rows, 0..) |row_json, i| {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -14942,7 +17347,7 @@ pub const DB = struct {
 
         var window_counters: RelationalRowsWindowCounterValues = .{};
 
-        for (source_rows.rows, 0..) |row_json, i| {
+        for (source_rows, 0..) |row_json, i| {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -14961,7 +17366,7 @@ pub const DB = struct {
                 }
             }
 
-            const out = try relationalRowsWindowResultRowJsonAlloc(alloc, parsed.value, source_rows.rows, partition_keys, i, req, window_counters);
+            const out = try relationalRowsWindowResultRowJsonAlloc(alloc, parsed.value, source_rows, partition_keys, order_keys, i, req, window_counters);
             var out_transferred = false;
             errdefer if (!out_transferred) alloc.free(out);
             try rows.append(alloc, out);
@@ -15088,6 +17493,7 @@ pub const DB = struct {
         row: std.json.Value,
         source_rows: []const []const u8,
         partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
         row_index: usize,
         req: types.RelationalRowsWindowRequest,
         counters: RelationalRowsWindowCounterValues,
@@ -15121,15 +17527,20 @@ pub const DB = struct {
             first = false;
             try writer.print("{f}:", .{std.json.fmt(window.output, .{})});
             switch (window.function) {
-                .row_number, .rank, .dense_rank => {
+                .row_number, .rank, .dense_rank, .percent_rank, .cume_dist => {
                     const value = switch (window.function) {
                         .row_number => counters.row_number,
                         .rank => counters.rank,
                         .dense_rank => counters.dense_rank,
-                        else => unreachable,
+                        else => null,
                     };
-                    try writer.print("{d}", .{value});
+                    if (value) |integer_value| {
+                        try writer.print("{d}", .{integer_value});
+                    } else {
+                        try writeRelationalRowsWindowRelativeRank(writer, source_rows, partition_keys, order_keys, row_index, window.function, counters);
+                    }
                 },
+                .ntile => try writeRelationalRowsWindowNtile(writer, source_rows, partition_keys, row_index, window, counters),
                 .lag, .lead => try writeRelationalRowsWindowOffsetValue(
                     alloc,
                     writer,
@@ -15138,10 +17549,432 @@ pub const DB = struct {
                     row_index,
                     window,
                 ),
+                .first_value => try writeRelationalRowsWindowFirstValue(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    order_keys,
+                    row_index,
+                    window,
+                ),
+                .last_value => try writeRelationalRowsWindowLastValue(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    order_keys,
+                    row_index,
+                    window,
+                ),
+                .nth_value => try writeRelationalRowsWindowNthValue(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    order_keys,
+                    row_index,
+                    window,
+                ),
+                .count => try writeRelationalRowsWindowCount(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    order_keys,
+                    row_index,
+                    window,
+                ),
+                .sum, .avg, .min, .max => try writeRelationalRowsWindowNumericAggregate(
+                    alloc,
+                    writer,
+                    source_rows,
+                    partition_keys,
+                    order_keys,
+                    row_index,
+                    window,
+                ),
             }
         }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
+    }
+
+    fn writeRelationalRowsWindowRelativeRank(
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        function: types.RelationalRowsWindowFunction,
+        counters: RelationalRowsWindowCounterValues,
+    ) !void {
+        const partition_start = relationalRowsWindowPartitionStartIndex(partition_keys, row_index);
+        const partition_end = relationalRowsWindowPartitionEndIndex(source_rows, partition_keys, row_index);
+        const partition_size = partition_end - partition_start + 1;
+        const value: f64 = switch (function) {
+            .percent_rank => if (partition_size <= 1)
+                0
+            else
+                @as(f64, @floatFromInt(counters.rank - 1)) / @as(f64, @floatFromInt(partition_size - 1)),
+            .cume_dist => blk: {
+                var peer_end = row_index;
+                while (peer_end + 1 <= partition_end and relationalRowsQueryOrderKeysEqual(order_keys[peer_end + 1], order_keys[row_index])) peer_end += 1;
+                break :blk @as(f64, @floatFromInt(peer_end - partition_start + 1)) / @as(f64, @floatFromInt(partition_size));
+            },
+            else => return error.InvalidQueryRequest,
+        };
+        try writer.print("{d}", .{value});
+    }
+
+    fn writeRelationalRowsWindowNtile(
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+        counters: RelationalRowsWindowCounterValues,
+    ) !void {
+        if (window.offset == 0) return error.InvalidQueryRequest;
+        const partition_start = relationalRowsWindowPartitionStartIndex(partition_keys, row_index);
+        const partition_end = relationalRowsWindowPartitionEndIndex(source_rows, partition_keys, row_index);
+        const partition_size: u64 = @intCast(partition_end - partition_start + 1);
+        const buckets: u64 = window.offset;
+        const base_size = partition_size / buckets;
+        const larger_bucket_count = partition_size % buckets;
+        const larger_bucket_size = base_size + 1;
+        const row_position = counters.row_number - 1;
+        const larger_rows = larger_bucket_count * larger_bucket_size;
+        const bucket = if (row_position < larger_rows)
+            (row_position / larger_bucket_size) + 1
+        else
+            larger_bucket_count + ((row_position - larger_rows) / base_size) + 1;
+        try writer.print("{d}", .{bucket});
+    }
+
+    fn relationalRowsWindowFrame(window: types.RelationalRowsWindowSpec) types.RelationalRowsWindowFrame {
+        return window.frame orelse .{ .unit = .range, .start = .unbounded_preceding, .end = .current_row };
+    }
+
+    const RelationalRowsWindowFrameRange = struct {
+        start: usize,
+        end: usize,
+    };
+
+    fn relationalRowsWindowPartitionStartIndex(
+        partition_keys: []const []const u8,
+        row_index: usize,
+    ) usize {
+        var target: usize = row_index;
+        while (target > 0 and std.mem.eql(u8, partition_keys[target - 1], partition_keys[row_index])) {
+            target -= 1;
+        }
+        return target;
+    }
+
+    fn relationalRowsWindowPartitionEndIndex(
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        row_index: usize,
+    ) usize {
+        var target: usize = row_index;
+        while (target + 1 < source_rows.len and std.mem.eql(u8, partition_keys[target + 1], partition_keys[row_index])) {
+            target += 1;
+        }
+        return target;
+    }
+
+    fn relationalRowsWindowFrameRange(
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        order_by: []const types.RelationalRowsQueryOrder,
+        row_index: usize,
+        frame: types.RelationalRowsWindowFrame,
+    ) !?RelationalRowsWindowFrameRange {
+        const partition_start = relationalRowsWindowPartitionStartIndex(partition_keys, row_index);
+        const partition_end = relationalRowsWindowPartitionEndIndex(source_rows, partition_keys, row_index);
+        const start = try relationalRowsWindowFrameBoundIndex(source_rows, partition_keys, order_keys, order_by, row_index, partition_start, partition_end, frame, frame.start, frame.start_offset, true) orelse return null;
+        const end = try relationalRowsWindowFrameBoundIndex(source_rows, partition_keys, order_keys, order_by, row_index, partition_start, partition_end, frame, frame.end, frame.end_offset, false) orelse return null;
+        if (start > end) return null;
+        return .{ .start = start, .end = end };
+    }
+
+    fn relationalRowsWindowFrameBoundIndex(
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        order_by: []const types.RelationalRowsQueryOrder,
+        row_index: usize,
+        partition_start: usize,
+        partition_end: usize,
+        frame: types.RelationalRowsWindowFrame,
+        bound: types.RelationalRowsWindowFrameBound,
+        offset: u32,
+        is_start: bool,
+    ) !?usize {
+        _ = source_rows;
+        _ = partition_keys;
+        switch (bound) {
+            .unbounded_preceding => return partition_start,
+            .unbounded_following => return partition_end,
+            .current_row => switch (frame.unit) {
+                .rows => return row_index,
+                .range => {
+                    var target: usize = row_index;
+                    if (is_start) {
+                        while (target > partition_start and relationalRowsQueryOrderKeysEqual(order_keys[target - 1], order_keys[row_index])) target -= 1;
+                    } else {
+                        while (target + 1 <= partition_end and relationalRowsQueryOrderKeysEqual(order_keys[target + 1], order_keys[row_index])) target += 1;
+                    }
+                    return target;
+                },
+            },
+            .offset_preceding, .offset_following => {
+                if (offset == 0) return error.InvalidQueryRequest;
+                switch (frame.unit) {
+                    .rows => {
+                        const distance: usize = @intCast(offset);
+                        if (bound == .offset_preceding) {
+                            if (row_index - partition_start < distance) {
+                                return if (is_start) partition_start else null;
+                            }
+                            return row_index - distance;
+                        }
+                        const remaining = partition_end - row_index;
+                        if (distance > remaining) {
+                            return if (is_start) null else partition_end;
+                        }
+                        return row_index + distance;
+                    },
+                    .range => return try relationalRowsWindowRangeOffsetBoundIndex(
+                        order_keys,
+                        order_by,
+                        row_index,
+                        partition_start,
+                        partition_end,
+                        bound,
+                        offset,
+                        is_start,
+                    ),
+                }
+            },
+        }
+    }
+
+    fn relationalRowsWindowRangeOffsetBoundIndex(
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        order_by: []const types.RelationalRowsQueryOrder,
+        row_index: usize,
+        partition_start: usize,
+        partition_end: usize,
+        bound: types.RelationalRowsWindowFrameBound,
+        offset: u32,
+        is_start: bool,
+    ) !?usize {
+        if (order_by.len != 1 or order_keys[row_index].len != 1) return error.InvalidQueryRequest;
+        const current = try relationalRowsWindowRangeOrderPosition(order_keys, order_by, row_index);
+        const distance: f64 = @floatFromInt(offset);
+        const target = switch (bound) {
+            .offset_preceding => current - distance,
+            .offset_following => current + distance,
+            else => return error.InvalidQueryRequest,
+        };
+        if (is_start) {
+            var candidate = partition_start;
+            while (candidate <= partition_end) : (candidate += 1) {
+                const position = try relationalRowsWindowRangeOrderPosition(order_keys, order_by, candidate);
+                if (position >= target) return candidate;
+            }
+            return null;
+        }
+        var candidate = partition_end + 1;
+        while (candidate > partition_start) {
+            candidate -= 1;
+            const position = try relationalRowsWindowRangeOrderPosition(order_keys, order_by, candidate);
+            if (position <= target) return candidate;
+        }
+        return null;
+    }
+
+    fn relationalRowsWindowRangeOrderPosition(
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        order_by: []const types.RelationalRowsQueryOrder,
+        index: usize,
+    ) !f64 {
+        if (order_by.len != 1 or order_keys[index].len != 1) return error.InvalidQueryRequest;
+        const value = switch (order_keys[index][0]) {
+            .number => |number| number,
+            else => return error.InvalidQueryRequest,
+        };
+        return switch (order_by[0].direction) {
+            .asc => value,
+            .desc => -value,
+        };
+    }
+
+    fn writeRelationalRowsWindowFirstValue(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("null");
+            return;
+        };
+        const target = range.start;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, source_rows[target], .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+    }
+
+    fn writeRelationalRowsWindowLastValue(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("null");
+            return;
+        };
+        const target = range.end;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, source_rows[target], .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+    }
+
+    fn writeRelationalRowsWindowNthValue(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        if (window.offset == 0) return error.InvalidQueryRequest;
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("null");
+            return;
+        };
+        const offset: usize = @intCast(window.offset - 1);
+        if (offset > range.end - range.start) {
+            try writer.writeAll("null");
+            return;
+        }
+        const target = range.start + offset;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, source_rows[target], .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+    }
+
+    fn writeRelationalRowsWindowCount(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("0");
+            return;
+        };
+        var count: u64 = 0;
+        if (window.value_expression) |expression| {
+            for (source_rows[range.start .. range.end + 1]) |row_json| {
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidQueryRequest;
+                const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+                defer alloc.free(value_json);
+                var value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                defer value.deinit();
+                if (value.value != .null) count += 1;
+            }
+        } else {
+            count = @intCast(range.end - range.start + 1);
+        }
+        try writer.print("{d}", .{count});
+    }
+
+    fn writeRelationalRowsWindowNumericAggregate(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("null");
+            return;
+        };
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        var count: u64 = 0;
+        var sum: f64 = 0;
+        var best: f64 = 0;
+        for (source_rows[range.start .. range.end + 1]) |row_json| {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+            defer alloc.free(value_json);
+            var value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+            defer value.deinit();
+            if (value.value == .null) continue;
+            const number = jsonNumberAsF64(value.value) orelse return error.InvalidQueryRequest;
+            if (count == 0) best = number;
+            switch (window.function) {
+                .sum, .avg => sum += number,
+                .min => {
+                    if (number < best) best = number;
+                },
+                .max => {
+                    if (number > best) best = number;
+                },
+                else => return error.InvalidQueryRequest,
+            }
+            count += 1;
+        }
+        if (count == 0) {
+            try writer.writeAll("null");
+            return;
+        }
+        const result = switch (window.function) {
+            .sum => sum,
+            .avg => sum / @as(f64, @floatFromInt(count)),
+            .min, .max => best,
+            else => return error.InvalidQueryRequest,
+        };
+        try writer.print("{d}", .{result});
     }
 
     fn writeRelationalRowsWindowOffsetValue(
@@ -15200,16 +18033,37 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) ![]u8 {
-        if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0) {
+        if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
             return try projectLookupStoredBytes(self, alloc, doc_key, row_json, .{
                 .fields = req.select,
                 .include_all_fields = req.select_all,
+            });
+        }
+        return try projectRelationalRowsQueryCandidateStaticAlloc(alloc, doc_key, row_json, req);
+    }
+
+    fn projectRelationalRowsQueryCandidateStaticAlloc(
+        alloc: Allocator,
+        doc_key: []const u8,
+        row_json: []const u8,
+        req: types.RelationalRowsQueryRequest,
+    ) ![]u8 {
+        if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
+            return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, row_json, .{
+                .fields = req.select,
+                .include_all_fields = req.select_all,
+            }, .{
+                .ctx = null,
+                .load_chunks = noSpecialRelationalRowsFieldValue,
+                .load_embeddings = noSpecialRelationalRowsFieldValue,
+                .load_artifacts = noSpecialRelationalRowsFieldValue,
             });
         }
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
+        try validateRelationalRowsMutationReturningRowOutputs(parsed.value, req.select, req.select_all, req.expressions);
 
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -15263,8 +18117,44 @@ pub const DB = struct {
                 try writer.writeAll("null");
             }
         }
+        for (req.expressions) |projection| {
+            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
+    }
+
+    fn relationalRowsQueryProjectionOutputAlreadyRendered(req: types.RelationalRowsQueryRequest, output: []const u8) bool {
+        for (req.select) |field| {
+            if (std.mem.eql(u8, field, output)) return true;
+        }
+        for (req.json_extract) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) return true;
+        }
+        for (req.array_length) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) return true;
+        }
+        for (req.coalesce) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) return true;
+        }
+        for (req.field_aliases) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) return true;
+        }
+        return false;
+    }
+
+    fn noSpecialRelationalRowsFieldValue(
+        _: ?*anyopaque,
+        _: Allocator,
+        _: []const u8,
+    ) !?std.json.Value {
+        return null;
     }
 
     fn relationalRowsMutationSourceOperationsAlloc(
@@ -15286,8 +18176,40 @@ pub const DB = struct {
         try relationalRowsAppendClonedTransformOpsAlloc(alloc, &operations, req.operations);
         try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, runtime_schema, parsed.value, &operations, req.patch_expressions, .set);
         try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, runtime_schema, parsed.value, &operations, req.increment_expressions, .inc);
+        try relationalRowsAppendJsonSetExpressionOpsAlloc(alloc, runtime_schema, parsed.value, &operations, req.json_set_expressions);
         try relationalRowsAppendOnUpdateOpsAlloc(alloc, runtime_schema, &operations);
         try relationalRowsAppendGeneratedColumnOpsAlloc(alloc, runtime_schema, row_json, &operations);
+
+        return try operations.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsJoinedMutationSourceOperationsAlloc(
+        alloc: Allocator,
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        target_json: []const u8,
+        source_json: []const u8,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) ![]types.TransformOp {
+        var parsed_target = std.json.parseFromSlice(std.json.Value, alloc, target_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_target.deinit();
+        if (parsed_target.value != .object) return error.InvalidQueryRequest;
+        var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_source.deinit();
+        if (parsed_source.value != .object) return error.InvalidQueryRequest;
+
+        var operations = std.ArrayListUnmanaged(types.TransformOp).empty;
+        errdefer {
+            relationalRowsFreeTransformOpPayloads(alloc, operations.items);
+            operations.deinit(alloc);
+        }
+
+        try relationalRowsAppendClonedTransformOpsAlloc(alloc, &operations, req.operations);
+        try relationalRowsAppendJoinedSourceAssignmentOpsAlloc(alloc, target_schema, source_schema, parsed_source.value, &operations, req);
+        try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, target_schema, parsed_target.value, &operations, req.patch_expressions, .set);
+        try relationalRowsAppendExpressionAssignmentOpsAlloc(alloc, target_schema, parsed_target.value, &operations, req.increment_expressions, .inc);
+        try relationalRowsAppendOnUpdateOpsAlloc(alloc, target_schema, &operations);
+        try relationalRowsAppendGeneratedColumnOpsAlloc(alloc, target_schema, target_json, &operations);
 
         return try operations.toOwnedSlice(alloc);
     }
@@ -15325,7 +18247,7 @@ pub const DB = struct {
         for (assignments) |assignment| {
             const column = relationalRowsFindColumn(runtime_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
             if (op == .inc and column.field_type != .numeric) return error.InvalidQueryRequest;
-            const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, assignment.expression);
+            const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, null, assignment.expression);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
             if (op == .inc) try relationalRowsValidateIncrementValueJson(alloc, value_json);
@@ -15334,6 +18256,82 @@ pub const DB = struct {
             errdefer if (!path_transferred) alloc.free(path);
             try operations.append(alloc, .{
                 .op = op,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsAppendJsonSetExpressionOpsAlloc(
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        row: std.json.Value,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+        assignments: []const types.RelationalRowsJsonSetExpressionAssignment,
+    ) !void {
+        for (assignments) |assignment| {
+            const column = relationalRowsFindColumn(runtime_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+            if (column.field_type != .json) return error.InvalidQueryRequest;
+            const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, null, assignment.expression);
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const path = try relationalRowsJsonSetTransformPathAlloc(alloc, column.path, assignment.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            try operations.append(alloc, .{
+                .op = .set,
+                .path = path,
+                .value_json = value_json,
+            });
+            path_transferred = true;
+            value_transferred = true;
+        }
+    }
+
+    fn relationalRowsJsonSetTransformPathAlloc(
+        alloc: Allocator,
+        field: []const u8,
+        path_segments: []const []const u8,
+    ) ![]u8 {
+        if (field.len == 0 or path_segments.len == 0) return error.InvalidQueryRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll(field);
+        for (path_segments) |segment| {
+            if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '.') != null) return error.InvalidQueryRequest;
+            try writer.writeByte('.');
+            try writer.writeAll(segment);
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn relationalRowsAppendJoinedSourceAssignmentOpsAlloc(
+        alloc: Allocator,
+        target_schema: schema_mod.TableSchema,
+        source_schema: schema_mod.TableSchema,
+        source_row: std.json.Value,
+        operations: *std.ArrayListUnmanaged(types.TransformOp),
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !void {
+        for (req.source_assignments) |assignment| {
+            if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+            const target_column = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+            const source_column = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+            if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
+            const value_json = if (relationalRowsJsonValueAtPath(source_row, source_column.path)) |selected|
+                try std.json.Stringify.valueAlloc(alloc, selected.*, .{})
+            else
+                try alloc.dupe(u8, "null");
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const path = try alloc.dupe(u8, target_column.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) alloc.free(path);
+            try operations.append(alloc, .{
+                .op = .set,
                 .path = path,
                 .value_json = value_json,
             });
@@ -15418,13 +18416,17 @@ pub const DB = struct {
         generated: schema_mod.RelationalGeneratedValue,
     ) ![]u8 {
         return switch (generated.op) {
-            .lower => blk: {
+            .lower, .upper => blk: {
                 const field = generated.field orelse return error.InvalidQueryRequest;
                 const selected = relationalRowsJsonValueAtPath(row, field) orelse return error.InvalidQueryRequest;
                 if (selected.* != .string) return error.InvalidQueryRequest;
-                const lowered = try std.ascii.allocLowerString(alloc, selected.string);
-                defer alloc.free(lowered);
-                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = lowered }, .{});
+                const folded = switch (generated.op) {
+                    .lower => try std.ascii.allocLowerString(alloc, selected.string),
+                    .upper => try std.ascii.allocUpperString(alloc, selected.string),
+                    .concat => unreachable,
+                };
+                defer alloc.free(folded);
+                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = folded }, .{});
             },
             .concat => blk: {
                 var joined = std.ArrayListUnmanaged(u8).empty;
@@ -15503,6 +18505,76 @@ pub const DB = struct {
             wrote = true;
             try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
             const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn validateRelationalRowsMutationReturningRowOutputs(
+        row: std.json.Value,
+        fields: []const []const u8,
+        returning_all: bool,
+        expressions: []const types.RelationalRowsExpressionProjection,
+    ) !void {
+        if (row != .object) return error.InvalidQueryRequest;
+        if (returning_all and fields.len != 0) return error.InvalidQueryRequest;
+        for (fields) |field| {
+            if (field.len == 0) return error.InvalidQueryRequest;
+            if (relationalRowsMutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
+        }
+        for (expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (returning_all and row.object.get(projection.output) != null) return error.InvalidQueryRequest;
+            if (relationalRowsMutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
+        }
+    }
+
+    fn relationalRowsJoinedMutationReturningJsonAlloc(
+        alloc: Allocator,
+        row_json: []const u8,
+        source_row_json: []const u8,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) ![]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_source.deinit();
+        if (parsed_source.value != .object) return error.InvalidQueryRequest;
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        var wrote = false;
+        if (req.returning_all) {
+            var fields = parsed.value.object.iterator();
+            while (fields.next()) |entry| {
+                if (wrote) try writer.writeByte(',');
+                wrote = true;
+                try writer.print("{f}:", .{std.json.fmt(entry.key_ptr.*, .{})});
+                try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+            }
+        }
+        for (req.returning) |field| {
+            if (field.len == 0) return error.InvalidQueryRequest;
+            if (wrote) try writer.writeByte(',');
+            wrote = true;
+            try writer.print("{f}:", .{std.json.fmt(field, .{})});
+            if (relationalRowsJsonValueAtPath(parsed.value, field)) |selected| {
+                try std.json.Stringify.value(selected.*, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+        }
+        for (req.returning_expressions) |projection| {
+            if (projection.output.len == 0) return error.InvalidQueryRequest;
+            if (wrote) try writer.writeByte(',');
+            wrote = true;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, parsed.value, null, parsed_source.value, projection.expression);
             defer alloc.free(value_json);
             try writer.writeAll(value_json);
         }
@@ -15654,13 +18726,37 @@ pub const DB = struct {
         plan: types.RelationalRowsAggregatePlan,
     ) !types.RelationalRowsAggregateResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        try validateRelationalRowsAggregateRequest(plan.aggregate);
+        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, plan.aggregate);
+        try validateRelationalRowsAggregatePlanCteReferences(plan);
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsAggregateAgainstPlannedCteOutput(planned_ctes, plan.aggregate);
         var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
         }
-        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ctes, &materialized_ctes);
-        return try self.aggregateRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.aggregate);
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ranges, plan.ctes, &materialized_ctes);
+        return try self.aggregateRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.ranges, plan.aggregate);
+    }
+
+    pub fn aggregateRelationalRowsAcrossRanges(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsAggregateRequest,
+        ranges: []const types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsAggregateResult {
+        try validateRelationalRowsAggregateRequest(req);
+        if (req.source.source_cte.len != 0) return error.InvalidQueryRequest;
+        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, req);
+
+        const source = relationalRowsAggregateSourceQuery(req);
+        var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
+        defer source_rows.deinit(alloc);
+
+        return try aggregateRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
     }
 
     fn aggregateRelationalRowsWithMaterializedCtesAlloc(
@@ -15670,28 +18766,53 @@ pub const DB = struct {
         materialized_ctes: []RelationalRowsMaterializedCte,
         req: types.RelationalRowsAggregateRequest,
     ) !types.RelationalRowsAggregateResult {
-        if (req.aggregations.len == 0) return error.InvalidArgument;
-        if (req.source.row_claim != null) return error.UnsupportedQueryRequest;
+        return try self.aggregateRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
+    }
 
+    fn aggregateRelationalRowsWithMaterializedCtesAndRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        ranges: []const types.RelationalRowsDocKeyRange,
+        req: types.RelationalRowsAggregateRequest,
+    ) !types.RelationalRowsAggregateResult {
+        try validateRelationalRowsAggregateRequest(req);
+        try validateRelationalRowsAggregateAgainstCteOutput(materialized_ctes, req);
+        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, req);
+
+        const source = relationalRowsAggregateSourceQuery(req);
+
+        var source_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, ranges, source);
+        defer source_rows.deinit(alloc);
+
+        return try aggregateRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
+    }
+
+    fn relationalRowsAggregateSourceQuery(req: types.RelationalRowsAggregateRequest) types.RelationalRowsQueryRequest {
         var source = req.source;
         source.select = &.{};
         source.select_all = true;
         source.order_by = &.{};
         source.limit = null;
         source.offset = 0;
+        return source;
+    }
 
-        var source_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, source);
-        defer source_rows.deinit(alloc);
-
+    pub fn aggregateRelationalRowsFromSourceRowsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsAggregateRequest,
+        source_rows: []const []const u8,
+    ) !types.RelationalRowsAggregateResult {
         var groups = std.StringArrayHashMapUnmanaged(RelationalRowsAggregateGroup).empty;
         defer deinitRelationalRowsAggregateGroups(alloc, &groups);
 
-        for (source_rows.rows) |row_json| {
+        for (source_rows) |row_json| {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidQueryRequest;
 
-            const key_json = try relationalRowsAggregateGroupKeyJsonAlloc(alloc, parsed.value, req.group_by);
+            const key_json = try relationalRowsAggregateGroupKeyJsonAlloc(alloc, parsed.value, req.group_by, req.group_expressions);
             var key_transferred = false;
             errdefer if (!key_transferred) alloc.free(key_json);
             const gop = try groups.getOrPut(alloc, key_json);
@@ -15710,10 +18831,10 @@ pub const DB = struct {
             rows.deinit(alloc);
         }
         for (groups.keys(), groups.values()) |key_json, group| {
-            const row_json = try relationalRowsAggregateResultRowJsonAlloc(alloc, key_json, req.group_by, req.aggregations, group);
+            const row_json = try relationalRowsAggregateResultRowJsonAlloc(alloc, key_json, req.group_by, req.group_expressions, req.aggregations, group);
             var row_transferred = false;
             errdefer if (!row_transferred) alloc.free(row_json);
-            if (!(try relationalRowsAggregateHavingPasses(alloc, row_json, req.having_predicates))) {
+            if (!(try relationalRowsAggregateHavingPasses(alloc, row_json, req.having_predicates, req.having_expressions, req.having_any, req.having_not))) {
                 alloc.free(row_json);
                 continue;
             }
@@ -15851,7 +18972,23 @@ pub const DB = struct {
             specs: []const types.RelationalRowsAggregateSpec,
         ) !void {
             for (specs, 0..) |spec, i| {
-                if (!(try relationalRowsAggregateFilterPasses(alloc, row, spec.filter_predicates, spec.filter_expressions))) continue;
+                if (!(try relationalRowsAggregateFilterPasses(
+                    alloc,
+                    row,
+                    spec.filter_predicates,
+                    spec.filter_array_any,
+                    spec.filter_array_contains,
+                    spec.filter_array_eq,
+                    spec.filter_in_predicates,
+                    spec.filter_json_contains,
+                    spec.filter_json_path_eq,
+                    spec.filter_json_path_exists,
+                    spec.filter_text_patterns,
+                    spec.filter_expressions,
+                    spec.filter_expression_array_contains,
+                    spec.filter_any,
+                    spec.filter_not,
+                ))) continue;
                 switch (spec.op) {
                     .count => {
                         if (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) |value_json| {
@@ -15920,14 +19057,22 @@ pub const DB = struct {
         alloc: Allocator,
         row_json: []const u8,
         predicates: []const schema_mod.RelationalCheck,
+        expressions: []const types.RelationalRowsExpressionCondition,
+        any_groups: []const types.RelationalRowsExpressionPredicateGroup,
+        not_groups: []const types.RelationalRowsExpressionPredicateGroup,
     ) !bool {
-        if (predicates.len == 0) return true;
+        if (predicates.len == 0 and expressions.len == 0 and any_groups.len == 0 and not_groups.len == 0) return true;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
         for (predicates) |predicate| {
             if (!(try relationalRowsQueryPredicatePasses(alloc, parsed.value, predicate))) return false;
         }
+        for (expressions) |expression| {
+            if (!(try relationalRowsExpressionConditionMatches(alloc, parsed.value, expression))) return false;
+        }
+        if (!(try relationalRowsQueryExpressionOrPredicateGroupsPass(alloc, parsed.value, any_groups))) return false;
+        if (!(try relationalRowsQueryExpressionNotPredicateGroupsPass(alloc, parsed.value, not_groups))) return false;
         return true;
     }
 
@@ -15944,6 +19089,7 @@ pub const DB = struct {
         alloc: Allocator,
         row: std.json.Value,
         group_by: []const []const u8,
+        group_expressions: []const types.RelationalRowsExpressionProjection,
     ) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -15957,6 +19103,12 @@ pub const DB = struct {
                 try writer.writeAll("null");
             }
         }
+        for (group_expressions, 0..) |projection, i| {
+            if (group_by.len != 0 or i != 0) try writer.writeByte(',');
+            const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
         try writer.writeByte(']');
         return try out.toOwnedSlice();
     }
@@ -15965,12 +19117,13 @@ pub const DB = struct {
         alloc: Allocator,
         key_json: []const u8,
         group_by: []const []const u8,
+        group_expressions: []const types.RelationalRowsExpressionProjection,
         specs: []const types.RelationalRowsAggregateSpec,
         group: RelationalRowsAggregateGroup,
     ) ![]u8 {
         var parsed_key = std.json.parseFromSlice(std.json.Value, alloc, key_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed_key.deinit();
-        if (parsed_key.value != .array or parsed_key.value.array.items.len != group_by.len) return error.InvalidQueryRequest;
+        if (parsed_key.value != .array or parsed_key.value.array.items.len != group_by.len + group_expressions.len) return error.InvalidQueryRequest;
 
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -15982,6 +19135,12 @@ pub const DB = struct {
             first = false;
             try writer.print("{f}:", .{std.json.fmt(field, .{})});
             try std.json.Stringify.value(parsed_key.value.array.items[i], .{}, writer);
+        }
+        for (group_expressions, 0..) |projection, i| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            try std.json.Stringify.value(parsed_key.value.array.items[group_by.len + i], .{}, writer);
         }
         for (specs, 0..) |spec, i| {
             if (spec.name.len == 0) return error.InvalidQueryRequest;
@@ -16068,13 +19227,46 @@ pub const DB = struct {
         plan: types.RelationalRowsJoinPlan,
     ) !types.RelationalRowsJoinResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        if ((plan.left_ranges.len == 0) != (plan.right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsJoinRequest(plan.join);
+        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, plan.join);
+        try validateRelationalRowsJoinPlanCteReferences(plan);
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, plan.join);
         var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
         }
-        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ctes, &materialized_ctes);
-        return try self.joinRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.join);
+        const cte_ranges = try relationalRowsPlanRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
+        defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, cte_ranges, plan.ctes, &materialized_ctes);
+        return try self.joinRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.left_ranges, plan.right_ranges, plan.join);
+    }
+
+    pub fn joinRelationalRowsAcrossRanges(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsJoinRequest,
+        left_ranges: []const types.RelationalRowsDocKeyRange,
+        right_ranges: []const types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsJoinResult {
+        if (req.left.source_cte.len != 0 or req.right.source_cte.len != 0) return error.InvalidQueryRequest;
+        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsJoinRequest(req);
+        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, req);
+
+        const left_source = relationalRowsJoinSideSource(req.left);
+        const right_source = relationalRowsJoinSideSource(req.right);
+
+        var left_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, left_source, left_ranges);
+        defer left_rows.deinit(alloc);
+        var right_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, right_source, right_ranges);
+        defer right_rows.deinit(alloc);
+
+        return try joinRelationalRowsFromSourceRowsAlloc(alloc, req, left_rows.rows, right_rows.rows);
     }
 
     pub fn lateralRelationalRowsPlan(
@@ -16084,13 +19276,42 @@ pub const DB = struct {
         plan: types.RelationalRowsLateralPlan,
     ) !types.RelationalRowsJoinResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        if ((plan.left_ranges.len == 0) != (plan.right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsLateralRequest(plan.lateral);
+        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, plan.lateral);
+        try validateRelationalRowsLateralPlanCteReferences(plan);
+        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        try validateRelationalRowsLateralAgainstPlannedCteOutput(planned_ctes, plan.lateral);
         var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
         }
-        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, plan.ctes, &materialized_ctes);
-        return try self.lateralRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.lateral);
+        const cte_ranges = try relationalRowsPlanRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
+        defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+        try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, cte_ranges, plan.ctes, &materialized_ctes);
+        return try self.lateralRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.left_ranges, plan.right_ranges, plan.lateral);
+    }
+
+    pub fn lateralRelationalRowsAcrossRanges(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsLateralRequest,
+        left_ranges: []const types.RelationalRowsDocKeyRange,
+        right_ranges: []const types.RelationalRowsDocKeyRange,
+    ) !types.RelationalRowsJoinResult {
+        if (req.left.source_cte.len != 0 or req.right.source_cte.len != 0) return error.InvalidQueryRequest;
+        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsLateralRequest(req);
+        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, req);
+
+        const left_source = relationalRowsLateralLeftSource(req.left);
+        var left_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, left_source, left_ranges);
+        defer left_rows.deinit(alloc);
+
+        return try self.lateralRelationalRowsFromLeftRowsAlloc(alloc, runtime_schema, .{ .ranges = right_ranges }, req, left_rows.rows);
     }
 
     fn joinRelationalRowsWithMaterializedCtesAlloc(
@@ -16100,24 +19321,145 @@ pub const DB = struct {
         materialized_ctes: []RelationalRowsMaterializedCte,
         req: types.RelationalRowsJoinRequest,
     ) !types.RelationalRowsJoinResult {
-        if (req.on.len == 0) return error.InvalidArgument;
-        if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
+        return try self.joinRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, &.{}, req);
+    }
 
-        var left_source = req.left;
-        left_source.select = &.{};
-        left_source.select_all = true;
-        var right_source = req.right;
-        right_source.select = &.{};
-        right_source.select_all = true;
+    fn joinRelationalRowsWithMaterializedCtesAndRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        left_ranges: []const types.RelationalRowsDocKeyRange,
+        right_ranges: []const types.RelationalRowsDocKeyRange,
+        req: types.RelationalRowsJoinRequest,
+    ) !types.RelationalRowsJoinResult {
+        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsJoinRequest(req);
+        try validateRelationalRowsJoinAgainstCteOutput(materialized_ctes, req);
+        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, req);
 
-        var left_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, left_source);
+        const left_source = relationalRowsJoinSideSource(req.left);
+        const right_source = relationalRowsJoinSideSource(req.right);
+
+        var left_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, left_ranges, left_source);
         defer left_rows.deinit(alloc);
-        var right_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, right_source);
+        var right_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, right_ranges, right_source);
         defer right_rows.deinit(alloc);
 
+        return try joinRelationalRowsFromSourceRowsAlloc(alloc, req, left_rows.rows, right_rows.rows);
+    }
+
+    fn validateRelationalRowsJoinRequest(req: types.RelationalRowsJoinRequest) !void {
+        if (req.on.len == 0) return error.InvalidArgument;
+        if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.left.doc_key_range != null or req.right.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsJoinMatchExpressionSources(req);
+        try validateRelationalRowsJoinProjectionOutputs(req.select);
+    }
+
+    fn validateRelationalRowsJoinMatchExpressionSources(req: types.RelationalRowsJoinRequest) error{UnsupportedQueryRequest}!void {
+        for (req.match_expression_predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        for (req.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        }
+        for (req.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        }
+        for (req.match_expression_array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionSourcesOne(predicate.expression);
+    }
+
+    fn validateRelationalRowsJoinMatchExpressionConditionSources(condition: types.RelationalRowsExpressionCondition) error{UnsupportedQueryRequest}!void {
+        try validateRelationalRowsJoinMatchExpressionSourcesOne(condition.lhs);
+        for (condition.rhs) |rhs| try validateRelationalRowsJoinMatchExpressionSourcesOne(rhs);
+    }
+
+    fn validateRelationalRowsJoinMatchExpressionSourcesOne(expression: types.RelationalRowsExpression) error{UnsupportedQueryRequest}!void {
+        if (expression.kind == .field and (expression.field_source == .existing or expression.field_source == .proposed)) {
+            return error.UnsupportedQueryRequest;
+        }
+        for (expression.operands) |operand| try validateRelationalRowsJoinMatchExpressionSourcesOne(operand);
+        for (expression.case_branches) |branch| {
+            try validateRelationalRowsJoinMatchExpressionConditionSources(branch.when);
+            try validateRelationalRowsJoinMatchExpressionSourcesOne(branch.then);
+        }
+        for (expression.case_else) |case_else| try validateRelationalRowsJoinMatchExpressionSourcesOne(case_else);
+    }
+
+    fn validateRelationalRowsJoinProjectionOutputs(select: []const types.RelationalRowsJoinProjection) !void {
+        for (select, 0..) |projection, i| {
+            if (projection.output.len == 0 or projection.field.len == 0) return error.InvalidQueryRequest;
+            for (select[i + 1 ..]) |other| {
+                if (std.mem.eql(u8, projection.output, other.output)) return error.InvalidQueryRequest;
+            }
+        }
+    }
+
+    fn relationalRowsJoinSideSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
+        var source = source_req;
+        source.select = &.{};
+        source.select_all = true;
+        return source;
+    }
+
+    fn relationalRowsJoinedMutationTargetQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+        return switch (req.target_side) {
+            .left => req.join.left,
+            .right => req.join.right,
+        };
+    }
+
+    fn relationalRowsJoinedMutationSourceQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+        return switch (req.target_side) {
+            .left => req.join.right,
+            .right => req.join.left,
+        };
+    }
+
+    fn relationalRowsJoinedMutationTargetSource(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+        var source = relationalRowsJoinedMutationTargetQuery(req);
+        source.select = &.{};
+        source.select_all = true;
+        source.row_claim = null;
+        source.limit = null;
+        source.offset = 0;
+        return source;
+    }
+
+    fn relationalRowsJoinedMutationSourceSide(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+        var source = relationalRowsJoinedMutationSourceQuery(req);
+        source.select = &.{};
+        source.select_all = true;
+        source.row_claim = null;
+        return source;
+    }
+
+    fn relationalRowsJoinedMutationClaim(req: types.RelationalRowsJoinedMutationSourceRequest) ?types.RowClaimRequest {
+        return relationalRowsJoinedMutationTargetQuery(req).row_claim;
+    }
+
+    fn relationalRowsJoinedMutationTargetJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) RelationalRowsJoinSide {
+        return switch (req.target_side) {
+            .left => .left,
+            .right => .right,
+        };
+    }
+
+    fn relationalRowsJoinedMutationSourceJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) RelationalRowsJoinSide {
+        return switch (req.target_side) {
+            .left => .right,
+            .right => .left,
+        };
+    }
+
+    pub fn joinRelationalRowsFromSourceRowsAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsJoinRequest,
+        left_rows: []const []const u8,
+        right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
         var right_index = std.StringArrayHashMapUnmanaged(RelationalRowsJoinRightList).empty;
         defer deinitRelationalRowsJoinRightIndex(alloc, &right_index);
-        for (right_rows.rows, 0..) |right_row, right_index_id| {
+        for (right_rows, 0..) |right_row, right_index_id| {
             var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row, .{}) catch return error.InvalidQueryRequest;
             defer parsed_right.deinit();
             if (parsed_right.value != .object) return error.InvalidQueryRequest;
@@ -16139,7 +19481,7 @@ pub const DB = struct {
             for (joined.items) |row| alloc.free(@constCast(row));
             joined.deinit(alloc);
         }
-        for (left_rows.rows) |left_row| {
+        for (left_rows) |left_row| {
             var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidQueryRequest;
             defer parsed_left.deinit();
             if (parsed_left.value != .object) return error.InvalidQueryRequest;
@@ -16149,7 +19491,8 @@ pub const DB = struct {
             if (key_json) |key| {
                 if (right_index.get(key)) |right_list| {
                     for (right_list.indexes.items) |right_index_id| {
-                        const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, right_rows.rows[right_index_id], req.select);
+                        if (!(try relationalRowsJoinMatchPredicatesPass(alloc, parsed_left.value, right_rows[right_index_id], req))) continue;
+                        const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, right_rows[right_index_id], req.select);
                         var row_transferred = false;
                         errdefer if (!row_transferred) alloc.free(row_json);
                         try joined.append(alloc, row_json);
@@ -16158,7 +19501,7 @@ pub const DB = struct {
                     continue;
                 }
             }
-            if (req.join_type == .left) {
+            if (req.join_type == .left and !relationalRowsJoinHasMatchPredicates(req)) {
                 const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
                 var row_transferred = false;
                 errdefer if (!row_transferred) alloc.free(row_json);
@@ -16189,6 +19532,35 @@ pub const DB = struct {
         };
     }
 
+    fn relationalRowsJoinHasMatchPredicates(req: types.RelationalRowsJoinRequest) bool {
+        return req.match_expression_predicates.len != 0 or
+            req.match_expression_or_predicates.len != 0 or
+            req.match_expression_not_predicates.len != 0 or
+            req.match_expression_array_contains.len != 0;
+    }
+
+    fn relationalRowsJoinMatchPredicatesPass(
+        alloc: Allocator,
+        left_row: std.json.Value,
+        right_row_json: []const u8,
+        req: types.RelationalRowsJoinRequest,
+    ) !bool {
+        if (!relationalRowsJoinHasMatchPredicates(req)) return true;
+
+        var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_right.deinit();
+        if (parsed_right.value != .object) return error.InvalidQueryRequest;
+        for (req.match_expression_predicates) |condition| {
+            if (!(try relationalRowsExpressionConditionMatchesWithSources(alloc, left_row, null, parsed_right.value, condition))) return false;
+        }
+        if (!(try relationalRowsExpressionOrPredicateGroupsPassWithSources(alloc, left_row, null, parsed_right.value, req.match_expression_or_predicates))) return false;
+        if (!(try relationalRowsExpressionNotPredicateGroupsPassWithSources(alloc, left_row, null, parsed_right.value, req.match_expression_not_predicates))) return false;
+        for (req.match_expression_array_contains) |predicate| {
+            if (!(try relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(alloc, left_row, null, parsed_right.value, predicate))) return false;
+        }
+        return true;
+    }
+
     fn lateralRelationalRowsWithMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
@@ -16196,24 +19568,104 @@ pub const DB = struct {
         materialized_ctes: []RelationalRowsMaterializedCte,
         req: types.RelationalRowsLateralRequest,
     ) !types.RelationalRowsJoinResult {
+        return try self.lateralRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, &.{}, req);
+    }
+
+    fn lateralRelationalRowsWithMaterializedCtesAndRangesAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        left_ranges: []const types.RelationalRowsDocKeyRange,
+        right_ranges: []const types.RelationalRowsDocKeyRange,
+        req: types.RelationalRowsLateralRequest,
+    ) !types.RelationalRowsJoinResult {
+        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+        try validateRelationalRowsLateralRequest(req);
+        try validateRelationalRowsLateralAgainstCteOutput(materialized_ctes, req);
+        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, req);
+
+        const left_source = relationalRowsLateralLeftSource(req.left);
+        var left_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, left_ranges, left_source);
+        defer left_rows.deinit(alloc);
+
+        return try self.lateralRelationalRowsFromLeftRowsAlloc(alloc, runtime_schema, .{ .materialized_ctes_and_ranges = .{ .ctes = materialized_ctes, .ranges = right_ranges } }, req, left_rows.rows);
+    }
+
+    pub fn lateralRelationalRowsFromSourceRowsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsLateralRequest,
+        left_rows: []const []const u8,
+        right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
+        try validateRelationalRowsLateralRequest(req);
+        return try self.lateralRelationalRowsFromLeftRowsAlloc(alloc, runtime_schema, .{ .source_rows = right_rows }, req, left_rows);
+    }
+
+    pub fn lateralRelationalRowsFromSourceRowsStaticAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsLateralRequest,
+        left_rows: []const []const u8,
+        right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
+        try validateRelationalRowsLateralRequest(req);
+        return try lateralRelationalRowsFromLeftRowsStaticAlloc(alloc, req, left_rows, right_rows);
+    }
+
+    const RelationalRowsLateralRightSource = union(enum) {
+        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes_and_ranges: struct {
+            ctes: []RelationalRowsMaterializedCte,
+            ranges: []const types.RelationalRowsDocKeyRange,
+        },
+        ranges: []const types.RelationalRowsDocKeyRange,
+        source_rows: []const []const u8,
+    };
+
+    fn validateRelationalRowsLateralRequest(req: types.RelationalRowsLateralRequest) !void {
         if (req.correlations.len == 0) return error.InvalidArgument;
         if (req.right.limit == null) return error.UnsupportedQueryRequest;
         if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
+        if (req.left.doc_key_range != null or req.right.doc_key_range != null) return error.InvalidQueryRequest;
+        try validateRelationalRowsLateralMatchExpressionSources(req);
+        try validateRelationalRowsJoinProjectionOutputs(req.select);
+    }
 
-        var left_source = req.left;
-        left_source.select = &.{};
-        left_source.select_all = true;
+    fn validateRelationalRowsLateralMatchExpressionSources(req: types.RelationalRowsLateralRequest) error{UnsupportedQueryRequest}!void {
+        for (req.match_expression_predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        for (req.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        }
+        for (req.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
+        }
+        for (req.match_expression_array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionSourcesOne(predicate.expression);
+    }
 
-        var left_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, left_source);
-        defer left_rows.deinit(alloc);
+    fn relationalRowsLateralLeftSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
+        var source = source_req;
+        source.select = &.{};
+        source.select_all = true;
+        return source;
+    }
 
+    fn lateralRelationalRowsFromLeftRowsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        right_source_kind: RelationalRowsLateralRightSource,
+        req: types.RelationalRowsLateralRequest,
+        left_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
         var joined = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (joined.items) |row| alloc.free(@constCast(row));
             joined.deinit(alloc);
         }
 
-        for (left_rows.rows) |left_row| {
+        for (left_rows) |left_row| {
             var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidQueryRequest;
             defer parsed_left.deinit();
             if (parsed_left.value != .object) return error.InvalidQueryRequest;
@@ -16234,13 +19686,14 @@ pub const DB = struct {
                     freeRelationalRowsChecks(alloc, right_source.predicates);
                     if (right_source.predicates.len > 0) alloc.free(right_source.predicates);
                 }
-                right_rows = try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, right_source);
+                right_rows = try self.queryRelationalRowsForLateralRightSourceAlloc(alloc, runtime_schema, right_source_kind, right_source);
             }
             defer if (right_rows) |*rows| rows.deinit(alloc);
 
             var matched = false;
             if (right_rows) |rows| {
                 for (rows.rows) |right_row| {
+                    if (!(try relationalRowsLateralMatchPredicatesPass(alloc, parsed_left.value, right_row, req))) continue;
                     const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, right_row, req.select);
                     var row_transferred = false;
                     errdefer if (!row_transferred) alloc.free(row_json);
@@ -16249,7 +19702,7 @@ pub const DB = struct {
                     matched = true;
                 }
             }
-            if (!matched) {
+            if (!matched and !relationalRowsLateralHasMatchPredicates(req)) {
                 const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
                 var row_transferred = false;
                 errdefer if (!row_transferred) alloc.free(row_json);
@@ -16278,6 +19731,183 @@ pub const DB = struct {
             .rows = try joined.toOwnedSlice(alloc),
             .total_rows = total_rows,
         };
+    }
+
+    fn lateralRelationalRowsFromLeftRowsStaticAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsLateralRequest,
+        left_rows: []const []const u8,
+        source_right_rows: []const []const u8,
+    ) !types.RelationalRowsJoinResult {
+        var joined = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (joined.items) |row| alloc.free(@constCast(row));
+            joined.deinit(alloc);
+        }
+
+        for (left_rows) |left_row| {
+            var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidQueryRequest;
+            defer parsed_left.deinit();
+            if (parsed_left.value != .object) return error.InvalidQueryRequest;
+
+            const correlated_predicates = try relationalRowsLateralCorrelationPredicatesAlloc(alloc, parsed_left.value, req.correlations);
+            defer {
+                freeRelationalRowsChecks(alloc, correlated_predicates);
+                if (correlated_predicates.len > 0) alloc.free(correlated_predicates);
+            }
+
+            var right_rows: ?types.RelationalRowsQueryResult = null;
+            if (correlated_predicates.len == req.correlations.len) {
+                var right_source = req.right;
+                right_source.select = &.{};
+                right_source.select_all = true;
+                right_source.predicates = try relationalRowsConcatChecksAlloc(alloc, req.right.predicates, correlated_predicates);
+                defer {
+                    freeRelationalRowsChecks(alloc, right_source.predicates);
+                    if (right_source.predicates.len > 0) alloc.free(right_source.predicates);
+                }
+                right_rows = try queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "lateral_right", source_right_rows, right_source);
+            }
+            defer if (right_rows) |*rows| rows.deinit(alloc);
+
+            var matched = false;
+            if (right_rows) |rows| {
+                for (rows.rows) |right_row| {
+                    if (!(try relationalRowsLateralMatchPredicatesPass(alloc, parsed_left.value, right_row, req))) continue;
+                    const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, right_row, req.select);
+                    var row_transferred = false;
+                    errdefer if (!row_transferred) alloc.free(row_json);
+                    try joined.append(alloc, row_json);
+                    row_transferred = true;
+                    matched = true;
+                }
+            }
+            if (!matched and !relationalRowsLateralHasMatchPredicates(req)) {
+                const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
+                var row_transferred = false;
+                errdefer if (!row_transferred) alloc.free(row_json);
+                try joined.append(alloc, row_json);
+                row_transferred = true;
+            }
+        }
+
+        try sortRelationalRowsOutputRowsAlloc(alloc, joined.items, req.order_by);
+
+        const total_rows: u32 = @intCast(joined.items.len);
+        const start = @min(@as(usize, req.offset), joined.items.len);
+        const limited_len: usize = if (req.limit) |limit|
+            @min(@as(usize, limit), joined.items.len - start)
+        else
+            joined.items.len - start;
+        if (start > 0 or limited_len < joined.items.len) {
+            for (joined.items[0..start]) |row| alloc.free(@constCast(row));
+            for (joined.items[start + limited_len ..]) |row| alloc.free(@constCast(row));
+            const kept = try alloc.dupe([]const u8, joined.items[start .. start + limited_len]);
+            joined.deinit(alloc);
+            return .{ .rows = kept, .total_rows = total_rows };
+        }
+
+        return .{
+            .rows = try joined.toOwnedSlice(alloc),
+            .total_rows = total_rows,
+        };
+    }
+
+    fn relationalRowsLateralHasMatchPredicates(req: types.RelationalRowsLateralRequest) bool {
+        return req.match_expression_predicates.len != 0 or
+            req.match_expression_or_predicates.len != 0 or
+            req.match_expression_not_predicates.len != 0 or
+            req.match_expression_array_contains.len != 0;
+    }
+
+    fn relationalRowsLateralMatchPredicatesPass(
+        alloc: Allocator,
+        left_row: std.json.Value,
+        right_row_json: []const u8,
+        req: types.RelationalRowsLateralRequest,
+    ) !bool {
+        if (!relationalRowsLateralHasMatchPredicates(req)) return true;
+
+        var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_right.deinit();
+        if (parsed_right.value != .object) return error.InvalidQueryRequest;
+        for (req.match_expression_predicates) |condition| {
+            if (!(try relationalRowsExpressionConditionMatchesWithSources(alloc, left_row, null, parsed_right.value, condition))) return false;
+        }
+        if (!(try relationalRowsExpressionOrPredicateGroupsPassWithSources(alloc, left_row, null, parsed_right.value, req.match_expression_or_predicates))) return false;
+        if (!(try relationalRowsExpressionNotPredicateGroupsPassWithSources(alloc, left_row, null, parsed_right.value, req.match_expression_not_predicates))) return false;
+        for (req.match_expression_array_contains) |predicate| {
+            if (!(try relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(alloc, left_row, null, parsed_right.value, predicate))) return false;
+        }
+        return true;
+    }
+
+    fn queryRelationalRowsForLateralRightSourceAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        right_source_kind: RelationalRowsLateralRightSource,
+        right_source: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        return switch (right_source_kind) {
+            .materialized_ctes => |materialized_ctes| try self.queryRelationalRowsWithMaterializedCtesAlloc(alloc, runtime_schema, materialized_ctes, right_source),
+            .materialized_ctes_and_ranges => |source| try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, source.ctes, source.ranges, right_source),
+            .ranges => |ranges| try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, right_source, ranges),
+            .source_rows => |source_rows| try self.queryRelationalRowsFromSourceRowsAlloc(alloc, "lateral_right", source_rows, right_source),
+        };
+    }
+
+    fn relationalRowsPlanRangesForJoinAlloc(
+        alloc: Allocator,
+        left_ranges: []const types.RelationalRowsDocKeyRange,
+        right_ranges: []const types.RelationalRowsDocKeyRange,
+    ) ![]const types.RelationalRowsDocKeyRange {
+        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+        if (left_ranges.len == 0) return &.{};
+        try validateRelationalRowsDocKeyRanges(left_ranges);
+        try validateRelationalRowsDocKeyRanges(right_ranges);
+        const sorted = try alloc.alloc(types.RelationalRowsDocKeyRange, left_ranges.len + right_ranges.len);
+        defer alloc.free(sorted);
+        @memcpy(sorted[0..left_ranges.len], left_ranges);
+        @memcpy(sorted[left_ranges.len..], right_ranges);
+        std.sort.pdq(types.RelationalRowsDocKeyRange, sorted, {}, relationalRowsDocKeyRangeLessThan);
+
+        var out = std.ArrayListUnmanaged(types.RelationalRowsDocKeyRange).empty;
+        errdefer out.deinit(alloc);
+        for (sorted) |range| {
+            if (out.items.len == 0) {
+                try out.append(alloc, range);
+                continue;
+            }
+            const last = &out.items[out.items.len - 1];
+            if (relationalRowsDocKeyRangesOverlapOrTouch(last.*, range)) {
+                last.end = relationalRowsDocKeyRangeMaxEnd(last.end, range.end);
+            } else {
+                try out.append(alloc, range);
+            }
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsDocKeyRangesOverlapOrTouch(lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
+        if (lhs.end.len == 0) return true;
+        if (rhs.start.len == 0) return true;
+        return std.mem.order(u8, rhs.start, lhs.end) != .gt;
+    }
+
+    fn relationalRowsDocKeyRangeMaxEnd(lhs: []const u8, rhs: []const u8) []const u8 {
+        if (lhs.len == 0 or rhs.len == 0) return "";
+        return if (std.mem.order(u8, lhs, rhs) == .lt) rhs else lhs;
+    }
+
+    fn relationalRowsDocKeyRangeLessThan(_: void, lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
+        if (lhs.start.len == 0) return rhs.start.len != 0;
+        if (rhs.start.len == 0) return false;
+        const start_order = std.mem.order(u8, lhs.start, rhs.start);
+        if (start_order != .eq) return start_order == .lt;
+        if (lhs.end.len == 0) return false;
+        if (rhs.end.len == 0) return true;
+        return std.mem.order(u8, lhs.end, rhs.end) == .lt;
     }
 
     const RelationalRowsJoinSide = enum {
@@ -16479,6 +20109,99 @@ pub const DB = struct {
         }
     };
 
+    pub const RelationalRowsMutationSourceCandidate = struct {
+        doc_key: []u8,
+        json: []u8,
+        version: u64 = 0,
+        order_keys: []RelationalRowsQueryOrderKey = &.{},
+        ordinal: usize,
+        group_id: u64 = 0,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.doc_key);
+            alloc.free(self.json);
+            freeRelationalRowsQueryOrderKeySlice(alloc, self.order_keys);
+            self.* = undefined;
+        }
+    };
+
+    pub fn cloneRelationalRowsMutationSourceCandidateAlloc(
+        alloc: Allocator,
+        candidate: RelationalRowsMutationSourceCandidate,
+    ) !RelationalRowsMutationSourceCandidate {
+        const doc_key = try alloc.dupe(u8, candidate.doc_key);
+        errdefer alloc.free(doc_key);
+        const json = try alloc.dupe(u8, candidate.json);
+        errdefer alloc.free(json);
+        const order_keys = try cloneRelationalRowsQueryOrderKeysAlloc(alloc, candidate.order_keys);
+        errdefer freeRelationalRowsQueryOrderKeySlice(alloc, order_keys);
+        return .{
+            .doc_key = doc_key,
+            .json = json,
+            .version = candidate.version,
+            .order_keys = order_keys,
+            .ordinal = candidate.ordinal,
+            .group_id = candidate.group_id,
+        };
+    }
+
+    pub const RelationalRowsMutationSourcePlan = struct {
+        matched: u32 = 0,
+        candidates: []RelationalRowsMutationSourceCandidate = &.{},
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.candidates) |*candidate| candidate.deinit(alloc);
+            if (self.candidates.len > 0) alloc.free(self.candidates);
+            self.* = undefined;
+        }
+    };
+
+    pub const RelationalRowsJoinedMutationSourceCandidate = struct {
+        target: RelationalRowsMutationSourceCandidate = .{ .doc_key = &.{}, .json = &.{}, .ordinal = 0 },
+        source_json: []u8 = &.{},
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.target.doc_key.len > 0 or self.target.json.len > 0 or self.target.order_keys.len > 0) self.target.deinit(alloc);
+            if (self.source_json.len > 0) alloc.free(self.source_json);
+            self.* = undefined;
+        }
+    };
+
+    pub const RelationalRowsJoinedMutationSourcePlan = struct {
+        matched: u32 = 0,
+        candidates: []RelationalRowsJoinedMutationSourceCandidate = &.{},
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.candidates) |*candidate| candidate.deinit(alloc);
+            if (self.candidates.len > 0) alloc.free(self.candidates);
+            self.* = undefined;
+        }
+    };
+
+    const RelationalRowsMutationSourceSortContext = struct {
+        order_by: []const types.RelationalRowsQueryOrder,
+    };
+
+    fn relationalRowsMutationSourceCandidateLessThan(
+        ctx: RelationalRowsMutationSourceSortContext,
+        lhs: RelationalRowsMutationSourceCandidate,
+        rhs: RelationalRowsMutationSourceCandidate,
+    ) bool {
+        return relationalRowsQueryOrderedCandidatesLessThan(ctx.order_by, lhs.order_keys, lhs.ordinal, rhs.order_keys, rhs.ordinal);
+    }
+
+    const RelationalRowsJoinedMutationSourceSortContext = struct {
+        order_by: []const types.RelationalRowsQueryOrder,
+    };
+
+    fn relationalRowsJoinedMutationSourceCandidateLessThan(
+        ctx: RelationalRowsJoinedMutationSourceSortContext,
+        lhs: RelationalRowsJoinedMutationSourceCandidate,
+        rhs: RelationalRowsJoinedMutationSourceCandidate,
+    ) bool {
+        return relationalRowsQueryOrderedCandidatesLessThan(ctx.order_by, lhs.target.order_keys, lhs.target.ordinal, rhs.target.order_keys, rhs.target.ordinal);
+    }
+
     const RelationalRowsOutputRowOrderCandidate = struct {
         index: usize,
         order_keys: []RelationalRowsQueryOrderKey = &.{},
@@ -16492,9 +20215,11 @@ pub const DB = struct {
 
     const RelationalRowsMaterializedCte = struct {
         name: []const u8,
+        output_fields: []const []const u8 = &.{},
         result: types.RelationalRowsQueryResult,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
+            freeOwnedConstStringSlice(alloc, self.output_fields);
             self.result.deinit(alloc);
             self.* = undefined;
         }
@@ -16507,7 +20232,7 @@ pub const DB = struct {
         return null;
     }
 
-    const RelationalRowsQueryOrderKey = union(enum) {
+    pub const RelationalRowsQueryOrderKey = union(enum) {
         missing,
         null,
         bool: bool,
@@ -17310,6 +21035,41 @@ pub const DB = struct {
         order_keys_transferred = true;
     }
 
+    fn appendRelationalRowsQueryCandidateFromJsonStaticAlloc(
+        alloc: Allocator,
+        req: types.RelationalRowsQueryRequest,
+        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
+        doc_key: []const u8,
+        row_json: []const u8,
+        version: u64,
+    ) !void {
+        if (!(try relationalRowsQueryJsonMatchesRequest(alloc, row_json, req))) return;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const order_keys = try relationalRowsQueryOrderKeysAlloc(alloc, parsed.value, req.order_by);
+        var order_keys_transferred = false;
+        errdefer if (!order_keys_transferred) freeRelationalRowsQueryOrderKeySlice(alloc, order_keys);
+
+        const owned_doc_key = try alloc.dupe(u8, doc_key);
+        var doc_key_transferred = false;
+        errdefer if (!doc_key_transferred) alloc.free(owned_doc_key);
+        const materialized = try alloc.dupe(u8, row_json);
+        var materialized_transferred = false;
+        errdefer if (!materialized_transferred) alloc.free(materialized);
+        try rows.append(alloc, .{
+            .doc_key = owned_doc_key,
+            .json = materialized,
+            .version = version,
+            .order_keys = order_keys,
+            .ordinal = rows.items.len,
+        });
+        doc_key_transferred = true;
+        materialized_transferred = true;
+        order_keys_transferred = true;
+    }
+
     fn relationalRowsDocKeyInQueryRange(req: types.RelationalRowsQueryRequest, doc_key: []const u8) bool {
         const range = req.doc_key_range orelse return true;
         if (range.start.len > 0 and std.mem.order(u8, doc_key, range.start) == .lt) return false;
@@ -17322,7 +21082,7 @@ pub const DB = struct {
         row_json: []const u8,
         req: types.RelationalRowsQueryRequest,
     ) !bool {
-        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
+        if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.access_or_predicates.len == 0 and req.access_not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -17331,6 +21091,8 @@ pub const DB = struct {
         }
         if (!(try relationalRowsQueryOrPredicateGroupsPass(alloc, parsed.value, req.or_predicates))) return false;
         if (!(try relationalRowsQueryNotPredicateGroupsPass(alloc, parsed.value, req.not_predicates))) return false;
+        if (!(try relationalRowsQueryAccessOrPredicateGroupsPass(alloc, parsed.value, req.access_or_predicates))) return false;
+        if (!(try relationalRowsQueryAccessNotPredicateGroupsPass(alloc, parsed.value, req.access_not_predicates))) return false;
         for (req.expression_predicates) |condition| {
             if (!(try relationalRowsExpressionConditionMatches(alloc, parsed.value, condition))) return false;
         }
@@ -17494,6 +21256,64 @@ pub const DB = struct {
         return true;
     }
 
+    fn relationalRowsQueryAccessPredicateGroupPasses(
+        alloc: Allocator,
+        row: std.json.Value,
+        group: types.RelationalRowsAccessPredicateGroup,
+    ) !bool {
+        for (group.predicates) |predicate| {
+            if (!(try relationalRowsQueryPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.array_any) |predicate| {
+            if (!(try relationalRowsQueryArrayAnyPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.array_contains) |predicate| {
+            if (!(try relationalRowsQueryArrayContainsPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.array_eq) |predicate| {
+            if (!(try relationalRowsQueryArrayEqPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.in_predicates) |predicate| {
+            if (!(try relationalRowsQueryInPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.json_contains) |predicate| {
+            if (!(try relationalRowsQueryJsonContainsPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.json_path_eq) |predicate| {
+            if (!(try relationalRowsQueryJsonPathEqPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (group.json_path_exists) |predicate| {
+            if (!relationalRowsQueryJsonPathExistsPredicatePasses(row, predicate)) return false;
+        }
+        for (group.text_patterns) |predicate| {
+            if (!relationalRowsQueryTextPatternPredicatePasses(row, predicate)) return false;
+        }
+        return true;
+    }
+
+    fn relationalRowsQueryAccessOrPredicateGroupsPass(
+        alloc: Allocator,
+        row: std.json.Value,
+        groups: []const types.RelationalRowsAccessPredicateGroup,
+    ) !bool {
+        if (groups.len == 0) return true;
+        for (groups) |group| {
+            if (try relationalRowsQueryAccessPredicateGroupPasses(alloc, row, group)) return true;
+        }
+        return false;
+    }
+
+    fn relationalRowsQueryAccessNotPredicateGroupsPass(
+        alloc: Allocator,
+        row: std.json.Value,
+        groups: []const types.RelationalRowsAccessPredicateGroup,
+    ) !bool {
+        for (groups) |group| {
+            if (try relationalRowsQueryAccessPredicateGroupPasses(alloc, row, group)) return false;
+        }
+        return true;
+    }
+
     fn relationalRowsQueryExpressionOrPredicateGroupsPass(
         alloc: Allocator,
         row: std.json.Value,
@@ -17522,6 +21342,75 @@ pub const DB = struct {
             var group_passes = true;
             for (group.conditions) |condition| {
                 if (!(try relationalRowsExpressionConditionMatches(alloc, row, condition))) {
+                    group_passes = false;
+                    break;
+                }
+            }
+            if (group_passes) return false;
+        }
+        return true;
+    }
+
+    fn relationalRowsJoinedMutationMatchPredicatesPass(
+        alloc: Allocator,
+        target_row: std.json.Value,
+        source_row_json: []const u8,
+        req: types.RelationalRowsJoinedMutationSourceRequest,
+    ) !bool {
+        if (req.match_expression_predicates.len == 0 and
+            req.match_expression_or_predicates.len == 0 and
+            req.match_expression_not_predicates.len == 0 and
+            req.match_expression_array_contains.len == 0)
+        {
+            return true;
+        }
+
+        var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed_source.deinit();
+        if (parsed_source.value != .object) return error.InvalidQueryRequest;
+        for (req.match_expression_predicates) |condition| {
+            if (!(try relationalRowsExpressionConditionMatchesWithSources(alloc, target_row, null, parsed_source.value, condition))) return false;
+        }
+        if (!(try relationalRowsExpressionOrPredicateGroupsPassWithSources(alloc, target_row, null, parsed_source.value, req.match_expression_or_predicates))) return false;
+        if (!(try relationalRowsExpressionNotPredicateGroupsPassWithSources(alloc, target_row, null, parsed_source.value, req.match_expression_not_predicates))) return false;
+        for (req.match_expression_array_contains) |predicate| {
+            if (!(try relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(alloc, target_row, null, parsed_source.value, predicate))) return false;
+        }
+        return true;
+    }
+
+    fn relationalRowsExpressionOrPredicateGroupsPassWithSources(
+        alloc: Allocator,
+        row: std.json.Value,
+        proposed_row: ?std.json.Value,
+        source_row: ?std.json.Value,
+        groups: []const types.RelationalRowsExpressionPredicateGroup,
+    ) !bool {
+        if (groups.len == 0) return true;
+        for (groups) |group| {
+            var group_passes = true;
+            for (group.conditions) |condition| {
+                if (!(try relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, source_row, condition))) {
+                    group_passes = false;
+                    break;
+                }
+            }
+            if (group_passes) return true;
+        }
+        return false;
+    }
+
+    fn relationalRowsExpressionNotPredicateGroupsPassWithSources(
+        alloc: Allocator,
+        row: std.json.Value,
+        proposed_row: ?std.json.Value,
+        source_row: ?std.json.Value,
+        groups: []const types.RelationalRowsExpressionPredicateGroup,
+    ) !bool {
+        for (groups) |group| {
+            var group_passes = true;
+            for (group.conditions) |condition| {
+                if (!(try relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, source_row, condition))) {
                     group_passes = false;
                     break;
                 }
@@ -17626,14 +21515,54 @@ pub const DB = struct {
         alloc: Allocator,
         row: std.json.Value,
         predicates: []const schema_mod.RelationalCheck,
+        array_any: []const types.RelationalRowsArrayAnyPredicate,
+        array_contains: []const types.RelationalRowsArrayContainsPredicate,
+        array_eq: []const types.RelationalRowsArrayEqPredicate,
+        in_predicates: []const types.RelationalRowsInPredicate,
+        json_contains: []const types.RelationalRowsJsonContainsPredicate,
+        json_path_eq: []const types.RelationalRowsJsonPathEqPredicate,
+        json_path_exists: []const types.RelationalRowsJsonPathExistsPredicate,
+        text_patterns: []const types.RelationalRowsTextPatternPredicate,
         expressions: []const types.RelationalRowsExpressionCondition,
+        expression_array_contains: []const types.RelationalRowsExpressionArrayContainsPredicate,
+        any_groups: []const types.RelationalRowsExpressionPredicateGroup,
+        not_groups: []const types.RelationalRowsExpressionPredicateGroup,
     ) !bool {
         for (predicates) |predicate| {
             if (!(try relationalRowsQueryPredicatePasses(alloc, row, predicate))) return false;
         }
+        for (array_any) |predicate| {
+            if (!(try relationalRowsQueryArrayAnyPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (array_contains) |predicate| {
+            if (!(try relationalRowsQueryArrayContainsPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (array_eq) |predicate| {
+            if (!(try relationalRowsQueryArrayEqPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (in_predicates) |predicate| {
+            if (!(try relationalRowsQueryInPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (json_contains) |predicate| {
+            if (!(try relationalRowsQueryJsonContainsPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (json_path_eq) |predicate| {
+            if (!(try relationalRowsQueryJsonPathEqPredicatePasses(alloc, row, predicate))) return false;
+        }
+        for (json_path_exists) |predicate| {
+            if (!relationalRowsQueryJsonPathExistsPredicatePasses(row, predicate)) return false;
+        }
+        for (text_patterns) |predicate| {
+            if (!relationalRowsQueryTextPatternPredicatePasses(row, predicate)) return false;
+        }
         for (expressions) |expression| {
             if (!(try relationalRowsExpressionConditionMatches(alloc, row, expression))) return false;
         }
+        for (expression_array_contains) |predicate| {
+            if (!(try relationalRowsQueryExpressionArrayContainsPredicatePasses(alloc, row, predicate))) return false;
+        }
+        if (!(try relationalRowsQueryExpressionOrPredicateGroupsPass(alloc, row, any_groups))) return false;
+        if (!(try relationalRowsQueryExpressionNotPredicateGroupsPass(alloc, row, not_groups))) return false;
         return true;
     }
 
@@ -17642,22 +21571,24 @@ pub const DB = struct {
         row: std.json.Value,
         expression: types.RelationalRowsExpression,
     ) anyerror![]u8 {
-        return try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, expression);
+        return try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, null, null, expression);
     }
 
     fn relationalRowsExpressionValueJsonWithSourcesAlloc(
         alloc: Allocator,
         row: std.json.Value,
         proposed_row: ?std.json.Value,
+        source_row: ?std.json.Value,
         expression: types.RelationalRowsExpression,
     ) anyerror![]u8 {
         return switch (expression.kind) {
             .field => blk: {
-                const source_row = switch (expression.field_source) {
+                const selected_row = switch (expression.field_source) {
                     .row, .existing => row,
                     .proposed => proposed_row orelse return error.InvalidQueryRequest,
+                    .source => source_row orelse return error.InvalidQueryRequest,
                 };
-                const selected = relationalRowsJsonValueAtPath(source_row, expression.field) orelse return try alloc.dupe(u8, "null");
+                const selected = relationalRowsJsonValueAtPath(selected_row, expression.field) orelse return try alloc.dupe(u8, "null");
                 break :blk try std.json.Stringify.valueAlloc(alloc, selected.*, .{});
             },
             .value => try alloc.dupe(u8, expression.value_json),
@@ -17667,7 +21598,7 @@ pub const DB = struct {
                 try std.fmt.allocPrint(alloc, "{d}", .{currentTimeNs()}),
             .coalesce => blk: {
                 for (expression.operands) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, operand);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch {
                         alloc.free(value_json);
                         return error.InvalidQueryRequest;
@@ -17681,31 +21612,53 @@ pub const DB = struct {
                 }
                 break :blk try alloc.dupe(u8, "null");
             },
-            .lower, .upper => blk: {
+            .lower, .upper, .trim => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
                 switch (parsed.value) {
                     .null => break :blk try alloc.dupe(u8, "null"),
                     .string => |text| {
-                        const transformed = if (expression.kind == .lower)
-                            try std.ascii.allocLowerString(alloc, text)
-                        else
-                            try std.ascii.allocUpperString(alloc, text);
+                        const transformed = switch (expression.kind) {
+                            .lower => try std.ascii.allocLowerString(alloc, text),
+                            .upper => try std.ascii.allocUpperString(alloc, text),
+                            .trim => try alloc.dupe(u8, std.mem.trim(u8, text, &std.ascii.whitespace)),
+                            else => unreachable,
+                        };
                         defer alloc.free(transformed);
                         break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
                     },
                     else => return error.InvalidQueryRequest,
                 }
             },
+            .replace => blk: {
+                if (expression.operands.len != 3) return error.InvalidQueryRequest;
+                const source_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+                defer alloc.free(source_json);
+                const needle_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
+                defer alloc.free(needle_json);
+                const replacement_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[2]);
+                defer alloc.free(replacement_json);
+                var source = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidQueryRequest;
+                defer source.deinit();
+                var needle = std.json.parseFromSlice(std.json.Value, alloc, needle_json, .{}) catch return error.InvalidQueryRequest;
+                defer needle.deinit();
+                var replacement = std.json.parseFromSlice(std.json.Value, alloc, replacement_json, .{}) catch return error.InvalidQueryRequest;
+                defer replacement.deinit();
+                if (source.value == .null or needle.value == .null or replacement.value == .null) break :blk try alloc.dupe(u8, "null");
+                if (source.value != .string or needle.value != .string or replacement.value != .string) return error.InvalidQueryRequest;
+                const transformed = try relationalRowsReplaceTextAlloc(alloc, source.value.string, needle.value.string, replacement.value.string);
+                defer alloc.free(transformed);
+                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
+            },
             .concat => blk: {
                 if (expression.operands.len == 0) return error.InvalidQueryRequest;
                 var joined = std.ArrayListUnmanaged(u8).empty;
                 defer joined.deinit(alloc);
                 for (expression.operands) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, operand);
                     defer alloc.free(value_json);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                     defer parsed.deinit();
@@ -17718,10 +21671,10 @@ pub const DB = struct {
             },
             .nullif => blk: {
                 if (expression.operands.len != 2) return error.InvalidQueryRequest;
-                const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 var lhs_transferred = false;
                 errdefer if (!lhs_transferred) alloc.free(lhs_json);
-                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[1]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
                 defer alloc.free(rhs_json);
                 var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer lhs.deinit();
@@ -17735,17 +21688,90 @@ pub const DB = struct {
                 lhs_transferred = true;
                 break :blk lhs_json;
             },
+            .greatest, .least => blk: {
+                if (expression.operands.len == 0) return error.InvalidQueryRequest;
+                var best_json: ?[]u8 = null;
+                errdefer if (best_json) |owned| alloc.free(owned);
+                var best_value: ?std.json.Parsed(std.json.Value) = null;
+                defer if (best_value) |*parsed| parsed.deinit();
+
+                for (expression.operands) |operand| {
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, operand);
+                    var value_transferred = false;
+                    errdefer if (!value_transferred) alloc.free(value_json);
+                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                    var parsed_transferred = false;
+                    defer if (!parsed_transferred) parsed.deinit();
+                    if (parsed.value == .null) {
+                        alloc.free(value_json);
+                        value_transferred = true;
+                        continue;
+                    }
+                    if (best_value) |*current| {
+                        const comparison = compareRelationalRowsJsonScalars(parsed.value, current.value) orelse return error.InvalidQueryRequest;
+                        const replace = switch (expression.kind) {
+                            .greatest => comparison == .gt,
+                            .least => comparison == .lt,
+                            else => unreachable,
+                        };
+                        if (!replace) {
+                            alloc.free(value_json);
+                            value_transferred = true;
+                            continue;
+                        }
+                        current.deinit();
+                        alloc.free(best_json.?);
+                    }
+                    best_json = value_json;
+                    best_value = parsed;
+                    value_transferred = true;
+                    parsed_transferred = true;
+                }
+                break :blk if (best_json) |owned| owned else try alloc.dupe(u8, "null");
+            },
+            .abs, .round, .floor, .ceil => blk: {
+                if (expression.operands.len != 1) return error.InvalidQueryRequest;
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                defer parsed.deinit();
+                if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+                const value = jsonNumberAsF64(parsed.value) orelse return error.InvalidQueryRequest;
+                const result = switch (expression.kind) {
+                    .abs => if (value < 0) -value else value,
+                    .round => @round(value),
+                    .floor => @floor(value),
+                    .ceil => @ceil(value),
+                    else => unreachable,
+                };
+                break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
+            },
+            .length => blk: {
+                if (expression.operands.len != 1) return error.InvalidQueryRequest;
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                defer parsed.deinit();
+                switch (parsed.value) {
+                    .null => break :blk try alloc.dupe(u8, "null"),
+                    .string => |text| {
+                        const len = std.unicode.utf8CountCodepoints(text) catch return error.InvalidQueryRequest;
+                        break :blk try std.fmt.allocPrint(alloc, "{d}", .{len});
+                    },
+                    else => return error.InvalidQueryRequest,
+                }
+            },
             .add, .sub, .mul, .div => blk: {
                 if ((expression.kind == .add or expression.kind == .mul) and expression.operands.len < 2) return error.InvalidQueryRequest;
                 if ((expression.kind == .sub or expression.kind == .div) and expression.operands.len != 2) return error.InvalidQueryRequest;
-                const first_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const first_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(first_json);
                 var first = std.json.parseFromSlice(std.json.Value, alloc, first_json, .{}) catch return error.InvalidQueryRequest;
                 defer first.deinit();
                 if (first.value == .null) break :blk try alloc.dupe(u8, "null");
                 var result = jsonNumberAsF64(first.value) orelse return error.InvalidQueryRequest;
                 for (expression.operands[1..]) |operand| {
-                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, operand);
+                    const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, operand);
                     defer alloc.free(value_json);
                     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                     defer parsed.deinit();
@@ -17761,10 +21787,14 @@ pub const DB = struct {
                 }
                 break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
             },
+            .interval_ns => blk: {
+                if (expression.operands.len != 1) return error.InvalidQueryRequest;
+                break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+            },
             .cast => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
                 const cast_type = expression.cast_type orelse return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
@@ -17773,7 +21803,7 @@ pub const DB = struct {
             },
             .json_extract => blk: {
                 if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidQueryRequest;
-                const root_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const root_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(root_json);
                 var root = std.json.parseFromSlice(std.json.Value, alloc, root_json, .{}) catch return error.InvalidQueryRequest;
                 defer root.deinit();
@@ -17783,7 +21813,7 @@ pub const DB = struct {
             },
             .array_length => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(value_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
@@ -17795,9 +21825,9 @@ pub const DB = struct {
             },
             .string_to_array => blk: {
                 if (expression.operands.len != 2) return error.InvalidQueryRequest;
-                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[0]);
+                const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(value_json);
-                const delimiter_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.operands[1]);
+                const delimiter_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
                 defer alloc.free(delimiter_json);
                 var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
                 defer parsed.deinit();
@@ -17810,11 +21840,11 @@ pub const DB = struct {
             .case => blk: {
                 if (expression.case_branches.len == 0 or expression.case_else.len != 1) return error.InvalidQueryRequest;
                 for (expression.case_branches) |branch| {
-                    if (try relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, branch.when)) {
-                        break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, branch.then);
+                    if (try relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, source_row, branch.when)) {
+                        break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, branch.then);
                     }
                 }
-                break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, expression.case_else[0]);
+                break :blk try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.case_else[0]);
             },
         };
     }
@@ -17844,7 +21874,17 @@ pub const DB = struct {
         row: std.json.Value,
         predicate: types.RelationalRowsExpressionArrayContainsPredicate,
     ) !bool {
-        const actual_json = try relationalRowsExpressionValueJsonAlloc(alloc, row, predicate.expression);
+        return try relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(alloc, row, null, null, predicate);
+    }
+
+    fn relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(
+        alloc: Allocator,
+        row: std.json.Value,
+        proposed_row: ?std.json.Value,
+        source_row: ?std.json.Value,
+        predicate: types.RelationalRowsExpressionArrayContainsPredicate,
+    ) !bool {
+        const actual_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, predicate.expression);
         defer alloc.free(actual_json);
         var actual = std.json.parseFromSlice(std.json.Value, alloc, actual_json, .{}) catch return error.InvalidQueryRequest;
         defer actual.deinit();
@@ -17861,16 +21901,17 @@ pub const DB = struct {
         row: std.json.Value,
         condition: types.RelationalRowsExpressionCondition,
     ) anyerror!bool {
-        return try relationalRowsExpressionConditionMatchesWithSources(alloc, row, null, condition);
+        return try relationalRowsExpressionConditionMatchesWithSources(alloc, row, null, null, condition);
     }
 
     fn relationalRowsExpressionConditionMatchesWithSources(
         alloc: Allocator,
         row: std.json.Value,
         proposed_row: ?std.json.Value,
+        source_row: ?std.json.Value,
         condition: types.RelationalRowsExpressionCondition,
     ) anyerror!bool {
-        const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.lhs);
+        const lhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, condition.lhs);
         defer alloc.free(lhs_json);
         var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
         defer lhs.deinit();
@@ -17879,7 +21920,7 @@ pub const DB = struct {
             .is_not_null => lhs.value != .null,
             .is_distinct, .is_not_distinct => blk: {
                 if (condition.rhs.len != 1) return error.InvalidQueryRequest;
-                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, condition.rhs[0]);
                 defer alloc.free(rhs_json);
                 var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer rhs.deinit();
@@ -17888,7 +21929,7 @@ pub const DB = struct {
             },
             .eq, .ne => blk: {
                 if (condition.rhs.len != 1) return error.InvalidQueryRequest;
-                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, condition.rhs[0]);
                 defer alloc.free(rhs_json);
                 var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer rhs.deinit();
@@ -17897,7 +21938,7 @@ pub const DB = struct {
             },
             .gt, .gte, .lt, .lte => blk: {
                 if (condition.rhs.len != 1) return error.InvalidQueryRequest;
-                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, condition.rhs[0]);
+                const rhs_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, condition.rhs[0]);
                 defer alloc.free(rhs_json);
                 var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer rhs.deinit();
@@ -17972,6 +22013,20 @@ pub const DB = struct {
         };
     }
 
+    fn relationalRowsReplaceTextAlloc(alloc: Allocator, source: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+        if (needle.len == 0) return try alloc.dupe(u8, source);
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(alloc);
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, source, start, needle)) |index| {
+            try out.appendSlice(alloc, source[start..index]);
+            try out.appendSlice(alloc, replacement);
+            start = index + needle.len;
+        }
+        try out.appendSlice(alloc, source[start..]);
+        return try out.toOwnedSlice(alloc);
+    }
+
     fn relationalRowsQueryOrderKeysAlloc(
         alloc: Allocator,
         row: std.json.Value,
@@ -17986,6 +22041,30 @@ pub const DB = struct {
         }
         for (order_by) |order| {
             keys[initialized] = try relationalRowsQueryOrderKeyAlloc(alloc, row, order);
+            initialized += 1;
+        }
+        return keys;
+    }
+
+    fn cloneRelationalRowsQueryOrderKeysAlloc(
+        alloc: Allocator,
+        source: []const RelationalRowsQueryOrderKey,
+    ) ![]RelationalRowsQueryOrderKey {
+        if (source.len == 0) return &.{};
+        const keys = try alloc.alloc(RelationalRowsQueryOrderKey, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            freeRelationalRowsQueryOrderKeys(alloc, keys[0..initialized]);
+            alloc.free(keys);
+        }
+        for (source) |key| {
+            keys[initialized] = switch (key) {
+                .missing => .missing,
+                .null => .null,
+                .bool => |value| .{ .bool = value },
+                .number => |value| .{ .number = value },
+                .string => |value| .{ .string = try alloc.dupe(u8, value) },
+            };
             initialized += 1;
         }
         return keys;
@@ -18068,15 +22147,25 @@ pub const DB = struct {
     }
 
     fn relationalRowsQueryCandidateLessThan(ctx: RelationalRowsQuerySortContext, lhs: RelationalRowsQueryCandidate, rhs: RelationalRowsQueryCandidate) bool {
-        for (ctx.order_by, 0..) |order, i| {
-            const comparison = compareRelationalRowsQueryOrderKeys(lhs.order_keys[i], rhs.order_keys[i]);
+        return relationalRowsQueryOrderedCandidatesLessThan(ctx.order_by, lhs.order_keys, lhs.ordinal, rhs.order_keys, rhs.ordinal);
+    }
+
+    fn relationalRowsQueryOrderedCandidatesLessThan(
+        order_by: []const types.RelationalRowsQueryOrder,
+        lhs_order_keys: []const RelationalRowsQueryOrderKey,
+        lhs_ordinal: usize,
+        rhs_order_keys: []const RelationalRowsQueryOrderKey,
+        rhs_ordinal: usize,
+    ) bool {
+        for (order_by, 0..) |order, i| {
+            const comparison = compareRelationalRowsQueryOrderKeys(lhs_order_keys[i], rhs_order_keys[i]);
             if (comparison == .eq) continue;
             return switch (order.direction) {
                 .asc => comparison == .lt,
                 .desc => comparison == .gt,
             };
         }
-        return lhs.ordinal < rhs.ordinal;
+        return lhs_ordinal < rhs_ordinal;
     }
 
     fn compareRelationalRowsQueryOrderKeys(lhs: RelationalRowsQueryOrderKey, rhs: RelationalRowsQueryOrderKey) RelationalRowsScalarComparison {
@@ -21778,6 +25867,119 @@ fn isUserRowMutationKey(key: []const u8) bool {
 
 fn rowClaimIntentKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
     return try std.mem.concat(alloc, u8, &.{ row_claim_intent_key_prefix, row_key });
+}
+
+fn rowClaimIntentValueAlloc(
+    alloc: Allocator,
+    txn_id: types.TxnId,
+    claim: types.RowClaimRequest,
+    now_ns: u64,
+) ![]u8 {
+    var txn_hex: [32]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (txn_id, 0..) |byte, i| {
+        txn_hex[i * 2] = hex[byte >> 4];
+        txn_hex[i * 2 + 1] = hex[byte & 0x0f];
+    }
+    const lease_ns = std.math.mul(u64, claim.lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .version = @as(u32, 1),
+        .mode = "for_update",
+        .skip_locked = claim.skip_locked,
+        .owner_id = claim.owner_id,
+        .lease_ms = claim.lease_ms,
+        .expires_at_ns = now_ns +| lease_ns,
+        .txn_id = txn_hex[0..],
+    }, .{});
+}
+
+fn rowClaimIntentPayloadExpired(alloc: Allocator, payload: []const u8, now_ns: u64) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const version = parsed.value.object.get("version") orelse return false;
+    if (version != .integer or version.integer != 1) return false;
+    const expires_at = parsed.value.object.get("expires_at_ns") orelse return false;
+    if (expires_at != .integer) return false;
+    if (expires_at.integer < 0) return true;
+    return @as(u64, @intCast(expires_at.integer)) <= now_ns;
+}
+
+fn freePendingIntentInfos(alloc: Allocator, items: []transactions_mod.PendingIntentInfo) void {
+    for (items) |*item| item.deinit(alloc);
+    if (items.len > 0) alloc.free(items);
+}
+
+fn reclaimExpiredRowClaimIntentsForRows(
+    self: *DB,
+    claiming_txn_id: types.TxnId,
+    row_keys: []const []const u8,
+    now_ns: u64,
+) !usize {
+    var reclaimed: usize = 0;
+    for (row_keys) |row_key| {
+        const claim_key = try rowClaimIntentKeyAlloc(self.alloc, row_key);
+        defer self.alloc.free(claim_key);
+        reclaimed += try reclaimExpiredRowClaimIntentKey(self, claim_key, claiming_txn_id, now_ns, false);
+    }
+    return reclaimed;
+}
+
+fn reclaimExpiredRowClaimIntentsForMutationKeys(
+    self: *DB,
+    writes: anytype,
+    deletes: []const []const u8,
+    exclude_txn_id: ?types.TxnId,
+    now_ns: u64,
+    comptime already_locked: bool,
+) !usize {
+    var reclaimed: usize = 0;
+    for (writes) |write| {
+        if (!isUserRowMutationKey(write.key)) continue;
+        const claim_key = try rowClaimIntentKeyAlloc(self.alloc, write.key);
+        defer self.alloc.free(claim_key);
+        reclaimed += try reclaimExpiredRowClaimIntentKey(self, claim_key, exclude_txn_id, now_ns, already_locked);
+    }
+    for (deletes) |key| {
+        if (!isUserRowMutationKey(key)) continue;
+        const claim_key = try rowClaimIntentKeyAlloc(self.alloc, key);
+        defer self.alloc.free(claim_key);
+        reclaimed += try reclaimExpiredRowClaimIntentKey(self, claim_key, exclude_txn_id, now_ns, already_locked);
+    }
+    return reclaimed;
+}
+
+fn reclaimExpiredRowClaimIntentKey(
+    self: *DB,
+    claim_key: []const u8,
+    exclude_txn_id: ?types.TxnId,
+    now_ns: u64,
+    comptime already_locked: bool,
+) !usize {
+    const pending = try self.core.collectPendingTransactionIntentsForKey(self.alloc, claim_key, exclude_txn_id);
+    defer freePendingIntentInfos(self.alloc, pending);
+    var reclaimed: usize = 0;
+    for (pending) |intent| {
+        const value = intent.value orelse continue;
+        if (!try rowClaimIntentPayloadExpired(self.alloc, value, now_ns)) continue;
+        if (already_locked) {
+            self.core.resolveTransactionIntents(intent.txn_id, .aborted, now_ns) catch |err| switch (err) {
+                transactions_mod.TxnError.DecisionConflict,
+                transactions_mod.TxnError.TxnNotFound,
+                => continue,
+                else => return err,
+            };
+        } else {
+            self.resolveTransactionIntents(intent.txn_id, .aborted, now_ns) catch |err| switch (err) {
+                transactions_mod.TxnError.DecisionConflict,
+                transactions_mod.TxnError.TxnNotFound,
+                => continue,
+                else => return err,
+            };
+        }
+        reclaimed += 1;
+    }
+    return reclaimed;
 }
 
 fn appendRowClaimPredicateForKey(
@@ -25582,6 +29784,7 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
         runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+    if (self.graph_metric_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
@@ -25593,6 +29796,7 @@ fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch
         runtime.applyBackpressure();
     }
     if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+    if (self.graph_metric_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
@@ -29871,6 +34075,23 @@ fn cleanupTempDir(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+fn graphMetricRuntimeWorkerSetHash(worker_ids: []const []const u8) u64 {
+    if (worker_ids.len == 0) return 0;
+    var xor_hash: u64 = 0;
+    var sum_hash: u64 = 0;
+    for (worker_ids) |worker_id| {
+        const item_hash = std.hash.Wyhash.hash(0, worker_id);
+        xor_hash ^= item_hash;
+        sum_hash +%= item_hash;
+    }
+    const fingerprint_words = [_]u64{
+        @intCast(worker_ids.len),
+        xor_hash,
+        sum_hash,
+    };
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(&fingerprint_words));
 }
 
 fn testStoreHasAlgebraicDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
@@ -39347,6 +43568,2510 @@ test "db runUntilIdle publishes configured graph pagerank metrics" {
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), degree_metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
+test "db runUntilIdle can use planned graph metric maintenance when enabled" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle planned graph metric maintenance reports budget exhaustion and resumes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "planned-idle-budgeted",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expect(pending.active_builds > 0);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db planned scheduler does not auto retry failed graph metric generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+    try std.testing.expectEqual(@as(usize, 1), start.active_builds);
+
+    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", error.InvalidGraphMetricBuildManifest);
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+    try std.testing.expect(failed.build_queued);
+    try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed.last_error);
+    const failed_target_generation = failed.target_edge_generation;
+
+    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 0);
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const duplicate = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 0), duplicate.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), duplicate.active_builds);
+    try std.testing.expectEqual(@as(usize, 0), duplicate.coordinator_steps);
+    try std.testing.expect(!duplicate.durableProgressed());
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, status.state);
+        try std.testing.expectEqual(failed_target_generation, status.target_edge_generation);
+        try std.testing.expectEqual(@as(u64, 0), status.build_job_id);
+        var failed_events: usize = 0;
+        for (status.recent_events) |event| {
+            if (event.kind == .failed) failed_events += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), failed_events);
+    }
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:e",
+            .value = "{\"title\":\"epsilon\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    const retry_new_generation = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), retry_new_generation.builds_started);
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expect(status.building_generation > failed_target_generation);
+    }
+}
+
+fn expectGraphMetricPlannedAutoDecision(
+    db: *DB,
+    should_run_planned: bool,
+    active_builds: usize,
+    eligible_queued: usize,
+    ineligible_queued: usize,
+) !void {
+    const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_builds, decision.active_builds);
+    try std.testing.expectEqual(eligible_queued, decision.eligible_queued);
+    try std.testing.expectEqual(ineligible_queued, decision.ineligible_queued);
+}
+
+fn expectGraphMetricDegreeCanaryDecision(
+    db: *DB,
+    should_run_planned: bool,
+    active_degree_builds: usize,
+    eligible_queued_degree: usize,
+    blocked_active_non_degree: usize,
+    blocked_queued_non_degree: usize,
+) !void {
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
+    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_degree_builds, decision.active_degree_builds);
+    try std.testing.expectEqual(eligible_queued_degree, decision.eligible_queued_degree);
+    try std.testing.expectEqual(blocked_active_non_degree, decision.blocked_active_non_degree);
+    try std.testing.expectEqual(blocked_queued_non_degree, decision.blocked_queued_non_degree);
+    try std.testing.expectEqual(@as(usize, 0), decision.failed_pages);
+    try std.testing.expect(!decision.truncated_pages);
+}
+
+test "db graph metric degree canary gate tracks queued active and capped degree work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-worker",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricDegreeCanaryDecision(&db, true, 0, 1, 0, 0);
+    const queued_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
+    try std.testing.expectEqual(@as(usize, 0), queued_decision.control_records);
+    try std.testing.expect(queued_decision.queued_degree_control_records > 0);
+    const capped_queued_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{
+        .max_control_records = queued_decision.queued_degree_control_records - 1,
+    });
+    try std.testing.expect(!capped_queued_decision.shouldRunPlanned());
+    try std.testing.expectEqual(queued_decision.queued_degree_control_records, capped_queued_decision.queued_degree_control_records);
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+    try expectGraphMetricDegreeCanaryDecision(&db, true, 1, 0, 0, 0);
+
+    const active_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
+    try std.testing.expect(active_decision.control_records > 0);
+    try std.testing.expect(active_decision.shouldRunPlanned());
+
+    const capped_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{
+        .max_control_records = active_decision.control_records - 1,
+    });
+    try std.testing.expect(!capped_decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_decision.control_records, capped_decision.control_records);
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 0, 0, 0);
+}
+
+test "db graph metric degree canary gate blocks non degree queued work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 1, 0, 1);
+
+    const degree_canary = try db.core.index_manager.shouldRunGraphMetricDegreeCanary(.{});
+    try std.testing.expect(!degree_canary);
+}
+
+test "db runUntilIdle degree canary mode uses planned maintenance for one degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricDegreeCanaryDecision(&db, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db degree canary planned maintenance reports bounded rounds and resumes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    try std.testing.expect(decision.shouldRunPlanned());
+    try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued_degree);
+
+    const budgeted = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "degree-canary-round-budget",
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), budgeted.rounds_executed);
+    try std.testing.expect(budgeted.budget_exhausted);
+    try std.testing.expect(budgeted.durableProgressed());
+
+    const resumed = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "degree-canary-round-budget",
+        .max_rounds = 200,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(!resumed.budget_exhausted);
+    try std.testing.expect(resumed.rounds_executed > 0);
+    try std.testing.expect(resumed.rounds_executed <= 200);
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle degree canary mode preserves published scores while rebuild is active" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-freshness",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try db.runUntilIdle();
+
+    var initial = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 1), initial.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[0].status.state);
+    const published_generation = initial.graph_metric_results[0].status.published_generation;
+    try std.testing.expect(published_generation > 0);
+    try std.testing.expectEqualStrings("doc:b", initial.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), initial.graph_metric_results[0].scores[0].score, 0.001);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:d",
+            .value = "{\"title\":\"delta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    db.graph_metric_idle_planned_options.max_rounds = 1;
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+
+    var published = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, published.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(published_generation, published.graph_metric_results[0].status.published_generation);
+    try std.testing.expect(published.graph_metric_results[0].status.building_generation > published_generation);
+    try std.testing.expectEqualStrings("doc:b", published.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published.graph_metric_results[0].scores[0].score, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "degree",
+        .freshness = .published,
+    }};
+    const traversal_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var traversal = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = traversal_query }},
+        .limit = 0,
+    });
+    defer traversal.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", traversal.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("degree", traversal.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metrics[0].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, traversal.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(published_generation, traversal.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "degree",
+        .freshness = .fresh,
+    }};
+    var fresh_traversal_query = traversal_query;
+    fresh_traversal_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_traversal_query }},
+        .limit = 0,
+    }));
+
+    var rerank = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "degree",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer rerank.deinit();
+    try std.testing.expectEqualStrings("doc:b", rerank.hits[0].id);
+    const rerank_status = rerank.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, rerank_status.state);
+    try std.testing.expectEqual(published_generation, rerank_status.published_generation);
+    const rerank_details = rerank.hits[0].score_details orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("degree", rerank_details.metric_name);
+    try std.testing.expectEqual(published_generation, rerank_details.published_generation);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rerank_details.metric_score orelse return error.TestUnexpectedResult, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    }));
+}
+
+test "db runUntilIdle degree canary mode fails fast when active planned work is outside guardrails" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-capped-active",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_degree_canary_options = .{
+            .max_control_records = 0,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    try std.testing.expectEqual(@as(usize, 1), decision.active_degree_builds);
+    try std.testing.expect(decision.control_records > decision.max_control_records);
+    try std.testing.expect(!decision.shouldRunPlanned());
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+}
+
+test "db runUntilIdle degree canary mode falls back to local oracle for mixed metrics" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 1, 0, 1);
+
+    try db.runUntilIdle();
+
+    var degree_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer degree_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), degree_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, degree_result.graph_metric_results[0].status.state);
+
+    var pagerank_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer pagerank_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pagerank_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, pagerank_result.graph_metric_results[0].status.state);
+}
+
+test "db runUntilIdle default graph metric maintenance auto chooses planned for one degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-degree-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle default graph metric maintenance auto chooses planned for one small pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-pagerank-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle default graph metric maintenance auto falls back for larger pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-large-pagerank-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 3,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(!decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle default graph metric maintenance auto can widen pagerank planned gate" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-wide-pagerank-planned",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 4,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle default graph metric maintenance auto falls back for multi metric indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-multi-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(!decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 2), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
+}
+
+test "db runUntilIdle default graph metric maintenance auto chooses planned for one small eigenvector" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-eigenvector-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db runUntilIdle default graph metric maintenance auto falls back for queued hits by default" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-hits-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(!decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+}
+
+test "db runUntilIdle default graph metric maintenance auto resumes active planned pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-active-pagerank",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance chooses planned for one small pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-planned-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance chooses planned for one degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-degree-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance chooses planned for one small eigenvector" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-eigenvector-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db runUntilIdle auto graph metric maintenance falls back for multi metric indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-legacy-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 2, 0);
+
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance falls back for larger pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-large-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 3,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(!decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance falls back for larger eigenvector" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-large-eigenvector-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_eigenvector_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db runUntilIdle auto graph metric maintenance can widen eigenvector planned gate" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-wide-eigenvector-planned",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_eigenvector_iterations = 2,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db runUntilIdle auto graph metric maintenance falls back for queued hits by default" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-default-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(!decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 0), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 1), decision.ineligible_queued);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+}
+
+test "db runUntilIdle auto graph metric maintenance falls back for incompatible opt-in hits pair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-incompatible-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_hits_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.00001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+}
+
+test "db runUntilIdle auto graph metric maintenance chooses planned for one opt-in small hits pair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-opt-in",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_hits_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[1].scores.len);
+    try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance resumes active planned degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-degree",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db runUntilIdle auto graph metric maintenance resumes active planned eigenvector" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-eigenvector",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db runUntilIdle auto graph metric maintenance resumes active planned hits pair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-hits",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[1].scores.len);
+    try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    try std.testing.expect(metric_result.graph_metric_results[1].scores[0].score >= metric_result.graph_metric_results[1].scores[1].score);
+    try std.testing.expect(metric_result.graph_metric_results[1].scores[1].score > metric_result.graph_metric_results[1].scores[2].score);
+}
+
 test "db graph metric manual refresh rebuild and delete operate on configured metric" {
     const alloc = std.testing.allocator;
 
@@ -39429,6 +46154,92 @@ test "db graph metric manual refresh rebuild and delete operate on configured me
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed_after_delete.state);
 }
 
+test "db graph metric public reads fail not ready before first publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 10,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 10,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 2,
+        .include_stored = false,
+    }));
+
+    try std.testing.expectError(error.MetricNotReady, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 2,
+        .include_stored = false,
+    }));
+}
+
 test "db graph metric freshness distinguishes published stale scores from fresh requirement" {
     const alloc = std.testing.allocator;
 
@@ -39487,6 +46298,96 @@ test "db graph metric freshness distinguishes published stale scores from fresh 
     try std.testing.expectEqual(refreshed.published_generation, published_result.graph_metric_results[0].status.published_generation);
     try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
     for (published_result.graph_metric_results[0].scores) |score| {
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), score.score, 0.001);
+    }
+
+    const active_target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        var building = try graph_entry.index.ensureGraphMetricPlannedBuild("manual_degree", target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+
+        const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-prepare");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+        try std.testing.expect(prepare.claimed_page);
+        try std.testing.expect(prepare.completed_page);
+
+        const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric("manual_degree");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+        try std.testing.expect(advance_prepare.advanced_phase);
+
+        const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-scan");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+        try std.testing.expect(scan.claimed_page);
+        try std.testing.expect(scan.completed_page);
+        break :blk target_generation;
+    };
+
+    var building_published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 10,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer building_published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building_published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(refreshed.published_generation, building_published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(active_target_generation, building_published_result.graph_metric_results[0].status.building_generation);
+    try std.testing.expectEqual(@as(usize, 2), building_published_result.graph_metric_results[0].scores.len);
+    for (building_published_result.graph_metric_results[0].scores) |score| {
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), score.score, 0.001);
+    }
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var failed = try graph_entry.index.failGraphMetricPlannedBuild("manual_degree", error.InvalidGraphMetricScore);
+        defer failed.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+        try std.testing.expectEqual(refreshed.published_generation, failed.published_generation);
+    }
+
+    var failed_published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 10,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer failed_published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(refreshed.published_generation, failed_published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), failed_published_result.graph_metric_results[0].scores.len);
+    for (failed_published_result.graph_metric_results[0].scores) |score| {
         try std.testing.expect(!std.mem.eql(u8, score.node, "doc:c"));
         try std.testing.expectApproxEqAbs(@as(f64, 1.0), score.score, 0.001);
     }
@@ -39571,6 +46472,36 @@ test "db graph metric rerank applies published metric scores to search hits" {
     });
     try db.runUntilIdle();
 
+    const active_target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        var building = try graph_entry.index.ensureGraphMetricPlannedBuild("manual_degree", target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+
+        const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-prepare");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+        try std.testing.expect(prepare.claimed_page);
+        try std.testing.expect(prepare.completed_page);
+
+        const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric("manual_degree");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+        try std.testing.expect(advance_prepare.advanced_phase);
+
+        const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-scan");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+        try std.testing.expect(scan.claimed_page);
+        try std.testing.expect(scan.completed_page);
+
+        var active_status = try graph_entry.index.graphMetricStatus("manual_degree");
+        defer active_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, active_status.state);
+        try std.testing.expectEqual(refreshed.published_generation, active_status.published_generation);
+        try std.testing.expectEqual(target_generation, active_status.building_generation);
+        break :blk target_generation;
+    };
+
     var stale_ok = try db.search(alloc, .{
         .index_name = "ft_v1",
         .full_text = .{ .match_all = {} },
@@ -39586,6 +46517,10 @@ test "db graph metric rerank applies published metric scores to search hits" {
     defer stale_ok.deinit();
     try std.testing.expectEqualStrings("doc:b", stale_ok.hits[0].id);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), stale_ok.hits[0].score orelse return error.TestUnexpectedResult, 0.001);
+    const stale_ok_status = stale_ok.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, stale_ok_status.state);
+    try std.testing.expectEqual(refreshed.published_generation, stale_ok_status.published_generation);
+    try std.testing.expectEqual(active_target_generation, stale_ok_status.building_generation);
 
     var explicit_expression = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -39623,6 +46558,46 @@ test "db graph metric rerank applies published metric scores to search hits" {
     try std.testing.expect(missing_details.missing_score_used);
     try std.testing.expectApproxEqAbs(@as(f64, -10.0), missing_details.metric_score_used, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, -20.0), missing_details.final_score, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    }));
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var failed = try graph_entry.index.failGraphMetricPlannedBuild("manual_degree", error.InvalidGraphMetricScore);
+        defer failed.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+        try std.testing.expectEqual(refreshed.published_generation, failed.published_generation);
+    }
+
+    var failed_rerank = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "manual_degree",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer failed_rerank.deinit();
+    try std.testing.expectEqualStrings("doc:b", failed_rerank.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), failed_rerank.hits[0].score orelse return error.TestUnexpectedResult, 0.001);
+    const failed_rerank_status = failed_rerank.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_rerank_status.state);
+    try std.testing.expectEqual(refreshed.published_generation, failed_rerank_status.published_generation);
 
     try std.testing.expectError(error.MetricStale, db.search(alloc, .{
         .index_name = "ft_v1",
@@ -39797,6 +46772,47 @@ test "db graph query metric freshness distinguishes stale projection from fresh 
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, published_result.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(refreshed.published_generation, published_result.graph_results[0].metric_status[0].published_generation);
 
+    const active_target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        var building = try graph_entry.index.ensureGraphMetricPlannedBuild("manual_degree", target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+
+        const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-prepare");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+        try std.testing.expect(prepare.claimed_page);
+        try std.testing.expect(prepare.completed_page);
+
+        const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric("manual_degree");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+        try std.testing.expect(advance_prepare.advanced_phase);
+
+        const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("manual_degree", "worker-scan");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+        try std.testing.expect(scan.claimed_page);
+        try std.testing.expect(scan.completed_page);
+        break :blk target_generation;
+    };
+
+    var building_published_result = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_query }},
+        .limit = 0,
+    });
+    defer building_published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", building_published_result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("manual_degree", building_published_result.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(building_published_result.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), building_published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), building_published_result.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building_published_result.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(refreshed.published_generation, building_published_result.graph_results[0].metric_status[0].published_generation);
+    try std.testing.expectEqual(active_target_generation, building_published_result.graph_results[0].metric_status[0].building_generation);
+
     const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
         .name = "manual_degree",
         .freshness = .fresh,
@@ -39830,6 +46846,8371 @@ test "db graph query metric freshness distinguishes stale projection from fresh 
     try std.testing.expectError(error.MetricStale, db.search(alloc, .{
         .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
         .limit = 0,
+    }));
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var failed = try graph_entry.index.failGraphMetricPlannedBuild("manual_degree", error.InvalidGraphMetricScore);
+        defer failed.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+        try std.testing.expectEqual(refreshed.published_generation, failed.published_generation);
+    }
+
+    var failed_published_result = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_query }},
+        .limit = 0,
+    });
+    defer failed_published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", failed_published_result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("manual_degree", failed_published_result.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(failed_published_result.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), failed_published_result.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), failed_published_result.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_published_result.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(refreshed.published_generation, failed_published_result.graph_results[0].metric_status[0].published_generation);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
+        .limit = 0,
+    }));
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_order_query }},
+        .limit = 0,
+    }));
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
+        .limit = 0,
+    }));
+}
+
+test "db graph metric planned scheduler boundary completes degree by name" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "worker-a", "worker-b" };
+    var step_index: usize = 0;
+    var published = false;
+    while (step_index < 1000) : (step_index += 1) {
+        const now_ms: u64 = 1000 + @as(u64, @intCast(step_index)) * 2;
+        const worker_step = try db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", workers[step_index % workers.len], now_ms);
+        try std.testing.expect(!worker_step.advanced_phase);
+        if (worker_step.completed_build) {
+            try std.testing.expect(worker_step.phase == .complete or worker_step.phase == .cleanup_old_generations);
+            published = true;
+            break;
+        }
+
+        const coordinator_step = try db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", now_ms + 1);
+        if (coordinator_step.completed_build) {
+            published = true;
+            break;
+        }
+
+        const progressed =
+            worker_step.claimed_page or
+            worker_step.completed_page or
+            coordinator_step.advanced_phase;
+        if (!progressed and worker_step.phase != .cleanup_old_generations) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(published);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric planned scheduler sweeps active degree work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.metrics_scanned);
+    try std.testing.expectEqual(@as(usize, 0), start.builds_started);
+    try std.testing.expect(start.active_builds > 0);
+
+    const workers = [_][]const u8{ "sweep-worker-a", "sweep-worker-b" };
+    var finished = false;
+    var saw_coordinator_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 1000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        try std.testing.expectEqual(@as(usize, 0), worker.published);
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        if (coordinator.published > 0) saw_coordinator_publish = true;
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("degree");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(saw_coordinator_publish);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric planned scheduler sweeps active pagerank work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":20,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "pagerank-sweep-a", "pagerank-sweep-b", "pagerank-sweep-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                try std.testing.expect(status.iterations_completed > 0);
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+}
+
+test "db graph metric planned scheduler sweeps pagerank across reopened handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":20,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+
+        const initial_tick = try coordinator.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        try std.testing.expect(initial_tick.active_builds > 0);
+    }
+
+    const workers = [_][]const u8{ "reopened-pagerank-a", "reopened-pagerank-b", "reopened-pagerank-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerSweep(.{
+                .worker_id = workers[step_index % workers.len],
+                .max_pages = 1,
+            });
+        };
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            const sweep = try coordinator_db.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = 8,
+                .start_background_builds = false,
+            });
+            {
+                const graph_entry = coordinator_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+                var status = try graph_entry.index.graphMetricStatus("pagerank");
+                defer status.deinit(alloc);
+                if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                    try std.testing.expectEqual(target_generation, status.published_generation);
+                    try std.testing.expect(status.iterations_completed > 0);
+                    finished = true;
+                }
+            }
+            break :blk sweep;
+        };
+        if (finished) break;
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric planned scheduler reopened coordinators do not duplicate pagerank publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-publish-race-worker-a", "db-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric planned scheduler reopened coordinators do not duplicate eigenvector publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-eigenvector-publish-race-worker-a", "db-eigenvector-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "eigenvector",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric planned scheduler reopened coordinators do not duplicate hits publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub_a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub_b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-hits-publish-race-worker-a", "db-hits-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+
+        var authority_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer authority_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), authority_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, authority_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), authority_result.graph_metric_results[0].scores.len);
+
+        var hub_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer hub_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), hub_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, hub_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), hub_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric planned maintenance drains background pagerank work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const maintenance = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "planned-maintenance-pagerank",
+        .max_rounds = 200,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), maintenance.builds_started);
+    try std.testing.expect(maintenance.pages_completed > 0);
+    try std.testing.expect(maintenance.phases_advanced > 0);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+}
+
+test "db graph metric runtime drains background pagerank through planned maintenance" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-pagerank-combined",
+            .planned_options = .{
+                .worker_id = "runtime-pagerank-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    {
+        const initial_stats = runtime.stats();
+        try std.testing.expect(initial_stats.enabled);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.combined, initial_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-combined"), initial_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "local"), initial_stats.owner_id_hash);
+        try std.testing.expect(initial_stats.lease_key_hash != 0);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-worker"), initial_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 1), initial_stats.worker_count);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(?[]const u8, null), initial_stats.last_error_name);
+    }
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(steps > 0);
+
+    {
+        const drained_stats = runtime.stats();
+        try std.testing.expectEqual(@as(u64, @intCast(steps + 1)), drained_stats.ticks_started);
+        try std.testing.expectEqual(drained_stats.ticks_started, drained_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, @intCast(steps)), drained_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), drained_stats.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), drained_stats.error_ticks);
+        try std.testing.expectEqual(@as(?[]const u8, null), drained_stats.last_error_name);
+        try std.testing.expect(!drained_stats.last_result.durableProgressed());
+    }
+
+    db.graph_metric_runtime = &runtime;
+    defer db.graph_metric_runtime = null;
+    {
+        const mapped_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, mapped_stats);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.enabled);
+        try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, mapped_stats.graph_metric_runtime.role.?);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-combined"), mapped_stats.graph_metric_runtime.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "local"), mapped_stats.graph_metric_runtime.owner_id_hash);
+        try std.testing.expectEqual(runtime.stats().lease_key_hash, mapped_stats.graph_metric_runtime.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-worker"), mapped_stats.graph_metric_runtime.worker_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.worker_count);
+        try std.testing.expectEqual(@as(u64, @intCast(steps + 1)), mapped_stats.graph_metric_runtime.ticks_started);
+        try std.testing.expectEqual(mapped_stats.graph_metric_runtime.ticks_started, mapped_stats.graph_metric_runtime.ticks_completed);
+        try std.testing.expectEqual(@as(u64, @intCast(steps)), mapped_stats.graph_metric_runtime.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.error_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.last_builds_started);
+        try std.testing.expect(!mapped_stats.graph_metric_runtime.last_budget_exhausted);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime lease ownership blocks duplicate owners and allows takeover" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-owned-a",
+            .lease_owned = true,
+            .owner_id = "runtime-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_a.deinit();
+    var owner_b = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-owned-b",
+            .lease_owned = true,
+            .owner_id = "runtime-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(owner_a_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), owner_a_tick.builds_started);
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-a"), stats.owner_id_hash);
+        try std.testing.expectEqual(owner_a.stats().lease_key_hash, owner_b.stats().lease_key_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1_000), stats.last_acquired_ms);
+    }
+
+    const blocked_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!blocked_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.coordinator_steps);
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), stats.idle_ticks);
+    }
+
+    manual_clock.advanceMs(101);
+    const takeover_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(takeover_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1_101), stats.last_acquired_ms);
+    }
+
+    const lost_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!lost_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    db.graph_metric_runtime = &owner_b;
+    defer db.graph_metric_runtime = null;
+    {
+        const mapped_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, mapped_stats);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.lease_owned);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-b"), mapped_stats.graph_metric_runtime.owner_id_hash);
+        try std.testing.expectEqual(owner_b.stats().lease_key_hash, mapped_stats.graph_metric_runtime.lease_key_hash);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 1_101), mapped_stats.graph_metric_runtime.last_acquired_ms);
+    }
+}
+
+test "db graph metric runtime releases durable owner lease on deinit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(5_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-release-a",
+            .lease_owned = true,
+            .owner_id = "runtime-release-owner-a",
+            .lease_ttl_ms = 30_000,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-release-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    var owner_a_active = true;
+    errdefer if (owner_a_active) owner_a.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!owner_a_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+    }
+    const owner_a_lease_key_hash = owner_a.stats().lease_key_hash;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, graph_metric_runtime_mod.default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-release-owner-a", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 35_000), record.expires_at_ms);
+    }
+
+    owner_a.deinit();
+    owner_a_active = false;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, graph_metric_runtime_mod.default_combined_lease_key);
+        defer lease.deinit();
+        try std.testing.expect((try lease.load(alloc)) == null);
+    }
+
+    var owner_b = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-release-b",
+            .lease_owned = true,
+            .owner_id = "runtime-release-owner-b",
+            .lease_ttl_ms = 30_000,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-release-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_b_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(owner_a_lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-release-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 5_000), stats.last_acquired_ms);
+    }
+}
+
+test "db graph metric runtime stale deinit preserves replacement owner lease" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(6_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-a",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    var owner_a_active = true;
+    errdefer if (owner_a_active) owner_a.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!owner_a_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 6_000), stats.last_acquired_ms);
+    }
+    const lease_key_hash = owner_a.stats().lease_key_hash;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, graph_metric_runtime_mod.default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-a", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_100), record.expires_at_ms);
+    }
+
+    manual_clock.advanceMs(101);
+    var owner_b = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-b",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_b_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-stale-release-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 6_101), stats.last_acquired_ms);
+    }
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, graph_metric_runtime_mod.default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-b", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_201), record.expires_at_ms);
+    }
+
+    owner_a.deinit();
+    owner_a_active = false;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, graph_metric_runtime_mod.default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-b", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_201), record.expires_at_ms);
+    }
+
+    var owner_c = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-c",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-c",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-c",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_c.deinit();
+
+    const owner_c_tick = try owner_c.runOnceDetailed();
+    try std.testing.expect(!owner_c_tick.durableProgressed());
+    {
+        const stats = owner_c.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-stale-release-owner-c"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const owner_b_renew_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_renew_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+    }
+}
+
+test "db graph metric runtime role leases allow split owners and block duplicate coordinators" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(2_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var coordinator = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-role-lease-coordinator-a",
+            .lease_owned = true,
+            .owner_id = "role-lease-coordinator-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-role-lease-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator.deinit();
+    var duplicate_coordinator = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-role-lease-coordinator-b",
+            .lease_owned = true,
+            .owner_id = "role-lease-coordinator-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-role-lease-coordinator-b-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer duplicate_coordinator.deinit();
+    var worker = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-role-lease-worker",
+            .lease_owned = true,
+            .owner_id = "role-lease-worker",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-role-lease-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker.deinit();
+    var duplicate_worker = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-role-lease-worker-duplicate",
+            .lease_owned = true,
+            .owner_id = "role-lease-worker-duplicate",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-role-lease-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer duplicate_worker.deinit();
+
+    const early_worker = try worker.runOnceDetailed();
+    try std.testing.expect(!early_worker.durableProgressed());
+    {
+        const stats = worker.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+    }
+
+    const coordinator_start = try coordinator.runOnceDetailed();
+    try std.testing.expect(coordinator_start.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), coordinator_start.builds_started);
+    {
+        const stats = coordinator.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+    }
+
+    const duplicate_blocked = try duplicate_coordinator.runOnceDetailed();
+    try std.testing.expect(!duplicate_blocked.durableProgressed());
+    {
+        const stats = duplicate_coordinator.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const duplicate_worker_blocked = try duplicate_worker.runOnceDetailed();
+    try std.testing.expect(!duplicate_worker_blocked.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), duplicate_worker_blocked.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), duplicate_worker_blocked.pages_completed);
+    {
+        const stats = duplicate_worker.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(worker.stats().lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(worker.stats().worker_id_hash, stats.worker_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const worker_prepare = try worker.runOnceDetailed();
+    try std.testing.expect(worker_prepare.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.pages_completed);
+
+    manual_clock.advanceMs(101);
+    const duplicate_takeover = try duplicate_coordinator.runOnceDetailed();
+    try std.testing.expect(duplicate_takeover.durableProgressed());
+    {
+        const stats = duplicate_coordinator.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 2_101), stats.last_acquired_ms);
+    }
+
+    const coordinator_lost = try coordinator.runOnceDetailed();
+    try std.testing.expect(!coordinator_lost.durableProgressed());
+    {
+        const stats = coordinator.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const worker_after_coordinator_takeover = try worker.runOnceDetailed();
+    try std.testing.expect(worker_after_coordinator_takeover.durableProgressed());
+    try std.testing.expect(worker_after_coordinator_takeover.worker_steps > 0);
+    {
+        const stats = worker.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+    }
+}
+
+test "db graph metric runtime worker leases are scoped by worker identity" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(3_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var worker_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-worker-lease-a",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_a.deinit();
+    var worker_b = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-worker-lease-b",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_b.deinit();
+    var duplicate_worker_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-worker-lease-a-duplicate",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-owner-a-duplicate",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer duplicate_worker_a.deinit();
+
+    const idle_a = try worker_a.runOnceDetailed();
+    try std.testing.expect(!idle_a.durableProgressed());
+    {
+        const stats = worker_a.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(usize, 1), stats.worker_count);
+        try std.testing.expect(stats.worker_id_hash != 0);
+        try std.testing.expect(stats.lease_key_hash != 0);
+        try std.testing.expect(stats.lease_key_hash != worker_b.stats().lease_key_hash);
+        try std.testing.expectEqual(stats.lease_key_hash, duplicate_worker_a.stats().lease_key_hash);
+    }
+
+    const idle_b = try worker_b.runOnceDetailed();
+    try std.testing.expect(!idle_b.durableProgressed());
+    {
+        const stats = worker_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(usize, 1), stats.worker_count);
+        try std.testing.expect(stats.worker_id_hash != 0);
+    }
+
+    const duplicate_blocked = try duplicate_worker_a.runOnceDetailed();
+    try std.testing.expect(!duplicate_blocked.durableProgressed());
+    {
+        const stats = duplicate_worker_a.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    manual_clock.advanceMs(101);
+    const duplicate_takeover = try duplicate_worker_a.runOnceDetailed();
+    try std.testing.expect(!duplicate_takeover.durableProgressed());
+    {
+        const stats = duplicate_worker_a.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 3_101), stats.last_acquired_ms);
+    }
+
+    const worker_a_lost = try worker_a.runOnceDetailed();
+    try std.testing.expect(!worker_a_lost.durableProgressed());
+    {
+        const stats = worker_a.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const worker_b_renewed = try worker_b.runOnceDetailed();
+    try std.testing.expect(!worker_b_renewed.durableProgressed());
+    {
+        const stats = worker_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+    }
+}
+
+test "db graph metric runtime worker pool leases are scoped by worker identity set" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(4_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    const pool_workers = [_][]const u8{ "runtime-pool-worker-a", "runtime-pool-worker-b" };
+    const reversed_pool_workers = [_][]const u8{ "runtime-pool-worker-b", "runtime-pool-worker-a" };
+    const other_pool_workers = [_][]const u8{ "runtime-pool-worker-c", "runtime-pool-worker-d" };
+    var pool_a = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-worker-pool-lease-a",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-pool-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_ids = pool_workers[0..],
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer pool_a.deinit();
+    var duplicate_reordered_pool = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-worker-pool-lease-a-reordered",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-pool-owner-a-reordered",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_ids = reversed_pool_workers[0..],
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer duplicate_reordered_pool.deinit();
+    var pool_b = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-worker-pool-lease-b",
+            .lease_owned = true,
+            .owner_id = "runtime-worker-pool-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_ids = other_pool_workers[0..],
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer pool_b.deinit();
+
+    const idle_pool_a = try pool_a.runOnceDetailed();
+    try std.testing.expect(!idle_pool_a.durableProgressed());
+    {
+        const stats = pool_a.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(usize, 2), stats.worker_count);
+        try std.testing.expect(stats.worker_id_hash != 0);
+        try std.testing.expect(stats.lease_key_hash != 0);
+        try std.testing.expectEqual(stats.lease_key_hash, duplicate_reordered_pool.stats().lease_key_hash);
+        try std.testing.expect(stats.lease_key_hash != pool_b.stats().lease_key_hash);
+    }
+
+    const duplicate_blocked = try duplicate_reordered_pool.runOnceDetailed();
+    try std.testing.expect(!duplicate_blocked.durableProgressed());
+    {
+        const stats = duplicate_reordered_pool.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+        try std.testing.expectEqual(pool_a.stats().worker_id_hash, stats.worker_id_hash);
+    }
+
+    const idle_pool_b = try pool_b.runOnceDetailed();
+    try std.testing.expect(!idle_pool_b.durableProgressed());
+    {
+        const stats = pool_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expect(stats.worker_id_hash != pool_a.stats().worker_id_hash);
+    }
+
+    manual_clock.advanceMs(101);
+    const duplicate_takeover = try duplicate_reordered_pool.runOnceDetailed();
+    try std.testing.expect(!duplicate_takeover.durableProgressed());
+    {
+        const stats = duplicate_reordered_pool.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 4_101), stats.last_acquired_ms);
+    }
+}
+
+test "db graph metric planned worker pools reject duplicate worker identities" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const duplicate_workers = [_][]const u8{ "runtime-pool-duplicate", "runtime-pool-duplicate" };
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_ids = duplicate_workers[0..],
+        .max_rounds = 1,
+        .max_metrics_per_round = 1,
+        .max_pages_per_round = 2,
+    }));
+
+    const resources = db.core.asyncResources();
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-worker-pool-duplicate",
+            .planned_options = .{
+                .worker_ids = duplicate_workers[0..],
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 2,
+            },
+        },
+    ));
+}
+
+test "db graph metric owned runtime worker calls are bound to configured identity" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(5_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var worker_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-owned-bound-worker",
+            .lease_owned = true,
+            .owner_id = "runtime-owned-bound-worker-owner",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-bound-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_runtime.deinit();
+
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, worker_runtime.runWorkerOnce("runtime-owned-bound-worker-b"));
+    {
+        const stats = worker_runtime.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 0), stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), stats.error_ticks);
+        try std.testing.expectEqualStrings("InvalidGraphMetricBuildWorker", stats.last_error_name.?);
+    }
+
+    const allowed_worker_tick = try worker_runtime.runWorkerOnce("runtime-owned-bound-worker-a");
+    try std.testing.expect(!allowed_worker_tick.durableProgressed());
+    {
+        const stats = worker_runtime.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), stats.idle_ticks);
+        try std.testing.expectEqual(@as(?[]const u8, null), stats.last_error_name);
+    }
+    try std.testing.expectError(error.InvalidGraphMetricRuntimeRole, worker_runtime.runCoordinatorOnce(false));
+    {
+        const stats = worker_runtime.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqualStrings("InvalidGraphMetricRuntimeRole", stats.last_error_name.?);
+    }
+
+    const pool_workers = [_][]const u8{ "runtime-owned-bound-pool-a", "runtime-owned-bound-pool-b" };
+    var pool_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-owned-bound-pool",
+            .lease_owned = true,
+            .owner_id = "runtime-owned-bound-pool-owner",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_ids = pool_workers[0..],
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer pool_runtime.deinit();
+
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, pool_runtime.runWorkerOnce("runtime-owned-bound-pool-c"));
+    {
+        const stats = pool_runtime.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.error_ticks);
+        try std.testing.expectEqualStrings("InvalidGraphMetricBuildWorker", stats.last_error_name.?);
+    }
+
+    const allowed_pool_tick = try pool_runtime.runWorkerOnce("runtime-owned-bound-pool-b");
+    try std.testing.expect(!allowed_pool_tick.durableProgressed());
+    {
+        const stats = pool_runtime.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_completed);
+        try std.testing.expectEqual(@as(?[]const u8, null), stats.last_error_name);
+    }
+    try std.testing.expectError(error.InvalidGraphMetricRuntimeRole, pool_runtime.runCoordinatorOnce(false));
+    {
+        const stats = pool_runtime.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqualStrings("InvalidGraphMetricRuntimeRole", stats.last_error_name.?);
+    }
+
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-owned-bound-coordinator",
+            .lease_owned = true,
+            .owner_id = "runtime-owned-bound-coordinator-owner",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-bound-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, coordinator_runtime.runWorkerOnce("runtime-owned-bound-coordinator-worker"));
+    {
+        const stats = coordinator_runtime.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.error_ticks);
+        try std.testing.expectEqualStrings("InvalidGraphMetricBuildWorker", stats.last_error_name.?);
+    }
+    try std.testing.expectError(error.InvalidGraphMetricRuntimeRole, coordinator_runtime.runWorkerPoolOnce());
+    {
+        const stats = coordinator_runtime.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqualStrings("InvalidGraphMetricRuntimeRole", stats.last_error_name.?);
+    }
+}
+
+test "db graph metric runtime skips paused background metrics" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer paused.deinit(alloc);
+    try std.testing.expect(paused.maintenance_paused);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, paused.state);
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expectEqual(@as(usize, 1), pending.paused_metrics);
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-paused-degree",
+            .planned_options = .{
+                .worker_id = "runtime-paused-degree-worker",
+                .max_rounds = 4,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 4,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    const paused_tick = try runtime.runOnceDetailed();
+    try std.testing.expect(!paused_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), paused_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), paused_tick.pages_claimed);
+    try std.testing.expectEqual(@as(usize, 0), paused_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), paused_tick.published);
+    {
+        const runtime_stats = runtime.stats();
+        try std.testing.expectEqual(@as(u64, 1), runtime_stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 1), runtime_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 0), runtime_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), runtime_stats.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), runtime_stats.error_ticks);
+        try std.testing.expect(!runtime_stats.last_result.durableProgressed());
+    }
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expect(status.maintenance_paused);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        try std.testing.expectEqual(@as(u64, 0), status.build_job_id);
+        try std.testing.expectEqual(@as(u64, 0), status.published_generation);
+    }
+
+    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer resumed.deinit(alloc);
+    try std.testing.expect(!resumed.maintenance_paused);
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(steps > 0);
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime idles on failed planned generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-failed-terminal-degree",
+            .planned_options = .{
+                .worker_id = "runtime-failed-terminal-degree-worker",
+                .max_rounds = 4,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 4,
+            },
+        },
+    );
+    defer runtime.deinit();
+    db.graph_metric_runtime = &runtime;
+    defer db.graph_metric_runtime = null;
+
+    const started_tick = try runtime.runCoordinatorOnce(true);
+    try std.testing.expect(started_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), started_tick.builds_started);
+
+    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "degree", error.InvalidGraphMetricBuildManifest);
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+    try std.testing.expect(failed.build_queued);
+    try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed.last_error);
+    const failed_target_generation = failed.target_edge_generation;
+
+    const terminal_tick = try runtime.runOnceDetailed();
+    try std.testing.expect(!terminal_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.active_builds);
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.pages_claimed);
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.published);
+    try std.testing.expectEqual(@as(usize, 0), terminal_tick.failed_builds);
+
+    {
+        const runtime_stats = runtime.stats();
+        try std.testing.expectEqual(@as(u64, 2), runtime_stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 2), runtime_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), runtime_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), runtime_stats.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), runtime_stats.error_ticks);
+        try std.testing.expect(!runtime_stats.last_result.durableProgressed());
+    }
+    {
+        const mapped_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, mapped_stats);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.enabled);
+        try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, mapped_stats.graph_metric_runtime.role.?);
+        try std.testing.expectEqual(@as(u64, 2), mapped_stats.graph_metric_runtime.ticks_started);
+        try std.testing.expectEqual(mapped_stats.graph_metric_runtime.ticks_started, mapped_stats.graph_metric_runtime.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.error_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.last_builds_started);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.last_failed_builds);
+        try std.testing.expect(!mapped_stats.graph_metric_runtime.last_budget_exhausted);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, status.state);
+        try std.testing.expectEqual(failed_target_generation, status.target_edge_generation);
+        try std.testing.expectEqual(@as(u64, 0), status.build_job_id);
+        var failed_events: usize = 0;
+        for (status.recent_events) |event| {
+            if (event.kind == .failed) failed_events += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), failed_events);
+    }
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:c",
+            .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const new_generation_tick = try runtime.runCoordinatorOnce(true);
+    try std.testing.expect(new_generation_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), new_generation_tick.builds_started);
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expect(status.building_generation > failed_target_generation);
+    }
+}
+
+test "db graph metric runtime skips paused active planned builds" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-paused-active-degree",
+            .planned_options = .{
+                .worker_id = "runtime-paused-active-degree-worker",
+                .max_rounds = 4,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 4,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    const started_tick = try runtime.runCoordinatorOnce(true);
+    try std.testing.expect(started_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), started_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), started_tick.pages_claimed);
+    try std.testing.expectEqual(@as(usize, 0), started_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), started_tick.published);
+
+    const active_job_id, const active_phase = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(target_generation, status.building_generation);
+        try std.testing.expect(status.build_job_id != 0);
+        break :blk .{ status.build_job_id, status.phase };
+    };
+
+    var paused = try db.pauseGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer paused.deinit(alloc);
+    try std.testing.expect(paused.maintenance_paused);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, paused.state);
+    try std.testing.expectEqual(target_generation, paused.building_generation);
+    try std.testing.expectEqual(active_job_id, paused.build_job_id);
+    try std.testing.expectEqual(active_phase, paused.phase);
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expectEqual(@as(usize, 1), pending.paused_metrics);
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    const paused_worker_tick = try runtime.runWorkerOnce("runtime-paused-active-worker");
+    try std.testing.expect(!paused_worker_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), paused_worker_tick.active_builds);
+    try std.testing.expectEqual(@as(usize, 0), paused_worker_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), paused_worker_tick.pages_claimed);
+    try std.testing.expectEqual(@as(usize, 0), paused_worker_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), paused_worker_tick.published);
+
+    const paused_coordinator_tick = try runtime.runCoordinatorOnce(true);
+    try std.testing.expect(!paused_coordinator_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), paused_coordinator_tick.active_builds);
+    try std.testing.expectEqual(@as(usize, 0), paused_coordinator_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), paused_coordinator_tick.coordinator_steps);
+    try std.testing.expectEqual(@as(usize, 0), paused_coordinator_tick.phases_advanced);
+    try std.testing.expectEqual(@as(usize, 0), paused_coordinator_tick.published);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expect(status.maintenance_paused);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(target_generation, status.building_generation);
+        try std.testing.expectEqual(active_job_id, status.build_job_id);
+        try std.testing.expectEqual(active_phase, status.phase);
+        try std.testing.expectEqual(@as(usize, 0), status.build_pages.len);
+        try std.testing.expectEqual(@as(u64, 0), status.published_generation);
+    }
+
+    var resumed = try db.resumeGraphMetricMaintenance(alloc, "graph_idx", "degree");
+    defer resumed.deinit(alloc);
+    try std.testing.expect(!resumed.maintenance_paused);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, resumed.state);
+    try std.testing.expectEqual(target_generation, resumed.building_generation);
+    try std.testing.expectEqual(active_job_id, resumed.build_job_id);
+
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 200) : (step_index += 1) {
+        const worker_tick = try runtime.runWorkerOnce("runtime-resumed-active-worker");
+        const coordinator_tick = try runtime.runCoordinatorOnce(false);
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            finished = true;
+            break;
+        }
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime starts automatically and drains notified background degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_maintenance = .{
+            .enabled = true,
+            .runtime_id = "runtime-auto-degree",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-auto-degree-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.executor.waitForAll(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var fresh = false;
+    for (0..200) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const runtime_stats = db.graphMetricRuntimeStats();
+        try std.testing.expect(runtime_stats.enabled);
+        try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, runtime_stats.role.?);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree"), runtime_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree-worker"), runtime_stats.worker_id_hash);
+        try std.testing.expect(runtime_stats.ticks_started > 0);
+        try std.testing.expect(runtime_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), runtime_stats.error_ticks);
+        try std.testing.expect(runtime_stats.total_builds_started > 0);
+        try std.testing.expect(runtime_stats.total_worker_steps > 0);
+        try std.testing.expect(runtime_stats.total_coordinator_steps > 0);
+        try std.testing.expect(runtime_stats.total_pages_completed > 0);
+        try std.testing.expect(runtime_stats.total_published > 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:a", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime open-configured split owners publish degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+            .sync_level = .write,
+        });
+
+        for (0..64) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+                .{i},
+            );
+            defer alloc.free(value);
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .write,
+            });
+        }
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    const workers = [_][]const u8{ "open-runtime-worker-a", "open-runtime-worker-b" };
+    var saw_coordinator_role = false;
+    var saw_worker_pool_role = false;
+    var fresh = false;
+    for (0..400) |_| {
+        {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "open-configured-coordinator",
+                    .lease_owned = true,
+                    .owner_id = "open-configured-coordinator",
+                    .planned_options = .{
+                        .worker_id = "open-configured-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            coordinator_total.add(tick);
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            try std.testing.expectEqual(@as(u64, 0), stats.error_ticks);
+            saw_coordinator_role = true;
+        }
+
+        {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "open-configured-worker-pool",
+                    .lease_owned = true,
+                    .owner_id = "open-configured-worker-pool",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            worker_total.add(tick);
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(graphMetricRuntimeWorkerSetHash(workers[0..]), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_published);
+            try std.testing.expectEqual(@as(u64, 0), stats.error_ticks);
+            saw_worker_pool_role = true;
+        }
+
+        {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "open-configured-coordinator",
+                    .lease_owned = true,
+                    .owner_id = "open-configured-coordinator",
+                    .planned_options = .{
+                        .worker_id = "open-configured-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            coordinator_total.add(tick);
+            const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("degree");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_coordinator_role);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 64.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    }
+}
+
+test "db graph metric runtime separates coordinator and worker ticks" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .planned_options = .{
+                .worker_id = "runtime-split-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectError(error.InvalidGraphMetricBuildWorker, runtime.runWorkerOnce(""));
+    {
+        const error_stats = runtime.stats();
+        try std.testing.expectEqual(@as(u64, 1), error_stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 0), error_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), error_stats.error_ticks);
+        try std.testing.expectEqualStrings("InvalidGraphMetricBuildWorker", error_stats.last_error_name.?);
+    }
+
+    const coordinator_start = try runtime.runCoordinatorOnce(true);
+    try std.testing.expectEqual(@as(usize, 1), coordinator_start.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_start.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_start.pages_completed);
+    {
+        const recovered_stats = runtime.stats();
+        try std.testing.expectEqual(@as(?[]const u8, null), recovered_stats.last_error_name);
+        try std.testing.expectEqual(@as(u64, 1), recovered_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), recovered_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(usize, 1), recovered_stats.last_result.builds_started);
+    }
+
+    const worker_prepare = try runtime.runWorkerOnce("runtime-split-worker");
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), worker_prepare.phases_advanced);
+    try std.testing.expectEqual(@as(usize, 0), worker_prepare.published);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, status.phase);
+    }
+
+    const coordinator_advance = try runtime.runCoordinatorOnce(false);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_advance.builds_started);
+    try std.testing.expect(coordinator_advance.phases_advanced > 0);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, status.phase);
+    }
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:a", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime roles separate automatic coordinator and worker loops" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-role-coordinator-owner",
+            .planned_options = .{
+                .worker_id = "runtime-role-coordinator",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    var worker_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-role-worker-owner",
+            .planned_options = .{
+                .worker_id = "runtime-role-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_runtime.deinit();
+
+    const early_worker = try worker_runtime.runOnceDetailed();
+    try std.testing.expect(!early_worker.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), early_worker.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), early_worker.worker_steps);
+
+    const coordinator_start = try coordinator_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), coordinator_start.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_start.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_start.pages_completed);
+
+    const worker_prepare = try worker_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), worker_prepare.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), worker_prepare.phases_advanced);
+    try std.testing.expectEqual(@as(usize, 0), worker_prepare.published);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, status.phase);
+    }
+
+    const coordinator_advance = try coordinator_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 0), coordinator_advance.builds_started);
+    try std.testing.expect(coordinator_advance.phases_advanced > 0);
+
+    var finished = false;
+    var steps: usize = 0;
+    while (steps < 200) : (steps += 1) {
+        const worker_tick = try worker_runtime.runOnceDetailed();
+        try std.testing.expectEqual(@as(usize, 0), worker_tick.phases_advanced);
+
+        const coordinator_tick = try coordinator_runtime.runOnceDetailed();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.phase == .complete) {
+            finished = true;
+            break;
+        }
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-role-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_runtime.stats();
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-role-worker-owner"), worker_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-role-worker"), worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 1), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expect(worker_stats.total_result.worker_steps > 0);
+        try std.testing.expect(worker_stats.total_result.pages_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:a", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime distinct worker owners complete separate active pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+        .sync_level = .write,
+    });
+
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(6_000 * std.time.ns_per_ms);
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-distinct-workers-coordinator",
+            .lease_owned = true,
+            .owner_id = "runtime-distinct-workers-coordinator",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-distinct-workers-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    var worker_a_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-distinct-worker-a",
+            .lease_owned = true,
+            .owner_id = "runtime-distinct-worker-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-distinct-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_a_runtime.deinit();
+
+    var worker_b_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-distinct-worker-b",
+            .lease_owned = true,
+            .owner_id = "runtime-distinct-worker-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-distinct-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_b_runtime.deinit();
+
+    var replacement_worker_a_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-distinct-worker-a-replacement",
+            .lease_owned = true,
+            .owner_id = "runtime-distinct-worker-a-replacement",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-distinct-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer replacement_worker_a_runtime.deinit();
+
+    const coordinator_start = try coordinator_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), coordinator_start.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_start.worker_steps);
+
+    const worker_a_prepare = try worker_a_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), worker_a_prepare.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), worker_a_prepare.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), worker_a_prepare.phases_advanced);
+
+    const coordinator_scan = try coordinator_runtime.runOnceDetailed();
+    try std.testing.expect(coordinator_scan.phases_advanced > 0);
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, status.phase);
+    }
+
+    const replacement_blocked = try replacement_worker_a_runtime.runOnceDetailed();
+    try std.testing.expect(!replacement_blocked.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), replacement_blocked.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), replacement_blocked.pages_completed);
+    {
+        const stats = replacement_worker_a_runtime.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(worker_a_runtime.stats().lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(worker_a_runtime.stats().worker_id_hash, stats.worker_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    manual_clock.advanceMs(101);
+    const replacement_scan = try replacement_worker_a_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), replacement_scan.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), replacement_scan.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), replacement_scan.phases_advanced);
+    try std.testing.expect(replacement_scan.budget_exhausted);
+    {
+        const stats = replacement_worker_a_runtime.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 6_101), stats.last_acquired_ms);
+        try std.testing.expect(stats.last_result.budget_exhausted);
+    }
+
+    const worker_a_lost = try worker_a_runtime.runOnceDetailed();
+    try std.testing.expect(!worker_a_lost.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), worker_a_lost.worker_steps);
+    {
+        const stats = worker_a_runtime.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const worker_b_scan = try worker_b_runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), worker_b_scan.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), worker_b_scan.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), worker_b_scan.phases_advanced);
+
+    {
+        const worker_a_stats = worker_a_runtime.stats();
+        const worker_b_stats = worker_b_runtime.stats();
+        try std.testing.expect(worker_a_stats.lease_owned);
+        try std.testing.expect(worker_b_stats.lease_owned);
+        try std.testing.expect(!worker_a_stats.has_lease);
+        try std.testing.expect(worker_b_stats.has_lease);
+        try std.testing.expect(worker_a_stats.lease_key_hash != 0);
+        try std.testing.expect(worker_b_stats.lease_key_hash != 0);
+        try std.testing.expect(worker_a_stats.lease_key_hash != worker_b_stats.lease_key_hash);
+        try std.testing.expect(worker_a_stats.worker_id_hash != worker_b_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), worker_a_stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 0), worker_b_stats.lease_acquire_failures);
+        try std.testing.expect(worker_a_stats.total_result.pages_completed >= 1);
+        try std.testing.expect(worker_b_stats.total_result.pages_completed >= 1);
+        const replacement_stats = replacement_worker_a_runtime.stats();
+        try std.testing.expect(replacement_stats.has_lease);
+        try std.testing.expectEqual(worker_a_stats.lease_key_hash, replacement_stats.lease_key_hash);
+        try std.testing.expectEqual(worker_a_stats.worker_id_hash, replacement_stats.worker_id_hash);
+        try std.testing.expect(replacement_stats.total_result.pages_completed >= 1);
+    }
+
+    var finished = false;
+    var steps: usize = 0;
+    while (steps < 200) : (steps += 1) {
+        const worker_tick = if (steps % 2 == 0)
+            try replacement_worker_a_runtime.runOnceDetailed()
+        else
+            try worker_b_runtime.runOnceDetailed();
+        try std.testing.expectEqual(@as(usize, 0), worker_tick.phases_advanced);
+
+        const coordinator_tick = try coordinator_runtime.runOnceDetailed();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation and status.phase == .complete) {
+            finished = true;
+            break;
+        }
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime background coordinator and worker loops publish degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-bg-coordinator-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    var worker_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker,
+            .runtime_id = "runtime-bg-worker-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer worker_runtime.deinit();
+
+    try coordinator_runtime.start();
+    try worker_runtime.start();
+    coordinator_runtime.notify();
+    worker_runtime.notify();
+
+    var fresh = false;
+    for (0..300) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expect(coordinator_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.ticks_started > 0);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.error_ticks);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_runtime.stats();
+        try std.testing.expect(worker_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-worker-owner"), worker_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-worker"), worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 1), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.ticks_started > 0);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), worker_stats.error_ticks);
+        try std.testing.expect(worker_stats.total_result.worker_steps > 0);
+        try std.testing.expect(worker_stats.total_result.pages_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:a", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime background coordinator and worker pool loops publish degree" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+        .sync_level = .write,
+    });
+
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-bg-pool-coordinator-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-pool-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    const workers = [_][]const u8{ "runtime-bg-pool-worker-a", "runtime-bg-pool-worker-b" };
+    var worker_pool_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-bg-pool-worker-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer worker_pool_runtime.deinit();
+
+    try coordinator_runtime.start();
+    try worker_pool_runtime.start();
+    coordinator_runtime.notify();
+    worker_pool_runtime.notify();
+
+    var fresh = false;
+    for (0..500) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expect(coordinator_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pool-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.ticks_started > 0);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.error_ticks);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_pool_runtime.stats();
+        try std.testing.expect(worker_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pool-worker-owner"), worker_stats.runtime_id_hash);
+        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.ticks_started > 0);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), worker_stats.error_ticks);
+        try std.testing.expect(worker_stats.total_result.worker_steps >= 2);
+        try std.testing.expect(worker_stats.total_result.pages_completed >= 2);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime background coordinator and worker pool loops publish pagerank" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-bg-pagerank-pool-coordinator-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-pagerank-pool-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    const workers = [_][]const u8{ "runtime-bg-pagerank-pool-worker-a", "runtime-bg-pagerank-pool-worker-b" };
+    var worker_pool_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-bg-pagerank-pool-worker-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer worker_pool_runtime.deinit();
+
+    try coordinator_runtime.start();
+    try worker_pool_runtime.start();
+    coordinator_runtime.notify();
+    worker_pool_runtime.notify();
+
+    var fresh = false;
+    for (0..700) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expect(coordinator_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pagerank-pool-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.ticks_started > 0);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.error_ticks);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expect(coordinator_stats.total_result.published > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_pool_runtime.stats();
+        try std.testing.expect(worker_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pagerank-pool-worker-owner"), worker_stats.runtime_id_hash);
+        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.ticks_started > 0);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), worker_stats.error_ticks);
+        try std.testing.expect(worker_stats.total_result.worker_steps > 0);
+        try std.testing.expect(worker_stats.total_result.pages_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime background coordinator and worker pool loops publish eigenvector" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-bg-eigenvector-pool-coordinator-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-eigenvector-pool-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    const workers = [_][]const u8{ "runtime-bg-eigenvector-pool-worker-a", "runtime-bg-eigenvector-pool-worker-b" };
+    var worker_pool_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-bg-eigenvector-pool-worker-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer worker_pool_runtime.deinit();
+
+    try coordinator_runtime.start();
+    try worker_pool_runtime.start();
+    coordinator_runtime.notify();
+    worker_pool_runtime.notify();
+
+    var fresh = false;
+    for (0..700) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation == target_generation) {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expect(coordinator_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-eigenvector-pool-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.ticks_started > 0);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.error_ticks);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expect(coordinator_stats.total_result.published > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_pool_runtime.stats();
+        try std.testing.expect(worker_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-eigenvector-pool-worker-owner"), worker_stats.runtime_id_hash);
+        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.ticks_started > 0);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), worker_stats.error_ticks);
+        try std.testing.expect(worker_stats.total_result.worker_steps > 0);
+        try std.testing.expect(worker_stats.total_result.pages_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime background coordinator and worker pool loops publish hits pair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var coordinator_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .coordinator,
+            .runtime_id = "runtime-bg-hits-pool-coordinator-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_id = "runtime-bg-hits-pool-coordinator-unused",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer coordinator_runtime.deinit();
+
+    const workers = [_][]const u8{ "runtime-bg-hits-pool-worker-a", "runtime-bg-hits-pool-worker-b" };
+    var worker_pool_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .role = .worker_pool,
+            .runtime_id = "runtime-bg-hits-pool-worker-owner",
+            .idle_interval_ms = 1,
+            .error_interval_ms = 1,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer worker_pool_runtime.deinit();
+
+    try coordinator_runtime.start();
+    try worker_pool_runtime.start();
+    coordinator_runtime.notify();
+    worker_pool_runtime.notify();
+
+    var fresh = false;
+    for (0..700) |_| {
+        yieldToBackground();
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority_status.deinit(alloc);
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        if (authority_status.state == .fresh and
+            hub_status.state == .fresh and
+            authority_status.published_generation == target_generation and
+            hub_status.published_generation == target_generation)
+        {
+            fresh = true;
+            break;
+        }
+    }
+    try std.testing.expect(fresh);
+
+    {
+        const coordinator_stats = coordinator_runtime.stats();
+        try std.testing.expect(coordinator_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, coordinator_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-hits-pool-coordinator-owner"), coordinator_stats.runtime_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.worker_count);
+        try std.testing.expect(coordinator_stats.ticks_started > 0);
+        try std.testing.expect(coordinator_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), coordinator_stats.error_ticks);
+        try std.testing.expect(coordinator_stats.total_result.builds_started > 0);
+        try std.testing.expect(coordinator_stats.total_result.coordinator_steps > 0);
+        try std.testing.expect(coordinator_stats.total_result.phases_advanced > 0);
+        try std.testing.expect(coordinator_stats.total_result.published > 0);
+        try std.testing.expectEqual(@as(usize, 0), coordinator_stats.total_result.worker_steps);
+        try std.testing.expect(coordinator_stats.last_result.worker_steps == 0);
+    }
+    {
+        const worker_stats = worker_pool_runtime.stats();
+        try std.testing.expect(worker_stats.started);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-hits-pool-worker-owner"), worker_stats.runtime_id_hash);
+        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
+        try std.testing.expect(worker_stats.ticks_started > 0);
+        try std.testing.expect(worker_stats.durable_progress_ticks > 0);
+        try std.testing.expectEqual(@as(u64, 0), worker_stats.error_ticks);
+        try std.testing.expect(worker_stats.total_result.worker_steps > 0);
+        try std.testing.expect(worker_stats.total_result.pages_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), worker_stats.total_result.coordinator_steps);
+        try std.testing.expect(worker_stats.last_result.coordinator_steps == 0);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime background worker pool survives separate reopened handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+            .sync_level = .write,
+        });
+
+        for (0..130) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+                .{i},
+            );
+            defer alloc.free(value);
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .write,
+            });
+        }
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-pool-worker-a", "runtime-reopened-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-pool-worker-b", "runtime-reopened-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_two_page_worker_pool_tick = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..400) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_pool.close();
+
+            const worker_resources = worker_pool.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                worker_resources.store,
+                worker_resources.index_manager,
+                worker_resources.apply_mutex,
+                worker_pool.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const tick = try runtime.runOnceDetailed();
+            const stats = runtime.stats();
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, stats.role);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(usize, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(usize, 0), stats.total_result.coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps >= 2 and tick.pages_completed >= 2) saw_two_page_worker_pool_tick = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                    alloc,
+                    worker_resources.store,
+                    worker_resources.index_manager,
+                    worker_resources.apply_mutex,
+                    worker_pool.backend_runtime,
+                    .{
+                        .enabled = true,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                );
+                defer duplicate_runtime.deinit();
+
+                const duplicate_tick = try duplicate_runtime.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_runtime.stats();
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const coordinator_resources = coordinator.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                coordinator_resources.store,
+                coordinator_resources.index_manager,
+                coordinator_resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const tick = try runtime.runOnceDetailed();
+            const stats = runtime.stats();
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, stats.role);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(usize, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(usize, 0), stats.total_result.worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("degree");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_two_page_worker_pool_tick);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps >= 2);
+    try std.testing.expect(worker_total.pages_completed >= 2);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    }
+}
+
+test "db graph metric runtime open-configured pagerank worker pool survives separate reopened handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-pagerank-pool-worker-a", "runtime-reopened-pagerank-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-pagerank-pool-worker-b", "runtime-reopened-pagerank-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-pagerank-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pagerank-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-pagerank-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pagerank-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-pagerank-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(metric_result.graph_metric_results[0].scores[0].score >= metric_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric runtime open-configured eigenvector worker pool survives separate reopened handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-eigenvector-pool-worker-a", "runtime-reopened-eigenvector-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-eigenvector-pool-worker-b", "runtime-reopened-eigenvector-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-eigenvector-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-eigenvector-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-eigenvector-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-eigenvector-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "eigenvector",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "eigenvector",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric runtime open-configured hits worker pool survives separate reopened handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-hits-pool-worker-a", "runtime-reopened-hits-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-hits-pool-worker-b", "runtime-reopened-hits-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-hits-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-hits-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-hits-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-hits-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-hits-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer authority_status.deinit(alloc);
+            var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+            defer hub_status.deinit(alloc);
+            if (authority_status.state == .fresh and
+                hub_status.state == .fresh and
+                authority_status.published_generation == target_generation and
+                hub_status.published_generation == target_generation)
+            {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{
+                .{
+                    .name = "authority",
+                    .query = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "hits_authority",
+                        .top_k = 3,
+                        .freshness = .fresh,
+                    },
+                },
+                .{
+                    .name = "hub",
+                    .query = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "hits_hub",
+                        .top_k = 3,
+                        .freshness = .fresh,
+                    },
+                },
+            },
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+        try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+        try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    }
+}
+
+test "db graph metric runtime split ticks survive reopened pagerank handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-reopened-coordinator",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-coordinator",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-coordinator",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const started = try runtime.runCoordinatorOnce(true);
+        try std.testing.expectEqual(@as(usize, 1), started.builds_started);
+        try std.testing.expectEqual(@as(usize, 0), started.worker_steps);
+        try std.testing.expectEqual(@as(usize, 0), started.pages_completed);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, stats.role);
+        }
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        const resources = worker.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            worker.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .worker,
+                .runtime_id = "runtime-reopened-worker-a",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-worker-a",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-worker-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const prepared = try runtime.runWorkerOnce("runtime-reopened-worker-a");
+        try std.testing.expectEqual(@as(usize, 1), prepared.worker_steps);
+        try std.testing.expectEqual(@as(usize, 1), prepared.pages_completed);
+        try std.testing.expectEqual(@as(usize, 0), prepared.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), prepared.published);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker, stats.role);
+        }
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, status.phase);
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-reopened-coordinator",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-coordinator",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-coordinator",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const advanced = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), advanced.builds_started);
+        try std.testing.expect(advanced.phases_advanced > 0);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, stats.role);
+        }
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-worker-a", "runtime-reopened-worker-b" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .runtime_id = workers[step_index % workers.len],
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-coordinator",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            const tick = try runtime.runCoordinatorOnce(false);
+            const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation and status.phase == .complete) {
+                try std.testing.expect(status.iterations_completed > 0);
+                finished = true;
+            }
+            break :blk tick;
+        };
+
+        if (finished) break;
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric runtime reopened coordinators do not duplicate pagerank publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-publish-race-worker-a", "runtime-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime reopened coordinators do not duplicate eigenvector publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-eigenvector-publish-race-worker-a", "runtime-eigenvector-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-eigenvector-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-eigenvector-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-eigenvector-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-eigenvector-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-eigenvector-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime reopened coordinators do not duplicate hits publish" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub_a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub_b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-hits-publish-race-worker-a", "runtime-hits-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-hits-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-hits-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-hits-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-hits-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-hits-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-hits-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-hits-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(graph_metric_runtime_mod.Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-hits-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer authority.deinit(alloc);
+            var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+            defer hub.deinit(alloc);
+            if (authority.state == .fresh and authority.phase == .complete and hub.state == .fresh and hub.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime cycles multiple worker ids across planned pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+        .sync_level = .write,
+    });
+
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const workers = [_][]const u8{ "runtime-worker-a", "runtime-worker-b" };
+    const resources = db.core.asyncResources();
+    var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    const prepare_tick = try runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), prepare_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 2), prepare_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), prepare_tick.pages_completed);
+    try std.testing.expect(prepare_tick.phases_advanced > 0);
+
+    const scan_tick = try runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 0), scan_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 2), scan_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 2), scan_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), scan_tick.phases_advanced);
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric planned maintenance reports budget exhaustion and resumes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "planned-maintenance-budgeted",
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(first_tick.budget_exhausted);
+    try std.testing.expect(first_tick.durableProgressed());
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expect(status.state != .fresh or status.phase != .complete);
+    }
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expect(pending.active_builds > 0);
+    }
+
+    var finished = false;
+    var saw_budget_exhausted = first_tick.budget_exhausted;
+    var tick_index: usize = 0;
+    while (tick_index < 200) : (tick_index += 1) {
+        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_id = "planned-maintenance-budgeted",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        });
+        saw_budget_exhausted = saw_budget_exhausted or tick.budget_exhausted;
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.phase == .complete) {
+            try std.testing.expectEqual(target_generation, status.published_generation);
+            try std.testing.expect(status.iterations_completed > 0);
+            finished = true;
+            break;
+        }
+        if (!tick.progressed()) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(saw_budget_exhausted);
+    try std.testing.expect(finished);
+
+    const no_work = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "planned-maintenance-budgeted",
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(!no_work.budget_exhausted);
+    try std.testing.expect(!no_work.durableProgressed());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric planned pagerank production budget matches local oracle" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank_local\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"pagerank_planned\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        writes.deinit(alloc);
+    }
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:src-{d:0>3}", .{i});
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        errdefer alloc.free(value);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+    const hub_key = try alloc.dupe(u8, "doc:hub");
+    errdefer alloc.free(hub_key);
+    const hub_value = try alloc.dupe(u8, "{\"title\":\"hub\"}");
+    errdefer alloc.free(hub_value);
+    try writes.append(alloc, .{ .key = hub_key, .value = hub_value });
+
+    try db.batch(.{
+        .writes = writes.items,
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var local_refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "pagerank_local");
+    defer local_refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_refreshed.state);
+    try std.testing.expectEqual(target_generation, local_refreshed.published_generation);
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(first_tick.budget_exhausted);
+    try std.testing.expect(first_tick.durableProgressed());
+    try std.testing.expect(first_tick.rounds_executed <= 1);
+
+    var total = first_tick;
+    var finished = false;
+    var saw_budget_exhausted = first_tick.budget_exhausted;
+    var tick_index: usize = 0;
+    while (tick_index < 400) : (tick_index += 1) {
+        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        });
+        total.add(tick);
+        saw_budget_exhausted = saw_budget_exhausted or tick.budget_exhausted;
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank_planned");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.phase == .complete) {
+            try std.testing.expectEqual(target_generation, status.published_generation);
+            finished = true;
+            break;
+        }
+        if (!tick.progressed()) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(saw_budget_exhausted);
+    try std.testing.expect(total.rounds_executed > 1);
+    try std.testing.expect(total.pages_completed > 1);
+    try std.testing.expect(total.phases_advanced > 0);
+    try std.testing.expect(total.published > 0);
+
+    const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    var local_status = try graph_entry.index.graphMetricStatus("pagerank_local");
+    defer local_status.deinit(alloc);
+    var planned_status = try graph_entry.index.graphMetricStatus("pagerank_planned");
+    defer planned_status.deinit(alloc);
+    try std.testing.expectEqual(local_status.published_generation, planned_status.published_generation);
+    try std.testing.expectEqual(local_status.iterations_completed, planned_status.iterations_completed);
+    try std.testing.expectEqual(local_status.converged, planned_status.converged);
+    try std.testing.expectApproxEqAbs(local_status.delta, planned_status.delta, 0.0000001);
+
+    const top_limit: usize = 32;
+    const local_top = try graph_entry.index.graphMetricTopK("pagerank_local", top_limit);
+    defer {
+        for (local_top) |*score| score.deinit(alloc);
+        alloc.free(local_top);
+    }
+    const planned_top = try graph_entry.index.graphMetricTopK("pagerank_planned", top_limit);
+    defer {
+        for (planned_top) |*score| score.deinit(alloc);
+        alloc.free(planned_top);
+    }
+    try std.testing.expectEqual(local_top.len, planned_top.len);
+    try std.testing.expectEqualStrings("doc:hub", planned_top[0].node);
+    for (local_top, planned_top) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+}
+
+test "db graph metric planned eigenvector production budget matches local oracle" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector_local\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"eigenvector_planned\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        writes.deinit(alloc);
+    }
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:src-{d:0>3}", .{i});
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        errdefer alloc.free(value);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+    const hub_key = try alloc.dupe(u8, "doc:hub");
+    errdefer alloc.free(hub_key);
+    const hub_value = try alloc.dupe(u8, "{\"title\":\"hub\"}");
+    errdefer alloc.free(hub_value);
+    try writes.append(alloc, .{ .key = hub_key, .value = hub_value });
+
+    try db.batch(.{
+        .writes = writes.items,
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var local_refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "eigenvector_local");
+    defer local_refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_refreshed.state);
+    try std.testing.expectEqual(target_generation, local_refreshed.published_generation);
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const first_tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(first_tick.budget_exhausted);
+    try std.testing.expect(first_tick.durableProgressed());
+    try std.testing.expect(first_tick.rounds_executed <= 1);
+
+    var total = first_tick;
+    var finished = false;
+    var saw_budget_exhausted = first_tick.budget_exhausted;
+    var tick_index: usize = 0;
+    while (tick_index < 600) : (tick_index += 1) {
+        const tick = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        });
+        total.add(tick);
+        saw_budget_exhausted = saw_budget_exhausted or tick.budget_exhausted;
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector_planned");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.phase == .complete) {
+            try std.testing.expectEqual(target_generation, status.published_generation);
+            finished = true;
+            break;
+        }
+        if (!tick.progressed()) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(saw_budget_exhausted);
+    try std.testing.expect(total.rounds_executed > 1);
+    try std.testing.expect(total.pages_completed > 1);
+    try std.testing.expect(total.phases_advanced > 0);
+    try std.testing.expect(total.published > 0);
+
+    const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    var local_status = try graph_entry.index.graphMetricStatus("eigenvector_local");
+    defer local_status.deinit(alloc);
+    var planned_status = try graph_entry.index.graphMetricStatus("eigenvector_planned");
+    defer planned_status.deinit(alloc);
+    try std.testing.expectEqual(local_status.published_generation, planned_status.published_generation);
+    try std.testing.expectEqual(local_status.iterations_completed, planned_status.iterations_completed);
+    try std.testing.expectEqual(local_status.converged, planned_status.converged);
+    try std.testing.expectApproxEqAbs(local_status.delta, planned_status.delta, 0.0000001);
+
+    const top_limit: usize = 32;
+    const local_top = try graph_entry.index.graphMetricTopK("eigenvector_local", top_limit);
+    defer {
+        for (local_top) |*score| score.deinit(alloc);
+        alloc.free(local_top);
+    }
+    const planned_top = try graph_entry.index.graphMetricTopK("eigenvector_planned", top_limit);
+    defer {
+        for (planned_top) |*score| score.deinit(alloc);
+        alloc.free(planned_top);
+    }
+    try std.testing.expectEqual(local_top.len, planned_top.len);
+    for (local_top, planned_top) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expect(std.math.isFinite(local.score));
+        try std.testing.expect(std.math.isFinite(planned.score));
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+}
+
+test "db graph metric planned hits production budget matches local oracle" {
+    const alloc = std.testing.allocator;
+
+    var local_path_buf: [256]u8 = undefined;
+    const local_path = tempPath(&local_path_buf);
+    defer cleanupTempDir(local_path);
+    var planned_path_buf: [256]u8 = undefined;
+    const planned_path = tempPath(&planned_path_buf);
+    defer cleanupTempDir(planned_path);
+
+    var local_db = try DB.open(alloc, std.mem.span(local_path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer local_db.close();
+    var planned_db = try DB.open(alloc, std.mem.span(planned_path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer planned_db.close();
+
+    const config_json =
+        "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}";
+    try local_db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = config_json,
+    });
+    try planned_db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = config_json,
+    });
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        writes.deinit(alloc);
+    }
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:hub-{d:0>3}", .{i});
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"hub {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:authority\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        errdefer alloc.free(value);
+        try writes.append(alloc, .{ .key = key, .value = value });
+    }
+    const authority_key = try alloc.dupe(u8, "doc:authority");
+    errdefer alloc.free(authority_key);
+    const authority_value = try alloc.dupe(u8, "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}");
+    errdefer alloc.free(authority_value);
+    try writes.append(alloc, .{ .key = authority_key, .value = authority_value });
+
+    try local_db.batch(.{
+        .writes = writes.items,
+        .sync_level = .write,
+    });
+    try planned_db.batch(.{
+        .writes = writes.items,
+        .sync_level = .write,
+    });
+    try local_db.runDerivedUntil(local_db.core.nextDerivedSequence());
+    try planned_db.runDerivedUntil(planned_db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = planned_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var local_authority_refreshed = try local_db.refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+    defer local_authority_refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, local_authority_refreshed.state);
+    try std.testing.expectEqual(target_generation, local_authority_refreshed.published_generation);
+
+    {
+        const pending = planned_db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const first_tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(first_tick.budget_exhausted);
+    try std.testing.expect(first_tick.durableProgressed());
+    try std.testing.expect(first_tick.rounds_executed <= 1);
+
+    var total = first_tick;
+    var finished = false;
+    var saw_budget_exhausted = first_tick.budget_exhausted;
+    var tick_index: usize = 0;
+    while (tick_index < 800) : (tick_index += 1) {
+        const tick = try planned_db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_ids = &.{ "budget-worker-a", "budget-worker-b" },
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        });
+        total.add(tick);
+        saw_budget_exhausted = saw_budget_exhausted or tick.budget_exhausted;
+        const graph_entry = planned_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority_status.deinit(alloc);
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        if (authority_status.state == .fresh and authority_status.phase == .complete and hub_status.state == .fresh and hub_status.phase == .complete) {
+            try std.testing.expectEqual(target_generation, authority_status.published_generation);
+            try std.testing.expectEqual(authority_status.published_generation, hub_status.published_generation);
+            finished = true;
+            break;
+        }
+        if (!tick.progressed()) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(saw_budget_exhausted);
+    try std.testing.expect(total.rounds_executed > 1);
+    try std.testing.expect(total.pages_completed > 1);
+    try std.testing.expect(total.phases_advanced > 0);
+    try std.testing.expect(total.published > 0);
+
+    const local_graph = local_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    const planned_graph = planned_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    var local_authority_status = try local_graph.index.graphMetricStatus("hits_authority");
+    defer local_authority_status.deinit(alloc);
+    var local_hub_status = try local_graph.index.graphMetricStatus("hits_hub");
+    defer local_hub_status.deinit(alloc);
+    var planned_authority_status = try planned_graph.index.graphMetricStatus("hits_authority");
+    defer planned_authority_status.deinit(alloc);
+    var planned_hub_status = try planned_graph.index.graphMetricStatus("hits_hub");
+    defer planned_hub_status.deinit(alloc);
+    try std.testing.expectEqual(local_authority_status.published_generation, planned_authority_status.published_generation);
+    try std.testing.expectEqual(local_hub_status.published_generation, planned_hub_status.published_generation);
+    try std.testing.expectEqual(planned_authority_status.published_generation, planned_hub_status.published_generation);
+    try std.testing.expectEqual(local_authority_status.iterations_completed, planned_authority_status.iterations_completed);
+    try std.testing.expectEqual(local_hub_status.iterations_completed, planned_hub_status.iterations_completed);
+    try std.testing.expectEqual(local_authority_status.converged, planned_authority_status.converged);
+    try std.testing.expectEqual(local_hub_status.converged, planned_hub_status.converged);
+    try std.testing.expectApproxEqAbs(local_authority_status.delta, planned_authority_status.delta, 0.0000001);
+    try std.testing.expectApproxEqAbs(local_hub_status.delta, planned_hub_status.delta, 0.0000001);
+
+    const local_authorities = try local_graph.index.graphMetricTopK("hits_authority", 32);
+    defer {
+        for (local_authorities) |*score| score.deinit(alloc);
+        alloc.free(local_authorities);
+    }
+    const planned_authorities = try planned_graph.index.graphMetricTopK("hits_authority", 32);
+    defer {
+        for (planned_authorities) |*score| score.deinit(alloc);
+        alloc.free(planned_authorities);
+    }
+    try std.testing.expectEqual(local_authorities.len, planned_authorities.len);
+    try std.testing.expectEqualStrings("doc:authority", planned_authorities[0].node);
+    for (local_authorities, planned_authorities) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expect(std.math.isFinite(local.score));
+        try std.testing.expect(std.math.isFinite(planned.score));
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+
+    const local_hubs = try local_graph.index.graphMetricTopK("hits_hub", 32);
+    defer {
+        for (local_hubs) |*score| score.deinit(alloc);
+        alloc.free(local_hubs);
+    }
+    const planned_hubs = try planned_graph.index.graphMetricTopK("hits_hub", 32);
+    defer {
+        for (planned_hubs) |*score| score.deinit(alloc);
+        alloc.free(planned_hubs);
+    }
+    try std.testing.expectEqual(local_hubs.len, planned_hubs.len);
+    for (local_hubs, planned_hubs) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expect(std.math.isFinite(local.score));
+        try std.testing.expect(std.math.isFinite(planned.score));
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+}
+
+test "db graph metric planned maintenance drains background centrality family work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const metric_names = [_][]const u8{ "degree", "eigenvector", "hits_authority", "hits_hub" };
+        for (metric_names) |metric_name| {
+            var status = try graph_entry.index.graphMetricStatus(metric_name);
+            defer status.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        }
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const maintenance = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "planned-maintenance-centrality",
+        .max_rounds = 400,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 3), maintenance.builds_started);
+    try std.testing.expect(maintenance.pages_completed > 0);
+    try std.testing.expect(maintenance.phases_advanced > 0);
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const metric_names = [_][]const u8{ "degree", "eigenvector", "hits_authority", "hits_hub" };
+        var authority_generation: u64 = 0;
+        for (metric_names) |metric_name| {
+            var status = try graph_entry.index.graphMetricStatus(metric_name);
+            defer status.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+            try std.testing.expectEqual(target_generation, status.published_generation);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+            try std.testing.expect(status.iterations_completed > 0);
+            if (std.mem.eql(u8, metric_name, "hits_authority")) {
+                authority_generation = status.published_generation;
+            } else if (std.mem.eql(u8, metric_name, "hits_hub")) {
+                try std.testing.expectEqual(authority_generation, status.published_generation);
+            }
+        }
+    }
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results.len);
+    try std.testing.expectEqualStrings("doc:authority", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectEqualStrings("doc:authority", published_result.graph_metric_results[1].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[2].scores[0].score >= published_result.graph_metric_results[2].scores[1].score);
+}
+
+test "db graph metric planned scheduler sweeps active eigenvector work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":20,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "eigenvector-sweep-a", "eigenvector-sweep-b", "eigenvector-sweep-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                try std.testing.expect(status.iterations_completed > 0);
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[0].scores[0].score > published_result.graph_metric_results[0].scores[1].score);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric planned scheduler sweeps active hits work" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "hits-sweep-a", "hits-sweep-b", "hits-sweep-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer authority_status.deinit(alloc);
+            var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+            defer hub_status.deinit(alloc);
+            if (authority_status.state == .fresh and authority_status.published_generation != 0 and authority_status.phase == .complete) {
+                try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_status.state);
+                try std.testing.expectEqual(authority_status.published_generation, hub_status.published_generation);
+                try std.testing.expectEqual(authority_status.iterations_completed, hub_status.iterations_completed);
+                try std.testing.expect(authority_status.iterations_completed > 0);
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(published_result.graph_metric_results[0].status.published_generation, published_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[1].scores.len);
+    try std.testing.expectEqualStrings("doc:authority", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+    try std.testing.expect(published_result.graph_metric_results[1].scores[0].score >= published_result.graph_metric_results[1].scores[1].score);
+    try std.testing.expect(published_result.graph_metric_results[1].scores[1].score > published_result.graph_metric_results[1].scores[2].score);
+}
+
+fn verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(
+    alloc: std.mem.Allocator,
+    metric_name: []const u8,
+    metric_kind: []const u8,
+) !void {
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    const graph_config = try std.fmt.allocPrint(
+        alloc,
+        "{{\"metrics\":{{\"{s}\":{{\"enabled\":true,\"kind\":\"{s}\",\"refresh\":\"manual\",\"max_iterations\":4,\"tolerance\":0.000001,\"edge_filter\":{{\"types\":[\"cites\"]}}}}}}}}",
+        .{ metric_name, metric_kind },
+    );
+    defer alloc.free(graph_config);
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = graph_config,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", metric_name);
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+    const published_generation = refreshed.published_generation;
+    try std.testing.expect(published_generation > 0);
+
+    var initial = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = metric_name,
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 1), initial.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(published_generation, initial.graph_metric_results[0].status.published_generation);
+    try std.testing.expect(initial.graph_metric_results[0].scores.len > 0);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:new-hub", .value = "{\"title\":\"new hub\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const rebuilding_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        try std.testing.expect(target_generation > published_generation);
+        var building = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+        break :blk target_generation;
+    };
+
+    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, error.InvalidGraphMetricScore);
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+    try std.testing.expectEqual(published_generation, failed.published_generation);
+    try std.testing.expectEqual(rebuilding_generation, failed.target_edge_generation);
+
+    var published_after_failure = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = metric_name,
+                .top_k = 4,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_after_failure.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, published_after_failure.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(published_generation, published_after_failure.graph_metric_results[0].status.published_generation);
+    try std.testing.expect(published_after_failure.graph_metric_results[0].scores.len > 0);
+    for (published_after_failure.graph_metric_results[0].scores) |score| {
+        try std.testing.expect(!std.mem.eql(u8, score.node, "doc:new-hub"));
+        try std.testing.expect(std.math.isFinite(score.score));
+    }
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = metric_name,
+        .freshness = .published,
+    }};
+    const published_graph_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:hub-a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var traversal_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_graph_query }},
+        .limit = 0,
+    });
+    defer traversal_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings(metric_name, traversal_after_failure.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expect(std.math.isFinite(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score.?));
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_after_failure.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(published_generation, traversal_after_failure.graph_results[0].metric_status[0].published_generation);
+
+    const published_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = metric_name,
+        .freshness = .published,
+    }};
+    var published_order_query = published_graph_query;
+    published_order_query.order_by = &published_metric_orders;
+    var traversal_order_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_order_query }},
+        .limit = 0,
+    });
+    defer traversal_order_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_order_after_failure.graph_results.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_order_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_order_after_failure.graph_results[0].metric_status[0].state);
+
+    const published_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = metric_name,
+        .op = .gte,
+        .value = 0.0,
+        .freshness = .published,
+    }};
+    var published_filter_query = published_graph_query;
+    published_filter_query.where_metric = &published_metric_filters;
+    var traversal_filter_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_filter_query }},
+        .limit = 0,
+    });
+    defer traversal_filter_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_filter_after_failure.graph_results.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_filter_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_filter_after_failure.graph_results[0].metric_status[0].state);
+
+    var rerank_after_failure = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = metric_name,
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer rerank_after_failure.deinit();
+    try std.testing.expectEqual(@as(u32, 4), rerank_after_failure.total_hits);
+    const rerank_status = rerank_after_failure.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, rerank_status.state);
+    try std.testing.expectEqual(published_generation, rerank_status.published_generation);
+    var saw_authority_score = false;
+    var saw_new_hub_missing_score = false;
+    for (rerank_after_failure.hits) |hit| {
+        const details = hit.score_details orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(published_generation, details.published_generation);
+        if (std.mem.eql(u8, hit.id, "doc:authority")) {
+            saw_authority_score = details.metric_score != null;
+        } else if (std.mem.eql(u8, hit.id, "doc:new-hub")) {
+            saw_new_hub_missing_score = details.metric_score == null;
+        }
+    }
+    try std.testing.expect(saw_authority_score);
+    try std.testing.expect(saw_new_hub_missing_score);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = metric_name,
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = metric_name,
+        .freshness = .fresh,
+    }};
+    var fresh_projection_query = published_graph_query;
+    fresh_projection_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = metric_name,
+        .freshness = .fresh,
+    }};
+    var fresh_order_query = published_graph_query;
+    fresh_order_query.order_by = &fresh_metric_orders;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_order_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = metric_name,
+        .op = .gte,
+        .value = 0.0,
+        .freshness = .fresh,
+    }};
+    var fresh_filter_query = published_graph_query;
+    fresh_filter_query.where_metric = &fresh_metric_filters;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
+        .limit = 0,
+    }));
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = metric_name,
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    }));
+}
+
+test "db single-vector failed planned rebuild preserves published public reads" {
+    const alloc = std.testing.allocator;
+    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(alloc, "pagerank", "pagerank");
+    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(alloc, "eigenvector", "eigenvector");
+}
+
+test "db paired hits failed planned rebuild preserves published public reads" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
+    const published_generation = refreshed.published_generation;
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_status.state);
+        try std.testing.expectEqual(published_generation, hub_status.published_generation);
+    }
+
+    var initial = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 2), initial.graph_metric_results.len);
+    try std.testing.expectEqualStrings("doc:authority", initial.graph_metric_results[0].scores[0].node);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(published_generation, initial.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(published_generation, initial.graph_metric_results[1].status.published_generation);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:new-hub", .value = "{\"title\":\"new hub\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const rebuilding_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        try std.testing.expect(target_generation > published_generation);
+        var building = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+        break :blk target_generation;
+    };
+
+    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", error.InvalidGraphMetricScore);
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+    try std.testing.expectEqual(published_generation, failed.published_generation);
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority_status.deinit(alloc);
+        var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, authority_status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, hub_status.state);
+        try std.testing.expectEqual(published_generation, authority_status.published_generation);
+        try std.testing.expectEqual(published_generation, hub_status.published_generation);
+        try std.testing.expectEqual(rebuilding_generation, authority_status.target_edge_generation);
+        try std.testing.expectEqual(rebuilding_generation, hub_status.target_edge_generation);
+    }
+
+    var published_after_failure = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 4,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 4,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer published_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 2), published_after_failure.graph_metric_results.len);
+    for (published_after_failure.graph_metric_results) |result| {
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, result.status.state);
+        try std.testing.expectEqual(published_generation, result.status.published_generation);
+        try std.testing.expect(result.scores.len > 0);
+        for (result.scores) |score| {
+            try std.testing.expect(!std.mem.eql(u8, score.node, "doc:new-hub"));
+        }
+    }
+    try std.testing.expectEqualStrings("doc:authority", published_after_failure.graph_metric_results[0].scores[0].node);
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{
+        .{ .name = "hits_authority", .freshness = .published },
+        .{ .name = "hits_hub", .freshness = .published },
+    };
+    const published_graph_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:hub-a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var traversal_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_graph_query }},
+        .limit = 0,
+    });
+    defer traversal_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 2), traversal_after_failure.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("hits_authority", traversal_after_failure.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), traversal_after_failure.graph_results[0].nodes[0].metrics[0].score.?, 0.001);
+    try std.testing.expectEqual(@as(usize, 2), traversal_after_failure.graph_results[0].metric_status.len);
+    for (traversal_after_failure.graph_results[0].metric_status) |status| {
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, status.state);
+        try std.testing.expectEqual(published_generation, status.published_generation);
+    }
+
+    const published_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "hits_authority",
+        .freshness = .published,
+    }};
+    var published_order_query = published_graph_query;
+    published_order_query.order_by = &published_metric_orders;
+    var traversal_order_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_order_query }},
+        .limit = 0,
+    });
+    defer traversal_order_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_order_after_failure.graph_results.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_order_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_order_after_failure.graph_results[0].metric_status[0].state);
+
+    const published_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "hits_authority",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .published,
+    }};
+    var published_filter_query = published_graph_query;
+    published_filter_query.where_metric = &published_metric_filters;
+    var traversal_filter_after_failure = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = published_filter_query }},
+        .limit = 0,
+    });
+    defer traversal_filter_after_failure.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal_filter_after_failure.graph_results.len);
+    try std.testing.expectEqualStrings("doc:authority", traversal_filter_after_failure.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_filter_after_failure.graph_results[0].metric_status[0].state);
+
+    var rerank_after_failure = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "hits_authority",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer rerank_after_failure.deinit();
+    try std.testing.expectEqual(@as(u32, 4), rerank_after_failure.total_hits);
+    const rerank_status = rerank_after_failure.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, rerank_status.state);
+    try std.testing.expectEqual(published_generation, rerank_status.published_generation);
+    var saw_authority_score = false;
+    var saw_new_hub_missing_score = false;
+    for (rerank_after_failure.hits) |hit| {
+        const details = hit.score_details orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(published_generation, details.published_generation);
+        if (std.mem.eql(u8, hit.id, "doc:authority")) {
+            saw_authority_score = details.metric_score != null;
+        } else if (std.mem.eql(u8, hit.id, "doc:new-hub")) {
+            saw_new_hub_missing_score = details.metric_score == null;
+        }
+    }
+    try std.testing.expect(saw_authority_score);
+    try std.testing.expect(saw_new_hub_missing_score);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{
+        .{ .name = "hits_authority", .freshness = .fresh },
+        .{ .name = "hits_hub", .freshness = .fresh },
+    };
+    var fresh_projection_query = published_graph_query;
+    fresh_projection_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "hits_authority",
+        .freshness = .fresh,
+    }};
+    var fresh_order_query = published_graph_query;
+    fresh_order_query.order_by = &fresh_metric_orders;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_order_query }},
+        .limit = 0,
+    }));
+
+    const fresh_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "hits_authority",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .fresh,
+    }};
+    var fresh_filter_query = published_graph_query;
+    fresh_filter_query.where_metric = &fresh_metric_filters;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
+        .limit = 0,
+    }));
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "hits_authority",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
     }));
 }
 
@@ -39881,6 +55262,29 @@ test "db graph metric pause and resume controls background maintenance" {
         },
         .sync_level = .write,
     });
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expectEqual(@as(usize, 1), pending.metrics_scanned);
+        try std.testing.expectEqual(@as(usize, 1), pending.paused_metrics);
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_pages);
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    const planned_while_paused = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "paused-degree-worker",
+        .max_rounds = 4,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 4,
+    });
+    try std.testing.expect(!planned_while_paused.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), planned_while_paused.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), planned_while_paused.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), planned_while_paused.coordinator_steps);
+    try std.testing.expectEqual(@as(usize, 0), planned_while_paused.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), planned_while_paused.published);
 
     try db.runUntilIdle();
 
@@ -54518,6 +69922,95 @@ test "db row claims block transactional and direct mutations until resolution" {
     try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
 }
 
+test "db row claim lease expiry aborts stale owner and lets next claimer proceed" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const stale_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:stale",
+        .lease_ms = 0,
+        .txn_id = stale_txn,
+    });
+
+    const next_txn = try db.beginTransaction(2_001);
+    try db.claimRowsForTransaction(next_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:next",
+        .txn_id = next_txn,
+    });
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(stale_txn));
+    try std.testing.expectError(transactions_mod.TxnError.DecisionConflict, db.writeTransaction(stale_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"stale\"}" }},
+    }));
+
+    const blocked_txn = try db.beginTransaction(2_002);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"blocked\"}" }},
+    }));
+
+    try db.commitTransaction(next_txn, 2_010);
+    try db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"updated\"}" }},
+    });
+    try db.commitTransaction(blocked_txn, 2_011);
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
+test "db row claim lease expiry lets direct mutation reclaim stale owner" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const stale_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:stale",
+        .lease_ms = 0,
+        .txn_id = stale_txn,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},
+        .timestamp_ns = 2_010,
+    });
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(stale_txn));
+    try std.testing.expectError(transactions_mod.TxnError.DecisionConflict, db.writeTransaction(stale_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"stale\"}" }},
+    }));
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"direct\"}", raw);
+}
+
 test "db row claim search skip locked returns claimed subset" {
     const alloc = std.testing.allocator;
 
@@ -60709,6 +76202,25 @@ test "relational rows query uses indexed candidates and authoritative base rows"
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"created_at\":20}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"d\",\"created_at\":10}", result.rows[1]);
 
+    const distinct_on = [_][]const u8{"status"};
+    const distinct_order = [_]types.RelationalRowsQueryOrder{
+        .{ .field = "status", .direction = .asc },
+        .{ .field = "created_at", .direction = .desc },
+    };
+    const distinct_select = [_][]const u8{ "status", "id", "created_at" };
+    var distinct = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = distinct_select[0..],
+        .select_all = false,
+        .distinct_on = distinct_on[0..],
+        .order_by = distinct_order[0..],
+        .limit = 10,
+    });
+    defer distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), distinct.total);
+    try std.testing.expectEqual(@as(usize, 2), distinct.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"closed\",\"id\":\"c\",\"created_at\":50}", distinct.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"open\",\"id\":\"b\",\"created_at\":40}", distinct.rows[1]);
+
     const in_predicates = [_]types.RelationalRowsInPredicate{.{
         .field = "status",
         .values_json = "[\"closed\"]",
@@ -60951,6 +76463,9 @@ test "relational rows query plan composes non-recursive ctes" {
             },
         },
     };
+    const default_cte_limits = types.relationalRowsCteMaterializationLimits(ctes[0]);
+    try std.testing.expectEqual(types.default_relational_rows_cte_max_rows, default_cte_limits.max_rows);
+    try std.testing.expectEqual(types.default_relational_rows_cte_max_bytes, default_cte_limits.max_bytes);
 
     var result = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .ctes = ctes[0..],
@@ -60968,6 +76483,247 @@ test "relational rows query plan composes non-recursive ctes" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":20}", result.rows[0]);
 
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .query = .{
+            .predicates = open_predicates[0..],
+            .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+        },
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .query = .{
+            .predicates = open_predicates[0..],
+            .row_claim = .{ .owner_id = "reader" },
+        },
+    }));
+
+    const projected_select = [_][]const u8{"id"};
+    const projected_amount_plus_one = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "amount_plus_one",
+        .expression = .{
+            .kind = .add,
+            .operands = &.{
+                .{ .kind = .field, .field = "amount" },
+                .{ .kind = .value, .value_json = "1" },
+            },
+        },
+    }};
+    const projected_ctes = [_]types.RelationalRowsCte{.{
+        .name = "projected_orders",
+        .query = .{
+            .predicates = open_predicates[0..],
+            .select = projected_select[0..],
+            .expressions = projected_amount_plus_one[0..],
+            .select_all = false,
+        },
+    }};
+    const projected_result_select = [_][]const u8{ "id", "amount_plus_one" };
+    const projected_order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "amount_plus_one",
+        .direction = .desc,
+    }};
+    var projected = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .select = projected_result_select[0..],
+            .select_all = false,
+            .order_by = projected_order_by[0..],
+        },
+    });
+    defer projected.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), projected.total);
+    try std.testing.expectEqual(@as(usize, 3), projected.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"amount_plus_one\":41}", projected.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount_plus_one\":21}", projected.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount_plus_one\":11}", projected.rows[2]);
+
+    const chained_projected_ctes = [_]types.RelationalRowsCte{
+        projected_ctes[0],
+        .{
+            .name = "projected_passthrough",
+            .query = .{
+                .source_cte = "projected_orders",
+                .select_all = true,
+            },
+        },
+    };
+    var chained_projected = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = chained_projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_passthrough",
+            .select = projected_result_select[0..],
+            .select_all = false,
+            .order_by = projected_order_by[0..],
+        },
+    });
+    defer chained_projected.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), chained_projected.total);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"amount_plus_one\":41}", chained_projected.rows[0]);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .predicates = final_predicates[0..],
+            .select = projected_select[0..],
+            .select_all = false,
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = chained_projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_passthrough",
+            .predicates = final_predicates[0..],
+            .select = projected_select[0..],
+            .select_all = false,
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .select = projected_select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+        },
+    }));
+
+    const missing_field_expression = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "missing_amount_plus_one",
+        .expression = .{
+            .kind = .add,
+            .operands = &.{
+                .{ .kind = .field, .field = "amount" },
+                .{ .kind = .value, .value_json = "1" },
+            },
+        },
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .select = projected_select[0..],
+            .expressions = missing_field_expression[0..],
+            .select_all = false,
+        },
+    }));
+
+    const capped_projected_ctes = [_]types.RelationalRowsCte{
+        .{
+            .name = "projected_orders_capped",
+            .query = .{
+                .predicates = open_predicates[0..],
+                .select = projected_select[0..],
+                .select_all = false,
+            },
+            .max_rows = 0,
+        },
+        .{
+            .name = "bad_projected_consumer",
+            .query = .{
+                .source_cte = "projected_orders_capped",
+                .select = &.{"amount"},
+                .select_all = false,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = capped_projected_ctes[0..],
+        .query = .{ .source_cte = "bad_projected_consumer" },
+    }));
+
+    const capped_ctes = [_]types.RelationalRowsCte{.{
+        .name = "open_orders",
+        .query = .{
+            .predicates = open_predicates[0..],
+            .select_all = true,
+        },
+        .max_rows = 2,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = capped_ctes[0..],
+        .query = .{ .source_cte = "open_orders" },
+    }));
+
+    const byte_capped_ctes = [_]types.RelationalRowsCte{.{
+        .name = "open_orders",
+        .query = .{
+            .predicates = open_predicates[0..],
+            .select_all = true,
+        },
+        .max_bytes = 1,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = byte_capped_ctes[0..],
+        .query = .{ .source_cte = "open_orders" },
+    }));
+
+    const duplicate_ctes = [_]types.RelationalRowsCte{
+        .{
+            .name = "open_orders",
+            .query = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+        },
+        .{
+            .name = "open_orders",
+            .query = .{
+                .select_all = true,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = duplicate_ctes[0..],
+        .query = .{ .source_cte = "open_orders" },
+    }));
+
+    const range_ctes = [_]types.RelationalRowsCte{
+        .{
+            .name = "open_orders",
+            .query = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+        },
+        .{
+            .name = "range_orders",
+            .query = .{
+                .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+                .select_all = true,
+            },
+        },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = range_ctes[0..],
+        .query = .{ .source_cte = "range_orders" },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{ .source_cte = "missing_orders" },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .row_claim = .{ .owner_id = "reader" },
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .query = .{
+            .source_cte = "projected_orders",
+            .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+        },
+    }));
+
     const forward_ref = [_]types.RelationalRowsCte{.{
         .name = "bad",
         .query = .{
@@ -60977,6 +76733,21 @@ test "relational rows query plan composes non-recursive ctes" {
     }};
     try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .ctes = forward_ref[0..],
+        .query = .{ .source_cte = "bad" },
+    }));
+
+    const forward_ref_after_valid = [_]types.RelationalRowsCte{
+        projected_ctes[0],
+        .{
+            .name = "bad",
+            .query = .{
+                .source_cte = "later",
+                .select_all = true,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = forward_ref_after_valid[0..],
         .query = .{ .source_cte = "bad" },
     }));
 }
@@ -61055,6 +76826,95 @@ test "relational rows window plan computes row_number over ordered partitions" {
             .order_by = window_order[0..],
             .value_expression = .{ .kind = .field, .field = "amount" },
         },
+        .{
+            .output = "first_amount",
+            .function = .first_value,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+        },
+        .{
+            .output = "last_amount",
+            .function = .last_value,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "partition_count",
+            .function = .count,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "partition_sum",
+            .function = .sum,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "current_avg",
+            .function = .avg,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .start = .current_row, .end = .current_row },
+        },
+        .{
+            .output = "partition_min",
+            .function = .min,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "partition_max",
+            .function = .max,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "tail_count",
+            .function = .count,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .frame = .{ .unit = .rows, .start = .current_row, .end = .unbounded_following },
+        },
+        .{
+            .output = "neighbor_count",
+            .function = .count,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .frame = .{ .unit = .rows, .start = .offset_preceding, .start_offset = 1, .end = .offset_following, .end_offset = 1 },
+        },
+        .{
+            .output = "next_frame_amount",
+            .function = .first_value,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "amount" },
+            .frame = .{ .unit = .rows, .start = .offset_following, .start_offset = 1, .end = .offset_following, .end_offset = 1 },
+        },
+        .{
+            .output = "range_tail_count",
+            .function = .count,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .frame = .{ .unit = .range, .start = .current_row, .end = .offset_following, .end_offset = 25 },
+        },
+        .{
+            .output = "range_count",
+            .function = .count,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
     };
     const select = [_][]const u8{ "tenant", "id", "amount" };
 
@@ -61073,11 +76933,11 @@ test "relational rows window plan computes row_number over ordered partitions" {
 
     try std.testing.expectEqual(@as(u32, 5), result.total_rows);
     try std.testing.expectEqual(@as(usize, 5), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":30}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10}", result.rows[1]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null}", result.rows[2]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":5}", result.rows[3]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2,\"rank\":2,\"dense_rank\":2,\"prev_amount\":40,\"next_amount\":null}", result.rows[4]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":30,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":3,\"neighbor_count\":2,\"next_frame_amount\":30,\"range_tail_count\":3,\"range_count\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", result.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":5,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":40,\"partition_min\":5,\"partition_max\":40,\"tail_count\":2,\"neighbor_count\":2,\"next_frame_amount\":5,\"range_tail_count\":1,\"range_count\":1}", result.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2,\"rank\":2,\"dense_rank\":2,\"prev_amount\":40,\"next_amount\":null,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":5,\"partition_min\":5,\"partition_max\":40,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":2}", result.rows[4]);
 
     const ctes = [_]types.RelationalRowsCte{.{
         .name = "open_usage",
@@ -61101,15 +76961,145 @@ test "relational rows window plan computes row_number over ordered partitions" {
 
     try std.testing.expectEqual(@as(u32, 5), paged.total_rows);
     try std.testing.expectEqual(@as(usize, 2), paged.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10}", paged.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null}", paged.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", paged.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", paged.rows[1]);
 
     const amount_expr = types.RelationalRowsExpression{ .kind = .field, .field = "amount" };
     const id_expr = types.RelationalRowsExpression{ .kind = .field, .field = "id" };
+    const amount_plus_one_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount" },
+        .{ .kind = .value, .value_json = "1" },
+    };
+    const amount_plus_one_expr = types.RelationalRowsExpression{ .kind = .add, .operands = amount_plus_one_operands[0..] };
     const amount_expr_order = [_]types.RelationalRowsQueryOrder{.{
         .expression = amount_expr,
         .direction = .desc,
     }};
+    const amount_plus_one_order = [_]types.RelationalRowsQueryOrder{.{
+        .expression = amount_plus_one_expr,
+        .direction = .desc,
+    }};
+    const expression_range_windows = [_]types.RelationalRowsWindowSpec{.{
+        .output = "expr_range_count",
+        .function = .count,
+        .partition_by = partition_by[0..],
+        .order_by = amount_plus_one_order[0..],
+        .frame = .{ .unit = .range, .start = .current_row, .end = .offset_following, .end_offset = 25 },
+    }};
+    var expression_range = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .window = .{
+            .source = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+            .windows = expression_range_windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    });
+    defer expression_range.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 5), expression_range.total_rows);
+    try std.testing.expectEqual(@as(usize, 5), expression_range.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"expr_range_count\":3}", expression_range.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"expr_range_count\":3}", expression_range.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"expr_range_count\":1}", expression_range.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"expr_range_count\":1}", expression_range.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"expr_range_count\":1}", expression_range.rows[4]);
+
+    const nth_windows = [_]types.RelationalRowsWindowSpec{.{
+        .output = "second_amount",
+        .function = .nth_value,
+        .partition_by = partition_by[0..],
+        .order_by = window_order[0..],
+        .value_expression = .{ .kind = .field, .field = "amount" },
+        .offset = 2,
+        .frame = .{ .unit = .rows, .start = .current_row, .end = .unbounded_following },
+    }};
+    var nth = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .window = .{
+            .source = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+            .windows = nth_windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    });
+    defer nth.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 5), nth.total_rows);
+    try std.testing.expectEqual(@as(usize, 5), nth.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"second_amount\":30}", nth.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"second_amount\":10}", nth.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"second_amount\":null}", nth.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"second_amount\":5}", nth.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"second_amount\":null}", nth.rows[4]);
+
+    const relative_rank_windows = [_]types.RelationalRowsWindowSpec{
+        .{
+            .output = "percent_rank",
+            .function = .percent_rank,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
+        .{
+            .output = "cume_dist",
+            .function = .cume_dist,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+        },
+    };
+    var relative_rank = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .window = .{
+            .source = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+            .windows = relative_rank_windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    });
+    defer relative_rank.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 5), relative_rank.total_rows);
+    try std.testing.expectEqual(@as(usize, 5), relative_rank.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"percent_rank\":0,\"cume_dist\":0.6666666666666666}", relative_rank.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"percent_rank\":0,\"cume_dist\":0.6666666666666666}", relative_rank.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"percent_rank\":1,\"cume_dist\":1}", relative_rank.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"percent_rank\":0,\"cume_dist\":0.5}", relative_rank.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"percent_rank\":1,\"cume_dist\":1}", relative_rank.rows[4]);
+
+    const ntile_windows = [_]types.RelationalRowsWindowSpec{.{
+        .output = "amount_bucket",
+        .function = .ntile,
+        .partition_by = partition_by[0..],
+        .order_by = window_order[0..],
+        .offset = 2,
+    }};
+    var ntile = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .window = .{
+            .source = .{
+                .predicates = open_predicates[0..],
+                .select_all = true,
+            },
+            .windows = ntile_windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    });
+    defer ntile.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 5), ntile.total_rows);
+    try std.testing.expectEqual(@as(usize, 5), ntile.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"amount_bucket\":1}", ntile.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"amount_bucket\":1}", ntile.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"amount_bucket\":2}", ntile.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"amount_bucket\":1}", ntile.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"amount_bucket\":2}", ntile.rows[4]);
+
     const id_expr_order = [_]types.RelationalRowsQueryOrder{.{
         .expression = id_expr,
         .direction = .desc,
@@ -61139,6 +77129,32 @@ test "relational rows window plan computes row_number over ordered partitions" {
             .select_all = false,
         },
     }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .window = .{
+            .source = .{
+                .source_cte = "open_usage",
+                .row_claim = .{ .owner_id = "reader" },
+            },
+            .windows = windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .window = .{
+            .source = .{
+                .source_cte = "open_usage",
+                .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+            },
+            .windows = windows[0..],
+            .select = select[0..],
+            .select_all = false,
+        },
+    }));
 }
 
 test "relational aggregate and join plans consume cte sources" {
@@ -61163,7 +77179,7 @@ test "relational aggregate and join plans consume cte sources" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "row:c1", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c1\",\"name\":\"Alice\"}" },
+            .{ .key = "row:c1", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c1\",\"name\":\"Alice\",\"amount\":0}" },
             .{ .key = "row:c2", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c2\",\"name\":\"Bob\"}" },
             .{ .key = "row:o1", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":10}" },
             .{ .key = "row:o2", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":20}" },
@@ -61215,6 +77231,23 @@ test "relational aggregate and join plans consume cte sources" {
     try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
     try std.testing.expectEqualStrings("{\"customer_id\":\"c1\",\"order_count\":2,\"amount_sum\":30}", aggregate.rows[0]);
 
+    const status_group_by = [_][]const u8{"status"};
+    var distinct_status = try db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..1],
+        .aggregate = .{
+            .source = .{ .source_cte = "orders" },
+            .group_by = status_group_by[0..],
+            .aggregations = &.{},
+            .order_by = &.{.{ .field = "status", .direction = .asc }},
+        },
+    });
+    defer distinct_status.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), distinct_status.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), distinct_status.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"closed\"}", distinct_status.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"open\"}", distinct_status.rows[1]);
+
     const on = [_]types.RelationalRowsJoinOn{.{
         .left_field = "customer_id",
         .right_field = "id",
@@ -61241,6 +77274,108 @@ test "relational aggregate and join plans consume cte sources" {
     try std.testing.expectEqual(@as(usize, 2), joined.rows.len);
     try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Alice\",\"amount\":20}", joined.rows[0]);
     try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", joined.rows[1]);
+
+    const projected_order_select = [_][]const u8{ "id", "customer_id" };
+    const projected_ctes = [_]types.RelationalRowsCte{
+        ctes[0],
+        ctes[1],
+        ctes[2],
+        .{
+            .name = "projected_open_orders",
+            .query = .{
+                .source_cte = "open_orders",
+                .select = projected_order_select[0..],
+                .select_all = false,
+            },
+        },
+    };
+    const projected_aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "order_count", .op = .count },
+    };
+    var projected_aggregate = try db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "projected_open_orders" },
+            .group_by = group_by[0..],
+            .aggregations = projected_aggregations[0..],
+        },
+    });
+    defer projected_aggregate.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), projected_aggregate.total_groups);
+    try std.testing.expectEqualStrings("{\"customer_id\":\"c1\",\"order_count\":2}", projected_aggregate.rows[0]);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "projected_open_orders" },
+            .group_by = group_by[0..],
+            .aggregations = aggregations[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..2],
+        .aggregate = .{
+            .source = .{
+                .source_cte = "open_orders",
+                .row_claim = .{ .owner_id = "reader" },
+            },
+            .group_by = group_by[0..],
+            .aggregations = aggregations[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..2],
+        .aggregate = .{
+            .source = .{
+                .source_cte = "open_orders",
+                .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+            },
+            .group_by = group_by[0..],
+            .aggregations = aggregations[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "projected_open_orders" },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .inner,
+            .select = select[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{
+                .source_cte = "open_orders",
+                .row_claim = .{ .owner_id = "reader" },
+            },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .inner,
+            .select = select[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{
+                .source_cte = "open_orders",
+                .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+            },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .inner,
+            .select = select[0..],
+        },
+    }));
 }
 
 test "relational rows query across ranges merges ordered windows globally" {
@@ -61255,7 +77390,7 @@ test "relational rows query across ranges merges ordered windows globally" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -61299,6 +77434,244 @@ test "relational rows query across ranges merges ordered windows globally" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"d\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+
+    const ctes = [_]types.RelationalRowsCte{.{
+        .name = "ready_rows",
+        .query = .{
+            .predicates = predicates[0..],
+            .select_all = true,
+        },
+    }};
+    var ranged_cte_query = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "ready_rows",
+            .select = select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .offset = 1,
+            .limit = 2,
+        },
+    });
+    defer ranged_cte_query.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), ranged_cte_query.total);
+    try std.testing.expectEqual(@as(usize, 2), ranged_cte_query.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", ranged_cte_query.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", ranged_cte_query.rows[1]);
+
+    const group_by = [_][]const u8{"status"};
+    const aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "rank_sum", .op = .sum, .field = "rank" },
+    };
+    var aggregate = try db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+    }, ranges[0..]);
+    defer aggregate.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), aggregate.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"ready\",\"row_count\":4,\"rank_sum\":10}", aggregate.rows[0]);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+        .order_by = &.{.{ .field = "rank", .direction = .asc }},
+    }, ranges[0..]));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+        .having_predicates = &.{.{ .name = "", .field = "rank", .op = .gt, .value_json = "0" }},
+    }, ranges[0..]));
+
+    const duplicate_aggregate_names = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "row_count", .op = .count },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = duplicate_aggregate_names[0..],
+    }, ranges[0..]));
+
+    const aggregate_name_collides_with_group = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "status", .op = .count },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .group_by = group_by[0..],
+        .aggregations = aggregate_name_collides_with_group[0..],
+    }, ranges[0..]));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.aggregateRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{
+            .predicates = predicates[0..],
+            .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+        },
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+    }, ranges[0..]));
+
+    var ranged_cte_aggregate = try db.aggregateRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "ready_rows" },
+            .group_by = group_by[0..],
+            .aggregations = aggregations[0..],
+        },
+    });
+    defer ranged_cte_aggregate.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), ranged_cte_aggregate.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), ranged_cte_aggregate.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"ready\",\"row_count\":4,\"rank_sum\":10}", ranged_cte_aggregate.rows[0]);
+
+    const window_select = [_][]const u8{ "id", "status", "rank" };
+    const window_specs = [_]types.RelationalRowsWindowSpec{.{
+        .output = "row_num",
+        .function = .row_number,
+        .partition_by = &.{"status"},
+        .order_by = order_by[0..],
+    }};
+    var window = try db.windowRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .windows = window_specs[0..],
+        .select = window_select[0..],
+    }, ranges[0..]);
+    defer window.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), window.total_rows);
+    try std.testing.expectEqual(@as(usize, 4), window.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"status\":\"ready\",\"rank\":1,\"row_num\":1}", window.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"status\":\"ready\",\"rank\":2,\"row_num\":2}", window.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"status\":\"ready\",\"rank\":3,\"row_num\":3}", window.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\",\"rank\":4,\"row_num\":4}", window.rows[3]);
+
+    const projected_window_result_select = [_][]const u8{ "id", "status" };
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .windows = window_specs[0..],
+        .select = projected_window_result_select[0..],
+        .order_by = &.{.{ .field = "rank", .direction = .asc }},
+    }, ranges[0..]));
+
+    const duplicate_window_select = [_][]const u8{ "id", "id" };
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .windows = window_specs[0..],
+        .select = duplicate_window_select[0..],
+    }, ranges[0..]));
+
+    const colliding_window_specs = [_]types.RelationalRowsWindowSpec{.{
+        .output = "id",
+        .function = .row_number,
+        .partition_by = &.{"status"},
+        .order_by = order_by[0..],
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .windows = colliding_window_specs[0..],
+        .select = window_select[0..],
+    }, ranges[0..]));
+
+    const duplicate_window_specs = [_]types.RelationalRowsWindowSpec{
+        .{
+            .output = "row_num",
+            .function = .row_number,
+            .partition_by = &.{"status"},
+            .order_by = order_by[0..],
+        },
+        .{
+            .output = "row_num",
+            .function = .rank,
+            .partition_by = &.{"status"},
+            .order_by = order_by[0..],
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .source = .{ .predicates = predicates[0..] },
+        .windows = duplicate_window_specs[0..],
+        .select = window_select[0..],
+    }, ranges[0..]));
+
+    var ranged_cte_window = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "ready_rows" },
+            .windows = window_specs[0..],
+            .select = window_select[0..],
+        },
+    });
+    defer ranged_cte_window.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), ranged_cte_window.total_rows);
+    try std.testing.expectEqual(@as(usize, 4), ranged_cte_window.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"status\":\"ready\",\"rank\":1,\"row_num\":1}", ranged_cte_window.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"status\":\"ready\",\"rank\":2,\"row_num\":2}", ranged_cte_window.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"status\":\"ready\",\"rank\":3,\"row_num\":3}", ranged_cte_window.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\",\"rank\":4,\"row_num\":4}", ranged_cte_window.rows[3]);
+
+    const projected_ready_select = [_][]const u8{ "id", "status" };
+    const projected_ready_ctes = [_]types.RelationalRowsCte{
+        ctes[0],
+        .{
+            .name = "projected_ready_rows",
+            .query = .{
+                .source_cte = "ready_rows",
+                .select = projected_ready_select[0..],
+                .select_all = false,
+            },
+        },
+    };
+    const projected_window_order = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const projected_window_specs = [_]types.RelationalRowsWindowSpec{.{
+        .output = "row_num",
+        .function = .row_number,
+        .partition_by = &.{"status"},
+        .order_by = projected_window_order[0..],
+    }};
+    var projected_window = try db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ready_ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "projected_ready_rows" },
+            .windows = projected_window_specs[0..],
+            .select = projected_ready_select[0..],
+        },
+    });
+    defer projected_window.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), projected_window.total_rows);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ready\",\"row_num\":1}", projected_window.rows[0]);
+
+    const invalid_window_specs = [_]types.RelationalRowsWindowSpec{.{
+        .output = "prev_rank",
+        .function = .lag,
+        .partition_by = &.{"status"},
+        .order_by = projected_window_order[0..],
+        .value_expression = .{ .kind = .field, .field = "rank" },
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.windowRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_ready_ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "projected_ready_rows" },
+            .windows = invalid_window_specs[0..],
+            .select = projected_ready_select[0..],
+        },
+    }));
 }
 
 test "relational rows query across ranges rejects overlapping ranges" {
@@ -61733,7 +78106,7 @@ test "relational rows query row claim skip locked returns claimed subset" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -61765,17 +78138,50 @@ test "relational rows query row claim skip locked returns claimed subset" {
         .direction = .asc,
     }};
     const select = [_][]const u8{"id"};
-    var claimed = try db.queryRelationalRows(alloc, runtime_schema, .{
+    const distinct_on = [_][]const u8{"status"};
+    const claim_request = types.RowClaimRequest{
+        .mode = .for_update,
+        .skip_locked = true,
+        .owner_id = "session:query",
+        .txn_id = query_txn,
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .distinct_on = distinct_on[0..],
+        .order_by = order_by[0..],
+        .row_claim = claim_request,
+    }));
+    const ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:",
+        .end = "row:z",
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .distinct_on = distinct_on[0..],
+        .order_by = order_by[0..],
+        .row_claim = claim_request,
+    }, ranges[0..]));
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
         .predicates = predicates[0..],
         .select = select[0..],
         .select_all = false,
         .order_by = order_by[0..],
         .row_claim = .{
             .mode = .for_update,
-            .skip_locked = true,
-            .owner_id = "session:query",
-            .txn_id = query_txn,
+            .owner_id = "session:query-missing-txn",
         },
+    }));
+
+    var claimed = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .row_claim = claim_request,
         .limit = 10,
     });
     defer claimed.deinit(alloc);
@@ -61802,7 +78208,7 @@ test "relational rows mutation source updates claimed base rows transactionally"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -61812,9 +78218,9 @@ test "relational rows mutation source updates claimed base rows transactionally"
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "row:locked", .value = "{\"id\":\"locked\",\"status\":\"ready\",\"rank\":1}" },
-            .{ .key = "row:free1", .value = "{\"id\":\"free1\",\"status\":\"ready\",\"rank\":2}" },
-            .{ .key = "row:free2", .value = "{\"id\":\"free2\",\"status\":\"ready\",\"rank\":3}" },
+            .{ .key = "row:locked", .value = "{\"id\":\"locked\",\"status\":\"ready\",\"rank\":1,\"metadata\":{}}" },
+            .{ .key = "row:free1", .value = "{\"id\":\"free1\",\"status\":\"ready\",\"rank\":2,\"metadata\":{}}" },
+            .{ .key = "row:free2", .value = "{\"id\":\"free2\",\"status\":\"ready\",\"rank\":3,\"metadata\":{}}" },
         },
         .timestamp_ns = 1_000,
     });
@@ -61846,6 +78252,15 @@ test "relational rows mutation source updates claimed base rows transactionally"
         .field = "rank",
         .expression = .{ .kind = .field, .field = "rank", .field_source = .existing },
     }};
+    const json_set_path = [_][]const u8{ "claim", "status_key" };
+    const json_set_expression_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "status", .field_source = .existing },
+    };
+    const json_set_expressions = [_]types.RelationalRowsJsonSetExpressionAssignment{.{
+        .field = "metadata",
+        .path = json_set_path[0..],
+        .expression = .{ .kind = .lower, .operands = json_set_expression_operands[0..] },
+    }};
     const returning_operands = [_]types.RelationalRowsExpression{
         .{ .kind = .field, .field = "rank" },
         .{ .kind = .value, .value_json = "1" },
@@ -61854,7 +78269,57 @@ test "relational rows mutation source updates claimed base rows transactionally"
         .output = "next_rank",
         .expression = .{ .kind = .add, .operands = returning_operands[0..] },
     }};
-    const returning = [_][]const u8{ "id", "status", "rank" };
+    const returning = [_][]const u8{ "id", "status", "rank", "metadata" };
+    const duplicate_returning = [_][]const u8{ "id", "id" };
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:mutation",
+                .txn_id = mutation_txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
+        .returning = duplicate_returning[0..],
+    }));
+    const colliding_returning_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "id",
+        .expression = .{ .kind = .add, .operands = returning_operands[0..] },
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:mutation",
+                .txn_id = mutation_txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
+        .returning_all = true,
+        .returning_expressions = colliding_returning_expressions[0..],
+    }));
+    const colliding_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "rank",
+        .value_json = "0",
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:mutation",
+                .txn_id = mutation_txn,
+            },
+        },
+        .operations = colliding_operations[0..],
+        .increment_expressions = increment_expressions[0..],
+    }));
 
     var mutation = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
         .kind = .update,
@@ -61871,6 +78336,7 @@ test "relational rows mutation source updates claimed base rows transactionally"
         },
         .patch_expressions = patch_expressions[0..],
         .increment_expressions = increment_expressions[0..],
+        .json_set_expressions = json_set_expressions[0..],
         .returning = returning[0..],
         .returning_expressions = returning_expressions[0..],
     });
@@ -61879,10 +78345,34 @@ test "relational rows mutation source updates claimed base rows transactionally"
     try std.testing.expectEqual(@as(u32, 3), mutation.matched);
     try std.testing.expectEqual(@as(u32, 2), mutation.staged);
     try std.testing.expectEqual(@as(usize, 2), mutation.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"ready-claimed\",\"rank\":4,\"next_rank\":5}", mutation.returning_rows[0]);
-    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"ready-claimed\",\"rank\":6,\"next_rank\":7}", mutation.returning_rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"free1\",\"status\":\"ready-claimed\",\"rank\":4,\"metadata\":{\"claim\":{\"status_key\":\"ready\"}},\"next_rank\":5}", mutation.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"free2\",\"status\":\"ready-claimed\",\"rank\":6,\"metadata\":{\"claim\":{\"status_key\":\"ready\"}},\"next_rank\":7}", mutation.returning_rows[1]);
+
+    const pending_claim_key = try rowClaimIntentKeyAlloc(alloc, "row:free1");
+    defer alloc.free(pending_claim_key);
+    const pending_mutations = try db.core.collectTransactionIntentMutations(alloc, mutation_txn);
+    defer {
+        for (pending_mutations) |*pending| pending.deinit(alloc);
+        if (pending_mutations.len > 0) alloc.free(pending_mutations);
+    }
+    var found_claim_payload = false;
+    for (pending_mutations) |pending| {
+        if (!std.mem.eql(u8, pending.key, pending_claim_key)) continue;
+        const value = pending.value orelse return error.TestExpectedEqual;
+        var parsed_claim = try std.json.parseFromSlice(std.json.Value, alloc, value, .{});
+        defer parsed_claim.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed_claim.value.object.get("version").?.integer);
+        try std.testing.expectEqualStrings("for_update", parsed_claim.value.object.get("mode").?.string);
+        try std.testing.expect(parsed_claim.value.object.get("skip_locked").?.bool);
+        try std.testing.expectEqualStrings("session:mutation", parsed_claim.value.object.get("owner_id").?.string);
+        try std.testing.expectEqual(@as(i64, 30_000), parsed_claim.value.object.get("lease_ms").?.integer);
+        try std.testing.expectEqual(@as(usize, 32), parsed_claim.value.object.get("txn_id").?.string.len);
+        found_claim_payload = true;
+    }
+    try std.testing.expect(found_claim_payload);
 
     try db.commitTransaction(mutation_txn, 2_010);
+    try std.testing.expect((try db.get(alloc, pending_claim_key)) == null);
 
     const select = [_][]const u8{ "id", "status" };
     var rows = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -61902,6 +78392,92 @@ test "relational rows mutation source updates claimed base rows transactionally"
             .predicates = predicates[0..],
         },
     }));
+
+    const routed_range = types.RelationalRowsDocKeyRange{ .start = "row:free1", .end = "row:free3" };
+    const ranged_txn = try db.beginTransaction(2_020);
+    defer db.abortTransaction(ranged_txn, 2_021) catch {};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .doc_key_range = routed_range,
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:mutation-ranged",
+                .txn_id = ranged_txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .doc_key_range = routed_range,
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:mutation-ranged",
+                .txn_id = ranged_txn,
+            },
+        },
+        .patch_expressions = patch_expressions[0..],
+    }, routed_range));
+}
+
+test "relational rows mutation source deletes all claimed base rows transactionally" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"ready\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"done\",\"rank\":3}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const mutation_txn = try db.beginTransaction(2_001);
+    var mutation = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .delete,
+        .source = .{
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:truncate",
+                .txn_id = mutation_txn,
+            },
+        },
+    });
+    defer mutation.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), mutation.matched);
+    try std.testing.expectEqual(@as(u32, 3), mutation.staged);
+    try std.testing.expectEqual(@as(usize, 0), mutation.returning_rows.len);
+
+    try db.commitTransaction(mutation_txn, 2_010);
+
+    var rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select_all = true,
+    });
+    defer rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), rows.total);
+    try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
 }
 
 test "relational rows query row claim skip locked limit fills from later candidates" {
@@ -62031,6 +78607,115 @@ test "relational rows query applies typed array and json predicates through inde
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"created_at\":30}", result.rows[0]);
 }
 
+test "relational rows query projects typed expression outputs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"},"created_at":{"type":"numeric"}},"required":["id","status","created_at"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ACTIVE\",\"tags\":[\"hot\",\"new\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"created_at\":30}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"ACTIVE\",\"tags\":[\"cold\"],\"attrs\":{\"billing\":{\"plan\":\"free\"}},\"created_at\":20}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select = [_][]const u8{"id"};
+    const lower_status_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+    }};
+    const next_created_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "created_at" },
+        .{ .kind = .value, .value_json = "1" },
+    };
+    const tag_count_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "tags",
+    }};
+    const attrs_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "attrs",
+    }};
+    const expressions = [_]types.RelationalRowsExpressionProjection{
+        .{
+            .output = "status_key",
+            .expression = .{ .kind = .lower, .operands = lower_status_operands[0..] },
+        },
+        .{
+            .output = "next_created",
+            .expression = .{ .kind = .add, .operands = next_created_operands[0..] },
+        },
+        .{
+            .output = "tag_count",
+            .expression = .{ .kind = .array_length, .operands = tag_count_operands[0..] },
+        },
+        .{
+            .output = "plan_text",
+            .expression = .{
+                .kind = .json_extract,
+                .json_path = "billing.plan",
+                .json_as_text = true,
+                .operands = attrs_operands[0..],
+            },
+        },
+    };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "created_at",
+        .direction = .desc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select[0..],
+        .select_all = false,
+        .expressions = expressions[0..],
+        .order_by = order_by[0..],
+        .limit = 1,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status_key\":\"active\",\"next_created\":31,\"tag_count\":2,\"plan_text\":\"pro\"}", result.rows[0]);
+
+    const select_all_extra_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "status_key",
+        .expression = .{ .kind = .lower, .operands = lower_status_operands[0..] },
+    }};
+    var select_all_extra = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select_all = true,
+        .expressions = select_all_extra_expressions[0..],
+        .order_by = order_by[0..],
+        .limit = 1,
+    });
+    defer select_all_extra.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), select_all_extra.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"ACTIVE\",\"tags\":[\"hot\",\"new\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"created_at\":30,\"status_key\":\"active\"}", select_all_extra.rows[0]);
+
+    const colliding_select_all_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "id",
+        .expression = .{ .kind = .lower, .operands = lower_status_operands[0..] },
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
+        .select_all = true,
+        .expressions = colliding_select_all_expressions[0..],
+    }));
+}
+
 test "relational rows query array_contains uses element index with authoritative recheck" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -62135,6 +78820,17 @@ test "relational rows query array_contains uses element index with authoritative
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"display\":\"b@example.test\",\"row_id\":\"b\"}", coalesce_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"display\":\"Alpha\",\"row_id\":\"a\"}", coalesce_result.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"display\":\"unknown\",\"row_id\":\"c\"}", coalesce_result.rows[2]);
+
+    const duplicate_alias = [_]types.RelationalRowsFieldAliasProjection{.{
+        .output = "display",
+        .field = "id",
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = select[0..],
+        .coalesce = coalesce[0..],
+        .field_aliases = duplicate_alias[0..],
+        .select_all = false,
+    }));
 
     const array_eq = [_]types.RelationalRowsArrayEqPredicate{.{
         .field = "tags",
@@ -62446,6 +79142,54 @@ test "relational rows aggregate supports distinct metric state" {
     try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"]}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":2,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":1,\"amount_sum\":14,\"distinct_amount_sum\":7,\"first_statuses\":[\"open\",\"closed\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"open\",\"closed\"]}", result.rows[1]);
 
+    const filter_open_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const filter_any_open = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "status" },
+        .op = .eq,
+        .rhs = filter_open_rhs[0..],
+    }};
+    const filter_amount_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "15",
+    }};
+    const filter_any_amount = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount" },
+        .op = .gt,
+        .rhs = filter_amount_rhs[0..],
+    }};
+    const filter_any = [_]types.RelationalRowsExpressionPredicateGroup{
+        .{ .conditions = filter_any_open[0..] },
+        .{ .conditions = filter_any_amount[0..] },
+    };
+    const filter_closed_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"closed\"",
+    }};
+    const filter_not_closed = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "status" },
+        .op = .eq,
+        .rhs = filter_closed_rhs[0..],
+    }};
+    const filter_not = [_]types.RelationalRowsExpressionPredicateGroup{.{ .conditions = filter_not_closed[0..] }};
+    const grouped_filter_aggregations = [_]types.RelationalRowsAggregateSpec{.{
+        .name = "filtered_amount_sum",
+        .op = .sum,
+        .field = "amount",
+        .filter_any = filter_any[0..],
+        .filter_not = filter_not[0..],
+    }};
+    var grouped_filter_result = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = grouped_filter_aggregations[0..],
+    });
+    defer grouped_filter_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), grouped_filter_result.total_groups);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"filtered_amount_sum\":20}", grouped_filter_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"filtered_amount_sum\":7}", grouped_filter_result.rows[1]);
+
     const having = [_]schema_mod.RelationalCheck{
         .{ .name = "", .field = "amount_sum", .op = .gt, .value_json = "20" },
     };
@@ -62459,6 +79203,60 @@ test "relational rows aggregate supports distinct metric state" {
     try std.testing.expectEqual(@as(usize, 1), filtered.rows.len);
     try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"]}", filtered.rows[0]);
 
+    const having_lhs_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount_sum" },
+        .{ .kind = .field, .field = "row_count" },
+    };
+    const having_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "30" }};
+    const having_expressions = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .sub, .operands = having_lhs_operands[0..] },
+        .op = .gt,
+        .rhs = having_rhs[0..],
+    }};
+    var expression_filtered = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+        .having_expressions = having_expressions[0..],
+    });
+    defer expression_filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), expression_filtered.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), expression_filtered.rows.len);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"]}", expression_filtered.rows[0]);
+
+    const any_high_amount_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "30" }};
+    const any_missing_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "100" }};
+    const having_any_conditions_0 = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount_sum" },
+        .op = .gt,
+        .rhs = any_high_amount_rhs[0..],
+    }};
+    const having_any_conditions_1 = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "row_count" },
+        .op = .gt,
+        .rhs = any_missing_rhs[0..],
+    }};
+    const having_any = [_]types.RelationalRowsExpressionPredicateGroup{
+        .{ .conditions = having_any_conditions_0[0..] },
+        .{ .conditions = having_any_conditions_1[0..] },
+    };
+    const not_low_amount_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "20" }};
+    const having_not_conditions = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount_sum" },
+        .op = .lt,
+        .rhs = not_low_amount_rhs[0..],
+    }};
+    const having_not = [_]types.RelationalRowsExpressionPredicateGroup{.{ .conditions = having_not_conditions[0..] }};
+    var grouped_filtered = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+        .having_any = having_any[0..],
+        .having_not = having_not[0..],
+    });
+    defer grouped_filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), grouped_filtered.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), grouped_filtered.rows.len);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"status_count\":2,\"lower_status_count\":2,\"open_lower_count\":2,\"amount_sum\":40,\"distinct_amount_sum\":30,\"first_statuses\":[\"open\",\"open\"],\"distinct_statuses\":[\"open\",\"closed\"],\"amount_ordered_statuses\":[\"closed\",\"open\"]}", grouped_filtered.rows[0]);
+
     const limited_distinct = [_]types.RelationalRowsAggregateSpec{
         .{ .name = "status_count", .op = .count, .field = "status", .distinct = true, .distinct_max_items = 1 },
     };
@@ -62466,6 +79264,135 @@ test "relational rows aggregate supports distinct metric state" {
         .group_by = group_by[0..],
         .aggregations = limited_distinct[0..],
     }));
+}
+
+test "relational rows aggregate folds json and array metric inputs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["id","customer"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:1", .value = "{\"id\":\"1\",\"customer\":\"alice\",\"tags\":[\"hot\",\"new\"],\"metadata\":{\"source\":\"api\",\"flags\":[\"a\"]}}" },
+            .{ .key = "row:2", .value = "{\"id\":\"2\",\"customer\":\"alice\",\"tags\":[\"new\"],\"metadata\":{\"source\":\"worker\",\"flags\":[\"b\"]}}" },
+            .{ .key = "row:3", .value = "{\"id\":\"3\",\"customer\":\"bob\",\"tags\":[],\"metadata\":{\"source\":\"api\",\"flags\":[]}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const group_by = [_][]const u8{"customer"};
+    const metadata_field = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "metadata",
+    }};
+    const flags_expression = types.RelationalRowsExpression{
+        .kind = .json_extract,
+        .json_path = "flags",
+        .operands = metadata_field[0..],
+    };
+    const source_expression = types.RelationalRowsExpression{
+        .kind = .json_extract,
+        .json_path = "source",
+        .json_as_text = true,
+        .operands = metadata_field[0..],
+    };
+    const aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "metadata_count", .op = .count, .field = "metadata" },
+        .{ .name = "source_count", .op = .count, .expression = source_expression, .distinct = true },
+        .{ .name = "tag_sets", .op = .array_agg, .field = "tags", .array_max_items = 4 },
+        .{ .name = "metadata_values", .op = .array_agg, .field = "metadata", .array_max_items = 4 },
+        .{ .name = "flag_sets", .op = .array_agg, .expression = flags_expression, .array_max_items = 4 },
+    };
+    var result = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .aggregations = aggregations[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"metadata_count\":2,\"source_count\":2,\"tag_sets\":[[\"hot\",\"new\"],[\"new\"]],\"metadata_values\":[{\"source\":\"api\",\"flags\":[\"a\"]},{\"source\":\"worker\",\"flags\":[\"b\"]}],\"flag_sets\":[[\"a\"],[\"b\"]]}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"metadata_count\":1,\"source_count\":1,\"tag_sets\":[[]],\"metadata_values\":[{\"source\":\"api\",\"flags\":[]}],\"flag_sets\":[[]]}", result.rows[1]);
+}
+
+test "relational rows aggregate groups by expression outputs" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","customer","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:1", .value = "{\"id\":\"1\",\"customer\":\"alice\",\"status\":\"OPEN\",\"amount\":10}" },
+            .{ .key = "row:2", .value = "{\"id\":\"2\",\"customer\":\"alice\",\"status\":\"open\",\"amount\":20}" },
+            .{ .key = "row:3", .value = "{\"id\":\"3\",\"customer\":\"alice\",\"status\":\"closed\",\"amount\":5}" },
+            .{ .key = "row:4", .value = "{\"id\":\"4\",\"customer\":\"bob\",\"status\":\"open\",\"amount\":7}" },
+        },
+        .sync_level = .write,
+    });
+
+    const group_by = [_][]const u8{"customer"};
+    const lower_status_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+    }};
+    const group_expressions = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = lower_status_operands[0..],
+        },
+    }};
+    const aggregations = [_]types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    const order_by = [_]types.RelationalRowsQueryOrder{
+        .{ .field = "customer", .direction = .asc },
+        .{ .field = "status_key", .direction = .asc },
+    };
+    var result = try db.aggregateRelationalRows(alloc, runtime_schema, .{
+        .group_by = group_by[0..],
+        .group_expressions = group_expressions[0..],
+        .aggregations = aggregations[0..],
+        .order_by = order_by[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"status_key\":\"closed\",\"row_count\":1,\"amount_sum\":5}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"status_key\":\"open\",\"row_count\":2,\"amount_sum\":30}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"status_key\":\"open\",\"row_count\":1,\"amount_sum\":7}", result.rows[2]);
 }
 
 test "relational rows join composes typed row-query streams" {
@@ -62518,6 +79445,10 @@ test "relational rows join composes typed row-query streams" {
         .{ .output = "customer_name", .side = .right, .field = "name" },
         .{ .output = "amount", .side = .left, .field = "amount" },
     };
+    const duplicate_select = [_]types.RelationalRowsJoinProjection{
+        .{ .output = "id", .side = .left, .field = "id" },
+        .{ .output = "id", .side = .right, .field = "id" },
+    };
     var result = try db.joinRelationalRows(alloc, runtime_schema, .{
         .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
         .right = .{ .predicates = right_predicates[0..] },
@@ -62533,6 +79464,497 @@ test "relational rows join composes typed row-query streams" {
     try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", result.rows[1]);
     try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", result.rows[2]);
+
+    const left_ranges = [_]types.RelationalRowsDocKeyRange{
+        .{ .start = "row:o1", .end = "row:o3" },
+        .{ .start = "row:o3", .end = "row:o4" },
+    };
+    const right_ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:c1",
+        .end = "row:c3",
+    }};
+    var routed = try db.joinRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .join_type = .left,
+        .select = select[0..],
+        .order_by = &.{.{ .field = "amount", .direction = .desc }},
+    }, left_ranges[0..], right_ranges[0..]);
+    defer routed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), routed.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), routed.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", routed.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", routed.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", routed.rows[2]);
+
+    const right_amount_expr = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount", .field_source = .source },
+        .{ .kind = .value, .value_json = "9" },
+    };
+    const residual_predicates = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .field, .field = "amount" },
+        .op = .gt,
+        .rhs = &.{.{ .kind = .add, .operands = right_amount_expr[0..] }},
+    }};
+    var residual = try db.joinRelationalRows(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .match_expression_predicates = residual_predicates[0..],
+        .join_type = .left,
+        .select = select[0..],
+        .order_by = &.{.{ .field = "amount", .direction = .desc }},
+    });
+    defer residual.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 1), residual.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", residual.rows[0]);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .join_type = .left,
+        .select = select[0..],
+    }, left_ranges[0..], &.{}));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .join_type = .left,
+        .select = select[0..],
+        .order_by = &.{.{ .field = "tenant", .direction = .asc }},
+    }, left_ranges[0..], right_ranges[0..]));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .join_type = .left,
+        .select = duplicate_select[0..],
+    }, left_ranges[0..], right_ranges[0..]));
+
+    const ctes = [_]types.RelationalRowsCte{
+        .{
+            .name = "orders",
+            .query = .{ .predicates = left_predicates[0..], .select_all = true },
+        },
+        .{
+            .name = "customers",
+            .query = .{ .predicates = right_predicates[0..], .select_all = true },
+        },
+    };
+    var ranged_cte_join = try db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = left_ranges[0..],
+        .right_ranges = right_ranges[0..],
+        .join = .{
+            .left = .{ .source_cte = "orders", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .left,
+            .select = select[0..],
+            .order_by = &.{.{ .field = "amount", .direction = .desc }},
+        },
+    });
+    defer ranged_cte_join.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), ranged_cte_join.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), ranged_cte_join.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", ranged_cte_join.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", ranged_cte_join.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", ranged_cte_join.rows[2]);
+
+    const overlapping_ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:",
+        .end = "row:z",
+    }};
+    var overlapping_cte_join = try db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = overlapping_ranges[0..],
+        .right_ranges = overlapping_ranges[0..],
+        .join = .{
+            .left = .{ .source_cte = "orders", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .left,
+            .select = select[0..],
+            .order_by = &.{.{ .field = "amount", .direction = .desc }},
+        },
+    });
+    defer overlapping_cte_join.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), overlapping_cte_join.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), overlapping_cte_join.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", overlapping_cte_join.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", overlapping_cte_join.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", overlapping_cte_join.rows[2]);
+
+    const unsorted_ranges = [_]types.RelationalRowsDocKeyRange{
+        .{ .start = "row:m", .end = "row:z" },
+        .{ .start = "row:a", .end = "row:m" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.joinRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = unsorted_ranges[0..],
+        .right_ranges = right_ranges[0..],
+        .join = .{
+            .left = .{ .source_cte = "orders", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "customers" },
+            .on = on[0..],
+            .join_type = .left,
+            .select = select[0..],
+        },
+    }));
+}
+
+test "relational joined mutation source stages target-side updates from source rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"},"rank":{"type":"numeric"}},"required":["kind","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:t1", .value = "{\"kind\":\"target\",\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":1,\"rank\":2}" },
+            .{ .key = "row:t2", .value = "{\"kind\":\"target\",\"id\":\"t2\",\"source_id\":\"missing\",\"status\":\"ready\",\"quantity\":3,\"rank\":1}" },
+            .{ .key = "row:t3", .value = "{\"kind\":\"target\",\"id\":\"t3\",\"source_id\":\"s1\",\"status\":\"expired\",\"quantity\":9,\"rank\":3}" },
+            .{ .key = "row:t4", .value = "{\"kind\":\"target\",\"id\":\"t4\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":50,\"rank\":0}" },
+            .{ .key = "row:s1", .value = "{\"kind\":\"source\",\"id\":\"s1\",\"status\":\"SOURCE\",\"quantity\":42}" },
+        },
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(10_000);
+    const left_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"target\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"ready\"" },
+    };
+    const right_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"source\"" },
+    };
+    const on = [_]types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "id",
+    }};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    const source_assignments = [_]types.RelationalRowsJoinedMutationFieldAssignment{.{
+        .field = "quantity",
+        .source_side = .right,
+        .source_field = "quantity",
+    }};
+    const duplicate_source_assignments = [_]types.RelationalRowsJoinedMutationFieldAssignment{
+        .{
+            .field = "quantity",
+            .source_side = .right,
+            .source_field = "quantity",
+        },
+        .{
+            .field = "quantity",
+            .source_side = .right,
+            .source_field = "rank",
+        },
+    };
+    const colliding_joined_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "quantity",
+        .value_json = "0",
+    }};
+    const returning = [_][]const u8{ "id", "status", "quantity" };
+    const source_returning = [_]types.RelationalRowsExpressionProjection{.{
+        .output = "source_status",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{
+                .kind = .field,
+                .field = "status",
+                .field_source = .source,
+            }},
+        },
+    }};
+    const joined_match_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "quantity",
+        .field_source = .source,
+    }};
+    const joined_match_predicates = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{
+            .kind = .field,
+            .field = "quantity",
+        },
+        .op = .lt,
+        .rhs = joined_match_rhs[0..],
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsJoinedSourceAlloc(alloc, runtime_schema, .{
+        .kind = .update,
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = left_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .predicates = right_predicates[0..] },
+            .on = on[0..],
+        },
+        .source_assignments = duplicate_source_assignments[0..],
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsJoinedSourceAlloc(alloc, runtime_schema, .{
+        .kind = .update,
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = left_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .predicates = right_predicates[0..] },
+            .on = on[0..],
+        },
+        .source_assignments = source_assignments[0..],
+        .operations = colliding_joined_operations[0..],
+    }));
+
+    var result = try db.mutateRelationalRowsJoinedSourceAlloc(alloc, runtime_schema, .{
+        .kind = .update,
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = left_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .predicates = right_predicates[0..] },
+            .on = on[0..],
+            .order_by = order_by[0..],
+            .limit = 1,
+        },
+        .match_expression_predicates = joined_match_predicates[0..],
+        .source_assignments = source_assignments[0..],
+        .operations = &.{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"synced\"",
+        }},
+        .returning = returning[0..],
+        .returning_expressions = source_returning[0..],
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"synced\",\"quantity\":42,\"source_status\":\"source\"}", result.returning_rows[0]);
+
+    try db.commitTransaction(txn_id, 10_001);
+
+    var target = (try db.lookup(alloc, "row:t1", .{})).?;
+    defer target.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, target.json, "\"status\":\"synced\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.json, "\"quantity\":42") != null);
+
+    var unmatched = (try db.lookup(alloc, "row:t2", .{})).?;
+    defer unmatched.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, unmatched.json, "\"quantity\":3") != null);
+
+    var filtered = (try db.lookup(alloc, "row:t4", .{})).?;
+    defer filtered.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.json, "\"status\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.json, "\"quantity\":50") != null);
+
+    const delete_txn_id = try db.beginTransaction(20_000);
+    const delete_left_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "kind", .op = .eq, .value_json = "\"target\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"expired\"" },
+    };
+    const delete_returning = [_][]const u8{ "id", "status" };
+    var delete_result = try db.mutateRelationalRowsJoinedSourceAlloc(alloc, runtime_schema, .{
+        .kind = .delete,
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = delete_left_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined-delete",
+                    .txn_id = delete_txn_id,
+                },
+            },
+            .right = .{ .predicates = right_predicates[0..] },
+            .on = on[0..],
+        },
+        .returning = delete_returning[0..],
+        .returning_expressions = source_returning[0..],
+    });
+    defer delete_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), delete_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t3\",\"status\":\"expired\",\"source_status\":\"source\"}", delete_result.returning_rows[0]);
+
+    try db.commitTransaction(delete_txn_id, 20_001);
+    try std.testing.expect((try db.lookup(alloc, "row:t3", .{})) == null);
+}
+
+test "relational joined mutation source stages target updates with separate source schema" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"target_rows","enforce_types":true,"document_schemas":{"target_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_target_schema = try table_schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target_schema.deinit(alloc);
+    const target_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_target_schema);
+    defer schema_mod.freeSchema(alloc, target_schema);
+    try db.setSchema(target_schema);
+
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"source_rows","enforce_types":true,"document_schemas":{"source_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"state":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_source_schema = try table_schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source_schema.deinit(alloc);
+    const source_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
+    defer schema_mod.freeSchema(alloc, source_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "target:t1",
+            .value = "{\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":1}",
+        }},
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(10_000);
+    const target_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"ready\"",
+    }};
+    const source_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "state",
+        .op = .eq,
+        .value_json = "\"source\"",
+    }};
+    const on = [_]types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "id",
+    }};
+    const source_assignments = [_]types.RelationalRowsJoinedMutationFieldAssignment{.{
+        .field = "quantity",
+        .source_side = .right,
+        .source_field = "source_quantity",
+    }};
+    const returning = [_][]const u8{ "id", "quantity" };
+    const req = types.RelationalRowsJoinedMutationSourceRequest{
+        .kind = .update,
+        .source_table = "source_rows",
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = target_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:cross-table-joined",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .predicates = source_predicates[0..] },
+            .on = on[0..],
+        },
+        .source_assignments = source_assignments[0..],
+        .returning = returning[0..],
+    };
+
+    const source_range = types.RelationalRowsDocKeyRange{ .start = "source:a", .end = "source:z" };
+    const bad_target_on = [_]types.RelationalRowsJoinOn{.{
+        .left_field = "missing_source_id",
+        .right_field = "id",
+    }};
+    var bad_target_join_req = req;
+    bad_target_join_req.join.on = bad_target_on[0..];
+    try std.testing.expectError(error.InvalidQueryRequest, db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, bad_target_join_req, null));
+
+    const bad_source_on = [_]types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "missing_source_pk",
+    }};
+    var bad_source_join_req = req;
+    bad_source_join_req.join.on = bad_source_on[0..];
+    try std.testing.expectError(error.InvalidQueryRequest, db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, source_schema, bad_source_join_req, source_range));
+
+    var embedded_source_range_req = req;
+    embedded_source_range_req.join.right.doc_key_range = source_range;
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsJoinedMutationSourceSideOnlyForRangeAlloc(alloc, source_schema, embedded_source_range_req, source_range));
+
+    var target_candidates = try db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+    errdefer {
+        for (target_candidates) |*candidate| candidate.deinit(alloc);
+        if (target_candidates.len > 0) alloc.free(target_candidates);
+    }
+    const source_rows = [_][]const u8{
+        "{\"id\":\"s1\",\"state\":\"source\",\"source_quantity\":42}",
+    };
+    var candidates = try DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows[0..]);
+    errdefer {
+        for (candidates) |*candidate| candidate.deinit(alloc);
+        if (candidates.len > 0) alloc.free(candidates);
+    }
+    var plan = try DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
+    defer plan.deinit(alloc);
+
+    var result = try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"quantity\":42}", result.returning_rows[0]);
+
+    try db.commitTransaction(txn_id, 10_001);
+
+    var target = (try db.lookup(alloc, "target:t1", .{})).?;
+    defer target.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, target.json, "\"quantity\":42") != null);
 }
 
 test "relational rows lateral join runs bounded correlated right query per left row" {
@@ -62557,9 +79979,9 @@ test "relational rows lateral join runs bounded correlated right query per left 
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "row:org:o1", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o1\"}" },
-            .{ .key = "row:org:o2", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o2\"}" },
-            .{ .key = "row:org:o3", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o3\"}" },
+            .{ .key = "row:org:o1", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o1\",\"amount\":3}" },
+            .{ .key = "row:org:o2", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o2\",\"amount\":1}" },
+            .{ .key = "row:org:o3", .value = "{\"kind\":\"organization\",\"tenant\":\"t1\",\"id\":\"o3\",\"amount\":20}" },
             .{ .key = "row:bal:b1", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b1\",\"organization_id\":\"o1\",\"amount\":5,\"created_at\":10}" },
             .{ .key = "row:bal:b2", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b2\",\"organization_id\":\"o1\",\"amount\":9,\"created_at\":20}" },
             .{ .key = "row:bal:b3", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b3\",\"organization_id\":\"o2\",\"amount\":7,\"created_at\":15}" },
@@ -62590,6 +80012,10 @@ test "relational rows lateral join runs bounded correlated right query per left 
         .{ .output = "latest_amount", .side = .right, .field = "amount" },
         .{ .output = "latest_created_at", .side = .right, .field = "created_at" },
     };
+    const duplicate_select = [_]types.RelationalRowsJoinProjection{
+        .{ .output = "id", .side = .left, .field = "id" },
+        .{ .output = "id", .side = .right, .field = "id" },
+    };
 
     var result = try db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
         .lateral = .{
@@ -62606,6 +80032,222 @@ test "relational rows lateral join runs bounded correlated right query per left 
     try std.testing.expectEqualStrings("{\"organization_id\":\"o1\",\"latest_amount\":9,\"latest_created_at\":20}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"organization_id\":\"o2\",\"latest_amount\":7,\"latest_created_at\":15}", result.rows[1]);
     try std.testing.expectEqualStrings("{\"organization_id\":\"o3\",\"latest_amount\":null,\"latest_created_at\":null}", result.rows[2]);
+
+    const residual_operands = [_]types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount", .field_source = .source },
+        .{ .kind = .field, .field = "amount" },
+    };
+    const residual_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "10",
+    }};
+    const residual_predicates = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .add, .operands = residual_operands[0..] },
+        .op = .gt,
+        .rhs = residual_rhs[0..],
+    }};
+    var residual_result = try db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .lateral = .{
+            .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+            .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .match_expression_predicates = residual_predicates[0..],
+            .select = select[0..],
+        },
+    });
+    defer residual_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), residual_result.total_rows);
+    try std.testing.expectEqual(@as(usize, 1), residual_result.rows.len);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o1\",\"latest_amount\":9,\"latest_created_at\":20}", residual_result.rows[0]);
+
+    const left_ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:org:o1",
+        .end = "row:org:o4",
+    }};
+    const right_ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:bal:b1",
+        .end = "row:bal:b4",
+    }};
+    var routed = try db.lateralRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+        .correlations = correlations[0..],
+        .select = select[0..],
+    }, left_ranges[0..], right_ranges[0..]);
+    defer routed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), routed.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), routed.rows.len);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o1\",\"latest_amount\":9,\"latest_created_at\":20}", routed.rows[0]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o2\",\"latest_amount\":7,\"latest_created_at\":15}", routed.rows[1]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o3\",\"latest_amount\":null,\"latest_created_at\":null}", routed.rows[2]);
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+        .correlations = correlations[0..],
+        .select = select[0..],
+    }, left_ranges[0..], &.{}));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+        .correlations = correlations[0..],
+        .select = select[0..],
+        .order_by = &.{.{ .field = "amount", .direction = .asc }},
+    }, left_ranges[0..], right_ranges[0..]));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+        .correlations = correlations[0..],
+        .select = duplicate_select[0..],
+    }, left_ranges[0..], right_ranges[0..]));
+
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .left = .{
+            .predicates = left_predicates[0..],
+            .order_by = left_order[0..],
+            .doc_key_range = .{ .start = "row:a", .end = "row:z" },
+        },
+        .right = .{ .predicates = right_predicates[0..], .order_by = right_order[0..], .limit = 1 },
+        .correlations = correlations[0..],
+        .select = select[0..],
+    }, left_ranges[0..], right_ranges[0..]));
+
+    const ctes = [_]types.RelationalRowsCte{
+        .{
+            .name = "organizations",
+            .query = .{ .predicates = left_predicates[0..], .select_all = true },
+        },
+        .{
+            .name = "balances",
+            .query = .{ .predicates = right_predicates[0..], .select_all = true },
+        },
+    };
+    var ranged_cte_lateral = try db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = left_ranges[0..],
+        .right_ranges = right_ranges[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "organizations", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    });
+    defer ranged_cte_lateral.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), ranged_cte_lateral.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), ranged_cte_lateral.rows.len);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o1\",\"latest_amount\":9,\"latest_created_at\":20}", ranged_cte_lateral.rows[0]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o2\",\"latest_amount\":7,\"latest_created_at\":15}", ranged_cte_lateral.rows[1]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o3\",\"latest_amount\":null,\"latest_created_at\":null}", ranged_cte_lateral.rows[2]);
+
+    const overlapping_ranges = [_]types.RelationalRowsDocKeyRange{.{
+        .start = "row:",
+        .end = "row:z",
+    }};
+    var overlapping_cte_lateral = try db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = overlapping_ranges[0..],
+        .right_ranges = overlapping_ranges[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "organizations", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    });
+    defer overlapping_cte_lateral.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), overlapping_cte_lateral.total_rows);
+    try std.testing.expectEqual(@as(usize, 3), overlapping_cte_lateral.rows.len);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o1\",\"latest_amount\":9,\"latest_created_at\":20}", overlapping_cte_lateral.rows[0]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o2\",\"latest_amount\":7,\"latest_created_at\":15}", overlapping_cte_lateral.rows[1]);
+    try std.testing.expectEqualStrings("{\"organization_id\":\"o3\",\"latest_amount\":null,\"latest_created_at\":null}", overlapping_cte_lateral.rows[2]);
+
+    const unsorted_ranges = [_]types.RelationalRowsDocKeyRange{
+        .{ .start = "row:m", .end = "row:z" },
+        .{ .start = "row:a", .end = "row:m" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = left_ranges[0..],
+        .right_ranges = unsorted_ranges[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "organizations", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    }));
+
+    const projected_balance_select = [_][]const u8{ "organization_id", "created_at" };
+    const projected_balance_ctes = [_]types.RelationalRowsCte{
+        ctes[0],
+        ctes[1],
+        .{
+            .name = "projected_balances",
+            .query = .{
+                .source_cte = "balances",
+                .select = projected_balance_select[0..],
+                .select_all = false,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_balance_ctes[0..],
+        .left_ranges = overlapping_ranges[0..],
+        .right_ranges = overlapping_ranges[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "organizations", .order_by = left_order[0..] },
+            .right = .{ .source_cte = "projected_balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    }));
+
+    const projected_organization_select = [_][]const u8{"tenant"};
+    const projected_organization_ctes = [_]types.RelationalRowsCte{
+        ctes[0],
+        ctes[1],
+        .{
+            .name = "projected_organizations",
+            .query = .{
+                .source_cte = "organizations",
+                .select = projected_organization_select[0..],
+                .select_all = false,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = projected_organization_ctes[0..],
+        .left_ranges = overlapping_ranges[0..],
+        .right_ranges = overlapping_ranges[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "projected_organizations" },
+            .right = .{ .source_cte = "balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = overlapping_ranges[0..],
+        .right_ranges = overlapping_ranges[0..],
+        .lateral = .{
+            .left = .{
+                .source_cte = "organizations",
+                .row_claim = .{ .owner_id = "reader" },
+            },
+            .right = .{ .source_cte = "balances", .order_by = right_order[0..], .limit = 1 },
+            .correlations = correlations[0..],
+            .select = select[0..],
+        },
+    }));
 
     try std.testing.expectError(error.UnsupportedQueryRequest, db.lateralRelationalRowsPlan(alloc, runtime_schema, .{
         .lateral = .{

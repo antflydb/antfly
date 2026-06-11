@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -10,7 +10,6 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.rows_array_update_transform import RowsArrayUpdateTransform
-    from ..models.rows_conflict_target import RowsConflictTarget
     from ..models.rows_expression_assignment_map import RowsExpressionAssignmentMap
     from ..models.rows_expression_condition import RowsExpressionCondition
     from ..models.rows_field_patch import RowsFieldPatch
@@ -29,7 +28,7 @@ class RowsOnConflict:
     reference `existing` and `proposed` row images.
 
         Attributes:
-            target (RowsConflictTarget): Primary-key or named unique constraint conflict target.
+            target (Any): Primary-key or named unique constraint conflict target.
             action (RowsOnConflictAction):
             patch (RowsFieldPatch | Unset): Static field patch for top-level relational columns. Primary-key fields
                 are rejected by the server.
@@ -44,7 +43,7 @@ class RowsOnConflict:
                 AST.
     """
 
-    target: RowsConflictTarget
+    target: Any
     action: RowsOnConflictAction
     patch: RowsFieldPatch | Unset = UNSET
     increment: RowsNumericIncrement | Unset = UNSET
@@ -55,7 +54,8 @@ class RowsOnConflict:
     where_expression: RowsExpressionCondition | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        target = self.target.to_dict()
+        target: Any
+        target = self.target
 
         action = self.action.value
 
@@ -121,7 +121,6 @@ class RowsOnConflict:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.rows_array_update_transform import RowsArrayUpdateTransform
-        from ..models.rows_conflict_target import RowsConflictTarget
         from ..models.rows_expression_assignment_map import RowsExpressionAssignmentMap
         from ..models.rows_expression_condition import RowsExpressionCondition
         from ..models.rows_field_patch import RowsFieldPatch
@@ -129,7 +128,11 @@ class RowsOnConflict:
         from ..models.rows_numeric_increment import RowsNumericIncrement
 
         d = dict(src_dict)
-        target = RowsConflictTarget.from_dict(d.pop("target"))
+
+        def _parse_target(data: object) -> Any:
+            return cast(Any, data)
+
+        target = _parse_target(d.pop("target"))
 
         action = RowsOnConflictAction(d.pop("action"))
 

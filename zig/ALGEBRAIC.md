@@ -1726,7 +1726,7 @@ proved exact.
 ### Public Query Contract
 
 Public search requests now have a canonical `query` field for structured query
-trees. Compatibility request fields are normalized into that tree before
+trees. Public shorthand request fields are normalized into that tree before
 algebraic, full-text, vector, graph, and join planning: `full_text_search`
 becomes scoring `bool.must`, `filter_query` becomes non-scoring `bool.filter`,
 and `exclusion_query` becomes `bool.must_not`.
@@ -1838,7 +1838,7 @@ using `materialized_expr` as the durable tensor-cache row name because that is a
 physical implementation detail, not a user-facing lifecycle API.
 
 The stable public query surface is the normalized structured `query` tree.
-Compatibility shorthands normalize into that tree at the API boundary. Typed
+Public shorthands normalize into that tree at the API boundary. Typed
 terms, path aliases, `terms`, and `exists` are the algebraic filter surface;
 query strings remain a full-text escape hatch rather than the algebraic planning
 contract.
@@ -1862,7 +1862,7 @@ Fine-grained records such as `AlgebraicCapabilityStats`,
 `AlgebraicAdaptiveCandidateStatus`, and
 `AlgebraicAdaptiveCandidateDecisionStatus` are useful internal/debug data, but
 they should not be stable public OpenAPI schemas. If operators need them, add an
-explicit diagnostics/admin surface with separate compatibility expectations, or
+explicit diagnostics/admin surface with separate stability expectations, or
 emit them through benchmark/debug JSONL where the shape can evolve.
 
 So the answer to whether the public API needs every algebraic status type is no.
@@ -1873,7 +1873,7 @@ or diagnostics data. They are still important for benchmarks, debug endpoints,
 and internal recovery decisions, but making each one a public schema would lock
 the storage and adaptive policy model too early.
 
-This is the compatibility rule for the public API:
+This is the public/private boundary for the API:
 
 ```text
 public:   AlgebraicIndexStats
@@ -1914,7 +1914,7 @@ Detailed decision history, candidate scoring inputs, policy-drift records,
 canonical recommendation hashes, dictionary ownership rows, error document keys,
 worker sequence cursors, and tensor-program proof internals belong in
 debug/admin diagnostics or benchmark JSONL, where they can evolve without
-becoming a broad public compatibility burden.
+becoming a broad public stability burden.
 
 ### Coverage And Selection
 
@@ -2360,7 +2360,7 @@ above and remove the temporary roadmap item.
    active-progress facts into `AlgebraicIndexStats`. If detailed
    adaptive/capability diagnostics are needed, expose them separately from normal
    index status and keep the default OpenAPI schema compact. Treat additions to
-   `AlgebraicIndexStats` as a compatibility-budget decision: prefer coarse
+   `AlgebraicIndexStats` as a public API stability-budget decision: prefer coarse
    counters and latest operator-relevant reasons, and keep candidate lists,
    proof objects, expression ids, dictionary registries, policy-scoring inputs,
    exact error document keys, decision-history counts, policy-drift counts,

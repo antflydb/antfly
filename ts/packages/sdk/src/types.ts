@@ -70,6 +70,8 @@ export type MultiBatchResult = components["schemas"]["MultiBatchResponse"];
 export type LinearMergeRequest = components["schemas"]["LinearMergeRequest"];
 export type LinearMergeResult = components["schemas"]["LinearMergeResult"];
 
+export type RowFilterEntry = components["schemas"]["RowFilterEntry"];
+
 // Relational row plan types
 export type RowsPlanRequest = components["schemas"]["RowsPlanRequest"];
 export type RowsQueryPlanRequest = components["schemas"]["RowsQueryPlanRequest"];
@@ -82,9 +84,19 @@ export type RowUniqueSelector = components["schemas"]["RowUniqueSelector"];
 export type RowSelector = components["schemas"]["RowSelector"];
 export type RowOperation = components["schemas"]["RowOperation"];
 export type RowsBatchRequest = components["schemas"]["RowsBatchRequest"];
+export type RowsGetRequest = components["schemas"]["RowsGetRequest"];
+export type RowsGetResult = components["schemas"]["RowsGetResult"];
+export type RowsGetResultSet = components["schemas"]["RowsGetResultSet"];
 export type RowsQueryRequest = components["schemas"]["RowsQueryRequest"];
+export type RowsWhere = components["schemas"]["RowsWhere"];
+export type RowsWhereAtom = components["schemas"]["RowsWhereAtom"];
+export type RowsWhereBranch = components["schemas"]["RowsWhereBranch"];
+export type RowsWhereBranchAll = components["schemas"]["RowsWhereBranchAll"];
+export type RowsWhereBranchAtom = components["schemas"]["RowsWhereBranchAtom"];
 export type RowsCte = components["schemas"]["RowsCte"];
 export type RowsQueryOrder = components["schemas"]["RowsQueryOrder"];
+export type RowsQueryOrderField = components["schemas"]["RowsQueryOrderField"];
+export type RowsQueryOrderExpression = components["schemas"]["RowsQueryOrderExpression"];
 export type RowsRowClaim = components["schemas"]["RowsRowClaim"];
 export type RowsDocKeyRange = components["schemas"]["RowsDocKeyRange"];
 export type RowsRowDocument = components["schemas"]["RowsRowDocument"];
@@ -101,10 +113,15 @@ export type RowsOnConflict = components["schemas"]["RowsOnConflict"];
 export type RowsJsonExtractProjection = components["schemas"]["RowsJsonExtractProjection"];
 export type RowsArrayLengthProjection = components["schemas"]["RowsArrayLengthProjection"];
 export type RowsCoalesceOperand = components["schemas"]["RowsCoalesceOperand"];
+export type RowsCoalesceFieldOperand = components["schemas"]["RowsCoalesceFieldOperand"];
+export type RowsCoalesceValueOperand = components["schemas"]["RowsCoalesceValueOperand"];
 export type RowsCoalesceProjection = components["schemas"]["RowsCoalesceProjection"];
 export type RowsFieldAliasProjection = components["schemas"]["RowsFieldAliasProjection"];
 export type RowsExpression = components["schemas"]["RowsExpression"];
 export type RowsExpressionCaseBranch = components["schemas"]["RowsExpressionCaseBranch"];
+export type RowsExpressionField = components["schemas"]["RowsExpressionField"];
+export type RowsExpressionValue = components["schemas"]["RowsExpressionValue"];
+export type RowsExpressionOperator = components["schemas"]["RowsExpressionOperator"];
 export type RowsExpressionCondition = components["schemas"]["RowsExpressionCondition"];
 export type RowsExpressionConditionGroup = components["schemas"]["RowsExpressionConditionGroup"];
 export type RowsExpressionArrayContainsPredicate = components["schemas"]["RowsExpressionArrayContainsPredicate"];
@@ -114,10 +131,17 @@ export type RowsAggregateSpec = components["schemas"]["RowsAggregateSpec"];
 export type RowsAggregateHaving = components["schemas"]["RowsAggregateHaving"];
 export type RowsAggregateHavingPredicate = components["schemas"]["RowsAggregateHavingPredicate"];
 export type RowsWindowRequest = components["schemas"]["RowsWindowRequest"];
+export type RowsWindowFrame = components["schemas"]["RowsWindowFrame"];
 export type RowsWindowSpec = components["schemas"]["RowsWindowSpec"];
 export type RowsJoinRequest = components["schemas"]["RowsJoinRequest"];
 export type RowsJoinOn = components["schemas"]["RowsJoinOn"];
 export type RowsJoinProjection = components["schemas"]["RowsJoinProjection"];
+export type RowsJoinedMutationSourceAssignment =
+  components["schemas"]["RowsJoinedMutationSourceAssignment"];
+export type RowsJoinedMutationSourceRequest =
+  components["schemas"]["RowsJoinedMutationSourceRequest"];
+export type RowsInsertSourceAssignment = components["schemas"]["RowsInsertSourceAssignment"];
+export type RowsInsertSourceRequest = components["schemas"]["RowsInsertSourceRequest"];
 export type RowsLateralRequest = components["schemas"]["RowsLateralRequest"];
 export type RowsLateralCorrelation = components["schemas"]["RowsLateralCorrelation"];
 export type RowsMutationSourceRequest = components["schemas"]["RowsMutationSourceRequest"];
@@ -155,6 +179,8 @@ export type IndexStatus = components["schemas"]["IndexStatus"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];
+export type GraphIndexStats = components["schemas"]["GraphIndexStats"];
+export type GraphMetricRuntimeStats = components["schemas"]["GraphMetricRuntimeStats"];
 export type EdgeTypeConfig = components["schemas"]["EdgeTypeConfig"];
 export type EdgeTopology = NonNullable<EdgeTypeConfig["topology"]>;
 

@@ -225,6 +225,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
                 .indexed = if (property.antfly_index) |indexed| indexed else true,
                 .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
                 .index_generation = property.index_generation orelse 0,
+                .index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null,
                 .default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null,
                 .on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null,
                 .generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null,
@@ -299,6 +300,7 @@ fn cloneRelationalGeneratedValue(
     return .{
         .op = switch (value.op) {
             .lower => .lower,
+            .upper => .upper,
             .concat => .concat,
         },
         .field = if (value.field) |field| try alloc.dupe(u8, field) else null,
@@ -495,6 +497,7 @@ fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueE
         out[initialized] = .{
             .op = switch (value.op) {
                 .lower => .lower,
+                .upper => .upper,
             },
             .field = try alloc.dupe(u8, value.field),
         };

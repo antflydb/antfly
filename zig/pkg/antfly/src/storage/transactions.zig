@@ -73,6 +73,16 @@ pub const OwnedIntentMutation = struct {
     }
 };
 
+pub const PendingIntentInfo = struct {
+    txn_id: TxnId,
+    value: ?[]u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const VersionPredicate = struct {
     key: []const u8,
     expected_version: u64, // 0 = key must not exist
@@ -199,6 +209,9 @@ pub const TxnManager = struct {
         intents: []const WriteIntent,
         predicates: []const VersionPredicate,
     ) !void {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.status != .pending) return TxnError.DecisionConflict;
+
         // Emit CheckPredicates before checks: TLA+ spec models this as an
         // always-succeeding snapshot step; WriteIntentFails detects conflicts.
         if (self.trace_writer) |tw| {
@@ -442,6 +455,51 @@ pub const TxnManager = struct {
                 .value = owned_value,
             });
             owned_key_pending = false;
+            owned_value_pending = false;
+        }
+
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn collectPendingIntentsForKeyAlloc(
+        self: *TxnManager,
+        alloc: Allocator,
+        user_key: []const u8,
+        exclude_txn: ?TxnId,
+    ) ![]PendingIntentInfo {
+        const all_intents = try self.scanPrefix(alloc, intents_prefix);
+        defer backend_scan.freeResults(alloc, all_intents);
+
+        var out = std.ArrayListUnmanaged(PendingIntentInfo).empty;
+        errdefer {
+            for (out.items) |*item| item.deinit(alloc);
+            out.deinit(alloc);
+        }
+
+        for (all_intents) |entry| {
+            if (entry.key.len < intents_prefix.len + 17) continue;
+            const entry_txn_id = entry.key[intents_prefix.len..][0..16].*;
+            if (exclude_txn) |txn_id| {
+                if (std.mem.eql(u8, &entry_txn_id, &txn_id)) continue;
+            }
+            const entry_user_key = entry.key[intents_prefix.len + 17 ..];
+            if (!std.mem.eql(u8, entry_user_key, user_key)) continue;
+
+            const status = self.getTransactionStatus(entry_txn_id) catch continue;
+            if (status != .pending) continue;
+
+            const owned_value = if (entry.value.len > 0 and entry.value[0] == 1)
+                null
+            else
+                try alloc.dupe(u8, if (entry.value.len > 1) entry.value[1..] else "");
+            var owned_value_pending = owned_value != null;
+            errdefer if (owned_value_pending) {
+                if (owned_value) |value| alloc.free(value);
+            };
+            try out.append(alloc, .{
+                .txn_id = entry_txn_id,
+                .value = owned_value,
+            });
             owned_value_pending = false;
         }
 

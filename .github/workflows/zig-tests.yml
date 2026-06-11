@@ -173,6 +173,38 @@ jobs:
       - name: Check OpenAPI generated sources
         run: make zig-openapi-check
 
+      - name: Run SQL/API typed-plan parity gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-sql-api-parity-test
+
+      - name: Run graph metric lifecycle gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-lifecycle-test
+
+      - name: Run graph metric cleanup gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-cleanup-test
+
+      - name: Run graph metric degree canary gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-degree-canary-test
+
+      - name: Run graph metric default auto gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-default-gate-test
+
+      - name: Run graph metric fan-in gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-fan-in-test
+
+      - name: Run graph metric operations gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-graph-metric-operations-test
+
+      - name: Run public API graph metric e2e gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-public-api-graph-metric-e2e-test
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         run: make zig-unit-test
@@ -278,6 +310,33 @@ jobs:
 
       - name: Verify Zig version
         run: zig version
+
+      - name: Run SQL/API typed-plan parity gate
+        run: make zig-sql-api-parity-test
+
+      - name: Run graph metric lifecycle gate
+        run: make zig-graph-metric-lifecycle-test
+
+      - name: Run graph metric cleanup gate
+        run: make zig-graph-metric-cleanup-test
+
+      - name: Run graph metric degree canary gate
+        run: make zig-graph-metric-degree-canary-test
+
+      - name: Run graph metric default auto gate
+        run: make zig-graph-metric-default-gate-test
+
+      - name: Run graph metric fan-in gate
+        run: make zig-graph-metric-fan-in-test
+
+      - name: Run graph metric operations gate
+        run: make zig-graph-metric-operations-test
+
+      - name: Run public API graph metric e2e gate
+        run: make zig-public-api-graph-metric-e2e-test
+
+      - name: Run graph metric process ownership gate
+        run: make zig-graph-metric-process-test
 
       - name: Run full Zig unit tests
         run: make zig-unit-test

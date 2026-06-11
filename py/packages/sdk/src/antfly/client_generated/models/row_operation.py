@@ -4,16 +4,13 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.row_operation_op import RowOperationOp
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.row_selector import RowSelector
     from ..models.rows_array_update_transform import RowsArrayUpdateTransform
     from ..models.rows_expression_assignment_map import RowsExpressionAssignmentMap
-    from ..models.rows_expression_condition import RowsExpressionCondition
     from ..models.rows_expression_projection import RowsExpressionProjection
     from ..models.rows_field_patch import RowsFieldPatch
     from ..models.rows_json_set_transform import RowsJsonSetTransform
@@ -32,15 +29,18 @@ class RowOperation:
     applies a non-upsert patch by primary or unique identity, and `delete`
     removes by primary or unique identity. `update.patch` cannot change
     primary-key components. Missing unique selectors fail the write request
-    rather than falling back to scans.
+    rather than falling back to scans. The operation envelope is exact and
+    operation-specific: unsupported fields for the selected `op` fail
+    validation instead of being ignored.
 
         Attributes:
             op (RowOperationOp):
             row (RowsRowDocument | Unset): Full relational row document. Keys are declared relational columns and
                 values are JSON values coerced through the table schema before storage.
-            where (RowSelector | Unset): Structured row selector. `primary` addresses declared primary-key
+            where (Any | Unset): Structured row selector. `primary` addresses declared primary-key
                 tables directly. `unique` addresses a declared unique constraint through
-                durable unique-owner rows.
+                durable unique-owner rows. The selector is exact and accepts exactly one
+                of `primary` or `unique`.
             patch (RowsFieldPatch | Unset): Static field patch for top-level relational columns. Primary-key fields
                 are rejected by the server.
             increment (RowsNumericIncrement | Unset): Numeric increment map keyed by declared numeric columns.
@@ -54,8 +54,6 @@ class RowOperation:
                 when the target already exists. `update` applies the same typed update
                 operators as ordinary row updates, with expression sources allowed to
                 reference `existing` and `proposed` row images.
-            where_expression (RowsExpressionCondition | Unset): Computed expression predicate over the shared row-expression
-                AST.
             returning (list[str] | Unset): Fields to return from the committed mutation image. `*` returns the full row and
                 cannot be combined with expression projections.
             returning_expressions (list[RowsExpressionProjection] | Unset): Typed row-expression projections from the
@@ -66,7 +64,7 @@ class RowOperation:
 
     op: RowOperationOp
     row: RowsRowDocument | Unset = UNSET
-    where: RowSelector | Unset = UNSET
+    where: Any | Unset = UNSET
     patch: RowsFieldPatch | Unset = UNSET
     increment: RowsNumericIncrement | Unset = UNSET
     patch_expr: RowsExpressionAssignmentMap | Unset = UNSET
@@ -74,11 +72,9 @@ class RowOperation:
     json_set: list[RowsJsonSetTransform] | Unset = UNSET
     array_update: list[RowsArrayUpdateTransform] | Unset = UNSET
     on_conflict: RowsOnConflict | Unset = UNSET
-    where_expression: RowsExpressionCondition | Unset = UNSET
     returning: list[str] | Unset = UNSET
     returning_expressions: list[RowsExpressionProjection] | Unset = UNSET
     expected_version: int | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         op = self.op.value
@@ -87,9 +83,11 @@ class RowOperation:
         if not isinstance(self.row, Unset):
             row = self.row.to_dict()
 
-        where: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.where, Unset):
-            where = self.where.to_dict()
+        where: Any | Unset
+        if isinstance(self.where, Unset):
+            where = UNSET
+        else:
+            where = self.where
 
         patch: dict[str, Any] | Unset = UNSET
         if not isinstance(self.patch, Unset):
@@ -125,10 +123,6 @@ class RowOperation:
         if not isinstance(self.on_conflict, Unset):
             on_conflict = self.on_conflict.to_dict()
 
-        where_expression: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.where_expression, Unset):
-            where_expression = self.where_expression.to_dict()
-
         returning: list[str] | Unset = UNSET
         if not isinstance(self.returning, Unset):
             returning = self.returning
@@ -143,7 +137,7 @@ class RowOperation:
         expected_version = self.expected_version
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "op": op,
@@ -167,8 +161,6 @@ class RowOperation:
             field_dict["array_update"] = array_update
         if on_conflict is not UNSET:
             field_dict["on_conflict"] = on_conflict
-        if where_expression is not UNSET:
-            field_dict["where_expression"] = where_expression
         if returning is not UNSET:
             field_dict["returning"] = returning
         if returning_expressions is not UNSET:
@@ -180,10 +172,8 @@ class RowOperation:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.row_selector import RowSelector
         from ..models.rows_array_update_transform import RowsArrayUpdateTransform
         from ..models.rows_expression_assignment_map import RowsExpressionAssignmentMap
-        from ..models.rows_expression_condition import RowsExpressionCondition
         from ..models.rows_expression_projection import RowsExpressionProjection
         from ..models.rows_field_patch import RowsFieldPatch
         from ..models.rows_json_set_transform import RowsJsonSetTransform
@@ -201,12 +191,12 @@ class RowOperation:
         else:
             row = RowsRowDocument.from_dict(_row)
 
-        _where = d.pop("where", UNSET)
-        where: RowSelector | Unset
-        if isinstance(_where, Unset):
-            where = UNSET
-        else:
-            where = RowSelector.from_dict(_where)
+        def _parse_where(data: object) -> Any | Unset:
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | Unset, data)
+
+        where = _parse_where(d.pop("where", UNSET))
 
         _patch = d.pop("patch", UNSET)
         patch: RowsFieldPatch | Unset
@@ -261,13 +251,6 @@ class RowOperation:
         else:
             on_conflict = RowsOnConflict.from_dict(_on_conflict)
 
-        _where_expression = d.pop("where_expression", UNSET)
-        where_expression: RowsExpressionCondition | Unset
-        if isinstance(_where_expression, Unset):
-            where_expression = UNSET
-        else:
-            where_expression = RowsExpressionCondition.from_dict(_where_expression)
-
         returning = cast(list[str], d.pop("returning", UNSET))
 
         _returning_expressions = d.pop("returning_expressions", UNSET)
@@ -292,27 +275,9 @@ class RowOperation:
             json_set=json_set,
             array_update=array_update,
             on_conflict=on_conflict,
-            where_expression=where_expression,
             returning=returning,
             returning_expressions=returning_expressions,
             expected_version=expected_version,
         )
 
-        row_operation.additional_properties = d
         return row_operation
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

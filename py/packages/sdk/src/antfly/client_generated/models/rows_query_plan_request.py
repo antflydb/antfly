@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -17,17 +17,19 @@ T = TypeVar("T", bound="RowsQueryPlanRequest")
 
 @_attrs_define
 class RowsQueryPlanRequest:
-    """Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`.
+    """Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`.
 
     Attributes:
         query (RowsQueryRequest): Typed relational row-query plan. Predicate and expression arrays carry
             Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
             native request shape.
         ctes (list[RowsCte] | Unset):
+        ranges (list[Any] | Unset):
     """
 
     query: RowsQueryRequest
     ctes: list[RowsCte] | Unset = UNSET
+    ranges: list[Any] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         query = self.query.to_dict()
@@ -39,6 +41,14 @@ class RowsQueryPlanRequest:
                 ctes_item = ctes_item_data.to_dict()
                 ctes.append(ctes_item)
 
+        ranges: list[Any] | Unset = UNSET
+        if not isinstance(self.ranges, Unset):
+            ranges = []
+            for ranges_item_data in self.ranges:
+                ranges_item: Any
+                ranges_item = ranges_item_data
+                ranges.append(ranges_item)
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -48,6 +58,8 @@ class RowsQueryPlanRequest:
         )
         if ctes is not UNSET:
             field_dict["ctes"] = ctes
+        if ranges is not UNSET:
+            field_dict["ranges"] = ranges
 
         return field_dict
 
@@ -68,9 +80,23 @@ class RowsQueryPlanRequest:
 
                 ctes.append(ctes_item)
 
+        _ranges = d.pop("ranges", UNSET)
+        ranges: list[Any] | Unset = UNSET
+        if _ranges is not UNSET:
+            ranges = []
+            for ranges_item_data in _ranges:
+
+                def _parse_ranges_item(data: object) -> Any:
+                    return cast(Any, data)
+
+                ranges_item = _parse_ranges_item(ranges_item_data)
+
+                ranges.append(ranges_item)
+
         rows_query_plan_request = cls(
             query=query,
             ctes=ctes,
+            ranges=ranges,
         )
 
         return rows_query_plan_request

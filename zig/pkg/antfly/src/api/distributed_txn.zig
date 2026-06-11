@@ -2840,7 +2840,7 @@ fn constraintMetadataTouchesPath(constraint: storage_schema.UniqueConstraint, pa
 
 fn uniqueExpressionDependency(expression: storage_schema.UniqueExpression) []const u8 {
     return switch (expression.op) {
-        .lower => expression.field,
+        .lower, .upper => expression.field,
     };
 }
 

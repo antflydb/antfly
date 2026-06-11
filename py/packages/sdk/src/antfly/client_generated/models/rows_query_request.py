@@ -4,23 +4,22 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.rows_array_length_projection import RowsArrayLengthProjection
     from ..models.rows_coalesce_projection import RowsCoalesceProjection
-    from ..models.rows_doc_key_range import RowsDocKeyRange
     from ..models.rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
     from ..models.rows_expression_condition import RowsExpressionCondition
     from ..models.rows_expression_condition_group import RowsExpressionConditionGroup
     from ..models.rows_expression_projection import RowsExpressionProjection
     from ..models.rows_field_alias_projection import RowsFieldAliasProjection
     from ..models.rows_json_extract_projection import RowsJsonExtractProjection
-    from ..models.rows_query_order import RowsQueryOrder
-    from ..models.rows_query_request_where import RowsQueryRequestWhere
+    from ..models.rows_query_order_expression import RowsQueryOrderExpression
+    from ..models.rows_query_order_field import RowsQueryOrderField
     from ..models.rows_row_claim import RowsRowClaim
+    from ..models.rows_where_type_0 import RowsWhereType0
 
 
 T = TypeVar("T", bound="RowsQueryRequest")
@@ -34,7 +33,12 @@ class RowsQueryRequest:
 
         Attributes:
             source_cte (str | Unset): Optional ordered CTE name to read instead of the base table.
-            where (RowsQueryRequestWhere | Unset): Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+            where (Any | RowsWhereType0 | Unset): Canonical row predicate tree. A top-level `where` is one predicate
+                atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an
+                `all` conjunction plus branch groups. Branches may contain scalar,
+                membership, array, JSON, and text-pattern atoms; the server stores
+                branches containing structured atoms in native mixed access predicate
+                groups and keeps scalar-only branches in scalar predicate groups.
             expression_where (list[RowsExpressionCondition] | Unset): All computed expression predicates that must pass.
             expression_any (list[RowsExpressionConditionGroup] | Unset): OR groups of computed expression predicates.
             expression_not (list[RowsExpressionConditionGroup] | Unset): NOT groups of computed expression predicates.
@@ -46,21 +50,22 @@ class RowsQueryRequest:
             coalesce (list[RowsCoalesceProjection] | Unset):
             field_aliases (list[RowsFieldAliasProjection] | Unset):
             expressions (list[RowsExpressionProjection] | Unset): Typed row-expression projections.
-            order_by (list[RowsQueryOrder] | Unset):
+            distinct_on (list[str] | Unset): Ordered row identity fields used to keep the first row per key after order_by
+                and before pagination. The leading order_by fields must match.
+            order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
             limit (int | Unset):
             offset (int | Unset):
             row_claim (RowsRowClaim | Unset): Lockable base-row claim metadata. Public row-plan endpoints reject this
                 field; it is only accepted by `rows:mutation-source` lockable base-row
                 sources and internal/coordinator execution paths. `transaction_id` is
-                the canonical field name; `txn_id` is accepted as an adapter alias.
-            doc_key_range (RowsDocKeyRange | Unset): Internal physical range selector used after durable range ownership
-                routing. Public REST/SDK endpoints reject this field; it is not stable
-                public row identity. At least one of `start` or `end` must be present,
+                the canonical field name.
+            doc_key_range (Any | Unset): Physical row-key range selector used by routed typed row plans after
+                durable range ownership is known. At least one of `start` or `end` must be present,
                 and a bounded range must have `start < end`.
     """
 
     source_cte: str | Unset = UNSET
-    where: RowsQueryRequestWhere | Unset = UNSET
+    where: Any | RowsWhereType0 | Unset = UNSET
     expression_where: list[RowsExpressionCondition] | Unset = UNSET
     expression_any: list[RowsExpressionConditionGroup] | Unset = UNSET
     expression_not: list[RowsExpressionConditionGroup] | Unset = UNSET
@@ -71,19 +76,26 @@ class RowsQueryRequest:
     coalesce: list[RowsCoalesceProjection] | Unset = UNSET
     field_aliases: list[RowsFieldAliasProjection] | Unset = UNSET
     expressions: list[RowsExpressionProjection] | Unset = UNSET
-    order_by: list[RowsQueryOrder] | Unset = UNSET
+    distinct_on: list[str] | Unset = UNSET
+    order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     row_claim: RowsRowClaim | Unset = UNSET
-    doc_key_range: RowsDocKeyRange | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    doc_key_range: Any | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.rows_query_order_field import RowsQueryOrderField
+        from ..models.rows_where_type_0 import RowsWhereType0
+
         source_cte = self.source_cte
 
-        where: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.where, Unset):
+        where: Any | dict[str, Any] | Unset
+        if isinstance(self.where, Unset):
+            where = UNSET
+        elif isinstance(self.where, RowsWhereType0):
             where = self.where.to_dict()
+        else:
+            where = self.where
 
         expression_where: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.expression_where, Unset):
@@ -152,11 +164,20 @@ class RowsQueryRequest:
                 expressions_item = expressions_item_data.to_dict()
                 expressions.append(expressions_item)
 
+        distinct_on: list[str] | Unset = UNSET
+        if not isinstance(self.distinct_on, Unset):
+            distinct_on = self.distinct_on
+
         order_by: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.order_by, Unset):
             order_by = []
             for order_by_item_data in self.order_by:
-                order_by_item = order_by_item_data.to_dict()
+                order_by_item: dict[str, Any]
+                if isinstance(order_by_item_data, RowsQueryOrderField):
+                    order_by_item = order_by_item_data.to_dict()
+                else:
+                    order_by_item = order_by_item_data.to_dict()
+
                 order_by.append(order_by_item)
 
         limit = self.limit
@@ -167,12 +188,14 @@ class RowsQueryRequest:
         if not isinstance(self.row_claim, Unset):
             row_claim = self.row_claim.to_dict()
 
-        doc_key_range: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.doc_key_range, Unset):
-            doc_key_range = self.doc_key_range.to_dict()
+        doc_key_range: Any | Unset
+        if isinstance(self.doc_key_range, Unset):
+            doc_key_range = UNSET
+        else:
+            doc_key_range = self.doc_key_range
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update({})
         if source_cte is not UNSET:
             field_dict["source_cte"] = source_cte
@@ -198,6 +221,8 @@ class RowsQueryRequest:
             field_dict["field_aliases"] = field_aliases
         if expressions is not UNSET:
             field_dict["expressions"] = expressions
+        if distinct_on is not UNSET:
+            field_dict["distinct_on"] = distinct_on
         if order_by is not UNSET:
             field_dict["order_by"] = order_by
         if limit is not UNSET:
@@ -215,26 +240,34 @@ class RowsQueryRequest:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.rows_array_length_projection import RowsArrayLengthProjection
         from ..models.rows_coalesce_projection import RowsCoalesceProjection
-        from ..models.rows_doc_key_range import RowsDocKeyRange
         from ..models.rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
         from ..models.rows_expression_condition import RowsExpressionCondition
         from ..models.rows_expression_condition_group import RowsExpressionConditionGroup
         from ..models.rows_expression_projection import RowsExpressionProjection
         from ..models.rows_field_alias_projection import RowsFieldAliasProjection
         from ..models.rows_json_extract_projection import RowsJsonExtractProjection
-        from ..models.rows_query_order import RowsQueryOrder
-        from ..models.rows_query_request_where import RowsQueryRequestWhere
+        from ..models.rows_query_order_expression import RowsQueryOrderExpression
+        from ..models.rows_query_order_field import RowsQueryOrderField
         from ..models.rows_row_claim import RowsRowClaim
+        from ..models.rows_where_type_0 import RowsWhereType0
 
         d = dict(src_dict)
         source_cte = d.pop("source_cte", UNSET)
 
-        _where = d.pop("where", UNSET)
-        where: RowsQueryRequestWhere | Unset
-        if isinstance(_where, Unset):
-            where = UNSET
-        else:
-            where = RowsQueryRequestWhere.from_dict(_where)
+        def _parse_where(data: object) -> Any | RowsWhereType0 | Unset:
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_where_type_0 = RowsWhereType0.from_dict(data)
+
+                return componentsschemas_rows_where_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(Any | RowsWhereType0 | Unset, data)
+
+        where = _parse_where(d.pop("where", UNSET))
 
         _expression_where = d.pop("expression_where", UNSET)
         expression_where: list[RowsExpressionCondition] | Unset = UNSET
@@ -321,12 +354,30 @@ class RowsQueryRequest:
 
                 expressions.append(expressions_item)
 
+        distinct_on = cast(list[str], d.pop("distinct_on", UNSET))
+
         _order_by = d.pop("order_by", UNSET)
-        order_by: list[RowsQueryOrder] | Unset = UNSET
+        order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
         if _order_by is not UNSET:
             order_by = []
             for order_by_item_data in _order_by:
-                order_by_item = RowsQueryOrder.from_dict(order_by_item_data)
+
+                def _parse_order_by_item(data: object) -> RowsQueryOrderExpression | RowsQueryOrderField:
+                    try:
+                        if not isinstance(data, dict):
+                            raise TypeError()
+                        componentsschemas_rows_query_order_type_0 = RowsQueryOrderField.from_dict(data)
+
+                        return componentsschemas_rows_query_order_type_0
+                    except (TypeError, ValueError, AttributeError, KeyError):
+                        pass
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_rows_query_order_type_1 = RowsQueryOrderExpression.from_dict(data)
+
+                    return componentsschemas_rows_query_order_type_1
+
+                order_by_item = _parse_order_by_item(order_by_item_data)
 
                 order_by.append(order_by_item)
 
@@ -341,12 +392,12 @@ class RowsQueryRequest:
         else:
             row_claim = RowsRowClaim.from_dict(_row_claim)
 
-        _doc_key_range = d.pop("doc_key_range", UNSET)
-        doc_key_range: RowsDocKeyRange | Unset
-        if isinstance(_doc_key_range, Unset):
-            doc_key_range = UNSET
-        else:
-            doc_key_range = RowsDocKeyRange.from_dict(_doc_key_range)
+        def _parse_doc_key_range(data: object) -> Any | Unset:
+            if isinstance(data, Unset):
+                return data
+            return cast(Any | Unset, data)
+
+        doc_key_range = _parse_doc_key_range(d.pop("doc_key_range", UNSET))
 
         rows_query_request = cls(
             source_cte=source_cte,
@@ -361,6 +412,7 @@ class RowsQueryRequest:
             coalesce=coalesce,
             field_aliases=field_aliases,
             expressions=expressions,
+            distinct_on=distinct_on,
             order_by=order_by,
             limit=limit,
             offset=offset,
@@ -368,21 +420,4 @@ class RowsQueryRequest:
             doc_key_range=doc_key_range,
         )
 
-        rows_query_request.additional_properties = d
         return rows_query_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

@@ -58,12 +58,19 @@ pub const Routes = struct {
     pub const batch_suffix = "/batch";
     pub const rows_batch_suffix = "/rows:batch";
     pub const rows_get_suffix = "/rows:get";
+    pub const rows_plan_suffix = "/rows:plan";
     pub const rows_query_suffix = "/rows:query";
     pub const rows_aggregate_suffix = "/rows:aggregate";
     pub const rows_window_suffix = "/rows:window";
     pub const rows_join_suffix = "/rows:join";
     pub const rows_lateral_suffix = "/rows:lateral";
+    pub const rows_source_suffix = "/rows:source";
     pub const rows_mutation_source_suffix = "/rows:mutation-source";
+    pub const rows_mutation_source_collect_suffix = "/rows:mutation-source-collect";
+    pub const rows_mutation_source_stage_suffix = "/rows:mutation-source-stage";
+    pub const rows_joined_mutation_source_collect_suffix = "/rows:joined-mutation-source-collect";
+    pub const rows_joined_mutation_source_inputs_suffix = "/rows:joined-mutation-source-inputs";
+    pub const rows_joined_mutation_source_stage_suffix = "/rows:joined-mutation-source-stage";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -87,6 +94,7 @@ pub const Routes = struct {
     pub const graph_expand_suffix = "/graph-expand";
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
+    pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";
@@ -281,6 +289,11 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const GroupRowsMutationSource = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupForeignKeyIntegrity = struct {
         group_id: u64,
         table_name: []const u8,
@@ -307,6 +320,11 @@ pub const Routes = struct {
     };
 
     pub const GroupGraphEdges = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupGraphMetricMaintenance = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -430,6 +448,10 @@ pub const Routes = struct {
         const table_name = path[tables_prefix.len .. path.len - rows_get_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableRowsPlan(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_plan_suffix);
     }
 
     pub fn matchTableRowsQuery(path: []const u8) ?TableRows {
@@ -724,6 +746,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupRowsSource(path: []const u8) ?GroupQuery {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, rows_source_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - rows_source_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupTextStats(path: []const u8) ?GroupTextStats {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -800,6 +832,36 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, batch_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - batch_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupRowsMutationSourceCollect(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_collect_suffix);
+    }
+
+    pub fn matchGroupRowsMutationSourceStage(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_mutation_source_stage_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceCollect(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_collect_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceInputs(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_inputs_suffix);
+    }
+
+    pub fn matchGroupRowsJoinedMutationSourceStage(path: []const u8) ?GroupRowsMutationSource {
+        return matchGroupRowsMutationSourceAction(path, rows_joined_mutation_source_stage_suffix);
+    }
+
+    fn matchGroupRowsMutationSourceAction(path: []const u8, suffix: []const u8) ?GroupRowsMutationSource {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -918,6 +980,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_edges_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_edges_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupGraphMetricMaintenance(path: []const u8) ?GroupGraphMetricMaintenance {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, graph_metric_maintenance_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - graph_metric_maintenance_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1148,6 +1220,9 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_query.group_id);
     const group_query_preflight = Routes.matchGroupQueryPreflight("/internal/v1/groups/7/tables/docs/query-preflight").?;
     try std.testing.expectEqual(@as(u64, 7), group_query_preflight.group_id);
+    const group_rows_source = Routes.matchGroupRowsSource("/internal/v1/groups/7/tables/docs/rows:source").?;
+    try std.testing.expectEqual(@as(u64, 7), group_rows_source.group_id);
+    try std.testing.expectEqualStrings("docs", group_rows_source.table_name);
     const group_batch = Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch").?;
     try std.testing.expectEqual(@as(u64, 7), group_batch.group_id);
     const group_fk_integrity = Routes.matchGroupForeignKeyIntegrity("/internal/v1/groups/7/tables/docs/foreign-key-integrity").?;
@@ -1177,6 +1252,8 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_graph_hydrate.group_id);
     const group_graph_edges = Routes.matchGroupGraphEdges("/internal/v1/groups/7/tables/docs/graph-edges").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_edges.group_id);
+    const group_graph_metric_maintenance = Routes.matchGroupGraphMetricMaintenance("/internal/v1/groups/7/tables/docs/graph-metric-maintenance").?;
+    try std.testing.expectEqual(@as(u64, 7), group_graph_metric_maintenance.group_id);
     const group_vector_worker = Routes.matchGroupVectorWorker("/internal/v1/groups/7/tables/docs/vector-worker").?;
     try std.testing.expectEqual(@as(u64, 7), group_vector_worker.group_id);
     const group_txn_begin = Routes.matchGroupTxnBegin("/internal/v1/groups/7/tables/docs/txn-begin").?;

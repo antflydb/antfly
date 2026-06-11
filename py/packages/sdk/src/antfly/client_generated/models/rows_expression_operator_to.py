@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class RowsExpressionTo(str, Enum):
+class RowsExpressionOperatorTo(str, Enum):
     BOOL = "bool"
     BOOLEAN = "boolean"
     NUMERIC = "numeric"

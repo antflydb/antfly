@@ -438,7 +438,7 @@ pub const AdminSource = struct {
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
         const table = tables_api.deriveTableRecord(table_name, normalized_req);
-        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -459,6 +459,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -474,7 +475,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -689,7 +690,7 @@ pub const AdminSource = struct {
         defer alloc.free(prepared_indexes_json);
         normalized_req.indexes_json = prepared_indexes_json;
         const table = tables_api.deriveTableRecord(table_name, normalized_req);
-        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, table);
         const ranges = try tables_api.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -713,6 +714,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -728,7 +730,7 @@ pub const AdminSource = struct {
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, updated);
         try svc.upsertTable(updated);
         try flushMetadataHttpServiceMutation(svc);
     }
@@ -1796,7 +1798,7 @@ fn applyRelationalSqlDdlOnMetadataService(
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
 
-    if (target.creates_table) {
+    if (target.createsTable()) {
         if (findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
         const base_table: metadata_table_manager.TableRecord = .{
             .table_id = tables_api.deriveTableId(target.table_name),
@@ -1811,7 +1813,7 @@ fn applyRelationalSqlDdlOnMetadataService(
         var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
-        try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
 
         const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
         defer {
@@ -1824,12 +1826,55 @@ fn applyRelationalSqlDdlOnMetadataService(
         return applied;
     }
 
-    const table = findTableByName(&snapshot, target.table_name) orelse return error.TableNotFound;
+    const table = findTableByName(&snapshot, target.table_name) orelse {
+        if (target.dropsTable() and target.if_exists) {
+            return try tables_api.missingDropTableIfExistsNoopAlloc(alloc, target.table_name);
+        }
+        return error.TableNotFound;
+    };
+    if (target.dropsTable()) {
+        if (target.cascade) {
+            try applyRelationalDropTableCascadeReferences(service_impl, alloc, &snapshot, table.*);
+        } else {
+            try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        }
+        const dropped = try metadata_table_manager.cloneTable(alloc, table.*);
+        errdefer metadata_table_manager.freeTable(alloc, dropped);
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.dropTable(service_impl, table.table_id);
+        return .{
+            .table = dropped,
+            .dropped_table = true,
+        };
+    }
+
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
     errdefer applied.deinit(alloc);
-    try validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+    try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
     try service_impl.upsertTable(applied.table);
     return applied;
+}
+
+fn applyRelationalDropTableCascadeReferences(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.tables) |candidate_table| {
+        if (candidate_table.table_id == target_table.table_id) continue;
+        const next_schema_json = (try tables_api.schemaWithoutForeignKeysReferencingTableAlloc(
+            alloc,
+            candidate_table.schema_json,
+            target_table.name,
+        )) orelse continue;
+        defer alloc.free(next_schema_json);
+
+        const updated = try tables_api.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        try service_impl.upsertTable(updated);
+    }
 }
 
 const ParsedGroupStatus = struct {
@@ -2652,78 +2697,6 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
     return null;
 }
 
-fn validateRelationalForeignKeyCatalogReferences(
-    alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
-    candidate_table: metadata_table_manager.TableRecord,
-) !void {
-    if (candidate_table.schema_json.len == 0) return;
-    var parsed_child = try tables_api.parseValidatedTableSchema(alloc, candidate_table.schema_json);
-    defer parsed_child.deinit(alloc);
-    const child_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_child);
-    defer storage_schema.freeSchema(alloc, child_schema);
-    if (child_schema.storage_mode != .relational) return;
-
-    for (child_schema.foreign_keys) |foreign_key| {
-        const parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, child_schema.default_type))
-            candidate_table.name
-        else
-            foreign_key.parent_table;
-        const parent_table = if (std.mem.eql(u8, parent_table_name, candidate_table.name))
-            candidate_table
-        else
-            (findTableByName(snapshot, parent_table_name) orelse return error.InvalidSchemaUpdateRequest).*;
-
-        var parsed_parent = try tables_api.parseValidatedTableSchema(alloc, parent_table.schema_json);
-        defer parsed_parent.deinit(alloc);
-        const parent_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_parent);
-        defer storage_schema.freeSchema(alloc, parent_schema);
-        if (parent_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
-
-        if (foreignKeyReferencesPrimaryKey(foreign_key)) continue;
-        if (!primaryKeyColumnsEqual(parent_schema.primary_key, foreign_key.parent_columns)) {
-            _ = findUniqueConstraintByColumns(parent_schema.unique_constraints, foreign_key.parent_columns) orelse return error.InvalidSchemaUpdateRequest;
-        }
-        if (foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSchemaUpdateRequest;
-        for (foreign_key.child_columns, foreign_key.parent_columns) |child_column_name, parent_column_name| {
-            const child_column = findRelationalColumn(child_schema.relational_columns, child_column_name) orelse return error.InvalidSchemaUpdateRequest;
-            const parent_column = findRelationalColumn(parent_schema.relational_columns, parent_column_name) orelse return error.InvalidSchemaUpdateRequest;
-            if (child_column.field_type != parent_column.field_type) return error.InvalidSchemaUpdateRequest;
-        }
-    }
-}
-
-fn foreignKeyReferencesPrimaryKey(foreign_key: storage_schema.ForeignKey) bool {
-    return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
-}
-
-fn primaryKeyColumnsEqual(primary_key: ?storage_schema.PrimaryKey, columns: []const []const u8) bool {
-    const key = primary_key orelse return false;
-    return stringSlicesEqual(key.columns, columns);
-}
-
-fn findUniqueConstraintByColumns(constraints: []const storage_schema.UniqueConstraint, columns: []const []const u8) ?storage_schema.UniqueConstraint {
-    for (constraints) |constraint| {
-        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
-    }
-    return null;
-}
-
-fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (!std.mem.eql(u8, left, right)) return false;
-    }
-    return true;
-}
-
-fn findRelationalColumn(columns: []const storage_schema.RelationalColumn, name: []const u8) ?storage_schema.RelationalColumn {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, name)) return column;
-    }
-    return null;
-}
-
 test "metadata catalog validation requires cross-table foreign keys to reference parent unique columns" {
     const orders: metadata_table_manager.TableRecord = .{
         .table_id = 7,
@@ -2770,7 +2743,7 @@ test "metadata catalog validation requires cross-table foreign keys to reference
     };
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
-        validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &missing_unique_snapshot, orders),
+        tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &missing_unique_snapshot, orders),
     );
 
     var valid_parent_tables = [_]metadata_table_manager.TableRecord{customers_with_unique};
@@ -2783,7 +2756,7 @@ test "metadata catalog validation requires cross-table foreign keys to reference
         .split_transitions = &.{},
         .merge_transitions = &.{},
     };
-    try validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &valid_parent_snapshot, orders);
+    try tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &valid_parent_snapshot, orders);
 
     var type_mismatch_tables = [_]metadata_table_manager.TableRecord{customers_type_mismatch};
     var type_mismatch_snapshot = metadata_api.AdminSnapshot{
@@ -2797,8 +2770,194 @@ test "metadata catalog validation requires cross-table foreign keys to reference
     };
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
-        validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &type_mismatch_snapshot, orders),
+        tables_api.validateRelationalForeignKeyCatalogReferences(std.testing.allocator, &type_mismatch_snapshot, orders),
     );
+}
+
+test "metadata catalog validation rejects relational parent table drop while referenced" {
+    const customers: metadata_table_manager.TableRecord = .{
+        .table_id = 8,
+        .name = "customers",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        .placement_role = "data",
+    };
+    const orders: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "orders",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+        ,
+        .placement_role = "data",
+    };
+    var tables = [_]metadata_table_manager.TableRecord{ customers, orders };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    try std.testing.expectError(
+        error.TableReferencedByForeignKey,
+        tables_api.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, customers),
+    );
+    try tables_api.validateRelationalTableDropAllowed(std.testing.allocator, &snapshot, orders);
+}
+
+test "metadata catalog validation applies sql drop table cascade through child schema updates" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        manager: metadata_table_manager.TableManager,
+
+        fn init(allocator: std.mem.Allocator) @This() {
+            return .{
+                .alloc = allocator,
+                .manager = metadata_table_manager.TableManager.init(allocator),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+            self.* = undefined;
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = try self.manager.listTables(self.alloc),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            self.manager.freeTables(self.alloc, snapshot.tables);
+            snapshot.* = undefined;
+        }
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            try self.manager.upsertTable(record);
+        }
+
+        pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            return try self.manager.listTables(allocator);
+        }
+
+        pub fn freeProjectedTables(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
+            self.manager.freeTables(allocator, records);
+        }
+
+        pub fn listProjectedRanges(_: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+            return try allocator.alloc(metadata_table_manager.RangeRecord, 0);
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try allocator.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            allocator.free(intents);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?metadata_transition_state.SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?metadata_transition_state.MergeObservation {
+            return null;
+        }
+
+        pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
+            for (plan.table_upserts) |record| try self.manager.upsertTable(record);
+            for (plan.table_removals) |table_id| _ = self.manager.removeTableTopology(table_id);
+        }
+    };
+
+    var fake = FakeService.init(alloc);
+    defer fake.deinit();
+    try fake.manager.upsertTable(.{
+        .table_id = 8,
+        .name = "customers",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        .placement_role = "data",
+    });
+    try fake.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "orders",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+        ,
+        .placement_role = "data",
+    });
+    try fake.manager.upsertTable(.{
+        .table_id = 9,
+        .name = "accounts",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        .placement_role = "data",
+    });
+
+    try std.testing.expectError(
+        error.TableReferencedByForeignKey,
+        applyRelationalSqlDdlOnMetadataService(&fake, alloc, "DROP TABLE customers;"),
+    );
+
+    var applied = try applyRelationalSqlDdlOnMetadataService(&fake, alloc, "DROP TABLE customers CASCADE;");
+    defer applied.deinit(alloc);
+    try std.testing.expect(applied.dropped_table);
+    try std.testing.expectEqualStrings("customers", applied.table.name);
+
+    const tables = try fake.manager.listTables(alloc);
+    defer fake.manager.freeTables(alloc, tables);
+    var orders: ?metadata_table_manager.TableRecord = null;
+    for (tables) |table| {
+        try std.testing.expect(!std.mem.eql(u8, table.name, "customers"));
+        if (std.mem.eql(u8, table.name, "orders")) orders = table;
+    }
+    const orders_table = orders orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, orders_table.schema_json, "orders_customer_id_fkey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, orders_table.schema_json, "orders_account_id_fkey") != null);
+}
+
+test "metadata catalog validation treats missing drop table if exists as ddl noop" {
+    var applied = try tables_api.missingDropTableIfExistsNoopAlloc(std.testing.allocator, "missing_usage");
+    defer applied.deinit(std.testing.allocator);
+    try std.testing.expect(applied.noop);
+    try std.testing.expect(!applied.created_table);
+    try std.testing.expect(!applied.dropped_table);
+    try std.testing.expectEqualStrings("missing_usage", applied.table.name);
 }
 
 fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, key: []const u8) ?u64 {

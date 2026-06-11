@@ -373,13 +373,14 @@ pub const Reconciler = struct {
 
             for (runtime.relational_columns) |column| {
                 if (!secondaryIndexColumnNeedsRebuild(column)) continue;
+                const index_name = relationalColumnIndexIdentity(column);
                 for (ranges) |range| {
                     if (range.table_id != table.table_id) continue;
-                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, column.name, column.index_generation, range.start_key)) continue;
-                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, column.name, column.index_generation, range.start_key);
+                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, index_name, column.index_generation, range.start_key)) continue;
+                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, index_name, column.index_generation, range.start_key);
                     try manager.upsertSecondaryIndexRebuildRange(.{
                         .table_id = table.table_id,
-                        .index_name = column.name,
+                        .index_name = index_name,
                         .index_generation = column.index_generation,
                         .start_row_key = range.start_key,
                         .end_row_key = range.end_key,
@@ -2287,6 +2288,10 @@ fn secondaryIndexColumnNeedsRebuild(column: anytype) bool {
         column.index_lifecycle == .building;
 }
 
+fn relationalColumnIndexIdentity(column: anytype) []const u8 {
+    return column.index_name orelse column.name;
+}
+
 fn secondaryIndexRebuildRangeStillDeclared(
     alloc: std.mem.Allocator,
     tables: []const table_manager.TableRecord,
@@ -2304,7 +2309,7 @@ fn secondaryIndexRebuildRangeStillDeclared(
     for (runtime.relational_columns) |column| {
         if (!secondaryIndexColumnNeedsRebuild(column)) continue;
         if (column.index_generation != record.index_generation) continue;
-        if (!std.mem.eql(u8, column.name, record.index_name)) continue;
+        if (!std.mem.eql(u8, relationalColumnIndexIdentity(column), record.index_name)) continue;
         declared = true;
         break;
     }

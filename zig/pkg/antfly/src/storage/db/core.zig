@@ -56,6 +56,7 @@ pub const PendingWorkStats = struct {
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
+    graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},
 };
 
 pub const MaintenanceDriver = struct {
@@ -1125,6 +1126,17 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.collectIntentMutations(alloc, txn_id);
+    }
+
+    pub fn collectPendingTransactionIntentsForKey(
+        self: *DBCore,
+        alloc: Allocator,
+        key: []const u8,
+        exclude_txn_id: ?transactions_mod.TxnId,
+    ) ![]transactions_mod.PendingIntentInfo {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectPendingIntentsForKeyAlloc(alloc, key, exclude_txn_id);
     }
 
     pub fn getTransactionStatus(self: *DBCore, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {

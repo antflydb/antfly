@@ -659,6 +659,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
@@ -688,7 +689,7 @@ fn applyRelationalSqlDdlOnService(
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
 
-    if (target.creates_table) {
+    if (target.createsTable()) {
         if (tables_api.findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
         const base_table: metadata_table_manager.TableRecord = .{
             .table_id = tables_api.deriveTableId(target.table_name),
@@ -703,6 +704,7 @@ fn applyRelationalSqlDdlOnService(
         var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
+        try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
 
         const ranges = try tables_api.deriveInitialRanges(alloc, applied.table);
         defer {
@@ -716,9 +718,29 @@ fn applyRelationalSqlDdlOnService(
         return applied;
     }
 
-    const table = tables_api.findTableByName(&snapshot, target.table_name) orelse return error.TableNotFound;
+    const table = tables_api.findTableByName(&snapshot, target.table_name) orelse {
+        if (target.dropsTable() and target.if_exists) {
+            return try tables_api.missingDropTableIfExistsNoopAlloc(alloc, target.table_name);
+        }
+        return error.TableNotFound;
+    };
+    if (target.dropsTable()) {
+        try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        const dropped = try metadata_table_manager.cloneTable(alloc, table.*);
+        errdefer metadata_table_manager.freeTable(alloc, dropped);
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.dropTable(svc, table.table_id);
+        try svc.runRound();
+        return .{
+            .table = dropped,
+            .dropped_table = true,
+        };
+    }
+
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
     errdefer applied.deinit(alloc);
+    try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
     try svc.upsertTable(applied.table);
     try svc.runRound();
     return applied;
@@ -3481,6 +3503,7 @@ pub const ApiHttpServer = struct {
                 }
                 self.source.dropTable(self.alloc, table_path.table_name) catch |err| switch (err) {
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TableReferencedByForeignKey => return try textResponse(self.alloc, 409, "table is referenced by foreign key"),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     else => {
                         std.log.err("public drop table metadata remove failed table={s} err={s}", .{
@@ -3555,6 +3578,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsGet(uri_parts.path)) |rows_route| {
                 return try self.handlePublicTableRowsGet(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsPlan(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsPlan(rows_route.table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -5749,36 +5777,155 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var rows_req = relational_rows_api.parseRowsMutationSourceRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
-        defer rows_req.deinit(self.alloc);
-
         var filter = self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema) catch |err| switch (err) {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
             else => return err,
         };
         defer if (filter) |*value| value.deinit(self.alloc);
-        if (filter) |active| {
-            try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.source);
+
+        if (isInsertRowsMutationSourceBody(body)) {
+            const insert_source_table = insertRowsMutationSourceTableFromBodyAlloc(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+            defer if (insert_source_table) |value| self.alloc.free(value);
+            const cross_table_source = if (insert_source_table) |value| !std.mem.eql(u8, value, table_name) else false;
+            const source_schema = if (cross_table_source)
+                self.runtimeSchemaForPublicRows(insert_source_table.?) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request")
+            else
+                schema;
+            defer if (cross_table_source) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+            var rows_req = relational_rows_api.parseRowsInsertSourceRequestWithSchemas(self.alloc, body, schema, source_schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+            defer rows_req.deinit(self.alloc);
+            if (cross_table_source) {
+                var source_filter = self.rowsAuthFilterPlanForIdentity(insert_source_table.?, authenticated_identity, source_schema) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                defer if (source_filter) |*value| value.deinit(self.alloc);
+                if (source_filter) |source_active| try self.applyRowsAuthFilterToQuery(source_schema, source_active, &rows_req.req.source);
+            } else {
+                if (filter) |active| {
+                    try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.source);
+                }
+            }
+            var result = (source.insertRowsFromSource(self.alloc, table_name, schema, source_schema, rows_req.req) catch |err| switch (err) {
+                error.InvalidArgument, error.InvalidQueryRequest, error.InvalidRowsRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+                error.UnsupportedOperation, error.UnsupportedRowsMutationSource => return try textResponse(self.alloc, 501, "rows insert source unavailable"),
+                error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                else => {
+                    std.log.err("public table rows insert source failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "rows insert source failed");
+                },
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+            defer result.deinit(self.alloc);
+
+            const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
         }
 
-        var result = (source.mutateRowsFromSource(self.alloc, table_name, schema, rows_req.req) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
-            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
-            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
-            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
-            error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
-            else => {
-                std.log.err("public table rows mutation source failed table={s} err={}", .{ table_name, err });
-                return try textResponse(self.alloc, 500, "rows mutation source failed");
-            },
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        var result = if (isJoinedRowsMutationSourceBody(body)) blk: {
+            const joined_source_table = joinedRowsMutationSourceTableFromBodyAlloc(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+            defer if (joined_source_table) |value| self.alloc.free(value);
+            const cross_table_source = if (joined_source_table) |value| !std.mem.eql(u8, value, table_name) else false;
+            const source_schema = if (cross_table_source)
+                self.runtimeSchemaForPublicRows(joined_source_table.?) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request")
+            else
+                schema;
+            defer if (cross_table_source) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+            var rows_req = relational_rows_api.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body, schema, source_schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+            defer rows_req.deinit(self.alloc);
+            if (cross_table_source) return try textResponse(self.alloc, 501, "cross-table rows mutation source unavailable");
+            if (filter) |active| {
+                try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.join.left);
+                try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.join.right);
+            }
+            break :blk (source.mutateRowsFromJoinedSource(self.alloc, table_name, schema, rows_req.req) catch |err| switch (err) {
+                error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
+                error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                else => {
+                    std.log.err("public table joined rows mutation source failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "rows mutation source failed");
+                },
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+        } else blk: {
+            var rows_req = relational_rows_api.parseRowsMutationSourceRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+            defer rows_req.deinit(self.alloc);
+            if (filter) |active| {
+                try self.applyRowsAuthFilterToQuery(schema, active, &rows_req.req.source);
+            }
+            break :blk (source.mutateRowsFromSource(self.alloc, table_name, schema, rows_req.req) catch |err| switch (err) {
+                error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+                error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
+                error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                else => {
+                    std.log.err("public table rows mutation source failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "rows mutation source failed");
+                },
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+        };
         defer result.deinit(self.alloc);
 
         const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn isJoinedRowsMutationSourceBody(body: []const u8) bool {
+        return std.mem.indexOf(u8, body, "\"join\"") != null and std.mem.indexOf(u8, body, "\"target_side\"") != null;
+    }
+
+    fn isInsertRowsMutationSourceBody(body: []const u8) bool {
+        return std.mem.indexOf(u8, body, "\"op\"") != null and
+            std.mem.indexOf(u8, body, "\"insert\"") != null and
+            std.mem.indexOf(u8, body, "\"assignments\"") != null;
+    }
+
+    fn insertRowsMutationSourceTableFromBodyAlloc(alloc: std.mem.Allocator, body: []const u8) !?[]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const op_value = parsed.value.object.get("op") orelse return error.InvalidRowsRequest;
+        if (op_value != .string or !std.mem.eql(u8, op_value.string, "insert")) return error.InvalidRowsRequest;
+        const value = parsed.value.object.get("source_table") orelse return null;
+        if (value != .string) return error.InvalidRowsRequest;
+        if (value.string.len == 0) return null;
+        for (value.string) |c| {
+            const valid = std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+            if (!valid) return error.InvalidRowsRequest;
+        }
+        return try alloc.dupe(u8, value.string);
+    }
+
+    fn joinedRowsMutationSourceTableFromBodyAlloc(alloc: std.mem.Allocator, body: []const u8) !?[]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{
+            .allocate = .alloc_always,
+        }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const value = parsed.value.object.get("source_table") orelse return null;
+        if (value != .string) return error.InvalidRowsRequest;
+        if (value.string.len == 0) return null;
+        for (value.string) |c| {
+            const valid = std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+            if (!valid) return error.InvalidRowsRequest;
+        }
+        return try alloc.dupe(u8, value.string);
     }
 
     pub fn handlePublicTableRowsGet(
@@ -5874,6 +6021,127 @@ pub const ApiHttpServer = struct {
         const response_body = try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, result);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicTableRowsPlan(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var plan = relational_rows_api.parseRowsPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows plan request");
+        defer plan.deinit(self.alloc);
+
+        switch (plan) {
+            .query => |*query_plan| {
+                self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, query_plan) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                var result = (source.rowsQueryPlan(self.alloc, table_name, schema, query_plan.*, .read_index) catch |err| switch (err) {
+                    error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows plan request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows plan unavailable"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    else => {
+                        std.log.err("public table rows plan query failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows plan failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                const response_body = try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, result);
+                defer self.alloc.free(response_body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+            },
+            .aggregate => |*aggregate_plan| {
+                self.applyRowsAggregatePlanRowFilter(table_name, authenticated_identity, schema, aggregate_plan) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, aggregate_plan.*, .read_index) catch |err| switch (err) {
+                    error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows plan request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows plan unavailable"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    else => {
+                        std.log.err("public table rows plan aggregate failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows plan failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                const response_body = try relational_rows_api.encodeRowsAggregateResponseAlloc(self.alloc, result);
+                defer self.alloc.free(response_body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+            },
+            .window => |*window_plan| {
+                self.applyRowsWindowPlanRowFilter(table_name, authenticated_identity, schema, window_plan) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                var result = (source.rowsWindowPlan(self.alloc, table_name, schema, window_plan.*, .read_index) catch |err| switch (err) {
+                    error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows plan request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows plan unavailable"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    else => {
+                        std.log.err("public table rows plan window failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows plan failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                const response_body = try relational_rows_api.encodeRowsWindowResponseAlloc(self.alloc, result);
+                defer self.alloc.free(response_body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+            },
+            .join => |*join_plan| {
+                self.applyRowsJoinPlanRowFilter(table_name, authenticated_identity, schema, join_plan) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                var result = (source.rowsJoinPlan(self.alloc, table_name, schema, join_plan.*, .read_index) catch |err| switch (err) {
+                    error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows plan request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows plan unavailable"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    else => {
+                        std.log.err("public table rows plan join failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows plan failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+                defer self.alloc.free(response_body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+            },
+            .lateral => |*lateral_plan| {
+                self.applyRowsLateralPlanRowFilter(table_name, authenticated_identity, schema, lateral_plan) catch |err| switch (err) {
+                    error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+                    else => return err,
+                };
+                var result = (source.rowsLateralPlan(self.alloc, table_name, schema, lateral_plan.*, .read_index) catch |err| switch (err) {
+                    error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows plan request"),
+                    error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows plan unavailable"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    else => {
+                        std.log.err("public table rows plan lateral failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows plan failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+                defer result.deinit(self.alloc);
+                const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+                defer self.alloc.free(response_body);
+                return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+            },
+        }
     }
 
     pub fn handlePublicTableRowsAggregate(
@@ -7376,6 +7644,11 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .permission_type = .read,
     };
     if (routes.Routes.matchTableRowsGet(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsPlan(path)) |rows| return .{
         .resource_type = .table,
         .resource = rows.table_name,
         .permission_type = .read,
@@ -12904,7 +13177,7 @@ test "api http server executes public relational row plan endpoints" {
         .method = .POST,
         .uri = "/tables/records/rows:query",
         .content_type = "application/json",
-        .body = "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+        .body = "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"id\",\"amount\"],\"expressions\":[{\"as\":\"amount_plus_one\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":1}]}},{\"as\":\"status_label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\":\"},{\"field\":\"id\"}]}}],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
     });
     defer query_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), query_resp.status);
@@ -12912,6 +13185,21 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_query.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_query.value.object.get("total").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 21), parsed_query.value.object.get("rows").?.array.items[0].object.get("amount_plus_one").?.integer);
+    try std.testing.expectEqualStrings("open:o2", parsed_query.value.object.get("rows").?.array.items[0].object.get("status_label").?.string);
+
+    var plan_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+    });
+    defer plan_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_query_resp.status);
+    var parsed_plan_query = try std.json.parseFromSlice(std.json.Value, alloc, plan_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_plan_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("o2", parsed_plan_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
 
     var public_claim_query_resp = try server.handle(.{
         .method = .POST,
@@ -12944,6 +13232,18 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqual(@as(i64, 1), parsed_aggregate.value.object.get("total_groups").?.integer);
     try std.testing.expectEqual(@as(i64, 30), parsed_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
 
+    var plan_aggregate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"ctes\":[{\"name\":\"open_orders\",\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}}}],\"aggregate\":{\"source\":{\"source_cte\":\"open_orders\"},\"group_by\":[\"customer_id\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}}",
+    });
+    defer plan_aggregate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_aggregate_resp.status);
+    var parsed_plan_aggregate = try std.json.parseFromSlice(std.json.Value, alloc, plan_aggregate_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan_aggregate.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_plan_aggregate.value.object.get("total_groups").?.integer);
+
     var window_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/records/rows:window",
@@ -12956,6 +13256,18 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_window.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_window.value.object.get("total_rows").?.integer);
     try std.testing.expectEqual(@as(i64, 1), parsed_window.value.object.get("rows").?.array.items[0].object.get("row_num").?.integer);
+
+    var plan_window_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"window\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"partition_by\":[\"customer_id\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}],\"select\":[\"id\",\"amount\"]}}",
+    });
+    defer plan_window_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_window_resp.status);
+    var parsed_plan_window = try std.json.parseFromSlice(std.json.Value, alloc, plan_window_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan_window.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_plan_window.value.object.get("total_rows").?.integer);
 
     var join_resp = try server.handle(.{
         .method = .POST,
@@ -12970,6 +13282,19 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqual(@as(i64, 2), parsed_join.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("Alice", parsed_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
 
+    var plan_join_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"},{\"as\":\"amount\",\"side\":\"left\",\"field\":\"amount\"}],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+    });
+    defer plan_join_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_join_resp.status);
+    var parsed_plan_join = try std.json.parseFromSlice(std.json.Value, alloc, plan_join_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan_join.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_plan_join.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("Alice", parsed_plan_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
+
     var lateral_resp = try server.handle(.{
         .method = .POST,
         .uri = "/tables/records/rows:lateral",
@@ -12982,6 +13307,28 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_lateral.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
+
+    var plan_lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"lateral\":{\"left\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"},\"order_by\":[{\"field\":\"id\"}]},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}],\"limit\":1},\"correlations\":[{\"left_field\":\"id\",\"right_field\":\"customer_id\"}],\"select\":[{\"as\":\"customer_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"latest_order_id\",\"side\":\"right\",\"field\":\"id\"},{\"as\":\"latest_amount\",\"side\":\"right\",\"field\":\"amount\"}]}}",
+    });
+    defer plan_lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_lateral_resp.status);
+    var parsed_plan_lateral = try std.json.parseFromSlice(std.json.Value, alloc, plan_lateral_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan_lateral.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_plan_lateral.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("o2", parsed_plan_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
+
+    var invalid_plan_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:plan",
+        .content_type = "application/json",
+        .body = "{\"query\":{},\"aggregate\":{\"source\":{},\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"}]}}",
+    });
+    defer invalid_plan_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_plan_resp.status);
 
     const mutation_txn_hex = "00112233445566778899aabbccddeeff";
     const mutation_txn_id = try distributed_txn.parseTxnIdHex(mutation_txn_hex);
@@ -13016,6 +13363,114 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_archived_get.deinit();
     const archived_row = parsed_archived_get.value.object.get("rows").?.array.items[0].object.get("row").?.object;
     try std.testing.expectEqualStrings("archived", archived_row.get("status").?.string);
+
+    var insert_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"insert\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"order_by\":[{\"field\":\"id\"}]},\"assignments\":[{\"target_field\":\"kind\",\"expr\":{\"value\":\"order_copy\"}},{\"target_field\":\"tenant\",\"expr\":{\"field\":\"tenant\",\"source\":\"source\"}},{\"target_field\":\"id\",\"expr\":{\"op\":\"concat\",\"args\":[{\"value\":\"copy:\"},{\"field\":\"id\",\"source\":\"source\"}]}},{\"target_field\":\"customer_id\",\"expr\":{\"field\":\"customer_id\",\"source\":\"source\"}},{\"target_field\":\"status\",\"expr\":{\"value\":\"copied\"}},{\"target_field\":\"amount\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\",\"source\":\"source\"},{\"value\":100}]}}],\"returning\":[\"id\",\"status\"],\"returning_expressions\":[{\"as\":\"label\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"kind\"},{\"value\":\":\"},{\"field\":\"id\"}]}}]}",
+    });
+    defer insert_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_source_resp.status);
+    var parsed_insert_source = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert_source.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_insert_source.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed_insert_source.value.object.get("staged").?.integer);
+    const insert_source_returning = parsed_insert_source.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("copy:o1", insert_source_returning.get("id").?.string);
+    try std.testing.expectEqualStrings("copied", insert_source_returning.get("status").?.string);
+    try std.testing.expectEqualStrings("order_copy:copy:o1", insert_source_returning.get("label").?.string);
+
+    var copied_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order_copy\"},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"id\"}]}}",
+    });
+    defer copied_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), copied_query_resp.status);
+    var parsed_copied_query = try std.json.parseFromSlice(std.json.Value, alloc, copied_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_copied_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_copied_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("copy:o1", parsed_copied_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 110), parsed_copied_query.value.object.get("rows").?.array.items[0].object.get("amount").?.integer);
+
+    var insert_source_conflict_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"insert\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"assignments\":[{\"target_field\":\"kind\",\"expr\":{\"value\":\"order_copy\"}},{\"target_field\":\"tenant\",\"expr\":{\"field\":\"tenant\",\"source\":\"source\"}},{\"target_field\":\"id\",\"expr\":{\"op\":\"concat\",\"args\":[{\"value\":\"copy:\"},{\"field\":\"id\",\"source\":\"source\"}]}},{\"target_field\":\"customer_id\",\"expr\":{\"field\":\"customer_id\",\"source\":\"source\"}},{\"target_field\":\"status\",\"expr\":{\"value\":\"copied\"}},{\"target_field\":\"amount\",\"expr\":{\"field\":\"amount\",\"source\":\"source\"}}],\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"nothing\"},\"returning\":[\"id\"]}",
+    });
+    defer insert_source_conflict_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_source_conflict_resp.status);
+    var parsed_insert_source_conflict = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_conflict_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert_source_conflict.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_insert_source_conflict.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed_insert_source_conflict.value.object.get("staged").?.integer);
+    try std.testing.expect(parsed_insert_source_conflict.value.object.get("returning") == null);
+
+    var insert_source_update_conflict_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"insert\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]}},\"assignments\":[{\"target_field\":\"kind\",\"expr\":{\"value\":\"order_copy\"}},{\"target_field\":\"tenant\",\"expr\":{\"field\":\"tenant\",\"source\":\"source\"}},{\"target_field\":\"id\",\"expr\":{\"op\":\"concat\",\"args\":[{\"value\":\"copy:\"},{\"field\":\"id\",\"source\":\"source\"}]}},{\"target_field\":\"customer_id\",\"expr\":{\"field\":\"customer_id\",\"source\":\"source\"}},{\"target_field\":\"status\",\"expr\":{\"value\":\"copied\"}},{\"target_field\":\"amount\",\"expr\":{\"field\":\"amount\",\"source\":\"source\"}}],\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"update\",\"increment_expr\":{\"amount\":{\"field\":\"amount\",\"source\":\"proposed\"}}},\"returning\":[\"id\",\"amount\"]}",
+    });
+    defer insert_source_update_conflict_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_source_update_conflict_resp.status);
+    var parsed_insert_source_update_conflict = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_update_conflict_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert_source_update_conflict.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_insert_source_update_conflict.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed_insert_source_update_conflict.value.object.get("staged").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), parsed_insert_source_update_conflict.value.object.get("returning").?.array.items.len);
+
+    var updated_copied_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order_copy\"},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"id\"}]}}",
+    });
+    defer updated_copied_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), updated_copied_query_resp.status);
+    var parsed_updated_copied_query = try std.json.parseFromSlice(std.json.Value, alloc, updated_copied_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_updated_copied_query.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_updated_copied_query.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("copy:o1", parsed_updated_copied_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 120), parsed_updated_copied_query.value.object.get("rows").?.array.items[0].object.get("amount").?.integer);
+    try std.testing.expectEqualStrings("copy:o2", parsed_updated_copied_query.value.object.get("rows").?.array.items[1].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 140), parsed_updated_copied_query.value.object.get("rows").?.array.items[1].object.get("amount").?.integer);
+
+    const joined_mutation_txn_hex = "11112222333344445555666677778888";
+    const joined_mutation_txn_id = try distributed_txn.parseTxnIdHex(joined_mutation_txn_hex);
+    _ = try db.beginTransactionWithId(joined_mutation_txn_id, 1_010);
+    var joined_mutation_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:joined\",\"transaction_id\":\"11112222333344445555666677778888\"}},\"right\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"customer\"}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"amount\",\"direction\":\"asc\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"name\",\"side\":\"right\",\"field\":\"name\"}],\"returning\":[\"id\",\"name\"]}",
+    });
+    defer joined_mutation_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), joined_mutation_source_resp.status);
+    var parsed_joined_mutation_source = try std.json.parseFromSlice(std.json.Value, alloc, joined_mutation_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_joined_mutation_source.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_joined_mutation_source.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_joined_mutation_source.value.object.get("staged").?.integer);
+    const joined_staged_returning = parsed_joined_mutation_source.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("o1", joined_staged_returning.get("id").?.string);
+    try std.testing.expectEqualStrings("Alice", joined_staged_returning.get("name").?.string);
+    try db.commitTransaction(joined_mutation_txn_id, 1_011);
+
+    var joined_updated_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\"}}]}",
+    });
+    defer joined_updated_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), joined_updated_get_resp.status);
+    var parsed_joined_updated_get = try std.json.parseFromSlice(std.json.Value, alloc, joined_updated_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_joined_updated_get.deinit();
+    const joined_updated_row = parsed_joined_updated_get.value.object.get("rows").?.array.items[0].object.get("row").?.object;
+    try std.testing.expectEqualStrings("Alice", joined_updated_row.get("name").?.string);
 
     var cross_tenant_resp = try server.handle(.{
         .method = .POST,
@@ -13073,6 +13528,35 @@ test "api http server executes public relational row plan endpoints" {
     var unsupported_mutation_resp = try server.handlePublicTableRowsMutationSource("records", "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}", unsupported_identity);
     defer unsupported_mutation_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), unsupported_mutation_resp.status);
+
+    const emptying_txn_hex = "22223333444455556666777788889999";
+    const emptying_txn_id = try distributed_txn.parseTxnIdHex(emptying_txn_hex);
+    _ = try db.beginTransactionWithId(emptying_txn_id, 1_020);
+    var emptying_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"delete\",\"source\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:truncate\",\"transaction_id\":\"22223333444455556666777788889999\"}}}",
+    });
+    defer emptying_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), emptying_resp.status);
+    var parsed_emptying = try std.json.parseFromSlice(std.json.Value, alloc, emptying_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_emptying.deinit();
+    try std.testing.expectEqual(@as(i64, 9), parsed_emptying.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), parsed_emptying.value.object.get("staged").?.integer);
+    try db.commitTransaction(emptying_txn_id, 1_021);
+
+    var empty_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows:query",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"select\":[\"id\"]}}",
+    });
+    defer empty_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), empty_query_resp.status);
+    var parsed_empty_query = try std.json.parseFromSlice(std.json.Value, alloc, empty_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_empty_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_empty_query.value.object.get("total").?.integer);
 }
 
 test "api http server serves public transaction commit route" {
@@ -17709,6 +18193,47 @@ test "api http server drop table waits for metadata lifecycle absence" {
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
     try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
+}
+
+test "api http server drop table returns conflict when referenced by foreign key" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .drop_table = dropTable,
+                    .wait_table_lifecycle = waitTableLifecycle,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn dropTable(_: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            try std.testing.expectEqualStrings("customers", table_name);
+            return error.TableReferencedByForeignKey;
+        }
+
+        fn waitTableLifecycle(_: *anyopaque, _: []const u8, _: TableVisibility) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+
+    var resp = try server.handle(.{
+        .method = .DELETE,
+        .uri = "/tables/customers",
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("table is referenced by foreign key", resp.body);
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {

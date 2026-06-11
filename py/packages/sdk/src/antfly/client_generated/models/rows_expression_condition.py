@@ -4,13 +4,14 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.rows_expression_condition_op import RowsExpressionConditionOp
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.rows_expression import RowsExpression
+    from ..models.rows_expression_field import RowsExpressionField
+    from ..models.rows_expression_operator import RowsExpressionOperator
+    from ..models.rows_expression_value import RowsExpressionValue
 
 
 T = TypeVar("T", bound="RowsExpressionCondition")
@@ -21,41 +22,59 @@ class RowsExpressionCondition:
     """Computed expression predicate over the shared row-expression AST.
 
     Attributes:
-        lhs (RowsExpression): Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+        lhs (RowsExpressionField | RowsExpressionOperator | RowsExpressionValue): Shared typed row-expression AST. A
+            node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
-            `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            `greatest`, `least`, numeric
+            `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.
             Mutation expressions may set `source` to `existing` or `proposed`; query
             expressions use the default row source.
         op (RowsExpressionConditionOp):
-        rhs (RowsExpression | Unset): Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+        rhs (RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset): Shared typed row-expression
+            AST. A node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
-            `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            `greatest`, `least`, numeric
+            `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.
             Mutation expressions may set `source` to `existing` or `proposed`; query
             expressions use the default row source.
     """
 
-    lhs: RowsExpression
+    lhs: RowsExpressionField | RowsExpressionOperator | RowsExpressionValue
     op: RowsExpressionConditionOp
-    rhs: RowsExpression | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    rhs: RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        lhs = self.lhs.to_dict()
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_value import RowsExpressionValue
+
+        lhs: dict[str, Any]
+        if isinstance(self.lhs, RowsExpressionField):
+            lhs = self.lhs.to_dict()
+        elif isinstance(self.lhs, RowsExpressionValue):
+            lhs = self.lhs.to_dict()
+        else:
+            lhs = self.lhs.to_dict()
 
         op = self.op.value
 
-        rhs: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.rhs, Unset):
+        rhs: dict[str, Any] | Unset
+        if isinstance(self.rhs, Unset):
+            rhs = UNSET
+        elif isinstance(self.rhs, RowsExpressionField):
+            rhs = self.rhs.to_dict()
+        elif isinstance(self.rhs, RowsExpressionValue):
+            rhs = self.rhs.to_dict()
+        else:
             rhs = self.rhs.to_dict()
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "lhs": lhs,
@@ -69,19 +88,65 @@ class RowsExpressionCondition:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rows_expression import RowsExpression
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_operator import RowsExpressionOperator
+        from ..models.rows_expression_value import RowsExpressionValue
 
         d = dict(src_dict)
-        lhs = RowsExpression.from_dict(d.pop("lhs"))
+
+        def _parse_lhs(data: object) -> RowsExpressionField | RowsExpressionOperator | RowsExpressionValue:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_0 = RowsExpressionField.from_dict(data)
+
+                return componentsschemas_rows_expression_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_1 = RowsExpressionValue.from_dict(data)
+
+                return componentsschemas_rows_expression_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_rows_expression_type_2 = RowsExpressionOperator.from_dict(data)
+
+            return componentsschemas_rows_expression_type_2
+
+        lhs = _parse_lhs(d.pop("lhs"))
 
         op = RowsExpressionConditionOp(d.pop("op"))
 
-        _rhs = d.pop("rhs", UNSET)
-        rhs: RowsExpression | Unset
-        if isinstance(_rhs, Unset):
-            rhs = UNSET
-        else:
-            rhs = RowsExpression.from_dict(_rhs)
+        def _parse_rhs(data: object) -> RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset:
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_0 = RowsExpressionField.from_dict(data)
+
+                return componentsschemas_rows_expression_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_1 = RowsExpressionValue.from_dict(data)
+
+                return componentsschemas_rows_expression_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_rows_expression_type_2 = RowsExpressionOperator.from_dict(data)
+
+            return componentsschemas_rows_expression_type_2
+
+        rhs = _parse_rhs(d.pop("rhs", UNSET))
 
         rows_expression_condition = cls(
             lhs=lhs,
@@ -89,21 +154,4 @@ class RowsExpressionCondition:
             rhs=rhs,
         )
 
-        rows_expression_condition.additional_properties = d
         return rows_expression_condition
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

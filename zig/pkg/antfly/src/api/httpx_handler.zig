@@ -1690,6 +1690,18 @@ pub const AntflyApiHandler = struct {
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
+    pub fn rowsMutationSource(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsMutationSource(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
     pub fn rowsGet(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -1699,6 +1711,18 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing body");
         };
         var resp = try self.api_server.handlePublicTableRowsGet(table_name, body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsPlan(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicTableRowsPlan(table_name, body_data, authenticated_identity);
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
@@ -2058,6 +2082,21 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, table_name, index_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn executeGraphMetricAction(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try public_table_http.handleTableGraphMetricAction(ctx.allocator, table_name, index_name, metric_name, action, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 

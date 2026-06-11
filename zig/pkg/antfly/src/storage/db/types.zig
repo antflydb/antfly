@@ -879,6 +879,67 @@ pub const RelationalRowsPredicateGroup = struct {
     predicates: []const schema_mod.RelationalCheck = &.{},
 };
 
+pub const RelationalRowsAccessPredicateGroup = struct {
+    predicates: []const schema_mod.RelationalCheck = &.{},
+    array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    in_predicates: []const RelationalRowsInPredicate = &.{},
+    json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+};
+
+fn freeRelationalRowsAccessPredicateGroup(alloc: Allocator, group: RelationalRowsAccessPredicateGroup) void {
+    for (group.predicates) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value_json| alloc.free(value_json);
+    }
+    if (group.predicates.len > 0) alloc.free(group.predicates);
+    for (group.array_any) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_any.len > 0) alloc.free(group.array_any);
+    for (group.array_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_contains.len > 0) alloc.free(group.array_contains);
+    for (group.array_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_eq.len > 0) alloc.free(group.array_eq);
+    for (group.in_predicates) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.values_json);
+    }
+    if (group.in_predicates.len > 0) alloc.free(group.in_predicates);
+    for (group.json_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_contains.len > 0) alloc.free(group.json_contains);
+    for (group.json_path_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_path_eq.len > 0) alloc.free(group.json_path_eq);
+    for (group.json_path_exists) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+    }
+    if (group.json_path_exists.len > 0) alloc.free(group.json_path_exists);
+    for (group.text_patterns) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.pattern);
+    }
+    if (group.text_patterns.len > 0) alloc.free(group.text_patterns);
+}
+
 pub const RelationalRowsJsonExtractProjection = struct {
     output: []const u8,
     field: []const u8,
@@ -919,12 +980,22 @@ pub const RelationalRowsExpressionKind = enum {
     now,
     lower,
     upper,
+    trim,
+    replace,
     concat,
+    length,
     nullif,
+    greatest,
+    least,
+    abs,
+    round,
+    floor,
+    ceil,
     add,
     sub,
     mul,
     div,
+    interval_ns,
     case,
     cast,
     json_extract,
@@ -936,6 +1007,7 @@ pub const RelationalRowsExpressionFieldSource = enum {
     row,
     existing,
     proposed,
+    source,
 };
 
 pub const RelationalRowsExpressionCastType = enum {
@@ -1012,6 +1084,8 @@ pub const RelationalRowsQueryRequest = struct {
     text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
     or_predicates: []const RelationalRowsPredicateGroup = &.{},
     not_predicates: []const RelationalRowsPredicateGroup = &.{},
+    access_or_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
+    access_not_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
     expression_predicates: []const RelationalRowsExpressionCondition = &.{},
     expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
@@ -1023,6 +1097,7 @@ pub const RelationalRowsQueryRequest = struct {
     field_aliases: []const RelationalRowsFieldAliasProjection = &.{},
     expressions: []const RelationalRowsExpressionProjection = &.{},
     select_all: bool = true,
+    distinct_on: []const []const u8 = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     row_claim: ?RowClaimRequest = null,
     doc_key_range: ?RelationalRowsDocKeyRange = null,
@@ -1093,6 +1168,10 @@ pub const RelationalRowsQueryRequest = struct {
             if (group.predicates.len > 0) alloc.free(group.predicates);
         }
         if (self.not_predicates.len > 0) alloc.free(self.not_predicates);
+        for (self.access_or_predicates) |group| freeRelationalRowsAccessPredicateGroup(alloc, group);
+        if (self.access_or_predicates.len > 0) alloc.free(self.access_or_predicates);
+        for (self.access_not_predicates) |group| freeRelationalRowsAccessPredicateGroup(alloc, group);
+        if (self.access_not_predicates.len > 0) alloc.free(self.access_not_predicates);
         for (self.expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
         if (self.expression_predicates.len > 0) alloc.free(self.expression_predicates);
         for (self.expression_or_predicates) |group| {
@@ -1112,6 +1191,8 @@ pub const RelationalRowsQueryRequest = struct {
         if (self.expression_array_contains.len > 0) alloc.free(self.expression_array_contains);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
+        for (self.distinct_on) |field| alloc.free(field);
+        if (self.distinct_on.len > 0) alloc.free(self.distinct_on);
         for (self.json_extract) |projection| {
             alloc.free(projection.output);
             alloc.free(projection.field);
@@ -1182,6 +1263,8 @@ fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: Relational
 pub const RelationalRowsCte = struct {
     name: []const u8,
     query: RelationalRowsQueryRequest = .{},
+    max_rows: ?u32 = null,
+    max_bytes: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.name);
@@ -1190,8 +1273,24 @@ pub const RelationalRowsCte = struct {
     }
 };
 
+pub const default_relational_rows_cte_max_rows: u32 = 65_536;
+pub const default_relational_rows_cte_max_bytes: u64 = 64 * 1024 * 1024;
+
+pub const RelationalRowsCteMaterializationLimits = struct {
+    max_rows: u32,
+    max_bytes: u64,
+};
+
+pub fn relationalRowsCteMaterializationLimits(cte: RelationalRowsCte) RelationalRowsCteMaterializationLimits {
+    return .{
+        .max_rows = cte.max_rows orelse default_relational_rows_cte_max_rows,
+        .max_bytes = cte.max_bytes orelse default_relational_rows_cte_max_bytes,
+    };
+}
+
 pub const RelationalRowsQueryPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
     query: RelationalRowsQueryRequest = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1200,6 +1299,7 @@ pub const RelationalRowsQueryPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
         self.query.deinit(alloc);
         self.* = undefined;
     }
@@ -1221,12 +1321,55 @@ pub const RelationalRowsMutationKind = enum {
     delete,
 };
 
+pub const RelationalRowsJsonSetExpressionAssignment = struct {
+    field: []const u8,
+    path: []const []const u8,
+    expression: RelationalRowsExpression,
+};
+
 pub const RelationalRowsMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,
     source: RelationalRowsQueryRequest = .{},
     operations: []const TransformOp = &.{},
     patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
     increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+};
+
+pub const RelationalRowsConflictAction = enum {
+    update,
+    nothing,
+};
+
+pub const RelationalRowsConflictTargetKind = enum {
+    primary,
+    unique,
+};
+
+pub const RelationalRowsConflictTarget = struct {
+    kind: RelationalRowsConflictTargetKind = .primary,
+    unique_name: []const u8 = "",
+    unique_predicates: []const schema_mod.RelationalCheck = &.{},
+};
+
+pub const RelationalRowsOnConflict = struct {
+    target: RelationalRowsConflictTarget = .{},
+    action: RelationalRowsConflictAction = .nothing,
+    operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    where_expression: ?RelationalRowsExpressionCondition = null,
+};
+
+pub const RelationalRowsInsertSourceRequest = struct {
+    source_table: []const u8 = "",
+    source: RelationalRowsQueryRequest = .{},
+    assignments: []const RelationalRowsExpressionAssignment = &.{},
+    on_conflict: ?RelationalRowsOnConflict = null,
     returning: []const []const u8 = &.{},
     returning_expressions: []const RelationalRowsExpressionProjection = &.{},
     returning_all: bool = false,
@@ -1248,8 +1391,40 @@ pub const RelationalRowsWindowFunction = enum {
     row_number,
     rank,
     dense_rank,
+    percent_rank,
+    cume_dist,
+    ntile,
     lag,
     lead,
+    first_value,
+    last_value,
+    nth_value,
+    count,
+    sum,
+    avg,
+    min,
+    max,
+};
+
+pub const RelationalRowsWindowFrameUnit = enum {
+    rows,
+    range,
+};
+
+pub const RelationalRowsWindowFrameBound = enum {
+    unbounded_preceding,
+    offset_preceding,
+    current_row,
+    offset_following,
+    unbounded_following,
+};
+
+pub const RelationalRowsWindowFrame = struct {
+    unit: RelationalRowsWindowFrameUnit = .range,
+    start: RelationalRowsWindowFrameBound = .unbounded_preceding,
+    start_offset: u32 = 0,
+    end: RelationalRowsWindowFrameBound = .current_row,
+    end_offset: u32 = 0,
 };
 
 pub const RelationalRowsWindowSpec = struct {
@@ -1260,6 +1435,7 @@ pub const RelationalRowsWindowSpec = struct {
     value_expression: ?RelationalRowsExpression = null,
     offset: u32 = 1,
     default_json: []const u8 = "",
+    frame: ?RelationalRowsWindowFrame = null,
 };
 
 pub const RelationalRowsWindowRequest = struct {
@@ -1299,6 +1475,7 @@ pub const RelationalRowsWindowRequest = struct {
 
 pub const RelationalRowsWindowPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
     window: RelationalRowsWindowRequest = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1307,6 +1484,7 @@ pub const RelationalRowsWindowPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
         self.window.deinit(alloc);
         self.* = undefined;
     }
@@ -1345,14 +1523,29 @@ pub const RelationalRowsAggregateSpec = struct {
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
     filter_predicates: []const schema_mod.RelationalCheck = &.{},
+    filter_array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    filter_array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    filter_array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    filter_in_predicates: []const RelationalRowsInPredicate = &.{},
+    filter_json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    filter_json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    filter_json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    filter_text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
     filter_expressions: []const RelationalRowsExpressionCondition = &.{},
+    filter_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    filter_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    filter_not: []const RelationalRowsExpressionPredicateGroup = &.{},
 };
 
 pub const RelationalRowsAggregateRequest = struct {
     source: RelationalRowsQueryRequest = .{},
     group_by: []const []const u8 = &.{},
+    group_expressions: []const RelationalRowsExpressionProjection = &.{},
     aggregations: []const RelationalRowsAggregateSpec = &.{},
     having_predicates: []const schema_mod.RelationalCheck = &.{},
+    having_expressions: []const RelationalRowsExpressionCondition = &.{},
+    having_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    having_not: []const RelationalRowsExpressionPredicateGroup = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
@@ -1361,6 +1554,11 @@ pub const RelationalRowsAggregateRequest = struct {
         self.source.deinit(alloc);
         for (self.group_by) |field| alloc.free(field);
         if (self.group_by.len > 0) alloc.free(self.group_by);
+        for (self.group_expressions) |projection| {
+            alloc.free(projection.output);
+            freeRelationalRowsExpression(alloc, projection.expression);
+        }
+        if (self.group_expressions.len > 0) alloc.free(self.group_expressions);
         for (self.aggregations) |aggregation| {
             alloc.free(aggregation.name);
             if (aggregation.field) |field| alloc.free(field);
@@ -1375,8 +1573,64 @@ pub const RelationalRowsAggregateRequest = struct {
                 if (predicate.value_json) |value_json| alloc.free(value_json);
             }
             if (aggregation.filter_predicates.len > 0) alloc.free(aggregation.filter_predicates);
+            for (aggregation.filter_array_any) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_any.len > 0) alloc.free(aggregation.filter_array_any);
+            for (aggregation.filter_array_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_contains.len > 0) alloc.free(aggregation.filter_array_contains);
+            for (aggregation.filter_array_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_eq.len > 0) alloc.free(aggregation.filter_array_eq);
+            for (aggregation.filter_in_predicates) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.values_json);
+            }
+            if (aggregation.filter_in_predicates.len > 0) alloc.free(aggregation.filter_in_predicates);
+            for (aggregation.filter_json_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_json_contains.len > 0) alloc.free(aggregation.filter_json_contains);
+            for (aggregation.filter_json_path_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_json_path_eq.len > 0) alloc.free(aggregation.filter_json_path_eq);
+            for (aggregation.filter_json_path_exists) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+            }
+            if (aggregation.filter_json_path_exists.len > 0) alloc.free(aggregation.filter_json_path_exists);
+            for (aggregation.filter_text_patterns) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.pattern);
+            }
+            if (aggregation.filter_text_patterns.len > 0) alloc.free(aggregation.filter_text_patterns);
             for (aggregation.filter_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
             if (aggregation.filter_expressions.len > 0) alloc.free(aggregation.filter_expressions);
+            for (aggregation.filter_expression_array_contains) |predicate| {
+                freeRelationalRowsExpression(alloc, predicate.expression);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_expression_array_contains.len > 0) alloc.free(aggregation.filter_expression_array_contains);
+            for (aggregation.filter_any) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (aggregation.filter_any.len > 0) alloc.free(aggregation.filter_any);
+            for (aggregation.filter_not) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (aggregation.filter_not.len > 0) alloc.free(aggregation.filter_not);
         }
         if (self.aggregations.len > 0) alloc.free(self.aggregations);
         for (self.having_predicates) |predicate| {
@@ -1384,6 +1638,18 @@ pub const RelationalRowsAggregateRequest = struct {
             if (predicate.value_json) |value_json| alloc.free(value_json);
         }
         if (self.having_predicates.len > 0) alloc.free(self.having_predicates);
+        for (self.having_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.having_expressions.len > 0) alloc.free(self.having_expressions);
+        for (self.having_any) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.having_any.len > 0) alloc.free(self.having_any);
+        for (self.having_not) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.having_not.len > 0) alloc.free(self.having_not);
         for (self.order_by) |order| {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
@@ -1395,6 +1661,7 @@ pub const RelationalRowsAggregateRequest = struct {
 
 pub const RelationalRowsAggregatePlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
     aggregate: RelationalRowsAggregateRequest = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1403,6 +1670,7 @@ pub const RelationalRowsAggregatePlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
         self.aggregate.deinit(alloc);
         self.* = undefined;
     }
@@ -1434,6 +1702,12 @@ pub const RelationalRowsJoinProjectionSide = enum {
     right,
 };
 
+pub const RelationalRowsJoinedMutationFieldAssignment = struct {
+    field: []const u8,
+    source_side: RelationalRowsJoinProjectionSide,
+    source_field: []const u8,
+};
+
 pub const RelationalRowsJoinProjection = struct {
     output: []const u8,
     side: RelationalRowsJoinProjectionSide,
@@ -1444,6 +1718,10 @@ pub const RelationalRowsJoinRequest = struct {
     left: RelationalRowsQueryRequest = .{},
     right: RelationalRowsQueryRequest = .{},
     on: []const RelationalRowsJoinOn = &.{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     join_type: RelationalRowsJoinType = .inner,
     select: []const RelationalRowsJoinProjection = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
@@ -1458,6 +1736,23 @@ pub const RelationalRowsJoinRequest = struct {
             alloc.free(join_on.right_field);
         }
         if (self.on.len > 0) alloc.free(self.on);
+        for (self.match_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        for (self.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        for (self.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        for (self.match_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
         for (self.select) |projection| {
             alloc.free(projection.output);
             alloc.free(projection.field);
@@ -1472,8 +1767,28 @@ pub const RelationalRowsJoinRequest = struct {
     }
 };
 
+pub const RelationalRowsJoinedMutationSourceRequest = struct {
+    kind: RelationalRowsMutationKind,
+    source_table: []const u8 = "",
+    target_side: RelationalRowsJoinProjectionSide = .left,
+    join: RelationalRowsJoinRequest = .{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    source_assignments: []const RelationalRowsJoinedMutationFieldAssignment = &.{},
+    operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+};
+
 pub const RelationalRowsJoinPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    left_ranges: []const RelationalRowsDocKeyRange = &.{},
+    right_ranges: []const RelationalRowsDocKeyRange = &.{},
     join: RelationalRowsJoinRequest = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1482,6 +1797,8 @@ pub const RelationalRowsJoinPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
+        freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
         self.join.deinit(alloc);
         self.* = undefined;
     }
@@ -1496,6 +1813,10 @@ pub const RelationalRowsLateralRequest = struct {
     left: RelationalRowsQueryRequest = .{},
     right: RelationalRowsQueryRequest = .{},
     correlations: []const RelationalRowsLateralCorrelation = &.{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     select: []const RelationalRowsJoinProjection = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
@@ -1509,6 +1830,23 @@ pub const RelationalRowsLateralRequest = struct {
             alloc.free(correlation.right_field);
         }
         if (self.correlations.len > 0) alloc.free(self.correlations);
+        for (self.match_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        for (self.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        for (self.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        for (self.match_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
         for (self.select) |projection| {
             alloc.free(projection.output);
             alloc.free(projection.field);
@@ -1525,6 +1863,8 @@ pub const RelationalRowsLateralRequest = struct {
 
 pub const RelationalRowsLateralPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    left_ranges: []const RelationalRowsDocKeyRange = &.{},
+    right_ranges: []const RelationalRowsDocKeyRange = &.{},
     lateral: RelationalRowsLateralRequest = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1533,10 +1873,20 @@ pub const RelationalRowsLateralPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
+        freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
         self.lateral.deinit(alloc);
         self.* = undefined;
     }
 };
+
+fn freeRelationalRowsDocKeyRanges(alloc: Allocator, ranges: []const RelationalRowsDocKeyRange) void {
+    for (ranges) |range| {
+        if (range.start.len > 0) alloc.free(range.start);
+        if (range.end.len > 0) alloc.free(range.end);
+    }
+    if (ranges.len > 0) alloc.free(ranges);
+}
 
 pub const RelationalRowsJoinResult = struct {
     rows: [][]const u8 = &.{},
@@ -2107,6 +2457,8 @@ pub const GraphMetricStatus = struct {
     build_cursor: []const u8 = "",
     build_completed_units: u64 = 0,
     build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
     retry_count: u64 = 0,
     last_error: []const u8 = "",
     progress: f64 = 0.0,
@@ -2122,8 +2474,32 @@ pub const GraphMetricStatus = struct {
         self.edge_filter.deinit(alloc);
         if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
         if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
         if (self.last_error.len > 0) alloc.free(self.last_error);
         if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
         self.* = undefined;
     }
 };
@@ -2228,6 +2604,7 @@ pub const TransactionRecoveryStats = struct {
     lease_owned: bool = false,
     has_lease: bool = false,
     acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
@@ -2274,6 +2651,107 @@ pub const TextMergeStats = struct {
     backpressure_ns: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
+};
+
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
 };
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
@@ -2391,6 +2869,7 @@ pub const DBStats = struct {
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
@@ -2932,6 +3411,7 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
         if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
         if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
         if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+        freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
         if (item.algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
             alloc.free(candidate.materialization_id);

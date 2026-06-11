@@ -886,12 +886,16 @@ export interface paths {
         put?: never;
         /**
          * Stage typed relational update/delete operations from a claimed row source
-         * @description Transaction-staging endpoint for bounded multi-row relational
-         *     update/delete operations. The source is a typed base row query with a
-         *     `row_claim` and transaction id; the server claims selected rows,
-         *     records committed-version predicates, stages update/delete intents into
-         *     the existing transaction, and returns optional projections from the
-         *     planned final image or deleted row image.
+         * @description Transaction-staging endpoint for bounded multi-row relational writes.
+         *     Update/delete sources use either a typed base row query with a
+         *     `row_claim` and transaction id, or a typed joined mutation-source plan
+         *     whose target side carries the row claim. Insert-source requests expose
+         *     the native source-to-target insert plan shape and fail closed until the
+         *     runtime insert-source executor is available. The server claims selected
+         *     target rows for update/delete, records committed-version predicates,
+         *     stages intents into the existing transaction, and returns optional
+         *     projections from the planned final target image or deleted target row
+         *     image.
          */
         post: operations["rowsMutationSource"];
         delete?: never;
@@ -922,6 +926,32 @@ export interface paths {
          *     diagnostic physical keys.
          */
         post: operations["rowsGet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows:plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a typed relational row read plan
+         * @description Executes exactly one typed read-plan envelope. This endpoint accepts the
+         *     same query, aggregate, window, join, and lateral plan bodies as the
+         *     operation-specific endpoints and dispatches them by the single operation
+         *     branch present in the request.
+         */
+        post: operations["rowsPlan"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2841,7 +2871,8 @@ export interface components {
          * @description Structured unique-key selector. The server encodes `values` with the
          *     same relational tuple encoder used by storage, routes to the durable
          *     unique-owner range, and reads the owner row to resolve the physical row
-         *     identity. This is a point lookup, not a query scan.
+         *     identity. This is a point lookup, not a query scan. The selector object
+         *     is exact: only `name` and `values` are accepted.
          */
         RowUniqueSelector: {
             /** @description Unique constraint name. */
@@ -2854,12 +2885,13 @@ export interface components {
         /**
          * @description Structured row selector. `primary` addresses declared primary-key
          *     tables directly. `unique` addresses a declared unique constraint through
-         *     durable unique-owner rows.
+         *     durable unique-owner rows. The selector is exact and accepts exactly one
+         *     of `primary` or `unique`.
          */
         RowSelector: {
             primary?: components["schemas"]["RowPrimarySelector"];
             unique?: components["schemas"]["RowUniqueSelector"];
-        };
+        } & (unknown | unknown);
         /**
          * @description Full relational row document. Keys are declared relational columns and
          *     values are JSON values coerced through the table schema before storage.
@@ -2882,14 +2914,16 @@ export interface components {
         RowsExpressionAssignmentMap: {
             [key: string]: components["schemas"]["RowsExpression"];
         };
-        /** @description JSON path assignment for a declared `json` column. */
+        /** @description JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied. */
         RowsJsonSetTransform: {
             /** @description Declared `json` column to update. */
             field: string;
             /** @description Non-empty path under the JSON column. */
             path: string[];
             /** @description JSON value to write at the path. */
-            value: unknown;
+            value?: unknown;
+            /** @description Expression value to evaluate at mutation time and write at the path. */
+            expr?: components["schemas"]["RowsExpression"];
         };
         /** @description Array transform for a declared `array` column. */
         RowsArrayUpdateTransform: {
@@ -2923,7 +2957,7 @@ export interface components {
             /** @description Set to `true` to target the declared primary key. */
             primary?: boolean;
             unique?: components["schemas"]["RowsConflictUniqueTarget"];
-        };
+        } & (unknown | unknown);
         /**
          * @description Typed conflict action for insert operations. `nothing` skips the insert
          *     when the target already exists. `update` applies the same typed update
@@ -2948,7 +2982,9 @@ export interface components {
          *     applies a non-upsert patch by primary or unique identity, and `delete`
          *     removes by primary or unique identity. `update.patch` cannot change
          *     primary-key components. Missing unique selectors fail the write request
-         *     rather than falling back to scans.
+         *     rather than falling back to scans. The operation envelope is exact and
+         *     operation-specific: unsupported fields for the selected `op` fail
+         *     validation instead of being ignored.
          */
         RowOperation: {
             /** @enum {string} */
@@ -2964,7 +3000,6 @@ export interface components {
             json_set?: components["schemas"]["RowsJsonSetTransform"][];
             array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
             on_conflict?: components["schemas"]["RowsOnConflict"];
-            where_expression?: components["schemas"]["RowsExpressionCondition"];
             /** @description Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections. */
             returning?: string[];
             /** @description Typed row-expression projections from the committed mutation image. */
@@ -3009,6 +3044,88 @@ export interface components {
             /** @description Typed row-expression projections over the final update image or deleted row image. */
             returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
         };
+        /** @description Target-column assignment for a typed insert-source plan. */
+        RowsInsertSourceAssignment: {
+            /** @description Declared target-table relational field to populate. */
+            target_field: string;
+            /** @description Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text. */
+            expr: components["schemas"]["RowsExpression"];
+        };
+        /**
+         * @description Typed relational insert-source plan. The `source` is a read-only row
+         *     query over `source_table` or, when omitted, the target table named in the
+         *     path. Each selected source row is projected through `assignments` into a
+         *     target insert row, then optional conflict handling and `RETURNING`
+         *     projection run through the same row-batch semantics as ordinary
+         *     inserts. Execution is fail-closed until the storage/runtime layer
+         *     implements source-to-target routing, duplicate-target detection, and
+         *     owner-local insert staging for this native plan.
+         */
+        RowsInsertSourceRequest: {
+            /** @enum {string} */
+            op: "insert";
+            /** @description Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support. */
+            source_table?: string;
+            source: components["schemas"]["RowsQueryRequest"];
+            /** @description Ordered target-field assignments used to build each proposed insert row from the source row. */
+            assignments: components["schemas"]["RowsInsertSourceAssignment"][];
+            on_conflict?: components["schemas"]["RowsOnConflict"];
+            /** @description Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the committed inserted or conflict-updated row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        /** @description Source-side assignment for joined mutation-source updates. */
+        RowsJoinedMutationSourceAssignment: {
+            /** @description Declared target-side relational field to assign. */
+            target_field: string;
+            /**
+             * @description Join side that supplies the source field. Must be the non-target side.
+             * @enum {string}
+             */
+            side: "left" | "right";
+            /** @description Declared relational field to copy from the source side. */
+            field: string;
+        };
+        /**
+         * @description Typed relational joined mutation-source plan. The target side of the
+         *     `join` must carry a lockable `row_claim.transaction_id`; the non-target
+         *     side is read-only input. Update plans can copy same-typed values from
+         *     the source side through `source_assignments` and can apply target-local
+         *     patches or expression assignments. Delete plans reject update
+         *     assignments. Execution must stage intents only for claimed target rows.
+         */
+        RowsJoinedMutationSourceRequest: {
+            /** @enum {string} */
+            op: "update" | "delete";
+            /** @description Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges. */
+            source_table?: string;
+            /** @enum {string} */
+            target_side: "left" | "right";
+            join: components["schemas"]["RowsJoinRequest"];
+            /** @description Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the target row and joined source row. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the target row and joined source row. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the target row and joined source row. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            /** @description Source-side assignments that copy values from the read-only joined source side into the claimed target side. */
+            source_assignments?: components["schemas"]["RowsJoinedMutationSourceAssignment"][];
+            /** @description Target-local static field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            /** @description Target-local numeric increments for update operations. */
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            /** @description Target-local field-to-expression assignments evaluated over the target row image. */
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Target-local field-to-expression numeric deltas evaluated over the target row image. */
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Fields to return from the final target update image or deleted target row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the final target update image or deleted target row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
         RowsMutationSourceResultSet: {
             /**
              * Format: int64
@@ -3047,18 +3164,29 @@ export interface components {
         RowsGetResultSet: {
             rows?: components["schemas"]["RowsGetResult"][];
         };
-        /** @description Ordered row-stream key. `field` names an output/base field; `expression` carries a typed row-expression AST for computed ordering. */
-        RowsQueryOrder: {
-            field?: string;
-            expression?: components["schemas"]["RowsExpression"];
+        /** @description Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering. */
+        RowsQueryOrder: components["schemas"]["RowsQueryOrderField"] | components["schemas"]["RowsQueryOrderExpression"];
+        RowsQueryOrderField: {
+            /** @description Output/base field to order by. Mutually exclusive with `expr`. */
+            field: string;
             /** @enum {string} */
-            direction: "asc" | "desc";
+            null_test?: "is_null" | "is_not_null";
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+        };
+        RowsQueryOrderExpression: {
+            /** @description Typed row-expression AST for computed ordering. Mutually exclusive with `field`. */
+            expr: components["schemas"]["RowsExpression"];
+            /** @enum {string} */
+            null_test?: "is_null" | "is_not_null";
+            /** @enum {string} */
+            direction?: "asc" | "desc";
         };
         /**
          * @description Lockable base-row claim metadata. Public row-plan endpoints reject this
          *     field; it is only accepted by `rows:mutation-source` lockable base-row
          *     sources and internal/coordinator execution paths. `transaction_id` is
-         *     the canonical field name; `txn_id` is accepted as an adapter alias.
+         *     the canonical field name.
          */
         RowsRowClaim: {
             /**
@@ -3076,13 +3204,10 @@ export interface components {
             owner_id?: string;
             /** @description Canonical 16-byte transaction id encoded as 32 hex characters. */
             transaction_id?: string;
-            /** @description Alias for `transaction_id`. */
-            txn_id?: string;
         };
         /**
-         * @description Internal physical range selector used after durable range ownership
-         *     routing. Public REST/SDK endpoints reject this field; it is not stable
-         *     public row identity. At least one of `start` or `end` must be present,
+         * @description Physical row-key range selector used by routed typed row plans after
+         *     durable range ownership is known. At least one of `start` or `end` must be present,
          *     and a bounded range must have `start < end`.
          */
         RowsDocKeyRange: {
@@ -3090,25 +3215,31 @@ export interface components {
             start?: string;
             /** @description Exclusive physical row-key upper bound. */
             end?: string;
-        };
+        } | unknown | unknown;
         /**
          * @description Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
          *     `{ "value": ... }`, or an operator node such as
          *     `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-         *     include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
-         *     `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+         *     include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+         *     `greatest`, `least`, numeric
+         *     `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
          *     `string_to_array`, and searched `case` with `cases` and `else`.
          *     Mutation expressions may set `source` to `existing` or `proposed`; query
          *     expressions use the default row source.
          */
-        RowsExpression: {
-            field?: string;
+        RowsExpression: components["schemas"]["RowsExpressionField"] | components["schemas"]["RowsExpressionValue"] | components["schemas"]["RowsExpressionOperator"];
+        RowsExpressionField: {
+            field: string;
             /** @enum {string} */
             source?: "row" | "existing" | "proposed";
+        };
+        RowsExpressionValue: {
             /** @description Literal JSON value for a value node. */
-            value?: unknown;
+            value: unknown;
+        };
+        RowsExpressionOperator: {
             /** @enum {string} */
-            op?: "now" | "coalesce" | "lower" | "upper" | "concat" | "nullif" | "add" | "sub" | "mul" | "div" | "cast" | "json_extract" | "array_length" | "string_to_array" | "case";
+            op: "now" | "coalesce" | "lower" | "upper" | "concat" | "length" | "nullif" | "greatest" | "least" | "abs" | "round" | "floor" | "ceil" | "add" | "sub" | "mul" | "div" | "interval_ns" | "cast" | "json_extract" | "array_length" | "string_to_array" | "case";
             /** @description Operand expressions for operator nodes. */
             args?: components["schemas"]["RowsExpression"][];
             /**
@@ -3124,8 +3255,6 @@ export interface components {
             cases?: components["schemas"]["RowsExpressionCaseBranch"][];
             /** @description Fallback expression for searched `case`. */
             else?: components["schemas"]["RowsExpression"];
-        } & {
-            [key: string]: unknown;
         };
         RowsExpressionCaseBranch: {
             when: components["schemas"]["RowsExpressionCondition"];
@@ -3171,11 +3300,14 @@ export interface components {
             field: string;
         };
         /** @description Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server. */
-        RowsCoalesceOperand: {
+        RowsCoalesceOperand: components["schemas"]["RowsCoalesceFieldOperand"] | components["schemas"]["RowsCoalesceValueOperand"];
+        RowsCoalesceFieldOperand: {
             /** @description Declared column to read. */
-            field?: string;
+            field: string;
+        };
+        RowsCoalesceValueOperand: {
             /** @description Literal JSON fallback value. */
-            value?: unknown;
+            value: unknown;
         };
         /** @description Compact COALESCE projection. */
         RowsCoalesceProjection: {
@@ -3191,6 +3323,98 @@ export interface components {
             field: string;
         };
         /**
+         * @description Typed scalar, array, JSON, or text-pattern row predicate atom over a
+         *     declared relational column. Null-test operators omit `value`; value
+         *     operators carry one JSON value; `in` and `not_in` carry an array value;
+         *     JSON path operators carry `path`; text-pattern operators carry
+         *     `pattern` and optional flags. The server validates column type and
+         *     operator-specific fields against the table schema.
+         */
+        RowsWhereAtom: {
+            /** @description Declared relational column. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        };
+        /** @description Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms. */
+        RowsWhereBranch: components["schemas"]["RowsWhereBranchAtom"] | components["schemas"]["RowsWhereBranchAll"];
+        RowsWhereBranchAtom: {
+            /** @description Declared relational column for a single-atom branch. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        };
+        RowsWhereBranchAll: {
+            /** @description Conjunction of typed atoms for this branch. */
+            all: components["schemas"]["RowsWhereAtom"][];
+        };
+        /**
+         * @description Canonical row predicate tree. A top-level `where` is one predicate
+         *     atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an
+         *     `all` conjunction plus branch groups. Branches may contain scalar,
+         *     membership, array, JSON, and text-pattern atoms; the server stores
+         *     branches containing structured atoms in native mixed access predicate
+         *     groups and keeps scalar-only branches in scalar predicate groups.
+         */
+        RowsWhere: {
+            /** @description Declared relational column for a single top-level atom. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        } | ({
+            all?: components["schemas"]["RowsWhereAtom"][];
+            any?: components["schemas"]["RowsWhereBranch"][];
+            not?: components["schemas"]["RowsWhereBranch"][];
+        } | unknown | unknown | unknown);
+        /**
          * @description Typed relational row-query plan. Predicate and expression arrays carry
          *     Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
          *     native request shape.
@@ -3199,9 +3423,7 @@ export interface components {
             /** @description Optional ordered CTE name to read instead of the base table. */
             source_cte?: string;
             /** @description Typed scalar, array, JSON, text-pattern, OR, and NOT predicates. */
-            where?: {
-                [key: string]: unknown;
-            };
+            where?: components["schemas"]["RowsWhere"];
             /** @description All computed expression predicates that must pass. */
             expression_where?: components["schemas"]["RowsExpressionCondition"][];
             /** @description OR groups of computed expression predicates. */
@@ -3217,6 +3439,8 @@ export interface components {
             field_aliases?: components["schemas"]["RowsFieldAliasProjection"][];
             /** @description Typed row-expression projections. */
             expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /** @description Ordered row identity fields used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. */
+            distinct_on?: string[];
             order_by?: components["schemas"]["RowsQueryOrder"][];
             /** Format: int64 */
             limit?: number;
@@ -3225,56 +3449,108 @@ export interface components {
             row_claim?: components["schemas"]["RowsRowClaim"];
             doc_key_range?: components["schemas"]["RowsDocKeyRange"];
         };
-        /** @description Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. */
+        /** @description Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared. */
         RowsCte: {
             name: string;
+            /** Format: int64 */
+            max_rows?: number;
+            /** Format: int64 */
+            max_bytes?: number;
             query: components["schemas"]["RowsQueryRequest"];
         };
         RowsAggregateSpec: {
             name: string;
-            op: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg";
             field?: string;
-            expression?: components["schemas"]["RowsExpression"];
+            expr?: components["schemas"]["RowsExpression"];
             distinct?: boolean;
-            filter?: {
-                [key: string]: unknown;
-            };
+            /** Format: int64 */
+            distinct_max_items?: number;
+            /** Format: int64 */
+            array_max_items?: number;
+            array_order_by?: components["schemas"]["RowsQueryOrder"][];
+            filter?: components["schemas"]["RowsWhere"];
+            /** @description Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`. */
+            filter_array_any?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`. */
+            filter_array_contains?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`. */
+            filter_array_eq?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`. */
+            filter_in?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`. */
+            filter_json_contains?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`. */
+            filter_json_path_eq?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`. */
+            filter_json_path_exists?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`. */
+            filter_text_patterns?: components["schemas"]["RowsWhereAtom"][];
             filter_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description Conjunctive computed array-containment filters for this aggregate. */
+            filter_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            /** @description Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches. */
+            filter_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches. */
+            filter_not?: components["schemas"]["RowsExpressionConditionGroup"][];
         };
-        /** @description Predicate over aggregate output fields, evaluated after grouping. */
+        /** @description Predicate over emitted aggregate output fields, evaluated after grouping. */
         RowsAggregateHavingPredicate: {
-            /** @description Aggregate output field name, usually an aggregation `name` or group key. */
+            /** @description Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias. */
             field: string;
             /** @enum {string} */
             op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
             /** @description Comparison value. Omit for `is_null` and `is_not_null`. */
             value?: unknown;
         };
-        /** @description Conjunction of aggregate-output predicates for HAVING. */
+        /** @description Conjunction of emitted aggregate-output predicates for HAVING. */
         RowsAggregateHaving: {
             all: components["schemas"]["RowsAggregateHavingPredicate"][];
         };
         RowsAggregateRequest: {
             source: components["schemas"]["RowsQueryRequest"];
             group_by?: string[];
+            /** @description Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows. */
+            group_expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /** @description Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key. */
             aggregations?: components["schemas"]["RowsAggregateSpec"][];
             having?: components["schemas"]["RowsAggregateHaving"];
+            /** @description Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names. */
+            having_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches. */
+            having_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches. */
+            having_not?: components["schemas"]["RowsExpressionConditionGroup"][];
             order_by?: components["schemas"]["RowsQueryOrder"][];
             /** Format: int64 */
             limit?: number;
             /** Format: int64 */
             offset?: number;
         };
+        RowsWindowFrame: {
+            /** @enum {string} */
+            unit: "rows" | "range";
+            /** @enum {string} */
+            start: "unbounded_preceding" | "offset_preceding" | "current_row" | "offset_following";
+            /** Format: int64 */
+            start_offset?: number;
+            /** @enum {string} */
+            end: "offset_preceding" | "current_row" | "offset_following" | "unbounded_following";
+            /** Format: int64 */
+            end_offset?: number;
+        };
         RowsWindowSpec: {
             as: string;
+            /** @description Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`. */
             function: string;
             partition_by?: string[];
             order_by: components["schemas"]["RowsQueryOrder"][];
-            field?: string;
-            expression?: components["schemas"]["RowsExpression"];
+            expr?: components["schemas"]["RowsExpression"];
             /** Format: int64 */
             offset?: number;
             default?: unknown;
+            frame?: components["schemas"]["RowsWindowFrame"];
         };
         RowsWindowRequest: {
             source: components["schemas"]["RowsQueryRequest"];
@@ -3301,6 +3577,14 @@ export interface components {
             left: components["schemas"]["RowsQueryRequest"];
             right: components["schemas"]["RowsQueryRequest"];
             on: components["schemas"]["RowsJoinOn"][];
+            /** @description Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the joined rows. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the joined rows. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the joined rows. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
             /** @enum {string} */
             join_type?: "inner" | "left";
             select?: components["schemas"]["RowsJoinProjection"][];
@@ -3319,6 +3603,14 @@ export interface components {
             left: components["schemas"]["RowsQueryRequest"];
             right: components["schemas"]["RowsQueryRequest"];
             correlations: components["schemas"]["RowsLateralCorrelation"][];
+            /** @description Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the left row and each bounded right row. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the left row and each bounded right row. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the left row and each bounded right row. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
             select?: components["schemas"]["RowsJoinProjection"][];
             order_by?: components["schemas"]["RowsQueryOrder"][];
             /** Format: int64 */
@@ -3327,41 +3619,42 @@ export interface components {
             offset?: number;
         };
         /**
-         * @description Generic typed relational row plan envelope. Public operation endpoints
-         *     use the operation-specific envelope schemas below and accept exactly one
-         *     top-level operation field plus optional ordered `ctes`.
+         * @description Generic typed relational row plan envelope. It is exactly one
+         *     operation-specific envelope: query, aggregate, window, join, or
+         *     lateral. Query, aggregate, and window plans use `ranges`; join and
+         *     lateral plans use paired `left_ranges` and `right_ranges`.
          */
-        RowsPlanRequest: {
-            ctes?: components["schemas"]["RowsCte"][];
-            query?: components["schemas"]["RowsQueryRequest"];
-            aggregate?: components["schemas"]["RowsAggregateRequest"];
-            window?: components["schemas"]["RowsWindowRequest"];
-            join?: components["schemas"]["RowsJoinRequest"];
-            lateral?: components["schemas"]["RowsLateralRequest"];
-        };
-        /** @description Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`. */
+        RowsPlanRequest: components["schemas"]["RowsQueryPlanRequest"] | components["schemas"]["RowsAggregatePlanRequest"] | components["schemas"]["RowsWindowPlanRequest"] | components["schemas"]["RowsJoinPlanRequest"] | components["schemas"]["RowsLateralPlanRequest"];
+        /** @description Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`. */
         RowsQueryPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
             query: components["schemas"]["RowsQueryRequest"];
         };
-        /** @description Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes`. */
+        /** @description Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`. */
         RowsAggregatePlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
             aggregate: components["schemas"]["RowsAggregateRequest"];
         };
-        /** @description Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes`. */
+        /** @description Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`. */
         RowsWindowPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
             window: components["schemas"]["RowsWindowRequest"];
         };
-        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`. */
+        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`. */
         RowsJoinPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            left_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            right_ranges?: components["schemas"]["RowsDocKeyRange"][];
             join: components["schemas"]["RowsJoinRequest"];
         };
-        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`. */
+        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`. */
         RowsLateralPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            left_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            right_ranges?: components["schemas"]["RowsDocKeyRange"][];
             lateral: components["schemas"]["RowsLateralRequest"];
         };
         RowsQueryResultSet: {
@@ -7550,6 +7843,89 @@ export interface components {
              */
             backfill_items_processed?: number;
         };
+        /** @description Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers. */
+        GraphMetricRuntimeStats: {
+            enabled?: boolean;
+            /** @enum {string} */
+            role?: "combined" | "coordinator" | "worker" | "worker_pool";
+            /** Format: uint64 */
+            runtime_id_hash?: number;
+            /** Format: uint64 */
+            owner_id_hash?: number;
+            /** Format: uint64 */
+            lease_key_hash?: number;
+            /** Format: uint64 */
+            worker_id_hash?: number;
+            /** Format: uint64 */
+            worker_count?: number;
+            lease_owned?: boolean;
+            has_lease?: boolean;
+            /** Format: uint64 */
+            acquisition_count?: number;
+            /** Format: uint64 */
+            takeover_count?: number;
+            /** Format: uint64 */
+            lease_acquire_failures?: number;
+            /** Format: uint64 */
+            lost_leases?: number;
+            /** Format: uint64 */
+            last_acquired_ms?: number;
+            started?: boolean;
+            shutdown?: boolean;
+            notified?: boolean;
+            /** Format: uint64 */
+            ticks_started?: number;
+            /** Format: uint64 */
+            ticks_completed?: number;
+            /** Format: uint64 */
+            durable_progress_ticks?: number;
+            /** Format: uint64 */
+            idle_ticks?: number;
+            /** Format: uint64 */
+            error_ticks?: number;
+            last_error_name?: string;
+            /** Format: uint64 */
+            total_metrics_scanned?: number;
+            /** Format: uint64 */
+            total_active_builds?: number;
+            /** Format: uint64 */
+            total_builds_started?: number;
+            /** Format: uint64 */
+            total_worker_steps?: number;
+            /** Format: uint64 */
+            total_coordinator_steps?: number;
+            /** Format: uint64 */
+            total_pages_claimed?: number;
+            /** Format: uint64 */
+            total_pages_completed?: number;
+            /** Format: uint64 */
+            total_phases_advanced?: number;
+            /** Format: uint64 */
+            total_published?: number;
+            /** Format: uint64 */
+            total_failed_builds?: number;
+            /** Format: uint64 */
+            last_metrics_scanned?: number;
+            /** Format: uint64 */
+            last_active_builds?: number;
+            /** Format: uint64 */
+            last_builds_started?: number;
+            /** Format: uint64 */
+            last_worker_steps?: number;
+            /** Format: uint64 */
+            last_coordinator_steps?: number;
+            /** Format: uint64 */
+            last_pages_claimed?: number;
+            /** Format: uint64 */
+            last_pages_completed?: number;
+            /** Format: uint64 */
+            last_phases_advanced?: number;
+            /** Format: uint64 */
+            last_published?: number;
+            /** Format: uint64 */
+            last_failed_builds?: number;
+            last_budget_exhausted?: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -7595,6 +7971,7 @@ export interface components {
                     result_nodes?: number;
                 };
             };
+            graph_metric_runtime?: components["schemas"]["GraphMetricRuntimeStats"];
         };
         /** @description Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics. */
         AlgebraicIndexStats: {
@@ -7682,6 +8059,43 @@ export interface components {
             mode: "all" | "types";
             types?: string[];
         };
+        GraphMetricBuildPageStatus: {
+            phase: string;
+            /** Format: int64 */
+            iteration: number;
+            /** Format: int64 */
+            page_id: number;
+            /** @enum {string} */
+            state: "pending" | "leased" | "complete" | "failed";
+            /** @enum {string} */
+            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control";
+            /** @description Worker id that owns or last failed this page. */
+            worker_id?: string;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Current attempt number for this page.
+             */
+            attempt?: number;
+            /** @description Opaque resumable cursor for this page. */
+            cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for this page.
+             */
+            completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for this page.
+             */
+            total_units?: number;
+            /** @description Last page-level error. */
+            last_error?: string;
+        };
         GraphMetricEvent: {
             /** Format: int64 */
             sequence: number;
@@ -7699,11 +8113,11 @@ export interface components {
         GraphMetricStatus: {
             state: string;
             /** @enum {string} */
-            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
+            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "hits_hub_contributions" | "hits_hub_reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
             edge_filter?: components["schemas"]["GraphMetricEdgeFilterStatus"];
             /**
              * Format: int64
-             * @description Version of the published graph metric metadata schema. Legacy unversioned materializations report 0.
+             * @description Version of the published graph metric metadata schema.
              */
             metadata_version?: number;
             maintenance_paused?: boolean;
@@ -7759,6 +8173,10 @@ export interface components {
              * @description Estimated total work units for the active graph metric build, or 0 when idle or unknown.
              */
             build_total_units?: number;
+            /** @description Active leased or failed build pages for the current build phase, capped and ordered by durable page key. */
+            build_pages?: components["schemas"]["GraphMetricBuildPageStatus"][];
+            /** @description Whether build_pages was capped before every active page could be included. */
+            build_pages_truncated?: boolean;
             /**
              * Format: int64
              * @description Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
@@ -11448,7 +11866,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RowsMutationSourceRequest"];
+                "application/json": components["schemas"]["RowsMutationSourceRequest"] | components["schemas"]["RowsInsertSourceRequest"] | components["schemas"]["RowsJoinedMutationSourceRequest"];
             };
         };
         responses: {
@@ -11496,6 +11914,37 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsPlan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row read-plan response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsQueryResultSet"] | components["schemas"]["RowsAggregateResultSet"] | components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
         };
     };
     rowsQuery: {

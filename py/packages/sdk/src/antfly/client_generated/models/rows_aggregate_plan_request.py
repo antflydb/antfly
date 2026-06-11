@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -17,15 +17,17 @@ T = TypeVar("T", bound="RowsAggregatePlanRequest")
 
 @_attrs_define
 class RowsAggregatePlanRequest:
-    """Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes`.
+    """Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`.
 
     Attributes:
         aggregate (RowsAggregateRequest):
         ctes (list[RowsCte] | Unset):
+        ranges (list[Any] | Unset):
     """
 
     aggregate: RowsAggregateRequest
     ctes: list[RowsCte] | Unset = UNSET
+    ranges: list[Any] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         aggregate = self.aggregate.to_dict()
@@ -37,6 +39,14 @@ class RowsAggregatePlanRequest:
                 ctes_item = ctes_item_data.to_dict()
                 ctes.append(ctes_item)
 
+        ranges: list[Any] | Unset = UNSET
+        if not isinstance(self.ranges, Unset):
+            ranges = []
+            for ranges_item_data in self.ranges:
+                ranges_item: Any
+                ranges_item = ranges_item_data
+                ranges.append(ranges_item)
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -46,6 +56,8 @@ class RowsAggregatePlanRequest:
         )
         if ctes is not UNSET:
             field_dict["ctes"] = ctes
+        if ranges is not UNSET:
+            field_dict["ranges"] = ranges
 
         return field_dict
 
@@ -66,9 +78,23 @@ class RowsAggregatePlanRequest:
 
                 ctes.append(ctes_item)
 
+        _ranges = d.pop("ranges", UNSET)
+        ranges: list[Any] | Unset = UNSET
+        if _ranges is not UNSET:
+            ranges = []
+            for ranges_item_data in _ranges:
+
+                def _parse_ranges_item(data: object) -> Any:
+                    return cast(Any, data)
+
+                ranges_item = _parse_ranges_item(ranges_item_data)
+
+                ranges.append(ranges_item)
+
         rows_aggregate_plan_request = cls(
             aggregate=aggregate,
             ctes=ctes,
+            ranges=ranges,
         )
 
         return rows_aggregate_plan_request

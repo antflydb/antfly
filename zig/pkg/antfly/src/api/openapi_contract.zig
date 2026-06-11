@@ -62,6 +62,17 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "total_indexed"));
     try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "index_type"));
+    try std.testing.expect(@hasDecl(indexes_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "owner_id_hash"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "worker_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "takeover_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lost_leases"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "total_pages_claimed"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "last_pages_completed"));
+    try std.testing.expect(@hasDecl(client_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasField(client_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(client_generated.GraphMetricRuntimeStats, "owner_id_hash"));
     try std.testing.expect(@hasDecl(indexes_generated, "AlgebraicIndexStats"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "healthy"));
@@ -92,6 +103,55 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_applied_sequence"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "materialization_id"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "engine_state_id"));
+}
+
+test "indexes openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"worker_pool","owner_id_hash":17,"worker_id_hash":23,"worker_count":3,"lease_owned":true,"has_lease":true,"takeover_count":2,"lost_leases":1,"ticks_started":9,"ticks_completed":8,"durable_progress_ticks":7,"total_pages_claimed":6,"total_pages_completed":5,"last_pages_claimed":4,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 23), runtime.worker_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
+            try std.testing.expect(runtime.lease_owned.?);
+            try std.testing.expect(runtime.has_lease.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
+}
+
+test "client openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(client_generated.IndexStats, alloc,
+        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"coordinator","owner_id_hash":99,"worker_count":1,"takeover_count":2,"lost_leases":1,"total_pages_claimed":6,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expectEqualStrings("coordinator", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
 }
 
 test "indexes openapi parses algebraic status as algebraic stats" {
@@ -603,6 +663,13 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_iteration") == ?i64);
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_lease_expires_at_ms") == ?i64);
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_worker_id") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_pages") == ?[]const client_generated.GraphMetricBuildPageStatus);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_pages_truncated") == ?bool);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "phase") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "page_id") == i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "state") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "range_kind") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "worker_id") == ?[]const u8);
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "retry_count") == ?i64);
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "last_error") == ?[]const u8);
     try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "progress") == f64);

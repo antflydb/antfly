@@ -30,6 +30,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const routes = @import("http_routes.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const table_reads = @import("table_reads.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -5830,6 +5831,86 @@ test "public api e2e supports graph queries" {
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
+    const not_ready_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
+        \\{"inserts":{
+        \\  "doc-a":{"title":"alpha","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5}],"related":[{"target":"doc-c","weight":0.5}]}}},
+        \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
+        \\  "doc-c":{"title":"gamma"}
+        \\},"sync_level":"write"}
+    );
+    defer std.testing.allocator.free(not_ready_batch_body);
+    var not_ready_batch = try client.fetchBatch(base_uri, "docs", not_ready_batch_body);
+    defer not_ready_batch.deinit(std.testing.allocator);
+
+    var not_ready_index_status = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
+    defer not_ready_index_status.deinit(std.testing.allocator);
+    var parsed_not_ready_index_status = try parseJsonBody(IndexStatusSummary, std.testing.allocator, not_ready_index_status.body);
+    defer parsed_not_ready_index_status.deinit();
+    const not_ready_metric_status = parsed_not_ready_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
+    const not_ready_pagerank_status = not_ready_metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("not_ready", not_ready_pagerank_status.state);
+    try std.testing.expectEqual(@as(i64, 0), not_ready_pagerank_status.published_generation);
+    try std.testing.expect(not_ready_pagerank_status.edge_generation > 0);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"published\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var not_ready_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_not_ready":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer not_ready_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_not_ready_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, not_ready_projected_metric_query.body, .{});
+    defer parsed_not_ready_projected_metric.deinit();
+    const not_ready_projected_neighbors = try expectSingleGraphResult.get(parsed_not_ready_projected_metric.value, "neighbors_metric_not_ready");
+    const not_ready_projected_status = not_ready_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const not_ready_projected_pagerank_status = not_ready_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("not_ready", not_ready_projected_pagerank_status.state);
+    try std.testing.expectEqual(@as(i64, 0), not_ready_projected_pagerank_status.published_generation);
+    const not_ready_projected_nodes = not_ready_projected_neighbors.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expect(not_ready_projected_nodes.len > 0);
+    const not_ready_projected_metrics = not_ready_projected_nodes[0].metrics orelse return error.TestUnexpectedResult;
+    const not_ready_projected_score = not_ready_projected_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(not_ready_projected_score.* == null);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_not_ready\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"published\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{
         \\  "doc-a":{"title":"alpha","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5}],"related":[{"target":"doc-c","weight":0.5}]}}},
@@ -5963,6 +6044,283 @@ test "public api e2e supports graph queries" {
     const filtered_metrics = filtered_nodes[0].metrics orelse return error.TestUnexpectedResult;
     const filtered_score = (filtered_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult).* orelse return error.TestUnexpectedResult;
     try std.testing.expect(filtered_score >= metric_filter_threshold);
+
+    const stale_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
+        \\{"inserts":{
+        \\  "doc-a":{"title":"alpha updated","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5},{"target":"doc-c","weight":0.75}]}}},
+        \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
+        \\  "doc-c":{"title":"gamma"}
+        \\},"sync_level":"write"}
+    );
+    defer std.testing.allocator.free(stale_batch_body);
+    var stale_batch = try client.fetchBatch(base_uri, "docs", stale_batch_body);
+    defer stale_batch.deinit(std.testing.allocator);
+
+    var stale_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer stale_metric_query.deinit(std.testing.allocator);
+    var parsed_stale_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_metric_query.body, .{});
+    defer parsed_stale_metric.deinit();
+    const stale_metric_responses = parsed_stale_metric.value.responses orelse return error.TestUnexpectedResult;
+    const stale_graph_metric_results = stale_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const stale_pagerank_result = stale_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("stale", stale_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, stale_pagerank_result.status.published_generation);
+    try std.testing.expect(stale_pagerank_result.status.edge_generation > stale_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), stale_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var stale_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_stale":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer stale_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_stale_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_projected_metric_query.body, .{});
+    defer parsed_stale_projected_metric.deinit();
+    const stale_projected_neighbors = try expectSingleGraphResult.get(parsed_stale_projected_metric.value, "neighbors_metric_stale");
+    const stale_projected_status = stale_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const stale_projected_pagerank_status = stale_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("stale", stale_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, stale_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_stale\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var stale_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer stale_rerank_query.deinit(std.testing.allocator);
+    var parsed_stale_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_rerank_query.body, .{});
+    defer parsed_stale_rerank.deinit();
+    const stale_rerank_responses = parsed_stale_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const stale_rerank_hits = stale_rerank_responses[0].hits orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stale_rerank_hits.hits.?.len > 0);
+    const stale_rerank_score_details = stale_rerank_hits.hits.?[0]._score_details orelse return error.TestUnexpectedResult;
+    const stale_rerank_details = stale_rerank_score_details.graph_metric_rerank orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("graph_idx", stale_rerank_details.index_name);
+    try std.testing.expectEqualStrings("pagerank", stale_rerank_details.metric_name);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(pagerank_result.status.published_generation)),
+        stale_rerank_details.published_generation,
+    );
+    const stale_rerank_profile = stale_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const stale_rerank_metric_profiles = stale_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    var found_stale_rerank_profile = false;
+    for (stale_rerank_metric_profiles) |profile| {
+        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+        found_stale_rerank_profile = true;
+        try std.testing.expectEqualStrings("graph_metric_rerank", profile.query_name);
+        try std.testing.expectEqualStrings("graph_idx", profile.index_name);
+        try std.testing.expectEqualStrings("pagerank", profile.metric_name);
+        try std.testing.expectEqualStrings("published", profile.freshness);
+        try std.testing.expectEqualStrings("stale", profile.status.state);
+        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
+        try std.testing.expect(profile.status.edge_generation > profile.status.published_generation);
+    }
+    try std.testing.expect(found_stale_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expect(projected_ranges.len > 0);
+    const group_id = projected_ranges[0].group_id;
+    const provisioned_db_path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, group_id);
+    defer std.testing.allocator.free(provisioned_db_path);
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer db.close();
+        var active_status = try db.ensureGraphMetricPlannedBuild(
+            std.testing.allocator,
+            "graph_idx",
+            "pagerank",
+            @intCast(stale_pagerank_result.status.edge_generation),
+        );
+        defer active_status.deinit(std.testing.allocator);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, active_status.state);
+        try std.testing.expectEqual(pagerank_result.status.published_generation, active_status.published_generation);
+        try std.testing.expectEqual(@as(u64, @intCast(stale_pagerank_result.status.edge_generation)), active_status.building_generation);
+    }
+
+    var active_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer active_metric_query.deinit(std.testing.allocator);
+    var parsed_active_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_metric_query.body, .{});
+    defer parsed_active_metric.deinit();
+    const active_metric_responses = parsed_active_metric.value.responses orelse return error.TestUnexpectedResult;
+    const active_graph_metric_results = active_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const active_pagerank_result = active_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("building", active_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, active_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), active_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var active_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_building":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer active_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_active_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_projected_metric_query.body, .{});
+    defer parsed_active_projected_metric.deinit();
+    const active_projected_neighbors = try expectSingleGraphResult.get(parsed_active_projected_metric.value, "neighbors_metric_building");
+    const active_projected_status = active_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const active_projected_pagerank_status = active_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("building", active_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, active_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_building\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var active_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer active_rerank_query.deinit(std.testing.allocator);
+    var parsed_active_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_rerank_query.body, .{});
+    defer parsed_active_rerank.deinit();
+    const active_rerank_responses = parsed_active_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const active_rerank_hits = active_rerank_responses[0].hits orelse return error.TestUnexpectedResult;
+    try std.testing.expect(active_rerank_hits.hits.?.len > 0);
+    const active_rerank_score_details = active_rerank_hits.hits.?[0]._score_details orelse return error.TestUnexpectedResult;
+    const active_rerank_details = active_rerank_score_details.graph_metric_rerank orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, @intCast(pagerank_result.status.published_generation)), active_rerank_details.published_generation);
+    const active_rerank_profile = active_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const active_rerank_metric_profiles = active_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    var found_active_rerank_profile = false;
+    for (active_rerank_metric_profiles) |profile| {
+        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+        found_active_rerank_profile = true;
+        try std.testing.expectEqualStrings("building", profile.status.state);
+        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
+    }
+    try std.testing.expect(found_active_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer db.close();
+        var failed_status = try db.failGraphMetricPlannedBuild(
+            std.testing.allocator,
+            "graph_idx",
+            "pagerank",
+            error.InvalidGraphMetricScore,
+        );
+        defer failed_status.deinit(std.testing.allocator);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_status.state);
+        try std.testing.expectEqual(pagerank_result.status.published_generation, failed_status.published_generation);
+    }
+
+    var failed_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer failed_metric_query.deinit(std.testing.allocator);
+    var parsed_failed_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_metric_query.body, .{});
+    defer parsed_failed_metric.deinit();
+    const failed_metric_responses = parsed_failed_metric.value.responses orelse return error.TestUnexpectedResult;
+    const failed_graph_metric_results = failed_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const failed_pagerank_result = failed_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", failed_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, failed_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), failed_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var failed_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_failed":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer failed_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_failed_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_projected_metric_query.body, .{});
+    defer parsed_failed_projected_metric.deinit();
+    const failed_projected_neighbors = try expectSingleGraphResult.get(parsed_failed_projected_metric.value, "neighbors_metric_failed");
+    const failed_projected_status = failed_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const failed_projected_pagerank_status = failed_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", failed_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, failed_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_failed\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var failed_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer failed_rerank_query.deinit(std.testing.allocator);
+    var parsed_failed_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_rerank_query.body, .{});
+    defer parsed_failed_rerank.deinit();
+    const failed_rerank_responses = parsed_failed_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const failed_rerank_profile = failed_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const failed_rerank_metric_profiles = failed_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    var found_failed_rerank_profile = false;
+    for (failed_rerank_metric_profiles) |profile| {
+        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+        found_failed_rerank_profile = true;
+        try std.testing.expectEqualStrings("failed", profile.status.state);
+        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
+    }
+    try std.testing.expect(found_failed_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(
         std.testing.allocator,

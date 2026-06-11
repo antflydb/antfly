@@ -674,6 +674,39 @@ pub const ApiHttpClient = struct {
         return summary;
     }
 
+    pub fn fetchGroupRowsSource(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.rows_source_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupJoinPartition(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -1408,6 +1441,92 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupRowsMutationSourceCollect(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return try self.fetchGroupRowsMutationSourceAction(base_uri, group_id, table_name, routes.Routes.rows_mutation_source_collect_suffix, body);
+    }
+
+    pub fn fetchGroupRowsMutationSourceStage(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return try self.fetchGroupRowsMutationSourceAction(base_uri, group_id, table_name, routes.Routes.rows_mutation_source_stage_suffix, body);
+    }
+
+    pub fn fetchGroupRowsJoinedMutationSourceCollect(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return try self.fetchGroupRowsMutationSourceAction(base_uri, group_id, table_name, routes.Routes.rows_joined_mutation_source_collect_suffix, body);
+    }
+
+    pub fn fetchGroupRowsJoinedMutationSourceInputs(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return try self.fetchGroupRowsMutationSourceAction(base_uri, group_id, table_name, routes.Routes.rows_joined_mutation_source_inputs_suffix, body);
+    }
+
+    pub fn fetchGroupRowsJoinedMutationSourceStage(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return try self.fetchGroupRowsMutationSourceAction(base_uri, group_id, table_name, routes.Routes.rows_joined_mutation_source_stage_suffix, body);
+    }
+
+    fn fetchGroupRowsMutationSourceAction(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        suffix_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            suffix_name,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidQueryRequest,
+            404 => return error.UnknownGroup,
+            409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupTxnBegin(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -1582,6 +1701,42 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupGraphMetricMaintenance(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.graph_metric_maintenance_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidGraphMetricRuntimeConfig,
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
@@ -2421,9 +2576,11 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
 
     conflict_executor.body = "topology changed";
     try std.testing.expectError(error.TopologyChanged, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.TopologyChanged, client.fetchGroupGraphMetricMaintenance(base_uri, 7, "docs", "{}"));
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

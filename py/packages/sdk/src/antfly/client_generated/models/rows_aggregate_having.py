@@ -14,7 +14,7 @@ T = TypeVar("T", bound="RowsAggregateHaving")
 
 @_attrs_define
 class RowsAggregateHaving:
-    """Conjunction of aggregate-output predicates for HAVING.
+    """Conjunction of emitted aggregate-output predicates for HAVING.
 
     Attributes:
         all_ (list[RowsAggregateHavingPredicate]):

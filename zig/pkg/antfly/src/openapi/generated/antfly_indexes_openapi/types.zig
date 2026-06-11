@@ -359,47 +359,52 @@ pub const EdgeTypeConfig = struct {
     required_metadata: ?[]const []const u8 = null,
 };
 
-/// Discriminator for the index stats variant.
-pub const GraphIndexStatsIndexType = enum {
-    graph,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .graph => "graph",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "graph", .graph },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Statistics for graph index
-pub const GraphIndexStats = struct {
-    /// Discriminator for the index stats variant.
-    index_type: GraphIndexStatsIndexType,
-    /// Error message if stats could not be retrieved
-    @"error": ?[]const u8 = null,
-    /// Total number of edges in the graph
-    total_edges: ?i64 = null,
-    /// Count of edges per edge type
-    edge_types: ?std.json.ArrayHashMap(i64) = null,
-    /// Whether the index is currently rebuilding
-    rebuilding: ?bool = null,
-    /// Rebuild progress as a ratio from 0.0 to 1.0
-    backfill_progress: ?f64 = null,
-    /// Number of edges indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
-    /// Algebraic graph execution health for bounded semiring traversal.
-    algebraic_graph: ?std.json.Value = null,
+/// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
+pub const GraphMetricRuntimeStats = struct {
+    enabled: ?bool = null,
+    role: ?[]const u8 = null,
+    runtime_id_hash: ?i64 = null,
+    owner_id_hash: ?i64 = null,
+    lease_key_hash: ?i64 = null,
+    worker_id_hash: ?i64 = null,
+    worker_count: ?i64 = null,
+    lease_owned: ?bool = null,
+    has_lease: ?bool = null,
+    acquisition_count: ?i64 = null,
+    takeover_count: ?i64 = null,
+    lease_acquire_failures: ?i64 = null,
+    lost_leases: ?i64 = null,
+    last_acquired_ms: ?i64 = null,
+    started: ?bool = null,
+    shutdown: ?bool = null,
+    notified: ?bool = null,
+    ticks_started: ?i64 = null,
+    ticks_completed: ?i64 = null,
+    durable_progress_ticks: ?i64 = null,
+    idle_ticks: ?i64 = null,
+    error_ticks: ?i64 = null,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: ?i64 = null,
+    total_active_builds: ?i64 = null,
+    total_builds_started: ?i64 = null,
+    total_worker_steps: ?i64 = null,
+    total_coordinator_steps: ?i64 = null,
+    total_pages_claimed: ?i64 = null,
+    total_pages_completed: ?i64 = null,
+    total_phases_advanced: ?i64 = null,
+    total_published: ?i64 = null,
+    total_failed_builds: ?i64 = null,
+    last_metrics_scanned: ?i64 = null,
+    last_active_builds: ?i64 = null,
+    last_builds_started: ?i64 = null,
+    last_worker_steps: ?i64 = null,
+    last_coordinator_steps: ?i64 = null,
+    last_pages_claimed: ?i64 = null,
+    last_pages_completed: ?i64 = null,
+    last_phases_advanced: ?i64 = null,
+    last_published: ?i64 = null,
+    last_failed_builds: ?i64 = null,
+    last_budget_exhausted: ?bool = null,
 };
 
 /// A typed, weighted connection between documents
@@ -558,6 +563,28 @@ pub const NodeFilter = struct {
     filter_prefix: ?[]const u8 = null,
 };
 
+pub const GraphMetricBuildPageStatus = struct {
+    phase: []const u8,
+    iteration: i64,
+    page_id: i64,
+    state: []const u8,
+    range_kind: []const u8,
+    /// Worker id that owns or last failed this page.
+    worker_id: ?[]const u8 = null,
+    /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+    lease_expires_at_ms: ?i64 = null,
+    /// Current attempt number for this page.
+    attempt: ?i64 = null,
+    /// Opaque resumable cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// Completed work units for this page.
+    completed_units: ?i64 = null,
+    /// Estimated total work units for this page.
+    total_units: ?i64 = null,
+    /// Last page-level error.
+    last_error: ?[]const u8 = null,
+};
+
 pub const GraphMetricEvent = struct {
     sequence: i64,
     kind: []const u8,
@@ -656,43 +683,48 @@ pub const GraphIndexConfig = struct {
     max_edges_per_document: ?i64 = null,
 };
 
-/// Statistics for an index
-pub const IndexStats = union(enum) {
-    full_text_index_stats: FullTextIndexStats,
-    embeddings_index_stats: EmbeddingsIndexStats,
-    graph_index_stats: GraphIndexStats,
-    algebraic_index_stats: AlgebraicIndexStats,
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
+/// Discriminator for the index stats variant.
+pub const GraphIndexStatsIndexType = enum {
+    graph,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .full_text_index_stats => |v| try jw.write(v),
-            .embeddings_index_stats => |v| try jw.write(v),
-            .graph_index_stats => |v| try jw.write(v),
-            .algebraic_index_stats => |v| try jw.write(v),
-        }
+        const s = switch (self) {
+            .graph => "graph",
+        };
+        try jw.write(s);
     }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Statistics for graph index
+pub const GraphIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: GraphIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Total number of edges in the graph
+    total_edges: ?i64 = null,
+    /// Count of edges per edge type
+    edge_types: ?std.json.ArrayHashMap(i64) = null,
+    /// Whether the index is currently rebuilding
+    rebuilding: ?bool = null,
+    /// Rebuild progress as a ratio from 0.0 to 1.0
+    backfill_progress: ?f64 = null,
+    /// Number of edges indexed during current rebuild
+    backfill_items_processed: ?i64 = null,
+    /// Algebraic graph execution health for bounded semiring traversal.
+    algebraic_graph: ?std.json.Value = null,
+    graph_metric_runtime: ?GraphMetricRuntimeStats = null,
 };
 
 /// A single result from graph traversal
@@ -834,7 +866,7 @@ pub const GraphMetricStatus = struct {
     state: []const u8,
     phase: []const u8,
     edge_filter: ?GraphMetricEdgeFilterStatus = null,
-    /// Version of the published graph metric metadata schema. Legacy unversioned materializations report 0.
+    /// Version of the published graph metric metadata schema.
     metadata_version: ?i64 = null,
     maintenance_paused: ?bool = null,
     /// Whether a local or distributed build is queued after the currently published or building generation.
@@ -862,6 +894,10 @@ pub const GraphMetricStatus = struct {
     build_completed_units: ?i64 = null,
     /// Estimated total work units for the active graph metric build, or 0 when idle or unknown.
     build_total_units: ?i64 = null,
+    /// Active leased or failed build pages for the current build phase, capped and ordered by durable page key.
+    build_pages: ?[]const GraphMetricBuildPageStatus = null,
+    /// Whether build_pages was capped before every active page could be included.
+    build_pages_truncated: ?bool = null,
     /// Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
     retry_count: ?i64 = null,
     /// Last build error for the current failed target generation.
@@ -888,6 +924,45 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
     enrichments: ?[]const []const u8 = null,
+};
+
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+        }
+    }
 };
 
 /// A step in a graph pattern query

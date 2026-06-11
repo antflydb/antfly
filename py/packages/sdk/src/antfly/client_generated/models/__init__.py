@@ -199,6 +199,9 @@ from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebrai
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_metric_action_response import GraphMetricActionResponse
+from .graph_metric_build_page_status import GraphMetricBuildPageStatus
+from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
+from .graph_metric_build_page_status_state import GraphMetricBuildPageStatusState
 from .graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
 from .graph_metric_edge_filter_status_mode import GraphMetricEdgeFilterStatusMode
 from .graph_metric_event import GraphMetricEvent
@@ -213,6 +216,8 @@ from .graph_metric_rerank import GraphMetricRerank
 from .graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
 from .graph_metric_rerank_score_details import GraphMetricRerankScoreDetails
 from .graph_metric_result import GraphMetricResult
+from .graph_metric_runtime_stats import GraphMetricRuntimeStats
+from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
 from .graph_metric_score import GraphMetricScore
 from .graph_metric_status import GraphMetricStatus
 from .graph_metric_status_phase import GraphMetricStatusPhase
@@ -447,7 +452,6 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .row_operation import RowOperation
 from .row_operation_op import RowOperationOp
 from .row_primary_selector import RowPrimarySelector
-from .row_selector import RowSelector
 from .row_unique_selector import RowUniqueSelector
 from .row_unique_selector_values import RowUniqueSelectorValues
 from .rows_aggregate_having import RowsAggregateHaving
@@ -458,40 +462,49 @@ from .rows_aggregate_request import RowsAggregateRequest
 from .rows_aggregate_result_set import RowsAggregateResultSet
 from .rows_aggregate_result_set_rows_item import RowsAggregateResultSetRowsItem
 from .rows_aggregate_spec import RowsAggregateSpec
-from .rows_aggregate_spec_filter import RowsAggregateSpecFilter
+from .rows_aggregate_spec_op import RowsAggregateSpecOp
 from .rows_array_length_projection import RowsArrayLengthProjection
 from .rows_array_update_transform import RowsArrayUpdateTransform
 from .rows_array_update_transform_op import RowsArrayUpdateTransformOp
 from .rows_batch_request import RowsBatchRequest
-from .rows_coalesce_operand import RowsCoalesceOperand
+from .rows_coalesce_field_operand import RowsCoalesceFieldOperand
 from .rows_coalesce_projection import RowsCoalesceProjection
-from .rows_conflict_target import RowsConflictTarget
+from .rows_coalesce_value_operand import RowsCoalesceValueOperand
 from .rows_conflict_unique_target import RowsConflictUniqueTarget
 from .rows_cte import RowsCte
-from .rows_doc_key_range import RowsDocKeyRange
-from .rows_expression import RowsExpression
 from .rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
 from .rows_expression_assignment_map import RowsExpressionAssignmentMap
 from .rows_expression_case_branch import RowsExpressionCaseBranch
 from .rows_expression_condition import RowsExpressionCondition
 from .rows_expression_condition_group import RowsExpressionConditionGroup
 from .rows_expression_condition_op import RowsExpressionConditionOp
-from .rows_expression_op import RowsExpressionOp
+from .rows_expression_field import RowsExpressionField
+from .rows_expression_field_source import RowsExpressionFieldSource
+from .rows_expression_operator import RowsExpressionOperator
+from .rows_expression_operator_op import RowsExpressionOperatorOp
+from .rows_expression_operator_to import RowsExpressionOperatorTo
 from .rows_expression_projection import RowsExpressionProjection
-from .rows_expression_source import RowsExpressionSource
-from .rows_expression_to import RowsExpressionTo
+from .rows_expression_value import RowsExpressionValue
 from .rows_field_alias_projection import RowsFieldAliasProjection
 from .rows_field_patch import RowsFieldPatch
 from .rows_get_request import RowsGetRequest
 from .rows_get_result import RowsGetResult
 from .rows_get_result_row import RowsGetResultRow
 from .rows_get_result_set import RowsGetResultSet
+from .rows_insert_source_assignment import RowsInsertSourceAssignment
+from .rows_insert_source_request import RowsInsertSourceRequest
+from .rows_insert_source_request_op import RowsInsertSourceRequestOp
 from .rows_join_on import RowsJoinOn
 from .rows_join_plan_request import RowsJoinPlanRequest
 from .rows_join_projection import RowsJoinProjection
 from .rows_join_projection_side import RowsJoinProjectionSide
 from .rows_join_request import RowsJoinRequest
 from .rows_join_request_join_type import RowsJoinRequestJoinType
+from .rows_joined_mutation_source_assignment import RowsJoinedMutationSourceAssignment
+from .rows_joined_mutation_source_assignment_side import RowsJoinedMutationSourceAssignmentSide
+from .rows_joined_mutation_source_request import RowsJoinedMutationSourceRequest
+from .rows_joined_mutation_source_request_op import RowsJoinedMutationSourceRequestOp
+from .rows_joined_mutation_source_request_target_side import RowsJoinedMutationSourceRequestTargetSide
 from .rows_json_extract_projection import RowsJsonExtractProjection
 from .rows_json_set_transform import RowsJsonSetTransform
 from .rows_lateral_correlation import RowsLateralCorrelation
@@ -504,12 +517,14 @@ from .rows_mutation_source_result_set_returning_item import RowsMutationSourceRe
 from .rows_numeric_increment import RowsNumericIncrement
 from .rows_on_conflict import RowsOnConflict
 from .rows_on_conflict_action import RowsOnConflictAction
-from .rows_plan_request import RowsPlanRequest
-from .rows_query_order import RowsQueryOrder
-from .rows_query_order_direction import RowsQueryOrderDirection
+from .rows_query_order_expression import RowsQueryOrderExpression
+from .rows_query_order_expression_direction import RowsQueryOrderExpressionDirection
+from .rows_query_order_expression_null_test import RowsQueryOrderExpressionNullTest
+from .rows_query_order_field import RowsQueryOrderField
+from .rows_query_order_field_direction import RowsQueryOrderFieldDirection
+from .rows_query_order_field_null_test import RowsQueryOrderFieldNullTest
 from .rows_query_plan_request import RowsQueryPlanRequest
 from .rows_query_request import RowsQueryRequest
-from .rows_query_request_where import RowsQueryRequestWhere
 from .rows_query_result_set import RowsQueryResultSet
 from .rows_query_result_set_rows_item import RowsQueryResultSetRowsItem
 from .rows_row_claim import RowsRowClaim
@@ -520,6 +535,17 @@ from .rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
 from .rows_unique_predicate import RowsUniquePredicate
 from .rows_unique_predicate_group import RowsUniquePredicateGroup
 from .rows_unique_predicate_op import RowsUniquePredicateOp
+from .rows_where_atom import RowsWhereAtom
+from .rows_where_atom_op import RowsWhereAtomOp
+from .rows_where_branch_all import RowsWhereBranchAll
+from .rows_where_branch_atom import RowsWhereBranchAtom
+from .rows_where_branch_atom_op import RowsWhereBranchAtomOp
+from .rows_where_type_0 import RowsWhereType0
+from .rows_where_type_0_op import RowsWhereType0Op
+from .rows_window_frame import RowsWindowFrame
+from .rows_window_frame_end import RowsWindowFrameEnd
+from .rows_window_frame_start import RowsWindowFrameStart
+from .rows_window_frame_unit import RowsWindowFrameUnit
 from .rows_window_plan_request import RowsWindowPlanRequest
 from .rows_window_request import RowsWindowRequest
 from .rows_window_spec import RowsWindowSpec
@@ -814,6 +840,9 @@ __all__ = (
     "GraphIndexStatsEdgeTypes",
     "GraphIndexStatsIndexType",
     "GraphMetricActionResponse",
+    "GraphMetricBuildPageStatus",
+    "GraphMetricBuildPageStatusRangeKind",
+    "GraphMetricBuildPageStatusState",
     "GraphMetricEdgeFilterStatus",
     "GraphMetricEdgeFilterStatusMode",
     "GraphMetricEvent",
@@ -828,6 +857,8 @@ __all__ = (
     "GraphMetricRerankMetricFreshness",
     "GraphMetricRerankScoreDetails",
     "GraphMetricResult",
+    "GraphMetricRuntimeStats",
+    "GraphMetricRuntimeStatsRole",
     "GraphMetricScore",
     "GraphMetricStatus",
     "GraphMetricStatusPhase",
@@ -1070,35 +1101,43 @@ __all__ = (
     "RowsAggregateResultSet",
     "RowsAggregateResultSetRowsItem",
     "RowsAggregateSpec",
-    "RowsAggregateSpecFilter",
+    "RowsAggregateSpecOp",
     "RowsArrayLengthProjection",
     "RowsArrayUpdateTransform",
     "RowsArrayUpdateTransformOp",
     "RowsBatchRequest",
-    "RowsCoalesceOperand",
+    "RowsCoalesceFieldOperand",
     "RowsCoalesceProjection",
-    "RowsConflictTarget",
+    "RowsCoalesceValueOperand",
     "RowsConflictUniqueTarget",
     "RowsCte",
-    "RowsDocKeyRange",
-    "RowSelector",
-    "RowsExpression",
     "RowsExpressionArrayContainsPredicate",
     "RowsExpressionAssignmentMap",
     "RowsExpressionCaseBranch",
     "RowsExpressionCondition",
     "RowsExpressionConditionGroup",
     "RowsExpressionConditionOp",
-    "RowsExpressionOp",
+    "RowsExpressionField",
+    "RowsExpressionFieldSource",
+    "RowsExpressionOperator",
+    "RowsExpressionOperatorOp",
+    "RowsExpressionOperatorTo",
     "RowsExpressionProjection",
-    "RowsExpressionSource",
-    "RowsExpressionTo",
+    "RowsExpressionValue",
     "RowsFieldAliasProjection",
     "RowsFieldPatch",
     "RowsGetRequest",
     "RowsGetResult",
     "RowsGetResultRow",
     "RowsGetResultSet",
+    "RowsInsertSourceAssignment",
+    "RowsInsertSourceRequest",
+    "RowsInsertSourceRequestOp",
+    "RowsJoinedMutationSourceAssignment",
+    "RowsJoinedMutationSourceAssignmentSide",
+    "RowsJoinedMutationSourceRequest",
+    "RowsJoinedMutationSourceRequestOp",
+    "RowsJoinedMutationSourceRequestTargetSide",
     "RowsJoinOn",
     "RowsJoinPlanRequest",
     "RowsJoinProjection",
@@ -1117,12 +1156,14 @@ __all__ = (
     "RowsNumericIncrement",
     "RowsOnConflict",
     "RowsOnConflictAction",
-    "RowsPlanRequest",
-    "RowsQueryOrder",
-    "RowsQueryOrderDirection",
+    "RowsQueryOrderExpression",
+    "RowsQueryOrderExpressionDirection",
+    "RowsQueryOrderExpressionNullTest",
+    "RowsQueryOrderField",
+    "RowsQueryOrderFieldDirection",
+    "RowsQueryOrderFieldNullTest",
     "RowsQueryPlanRequest",
     "RowsQueryRequest",
-    "RowsQueryRequestWhere",
     "RowsQueryResultSet",
     "RowsQueryResultSetRowsItem",
     "RowsRowClaim",
@@ -1133,6 +1174,17 @@ __all__ = (
     "RowsUniquePredicate",
     "RowsUniquePredicateGroup",
     "RowsUniquePredicateOp",
+    "RowsWhereAtom",
+    "RowsWhereAtomOp",
+    "RowsWhereBranchAll",
+    "RowsWhereBranchAtom",
+    "RowsWhereBranchAtomOp",
+    "RowsWhereType0",
+    "RowsWhereType0Op",
+    "RowsWindowFrame",
+    "RowsWindowFrameEnd",
+    "RowsWindowFrameStart",
+    "RowsWindowFrameUnit",
     "RowsWindowPlanRequest",
     "RowsWindowRequest",
     "RowsWindowSpec",

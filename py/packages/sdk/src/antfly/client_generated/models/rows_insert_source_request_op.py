@@ -1,9 +1,8 @@
 from enum import Enum
 
 
-class RowsQueryOrderDirection(str, Enum):
-    ASC = "asc"
-    DESC = "desc"
+class RowsInsertSourceRequestOp(str, Enum):
+    INSERT = "insert"
 
     def __str__(self) -> str:
         return str(self.value)

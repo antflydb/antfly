@@ -10,6 +10,7 @@ from ..models.graph_metric_status_phase import GraphMetricStatusPhase
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_metric_build_page_status import GraphMetricBuildPageStatus
     from ..models.graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
     from ..models.graph_metric_event import GraphMetricEvent
 
@@ -34,8 +35,7 @@ class GraphMetricStatus:
         delta (float):
         computed_at_ms (int):
         edge_filter (GraphMetricEdgeFilterStatus | Unset):
-        metadata_version (int | Unset): Version of the published graph metric metadata schema. Legacy unversioned
-            materializations report 0.
+        metadata_version (int | Unset): Version of the published graph metric metadata schema.
         maintenance_paused (bool | Unset):
         queued_generation (int | Unset): Pending edge generation waiting to build, or 0 when no build is queued.
         building_generation (int | Unset): Edge generation currently held by an active build lease, or 0 when idle.
@@ -53,6 +53,9 @@ class GraphMetricStatus:
             unknown.
         build_total_units (int | Unset): Estimated total work units for the active graph metric build, or 0 when idle or
             unknown.
+        build_pages (list[GraphMetricBuildPageStatus] | Unset): Active leased or failed build pages for the current
+            build phase, capped and ordered by durable page key.
+        build_pages_truncated (bool | Unset): Whether build_pages was capped before every active page could be included.
         retry_count (int | Unset): Number of consecutive failed build attempts for the current target generation, or 0
             when no failure applies.
         last_error (str | Unset): Last build error for the current failed target generation.
@@ -84,6 +87,8 @@ class GraphMetricStatus:
     build_cursor: str | Unset = UNSET
     build_completed_units: int | Unset = UNSET
     build_total_units: int | Unset = UNSET
+    build_pages: list[GraphMetricBuildPageStatus] | Unset = UNSET
+    build_pages_truncated: bool | Unset = UNSET
     retry_count: int | Unset = UNSET
     last_error: str | Unset = UNSET
     last_event: GraphMetricEvent | Unset = UNSET
@@ -140,6 +145,15 @@ class GraphMetricStatus:
         build_completed_units = self.build_completed_units
 
         build_total_units = self.build_total_units
+
+        build_pages: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.build_pages, Unset):
+            build_pages = []
+            for build_pages_item_data in self.build_pages:
+                build_pages_item = build_pages_item_data.to_dict()
+                build_pages.append(build_pages_item)
+
+        build_pages_truncated = self.build_pages_truncated
 
         retry_count = self.retry_count
 
@@ -199,6 +213,10 @@ class GraphMetricStatus:
             field_dict["build_completed_units"] = build_completed_units
         if build_total_units is not UNSET:
             field_dict["build_total_units"] = build_total_units
+        if build_pages is not UNSET:
+            field_dict["build_pages"] = build_pages
+        if build_pages_truncated is not UNSET:
+            field_dict["build_pages_truncated"] = build_pages_truncated
         if retry_count is not UNSET:
             field_dict["retry_count"] = retry_count
         if last_error is not UNSET:
@@ -212,6 +230,7 @@ class GraphMetricStatus:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_metric_build_page_status import GraphMetricBuildPageStatus
         from ..models.graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
         from ..models.graph_metric_event import GraphMetricEvent
 
@@ -269,6 +288,17 @@ class GraphMetricStatus:
 
         build_total_units = d.pop("build_total_units", UNSET)
 
+        _build_pages = d.pop("build_pages", UNSET)
+        build_pages: list[GraphMetricBuildPageStatus] | Unset = UNSET
+        if _build_pages is not UNSET:
+            build_pages = []
+            for build_pages_item_data in _build_pages:
+                build_pages_item = GraphMetricBuildPageStatus.from_dict(build_pages_item_data)
+
+                build_pages.append(build_pages_item)
+
+        build_pages_truncated = d.pop("build_pages_truncated", UNSET)
+
         retry_count = d.pop("retry_count", UNSET)
 
         last_error = d.pop("last_error", UNSET)
@@ -314,6 +344,8 @@ class GraphMetricStatus:
             build_cursor=build_cursor,
             build_completed_units=build_completed_units,
             build_total_units=build_total_units,
+            build_pages=build_pages,
+            build_pages_truncated=build_pages_truncated,
             retry_count=retry_count,
             last_error=last_error,
             last_event=last_event,

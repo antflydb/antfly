@@ -7,6 +7,8 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.rows_insert_source_request import RowsInsertSourceRequest
+from ...models.rows_joined_mutation_source_request import RowsJoinedMutationSourceRequest
 from ...models.rows_mutation_source_request import RowsMutationSourceRequest
 from ...models.rows_mutation_source_result_set import RowsMutationSourceResultSet
 from ...types import Response
@@ -15,7 +17,7 @@ from ...types import Response
 def _get_kwargs(
     table_name: str,
     *,
-    body: RowsMutationSourceRequest,
+    body: RowsInsertSourceRequest | RowsJoinedMutationSourceRequest | RowsMutationSourceRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -26,7 +28,12 @@ def _get_kwargs(
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, RowsMutationSourceRequest):
+        _kwargs["json"] = body.to_dict()
+    elif isinstance(body, RowsInsertSourceRequest):
+        _kwargs["json"] = body.to_dict()
+    else:
+        _kwargs["json"] = body.to_dict()
 
     headers["Content-Type"] = "application/json"
 
@@ -88,27 +95,25 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RowsMutationSourceRequest,
+    body: RowsInsertSourceRequest | RowsJoinedMutationSourceRequest | RowsMutationSourceRequest,
 ) -> Response[Error | RowsMutationSourceResultSet]:
     """Stage typed relational update/delete operations from a claimed row source
 
-     Transaction-staging endpoint for bounded multi-row relational
-    update/delete operations. The source is a typed base row query with a
-    `row_claim` and transaction id; the server claims selected rows,
-    records committed-version predicates, stages update/delete intents into
-    the existing transaction, and returns optional projections from the
-    planned final image or deleted row image.
+     Transaction-staging endpoint for bounded multi-row relational writes.
+    Update/delete sources use either a typed base row query with a
+    `row_claim` and transaction id, or a typed joined mutation-source plan
+    whose target side carries the row claim. Insert-source requests expose
+    the native source-to-target insert plan shape and fail closed until the
+    runtime insert-source executor is available. The server claims selected
+    target rows for update/delete, records committed-version predicates,
+    stages intents into the existing transaction, and returns optional
+    projections from the planned final target image or deleted target row
+    image.
 
     Args:
         table_name (str):
-        body (RowsMutationSourceRequest): Typed relational mutation-source plan. The `source` is a
-            lockable base
-            row-query request with `row_claim.transaction_id` and no
-            `source_cte` or `doc_key_range`; update/delete intents are staged into
-            that transaction using committed-version predicates from the selected
-            preimages. Claims over physical ranges, CTEs, joins, aggregates,
-            windows, and lateral outputs are rejected until those stages expose an
-            explicit lockable base-row contract.
+        body (RowsInsertSourceRequest | RowsJoinedMutationSourceRequest |
+            RowsMutationSourceRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -134,27 +139,25 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RowsMutationSourceRequest,
+    body: RowsInsertSourceRequest | RowsJoinedMutationSourceRequest | RowsMutationSourceRequest,
 ) -> Error | RowsMutationSourceResultSet | None:
     """Stage typed relational update/delete operations from a claimed row source
 
-     Transaction-staging endpoint for bounded multi-row relational
-    update/delete operations. The source is a typed base row query with a
-    `row_claim` and transaction id; the server claims selected rows,
-    records committed-version predicates, stages update/delete intents into
-    the existing transaction, and returns optional projections from the
-    planned final image or deleted row image.
+     Transaction-staging endpoint for bounded multi-row relational writes.
+    Update/delete sources use either a typed base row query with a
+    `row_claim` and transaction id, or a typed joined mutation-source plan
+    whose target side carries the row claim. Insert-source requests expose
+    the native source-to-target insert plan shape and fail closed until the
+    runtime insert-source executor is available. The server claims selected
+    target rows for update/delete, records committed-version predicates,
+    stages intents into the existing transaction, and returns optional
+    projections from the planned final target image or deleted target row
+    image.
 
     Args:
         table_name (str):
-        body (RowsMutationSourceRequest): Typed relational mutation-source plan. The `source` is a
-            lockable base
-            row-query request with `row_claim.transaction_id` and no
-            `source_cte` or `doc_key_range`; update/delete intents are staged into
-            that transaction using committed-version predicates from the selected
-            preimages. Claims over physical ranges, CTEs, joins, aggregates,
-            windows, and lateral outputs are rejected until those stages expose an
-            explicit lockable base-row contract.
+        body (RowsInsertSourceRequest | RowsJoinedMutationSourceRequest |
+            RowsMutationSourceRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -175,27 +178,25 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RowsMutationSourceRequest,
+    body: RowsInsertSourceRequest | RowsJoinedMutationSourceRequest | RowsMutationSourceRequest,
 ) -> Response[Error | RowsMutationSourceResultSet]:
     """Stage typed relational update/delete operations from a claimed row source
 
-     Transaction-staging endpoint for bounded multi-row relational
-    update/delete operations. The source is a typed base row query with a
-    `row_claim` and transaction id; the server claims selected rows,
-    records committed-version predicates, stages update/delete intents into
-    the existing transaction, and returns optional projections from the
-    planned final image or deleted row image.
+     Transaction-staging endpoint for bounded multi-row relational writes.
+    Update/delete sources use either a typed base row query with a
+    `row_claim` and transaction id, or a typed joined mutation-source plan
+    whose target side carries the row claim. Insert-source requests expose
+    the native source-to-target insert plan shape and fail closed until the
+    runtime insert-source executor is available. The server claims selected
+    target rows for update/delete, records committed-version predicates,
+    stages intents into the existing transaction, and returns optional
+    projections from the planned final target image or deleted target row
+    image.
 
     Args:
         table_name (str):
-        body (RowsMutationSourceRequest): Typed relational mutation-source plan. The `source` is a
-            lockable base
-            row-query request with `row_claim.transaction_id` and no
-            `source_cte` or `doc_key_range`; update/delete intents are staged into
-            that transaction using committed-version predicates from the selected
-            preimages. Claims over physical ranges, CTEs, joins, aggregates,
-            windows, and lateral outputs are rejected until those stages expose an
-            explicit lockable base-row contract.
+        body (RowsInsertSourceRequest | RowsJoinedMutationSourceRequest |
+            RowsMutationSourceRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -219,27 +220,25 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: RowsMutationSourceRequest,
+    body: RowsInsertSourceRequest | RowsJoinedMutationSourceRequest | RowsMutationSourceRequest,
 ) -> Error | RowsMutationSourceResultSet | None:
     """Stage typed relational update/delete operations from a claimed row source
 
-     Transaction-staging endpoint for bounded multi-row relational
-    update/delete operations. The source is a typed base row query with a
-    `row_claim` and transaction id; the server claims selected rows,
-    records committed-version predicates, stages update/delete intents into
-    the existing transaction, and returns optional projections from the
-    planned final image or deleted row image.
+     Transaction-staging endpoint for bounded multi-row relational writes.
+    Update/delete sources use either a typed base row query with a
+    `row_claim` and transaction id, or a typed joined mutation-source plan
+    whose target side carries the row claim. Insert-source requests expose
+    the native source-to-target insert plan shape and fail closed until the
+    runtime insert-source executor is available. The server claims selected
+    target rows for update/delete, records committed-version predicates,
+    stages intents into the existing transaction, and returns optional
+    projections from the planned final target image or deleted target row
+    image.
 
     Args:
         table_name (str):
-        body (RowsMutationSourceRequest): Typed relational mutation-source plan. The `source` is a
-            lockable base
-            row-query request with `row_claim.transaction_id` and no
-            `source_cte` or `doc_key_range`; update/delete intents are staged into
-            that transaction using committed-version predicates from the selected
-            preimages. Claims over physical ranges, CTEs, joins, aggregates,
-            windows, and lateral outputs are rejected until those stages expose an
-            explicit lockable base-row contract.
+        body (RowsInsertSourceRequest | RowsJoinedMutationSourceRequest |
+            RowsMutationSourceRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

@@ -3051,6 +3051,8 @@ fn graphMetricPhaseName(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) []con
         .initialize_ranks => "initialize_ranks",
         .iterate_contributions => "iterate_contributions",
         .reduce_ranks => "reduce_ranks",
+        .hits_hub_contributions => "hits_hub_contributions",
+        .hits_hub_reduce_ranks => "hits_hub_reduce_ranks",
         .check_convergence => "check_convergence",
         .publish_generation => "publish_generation",
         .cleanup_old_generations => "cleanup_old_generations",
@@ -3094,6 +3096,8 @@ fn toOpenApiGraphMetricStatus(
         .build_cursor = if (status.build_cursor.len > 0) status.build_cursor else null,
         .build_completed_units = saturatingI64(status.build_completed_units),
         .build_total_units = saturatingI64(status.build_total_units),
+        .build_pages = try toOpenApiGraphMetricBuildPageStatuses(alloc, status.build_pages),
+        .build_pages_truncated = if (status.build_pages_truncated) true else null,
         .retry_count = saturatingI64(status.retry_count),
         .last_error = if (status.last_error.len > 0) status.last_error else null,
         .progress = status.progress,
@@ -3104,6 +3108,31 @@ fn toOpenApiGraphMetricStatus(
         .last_event = toOpenApiGraphMetricEvent(status.last_event),
         .recent_events = try toOpenApiGraphMetricEvents(alloc, status.recent_events),
     };
+}
+
+fn toOpenApiGraphMetricBuildPageStatuses(
+    alloc: std.mem.Allocator,
+    pages: []const db_mod.types.GraphMetricBuildPageStatus,
+) !?[]indexes_openapi.GraphMetricBuildPageStatus {
+    if (pages.len == 0) return null;
+    const out = try alloc.alloc(indexes_openapi.GraphMetricBuildPageStatus, pages.len);
+    for (pages, 0..) |page, i| {
+        out[i] = .{
+            .phase = graphMetricPhaseName(page.phase),
+            .iteration = @intCast(page.iteration),
+            .page_id = saturatingI64(page.page_id),
+            .state = @tagName(page.state),
+            .range_kind = @tagName(page.range_kind),
+            .worker_id = if (page.worker_id.len > 0) page.worker_id else null,
+            .lease_expires_at_ms = saturatingI64(page.lease_expires_at_ms),
+            .attempt = saturatingI64(page.attempt),
+            .cursor = if (page.cursor.len > 0) page.cursor else null,
+            .completed_units = saturatingI64(page.completed_units),
+            .total_units = saturatingI64(page.total_units),
+            .last_error = if (page.last_error.len > 0) page.last_error else null,
+        };
+    }
+    return out;
 }
 
 fn toOpenApiGraphMetricEvents(
@@ -4732,6 +4761,7 @@ fn parseGraphMetricQueriesAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const metric_value = parsed.value.object.get("graph_metric") orelse return &.{};
+    if (metric_value == .null) return &.{};
     if (metric_value != .object) return error.InvalidQueryRequest;
 
     const index_name = try parseRequiredStringField(metric_value.object, "index");
@@ -4778,6 +4808,7 @@ fn parseGraphMetricRerankAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const rerank_value = parsed.value.object.get("graph_metric_rerank") orelse return null;
+    if (rerank_value == .null) return null;
     if (rerank_value != .object) return error.InvalidQueryRequest;
 
     const index_name = try parseRequiredStringField(rerank_value.object, "index");
@@ -5293,14 +5324,16 @@ fn queryBodyHasGraphMetric(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    return parsed.value.object.get("graph_metric") != null;
+    const value = parsed.value.object.get("graph_metric") orelse return false;
+    return value != .null;
 }
 
 fn queryBodyHasGraphMetricRerank(alloc: std.mem.Allocator, body: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    return parsed.value.object.get("graph_metric_rerank") != null;
+    const value = parsed.value.object.get("graph_metric_rerank") orelse return false;
+    return value != .null;
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {

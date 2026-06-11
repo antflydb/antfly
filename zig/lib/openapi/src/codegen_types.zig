@@ -577,7 +577,6 @@ pub const TypeGenerator = struct {
         var selector_keys = std.ArrayListUnmanaged([]const u8).empty;
         for (resolved.properties.keys()) |prop_name| {
             if (std.mem.eql(u8, prop_name, "boost")) continue;
-            if (std.mem.eql(u8, prop_name, "field")) continue;
             try selector_keys.append(self.arena, prop_name);
         }
 
@@ -1019,6 +1018,59 @@ test "undiscriminated recursive oneOf generates structural union" {
     try std.testing.expect(std.mem.indexOf(u8, output, "match_query: *MatchQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "boolean_query: *BooleanQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (objectHasAnyKey(source.object, &.{") != null);
+}
+
+test "structural union uses field-only variants as selector keys" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "FieldExpr", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = blk: {
+                var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+                try props.put(arena, "field", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+                break :blk props;
+            },
+            .required = &.{"field"},
+        },
+    });
+    try schemas.put(arena, "ValueExpr", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = blk: {
+                var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+                try props.put(arena, "value", .{ .schema = .{} });
+                break :blk props;
+            },
+            .required = &.{"value"},
+        },
+    });
+    try schemas.put(arena, "Expr", .{
+        .schema = .{
+            .one_of = &.{
+                .{ .ref = .{ .ref_string = "#/components/schemas/FieldExpr" } },
+                .{ .ref = .{ .ref_string = "#/components/schemas/ValueExpr" } },
+            },
+        },
+    });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"field\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "if (try parseStructuralVariant(FieldExpr, allocator, source, options)) |parsed| return .{ .field_expr = parsed };") != null);
 }
 
 test "allOf flattens nested oneOf member properties into struct" {

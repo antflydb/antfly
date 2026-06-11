@@ -6,6 +6,8 @@ class GraphMetricStatusPhase(str, Enum):
     CLEANUP_OLD_GENERATIONS = "cleanup_old_generations"
     COMPLETE = "complete"
     COMPUTING = "computing"
+    HITS_HUB_CONTRIBUTIONS = "hits_hub_contributions"
+    HITS_HUB_REDUCE_RANKS = "hits_hub_reduce_ranks"
     IDLE = "idle"
     INITIALIZE_RANKS = "initialize_ranks"
     ITERATE_CONTRIBUTIONS = "iterate_contributions"

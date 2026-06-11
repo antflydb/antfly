@@ -4,10 +4,11 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.rows_expression import RowsExpression
+    from ..models.rows_expression_field import RowsExpressionField
+    from ..models.rows_expression_operator import RowsExpressionOperator
+    from ..models.rows_expression_value import RowsExpressionValue
 
 
 T = TypeVar("T", bound="RowsExpressionArrayContainsPredicate")
@@ -17,28 +18,38 @@ T = TypeVar("T", bound="RowsExpressionArrayContainsPredicate")
 class RowsExpressionArrayContainsPredicate:
     """
     Attributes:
-        expr (RowsExpression): Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+        expr (RowsExpressionField | RowsExpressionOperator | RowsExpressionValue): Shared typed row-expression AST. A
+            node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
             `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric
-            `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`,
+            include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`,
+            `greatest`, `least`, numeric
+            `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
             `string_to_array`, and searched `case` with `cases` and `else`.
             Mutation expressions may set `source` to `existing` or `proposed`; query
             expressions use the default row source.
         value (list[Any]):
     """
 
-    expr: RowsExpression
+    expr: RowsExpressionField | RowsExpressionOperator | RowsExpressionValue
     value: list[Any]
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        expr = self.expr.to_dict()
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_value import RowsExpressionValue
+
+        expr: dict[str, Any]
+        if isinstance(self.expr, RowsExpressionField):
+            expr = self.expr.to_dict()
+        elif isinstance(self.expr, RowsExpressionValue):
+            expr = self.expr.to_dict()
+        else:
+            expr = self.expr.to_dict()
 
         value = self.value
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "expr": expr,
@@ -50,10 +61,36 @@ class RowsExpressionArrayContainsPredicate:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rows_expression import RowsExpression
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_operator import RowsExpressionOperator
+        from ..models.rows_expression_value import RowsExpressionValue
 
         d = dict(src_dict)
-        expr = RowsExpression.from_dict(d.pop("expr"))
+
+        def _parse_expr(data: object) -> RowsExpressionField | RowsExpressionOperator | RowsExpressionValue:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_0 = RowsExpressionField.from_dict(data)
+
+                return componentsschemas_rows_expression_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_rows_expression_type_1 = RowsExpressionValue.from_dict(data)
+
+                return componentsschemas_rows_expression_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_rows_expression_type_2 = RowsExpressionOperator.from_dict(data)
+
+            return componentsschemas_rows_expression_type_2
+
+        expr = _parse_expr(d.pop("expr"))
 
         value = cast(list[Any], d.pop("value"))
 
@@ -62,21 +99,4 @@ class RowsExpressionArrayContainsPredicate:
             value=value,
         )
 
-        rows_expression_array_contains_predicate.additional_properties = d
         return rows_expression_array_contains_predicate
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

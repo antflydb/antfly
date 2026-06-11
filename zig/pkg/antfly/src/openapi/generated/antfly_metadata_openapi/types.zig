@@ -555,7 +555,7 @@ pub const BatchResponse = struct {
 /// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
 pub const RowPrimarySelector = struct {};
 
-/// Structured unique-key selector. The server encodes `values` with the same relational tuple encoder used by storage, routes to the durable unique-owner range, and reads the owner row to resolve the physical row identity. This is a point lookup, not a query scan.
+/// Structured unique-key selector. The server encodes `values` with the same relational tuple encoder used by storage, routes to the durable unique-owner range, and reads the owner row to resolve the physical row identity. This is a point lookup, not a query scan. The selector object is exact: only `name` and `values` are accepted.
 pub const RowUniqueSelector = struct {
     /// Unique constraint name.
     name: []const u8,
@@ -571,16 +571,6 @@ pub const RowsFieldPatch = struct {};
 
 /// Numeric increment map keyed by declared numeric columns.
 pub const RowsNumericIncrement = struct {};
-
-/// JSON path assignment for a declared `json` column.
-pub const RowsJsonSetTransform = struct {
-    /// Declared `json` column to update.
-    field: []const u8,
-    /// Non-empty path under the JSON column.
-    path: []const []const u8,
-    /// JSON value to write at the path.
-    value: std.json.Value,
-};
 
 /// Array transform for a declared `array` column.
 pub const RowsArrayUpdateTransform = struct {
@@ -599,6 +589,16 @@ pub const RowsUniquePredicate = struct {
     value: ?std.json.Value = null,
 };
 
+/// Source-side assignment for joined mutation-source updates.
+pub const RowsJoinedMutationSourceAssignment = struct {
+    /// Declared target-side relational field to assign.
+    target_field: []const u8,
+    /// Join side that supplies the source field. Must be the non-target side.
+    side: []const u8,
+    /// Declared relational field to copy from the source side.
+    field: []const u8,
+};
+
 pub const RowsMutationSourceResultSet = struct {
     /// Number of source rows that matched before lock/limit selection.
     matched: ?i64 = null,
@@ -608,7 +608,14 @@ pub const RowsMutationSourceResultSet = struct {
     returning: ?[]const std.json.Value = null,
 };
 
-/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name; `txn_id` is accepted as an adapter alias.
+pub const RowsQueryOrderField = struct {
+    /// Output/base field to order by. Mutually exclusive with `expr`.
+    field: []const u8,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
     mode: ?[]const u8 = null,
     skip_locked: ?bool = null,
@@ -616,16 +623,24 @@ pub const RowsRowClaim = struct {
     owner_id: ?[]const u8 = null,
     /// Canonical 16-byte transaction id encoded as 32 hex characters.
     transaction_id: ?[]const u8 = null,
-    /// Alias for `transaction_id`.
-    txn_id: ?[]const u8 = null,
 };
 
-/// Internal physical range selector used after durable range ownership routing. Public REST/SDK endpoints reject this field; it is not stable public row identity. At least one of `start` or `end` must be present, and a bounded range must have `start < end`.
+/// Physical row-key range selector used by routed typed row plans after durable range ownership is known. At least one of `start` or `end` must be present, and a bounded range must have `start < end`.
 pub const RowsDocKeyRange = struct {
     /// Inclusive physical row-key lower bound.
     start: ?[]const u8 = null,
     /// Exclusive physical row-key upper bound.
     end: ?[]const u8 = null,
+};
+
+pub const RowsExpressionField = struct {
+    field: []const u8,
+    source: ?[]const u8 = null,
+};
+
+pub const RowsExpressionValue = struct {
+    /// Literal JSON value for a value node.
+    value: std.json.Value,
 };
 
 /// Compact JSON path projection over a declared `json` column.
@@ -648,12 +663,14 @@ pub const RowsArrayLengthProjection = struct {
     field: []const u8,
 };
 
-/// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
-pub const RowsCoalesceOperand = struct {
+pub const RowsCoalesceFieldOperand = struct {
     /// Declared column to read.
-    field: ?[]const u8 = null,
+    field: []const u8,
+};
+
+pub const RowsCoalesceValueOperand = struct {
     /// Literal JSON fallback value.
-    value: ?std.json.Value = null,
+    value: std.json.Value,
 };
 
 /// Compact field alias projection over a declared column.
@@ -664,13 +681,54 @@ pub const RowsFieldAliasProjection = struct {
     field: []const u8,
 };
 
-/// Predicate over aggregate output fields, evaluated after grouping.
+/// Typed scalar, array, JSON, or text-pattern row predicate atom over a declared relational column. Null-test operators omit `value`; value operators carry one JSON value; `in` and `not_in` carry an array value; JSON path operators carry `path`; text-pattern operators carry `pattern` and optional flags. The server validates column type and operator-specific fields against the table schema.
+pub const RowsWhereAtom = struct {
+    /// Declared relational column.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+pub const RowsWhereBranchAtom = struct {
+    /// Declared relational column for a single-atom branch.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+/// Predicate over emitted aggregate output fields, evaluated after grouping.
 pub const RowsAggregateHavingPredicate = struct {
-    /// Aggregate output field name, usually an aggregation `name` or group key.
+    /// Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
     field: []const u8,
     op: []const u8,
     /// Comparison value. Omit for `is_null` and `is_not_null`.
     value: ?std.json.Value = null,
+};
+
+pub const RowsWindowFrame = struct {
+    unit: []const u8,
+    start: []const u8,
+    start_offset: ?i64 = null,
+    end: []const u8,
+    end_offset: ?i64 = null,
 };
 
 pub const RowsJoinOn = struct {
@@ -1606,7 +1664,7 @@ pub const TransactionCommitResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
-/// Structured row selector. `primary` addresses declared primary-key tables directly. `unique` addresses a declared unique constraint through durable unique-owner rows.
+/// Structured row selector. `primary` addresses declared primary-key tables directly. `unique` addresses a declared unique constraint through durable unique-owner rows. The selector is exact and accepts exactly one of `primary` or `unique`.
 pub const RowSelector = struct {
     primary: ?RowPrimarySelector = null,
     unique: ?RowUniqueSelector = null,
@@ -1617,14 +1675,57 @@ pub const RowsUniquePredicateGroup = struct {
     all: []const RowsUniquePredicate,
 };
 
-/// Compact COALESCE projection.
-pub const RowsCoalesceProjection = struct {
-    /// Output field name.
-    as: []const u8,
-    operands: []const RowsCoalesceOperand,
+/// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+pub const RowsCoalesceOperand = union(enum) {
+    rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
+    rows_coalesce_value_operand: *RowsCoalesceValueOperand,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceFieldOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_field_operand = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceValueOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_value_operand = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_coalesce_field_operand => |v| try jw.write(v.*),
+            .rows_coalesce_value_operand => |v| try jw.write(v.*),
+        }
+    }
 };
 
-/// Conjunction of aggregate-output predicates for HAVING.
+pub const RowsWhereBranchAll = struct {
+    /// Conjunction of typed atoms for this branch.
+    all: []const RowsWhereAtom,
+};
+
+/// Conjunction of emitted aggregate-output predicates for HAVING.
 pub const RowsAggregateHaving = struct {
     all: []const RowsAggregateHavingPredicate,
 };
@@ -1948,6 +2049,64 @@ pub const RowsConflictUniqueTarget = struct {
     where: ?RowsUniquePredicateGroup = null,
 };
 
+/// Compact COALESCE projection.
+pub const RowsCoalesceProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    operands: []const RowsCoalesceOperand,
+};
+
+/// Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms.
+pub const RowsWhereBranch = union(enum) {
+    rows_where_branch_atom: *RowsWhereBranchAtom,
+    rows_where_branch_all: *RowsWhereBranchAll,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "op",
+            "value",
+            "path",
+            "pattern",
+            "case_insensitive",
+            "negated",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAtom, allocator, source, options)) |parsed| return .{ .rows_where_branch_atom = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "all",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAll, allocator, source, options)) |parsed| return .{ .rows_where_branch_all = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_where_branch_atom => |v| try jw.write(v.*),
+            .rows_where_branch_all => |v| try jw.write(v.*),
+        }
+    }
+};
+
 pub const SSEStepCompleted = AgentStep;
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
@@ -2044,6 +2203,33 @@ pub const RowsConflictTarget = struct {
     /// Set to `true` to target the declared primary key.
     primary: ?bool = null,
     unique: ?RowsConflictUniqueTarget = null,
+};
+
+/// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
+pub const RowsWhere = union(enum) {
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(_: @This(), _: anytype) !void {}
 };
 
 pub const QueryRequest = struct {
@@ -2452,6 +2638,18 @@ pub const AggregationResult = struct {
 /// Field-to-expression assignment map over the shared row-expression AST.
 pub const RowsExpressionAssignmentMap = struct {};
 
+/// JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied.
+pub const RowsJsonSetTransform = struct {
+    /// Declared `json` column to update.
+    field: []const u8,
+    /// Non-empty path under the JSON column.
+    path: []const []const u8,
+    /// JSON value to write at the path.
+    value: ?std.json.Value = null,
+    /// Expression value to evaluate at mutation time and write at the path.
+    expr: ?RowsExpression = null,
+};
+
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
 pub const RowsOnConflict = struct {
     target: RowsConflictTarget,
@@ -2465,7 +2663,7 @@ pub const RowsOnConflict = struct {
     where_expression: ?RowsExpressionCondition = null,
 };
 
-/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans.
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans. The operation envelope is exact and operation-specific: unsupported fields for the selected `op` fail validation instead of being ignored.
 pub const RowOperation = struct {
     op: []const u8,
     /// Full row document for insert/upsert. Must include primary-key columns.
@@ -2479,7 +2677,6 @@ pub const RowOperation = struct {
     json_set: ?[]const RowsJsonSetTransform = null,
     array_update: ?[]const RowsArrayUpdateTransform = null,
     on_conflict: ?RowsOnConflict = null,
-    where_expression: ?RowsExpressionCondition = null,
     /// Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections.
     returning: ?[]const []const u8 = null,
     /// Typed row-expression projections from the committed mutation image.
@@ -2515,20 +2712,177 @@ pub const RowsMutationSourceRequest = struct {
     returning_expressions: ?[]const RowsExpressionProjection = null,
 };
 
-/// Ordered row-stream key. `field` names an output/base field; `expression` carries a typed row-expression AST for computed ordering.
-pub const RowsQueryOrder = struct {
-    field: ?[]const u8 = null,
-    expression: ?RowsExpression = null,
-    direction: []const u8,
+/// Target-column assignment for a typed insert-source plan.
+pub const RowsInsertSourceAssignment = struct {
+    /// Declared target-table relational field to populate.
+    target_field: []const u8,
+    /// Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text.
+    expr: RowsExpression,
 };
 
-/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `concat`, `nullif`, numeric `add`/`sub`/`mul`/`div`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
-pub const RowsExpression = struct {
-    field: ?[]const u8 = null,
-    source: ?[]const u8 = null,
-    /// Literal JSON value for a value node.
-    value: ?std.json.Value = null,
-    op: ?[]const u8 = null,
+/// Typed relational insert-source plan. The `source` is a read-only row query over `source_table` or, when omitted, the target table named in the path. Each selected source row is projected through `assignments` into a target insert row, then optional conflict handling and `RETURNING` projection run through the same row-batch semantics as ordinary inserts. Execution is fail-closed until the storage/runtime layer implements source-to-target routing, duplicate-target detection, and owner-local insert staging for this native plan.
+pub const RowsInsertSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
+    source_table: ?[]const u8 = null,
+    source: RowsQueryRequest,
+    /// Ordered target-field assignments used to build each proposed insert row from the source row.
+    assignments: []const RowsInsertSourceAssignment,
+    on_conflict: ?RowsOnConflict = null,
+    /// Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the committed inserted or conflict-updated row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Typed relational joined mutation-source plan. The target side of the `join` must carry a lockable `row_claim.transaction_id`; the non-target side is read-only input. Update plans can copy same-typed values from the source side through `source_assignments` and can apply target-local patches or expression assignments. Delete plans reject update assignments. Execution must stage intents only for claimed target rows.
+pub const RowsJoinedMutationSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
+    source_table: ?[]const u8 = null,
+    target_side: []const u8,
+    join: RowsJoinRequest,
+    /// Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the target row and joined source row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the target row and joined source row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the target row and joined source row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Source-side assignments that copy values from the read-only joined source side into the claimed target side.
+    source_assignments: ?[]const RowsJoinedMutationSourceAssignment = null,
+    /// Target-local static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Target-local numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Target-local field-to-expression assignments evaluated over the target row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Target-local field-to-expression numeric deltas evaluated over the target row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// Fields to return from the final target update image or deleted target row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final target update image or deleted target row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering.
+pub const RowsQueryOrder = union(enum) {
+    rows_query_order_expression: *RowsQueryOrderExpression,
+    rows_query_order_field: *RowsQueryOrderField,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "expr",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderExpression, allocator, source, options)) |parsed| return .{ .rows_query_order_expression = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderField, allocator, source, options)) |parsed| return .{ .rows_query_order_field = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_query_order_expression => |v| try jw.write(v.*),
+            .rows_query_order_field => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsQueryOrderExpression = struct {
+    /// Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
+    expr: RowsExpression,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `concat`, `length`, `nullif`, `greatest`, `least`, numeric `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+pub const RowsExpression = union(enum) {
+    rows_expression_operator: *RowsExpressionOperator,
+    rows_expression_field: *RowsExpressionField,
+    rows_expression_value: *RowsExpressionValue,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "op",
+            "args",
+            "to",
+            "path",
+            "as_text",
+            "cases",
+            "else",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionOperator, allocator, source, options)) |parsed| return .{ .rows_expression_operator = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "source",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionField, allocator, source, options)) |parsed| return .{ .rows_expression_field = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_expression_operator => |v| try jw.write(v.*),
+            .rows_expression_field => |v| try jw.write(v.*),
+            .rows_expression_value => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsExpressionOperator = struct {
+    op: []const u8,
     /// Operand expressions for operator nodes.
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
@@ -2574,7 +2928,7 @@ pub const RowsQueryRequest = struct {
     /// Optional ordered CTE name to read instead of the base table.
     source_cte: ?[]const u8 = null,
     /// Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
-    where: ?std.json.Value = null,
+    where: ?RowsWhere = null,
     /// All computed expression predicates that must pass.
     expression_where: ?[]const RowsExpressionCondition = null,
     /// OR groups of computed expression predicates.
@@ -2590,6 +2944,8 @@ pub const RowsQueryRequest = struct {
     field_aliases: ?[]const RowsFieldAliasProjection = null,
     /// Typed row-expression projections.
     expressions: ?[]const RowsExpressionProjection = null,
+    /// Ordered row identity fields used to keep the first row per key after order_by and before pagination. The leading order_by fields must match.
+    distinct_on: ?[]const []const u8 = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
@@ -2597,9 +2953,11 @@ pub const RowsQueryRequest = struct {
     doc_key_range: ?RowsDocKeyRange = null,
 };
 
-/// Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`.
+/// Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared.
 pub const RowsCte = struct {
     name: []const u8,
+    max_rows: ?i64 = null,
+    max_bytes: ?i64 = null,
     query: RowsQueryRequest,
 };
 
@@ -2607,17 +2965,51 @@ pub const RowsAggregateSpec = struct {
     name: []const u8,
     op: []const u8,
     field: ?[]const u8 = null,
-    expression: ?RowsExpression = null,
+    expr: ?RowsExpression = null,
     distinct: ?bool = null,
-    filter: ?std.json.Value = null,
+    distinct_max_items: ?i64 = null,
+    array_max_items: ?i64 = null,
+    array_order_by: ?[]const RowsQueryOrder = null,
+    filter: ?RowsWhere = null,
+    /// Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`.
+    filter_array_any: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`.
+    filter_array_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`.
+    filter_array_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`.
+    filter_in: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`.
+    filter_json_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`.
+    filter_json_path_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`.
+    filter_json_path_exists: ?[]const RowsWhereAtom = null,
+    /// Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`.
+    filter_text_patterns: ?[]const RowsWhereAtom = null,
     filter_expressions: ?[]const RowsExpressionCondition = null,
+    /// Conjunctive computed array-containment filters for this aggregate.
+    filter_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches.
+    filter_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches.
+    filter_not: ?[]const RowsExpressionConditionGroup = null,
 };
 
 pub const RowsAggregateRequest = struct {
     source: RowsQueryRequest,
     group_by: ?[]const []const u8 = null,
+    /// Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows.
+    group_expressions: ?[]const RowsExpressionProjection = null,
+    /// Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key.
     aggregations: ?[]const RowsAggregateSpec = null,
     having: ?RowsAggregateHaving = null,
+    /// Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names.
+    having_expressions: ?[]const RowsExpressionCondition = null,
+    /// Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches.
+    having_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches.
+    having_not: ?[]const RowsExpressionConditionGroup = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
@@ -2625,13 +3017,14 @@ pub const RowsAggregateRequest = struct {
 
 pub const RowsWindowSpec = struct {
     as: []const u8,
+    /// Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`.
     function: []const u8,
     partition_by: ?[]const []const u8 = null,
     order_by: []const RowsQueryOrder,
-    field: ?[]const u8 = null,
-    expression: ?RowsExpression = null,
+    expr: ?RowsExpression = null,
     offset: ?i64 = null,
     default: ?std.json.Value = null,
+    frame: ?RowsWindowFrame = null,
 };
 
 pub const RowsWindowRequest = struct {
@@ -2648,6 +3041,14 @@ pub const RowsJoinRequest = struct {
     left: RowsQueryRequest,
     right: RowsQueryRequest,
     on: []const RowsJoinOn,
+    /// Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the joined rows.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the joined rows.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the joined rows.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
     join_type: ?[]const u8 = null,
     select: ?[]const RowsJoinProjection = null,
     order_by: ?[]const RowsQueryOrder = null,
@@ -2660,49 +3061,132 @@ pub const RowsLateralRequest = struct {
     left: RowsQueryRequest,
     right: RowsQueryRequest,
     correlations: []const RowsLateralCorrelation,
+    /// Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the left row and each bounded right row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
     select: ?[]const RowsJoinProjection = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
 };
 
-/// Generic typed relational row plan envelope. Public operation endpoints use the operation-specific envelope schemas below and accept exactly one top-level operation field plus optional ordered `ctes`.
-pub const RowsPlanRequest = struct {
-    ctes: ?[]const RowsCte = null,
-    query: ?RowsQueryRequest = null,
-    aggregate: ?RowsAggregateRequest = null,
-    window: ?RowsWindowRequest = null,
-    join: ?RowsJoinRequest = null,
-    lateral: ?RowsLateralRequest = null,
+/// Generic typed relational row plan envelope. It is exactly one operation-specific envelope: query, aggregate, window, join, or lateral. Query, aggregate, and window plans use `ranges`; join and lateral plans use paired `left_ranges` and `right_ranges`.
+pub const RowsPlanRequest = union(enum) {
+    rows_join_plan_request: *RowsJoinPlanRequest,
+    rows_lateral_plan_request: *RowsLateralPlanRequest,
+    rows_aggregate_plan_request: *RowsAggregatePlanRequest,
+    rows_query_plan_request: *RowsQueryPlanRequest,
+    rows_window_plan_request: *RowsWindowPlanRequest,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_ranges",
+            "right_ranges",
+            "join",
+        })) {
+            if (try parseStructuralVariant(RowsJoinPlanRequest, allocator, source, options)) |parsed| return .{ .rows_join_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_ranges",
+            "right_ranges",
+            "lateral",
+        })) {
+            if (try parseStructuralVariant(RowsLateralPlanRequest, allocator, source, options)) |parsed| return .{ .rows_lateral_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "aggregate",
+        })) {
+            if (try parseStructuralVariant(RowsAggregatePlanRequest, allocator, source, options)) |parsed| return .{ .rows_aggregate_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "query",
+        })) {
+            if (try parseStructuralVariant(RowsQueryPlanRequest, allocator, source, options)) |parsed| return .{ .rows_query_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "window",
+        })) {
+            if (try parseStructuralVariant(RowsWindowPlanRequest, allocator, source, options)) |parsed| return .{ .rows_window_plan_request = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_join_plan_request => |v| try jw.write(v.*),
+            .rows_lateral_plan_request => |v| try jw.write(v.*),
+            .rows_aggregate_plan_request => |v| try jw.write(v.*),
+            .rows_query_plan_request => |v| try jw.write(v.*),
+            .rows_window_plan_request => |v| try jw.write(v.*),
+        }
+    }
 };
 
-/// Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes`.
+/// Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`.
 pub const RowsQueryPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
     query: RowsQueryRequest,
 };
 
-/// Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes`.
+/// Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`.
 pub const RowsAggregatePlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
     aggregate: RowsAggregateRequest,
 };
 
-/// Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes`.
+/// Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`.
 pub const RowsWindowPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
     window: RowsWindowRequest,
 };
 
-/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`.
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
 pub const RowsJoinPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
     join: RowsJoinRequest,
 };
 
-/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`.
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
 pub const RowsLateralPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
     lateral: RowsLateralRequest,
 };
 

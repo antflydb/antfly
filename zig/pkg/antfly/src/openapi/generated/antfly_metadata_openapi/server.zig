@@ -233,8 +233,8 @@ pub const RowsMutationSourcePathParams = struct {
 };
 
 /// Parse the JSON request body for rowsMutationSource.
-pub fn parseRowsMutationSourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsMutationSourceRequest) {
-    return std.json.parseFromSlice(types.RowsMutationSourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseRowsMutationSourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Lookup relational rows by structured row identity
@@ -246,6 +246,17 @@ pub const RowsGetPathParams = struct {
 /// Parse the JSON request body for rowsGet.
 pub fn parseRowsGetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsGetRequest) {
     return std.json.parseFromSlice(types.RowsGetRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a typed relational row read plan
+pub const RowsPlanPathParams = struct {
+    /// Name of the relational table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for rowsPlan.
+pub fn parseRowsPlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RowsPlanRequest) {
+    return std.json.parseFromSlice(types.RowsPlanRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Execute a typed relational row query plan
@@ -450,6 +461,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/rows:batch", .operation_id = "rowsBatchWrite" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:mutation-source", .operation_id = "rowsMutationSource" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:get", .operation_id = "rowsGet" },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows:plan", .operation_id = "rowsPlan" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:query", .operation_id = "rowsQuery" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:aggregate", .operation_id = "rowsAggregate" },
     .{ .method = "POST", .path = "/tables/{tableName}/rows:window", .operation_id = "rowsWindow" },
@@ -514,6 +526,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "rowsBatchWrite")) @compileError("ServerRouter: Impl missing required method 'rowsBatchWrite'");
         if (!@hasDecl(Impl, "rowsMutationSource")) @compileError("ServerRouter: Impl missing required method 'rowsMutationSource'");
         if (!@hasDecl(Impl, "rowsGet")) @compileError("ServerRouter: Impl missing required method 'rowsGet'");
+        if (!@hasDecl(Impl, "rowsPlan")) @compileError("ServerRouter: Impl missing required method 'rowsPlan'");
         if (!@hasDecl(Impl, "rowsQuery")) @compileError("ServerRouter: Impl missing required method 'rowsQuery'");
         if (!@hasDecl(Impl, "rowsAggregate")) @compileError("ServerRouter: Impl missing required method 'rowsAggregate'");
         if (!@hasDecl(Impl, "rowsWindow")) @compileError("ServerRouter: Impl missing required method 'rowsWindow'");
@@ -579,6 +592,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/rows:batch", rowsBatchWrite);
             try server.post("/tables/:tableName/rows:mutation-source", rowsMutationSource);
             try server.post("/tables/:tableName/rows:get", rowsGet);
+            try server.post("/tables/:tableName/rows:plan", rowsPlan);
             try server.post("/tables/:tableName/rows:query", rowsQuery);
             try server.post("/tables/:tableName/rows:aggregate", rowsAggregate);
             try server.post("/tables/:tableName/rows:window", rowsWindow);
@@ -882,6 +896,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.rowsGet(ctx, table_name);
         }
 
+        /// Execute a typed relational row read plan
+        /// POST /tables/{tableName}/rows:plan
+        fn rowsPlan(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.rowsPlan(ctx, table_name);
+        }
+
         /// Execute a typed relational row query plan
         /// POST /tables/{tableName}/rows:query
         fn rowsQuery(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1049,6 +1071,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn rowsBatchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsMutationSource(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsGet(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn rowsPlan(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsAggregate(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn rowsWindow(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

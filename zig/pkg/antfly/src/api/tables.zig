@@ -50,8 +50,11 @@ pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
 pub const AppliedRelationalSqlDdlRecord = struct {
     table: metadata_table_manager.TableRecord,
     created_table: bool = false,
+    dropped_table: bool = false,
+    noop: bool = false,
     requires_rebuild: bool = false,
     validation_required: bool = false,
+    rewrite_required: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         metadata_table_manager.freeTable(alloc, self.table);
@@ -59,13 +62,29 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     }
 };
 
+pub const RelationalSqlDdlAction = enum {
+    create_table,
+    update_table,
+    drop_table,
+};
+
 pub const RelationalSqlDdlTarget = struct {
     table_name: []u8,
-    creates_table: bool = false,
+    action: RelationalSqlDdlAction = .update_table,
+    if_exists: bool = false,
+    cascade: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.* = undefined;
+    }
+
+    pub fn createsTable(self: @This()) bool {
+        return self.action == .create_table;
+    }
+
+    pub fn dropsTable(self: @This()) bool {
+        return self.action == .drop_table;
     }
 };
 pub const LsmStorageStatus = struct {
@@ -935,15 +954,17 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    const table_name = relationalSqlDdlPlanTableName(plan);
-    if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidSchemaUpdateRequest;
+    if (relationalSqlDdlPlanTableName(plan)) |table_name| {
+        if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidSchemaUpdateRequest;
+    }
 
     const current_schema_json: []const u8 = switch (plan) {
         .create_table => blk: {
             if (table.schema_json.len != 0) return error.InvalidSchemaUpdateRequest;
             break :blk "";
         },
-        .create_index, .alter_table, .create_update_policy => table.schema_json,
+        .drop_table => return error.UnsupportedSqlShape,
+        .create_index, .drop_index, .alter_table, .create_update_policy => table.schema_json,
     };
     var applied = try relational_sql.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
     defer applied.deinit(alloc);
@@ -953,6 +974,7 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
         .table = updated,
         .requires_rebuild = applied.requires_rebuild,
         .validation_required = applied.validation_required,
+        .rewrite_required = applied.rewrite_required,
     };
 }
 
@@ -963,19 +985,31 @@ pub fn relationalSqlDdlTargetAlloc(
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
+    const table_name = relationalSqlDdlPlanTableName(plan) orelse return error.UnsupportedSqlShape;
     return .{
-        .table_name = try alloc.dupe(u8, relationalSqlDdlPlanTableName(plan)),
-        .creates_table = switch (plan) {
-            .create_table => true,
-            .create_index, .alter_table, .create_update_policy => false,
+        .table_name = try alloc.dupe(u8, table_name),
+        .action = switch (plan) {
+            .create_table => .create_table,
+            .drop_table => .drop_table,
+            .create_index, .drop_index, .alter_table, .create_update_policy => .update_table,
+        },
+        .if_exists = switch (plan) {
+            .drop_table => |drop_table| drop_table.if_exists,
+            else => false,
+        },
+        .cascade = switch (plan) {
+            .drop_table => |drop_table| drop_table.cascade,
+            else => false,
         },
     };
 }
 
-fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) []const u8 {
+fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
         .create_index => |create_index| create_index.table_name,
+        .drop_index => null,
+        .drop_table => |drop_table| drop_table.table_name,
         .alter_table => |alter_table| alter_table.table_name,
         .create_update_policy => |update_policy| update_policy.table_name,
     };
@@ -1266,7 +1300,7 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     if (schema.* != .object) return error.InvalidSchemaUpdateRequest;
     const properties = schema.object.getPtr("properties") orelse return error.InvalidSchemaUpdateRequest;
     if (properties.* != .object) return error.InvalidSchemaUpdateRequest;
-    const property = properties.object.getPtr(index_name) orelse return error.SecondaryIndexNotFound;
+    const property = schemaPropertyForSecondaryIndex(properties, index_name) orelse return error.SecondaryIndexNotFound;
     if (property.* != .object) return error.InvalidSchemaUpdateRequest;
 
     const generation_value = property.object.get("x-antfly-index-generation") orelse return error.SecondaryIndexGenerationMismatch;
@@ -1284,6 +1318,17 @@ pub fn schemaWithSecondaryIndexReadyAlloc(
     var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
     validated.deinit(alloc);
     return updated;
+}
+
+fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []const u8) ?*std.json.Value {
+    if (properties.* != .object) return null;
+    var it = properties.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const declared = entry.value_ptr.object.get("x-antfly-index-name") orelse continue;
+        if (declared == .string and std.mem.eql(u8, declared.string, index_name)) return entry.value_ptr;
+    }
+    return properties.object.getPtr(index_name);
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -2463,6 +2508,149 @@ pub fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: 
     return null;
 }
 
+pub fn missingDropTableIfExistsNoopAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+) !AppliedRelationalSqlDdlRecord {
+    return .{
+        .table = try metadata_table_manager.cloneTable(alloc, .{
+            .table_id = deriveTableId(table_name),
+            .name = table_name,
+        }),
+        .noop = true,
+    };
+}
+
+pub fn validateRelationalTableDropAllowed(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.tables) |candidate_table| {
+        if (candidate_table.table_id == target_table.table_id) continue;
+        if (candidate_table.schema_json.len == 0) continue;
+        var parsed_child = try parseValidatedTableSchema(alloc, candidate_table.schema_json);
+        defer parsed_child.deinit(alloc);
+        const child_schema = try deriveRuntimeTableSchema(alloc, parsed_child);
+        defer runtime_schema_mod.freeSchema(alloc, child_schema);
+        if (child_schema.storage_mode != .relational) continue;
+        for (child_schema.foreign_keys) |foreign_key| {
+            if (std.mem.eql(u8, foreign_key.parent_table, target_table.name)) return error.TableReferencedByForeignKey;
+        }
+    }
+}
+
+pub fn schemaWithoutForeignKeysReferencingTableAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    parent_table_name: []const u8,
+) !?[]u8 {
+    if (schema_json.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const foreign_keys = root.getPtr("foreign_keys") orelse return null;
+    const foreign_key_array = switch (foreign_keys.*) {
+        .array => |*array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    var changed = false;
+    var i: usize = 0;
+    while (i < foreign_key_array.items.len) {
+        const foreign_key = switch (foreign_key_array.items[i]) {
+            .object => |*object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        const references = foreign_key.get("references") orelse return error.InvalidSchemaUpdateRequest;
+        if (references != .object) return error.InvalidSchemaUpdateRequest;
+        const table = references.object.get("table") orelse return error.InvalidSchemaUpdateRequest;
+        if (table != .string) return error.InvalidSchemaUpdateRequest;
+        if (!std.mem.eql(u8, table.string, parent_table_name)) {
+            i += 1;
+            continue;
+        }
+        _ = foreign_key_array.orderedRemove(i);
+        changed = true;
+    }
+    if (!changed) return null;
+    if (foreign_key_array.items.len == 0) _ = root.orderedRemove("foreign_keys");
+
+    const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(updated);
+    var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
+    validated.deinit(alloc);
+    return updated;
+}
+
+pub fn validateRelationalForeignKeyCatalogReferences(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    candidate_table: metadata_table_manager.TableRecord,
+) !void {
+    if (candidate_table.schema_json.len == 0) return;
+    var parsed_child = try parseValidatedTableSchema(alloc, candidate_table.schema_json);
+    defer parsed_child.deinit(alloc);
+    const child_schema = try deriveRuntimeTableSchema(alloc, parsed_child);
+    defer runtime_schema_mod.freeSchema(alloc, child_schema);
+    if (child_schema.storage_mode != .relational) return;
+
+    for (child_schema.foreign_keys) |foreign_key| {
+        const parent_table_name = if (std.mem.eql(u8, foreign_key.parent_table, child_schema.default_type))
+            candidate_table.name
+        else
+            foreign_key.parent_table;
+        const parent_table = if (std.mem.eql(u8, parent_table_name, candidate_table.name))
+            candidate_table
+        else
+            (findTableByName(snapshot, parent_table_name) orelse return error.InvalidSchemaUpdateRequest).*;
+
+        var parsed_parent = try parseValidatedTableSchema(alloc, parent_table.schema_json);
+        defer parsed_parent.deinit(alloc);
+        const parent_schema = try deriveRuntimeTableSchema(alloc, parsed_parent);
+        defer runtime_schema_mod.freeSchema(alloc, parent_schema);
+        if (parent_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+
+        if (foreignKeyReferencesPrimaryKey(foreign_key)) continue;
+        if (!primaryKeyColumnsEqual(parent_schema.primary_key, foreign_key.parent_columns)) {
+            _ = findUniqueConstraintByColumns(parent_schema.unique_constraints, foreign_key.parent_columns) orelse return error.InvalidSchemaUpdateRequest;
+        }
+        if (foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSchemaUpdateRequest;
+        for (foreign_key.child_columns, foreign_key.parent_columns) |child_column_name, parent_column_name| {
+            const child_column = findRelationalColumn(child_schema.relational_columns, child_column_name) orelse return error.InvalidSchemaUpdateRequest;
+            const parent_column = findRelationalColumn(parent_schema.relational_columns, parent_column_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (child_column.field_type != parent_column.field_type) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn foreignKeyReferencesPrimaryKey(foreign_key: runtime_schema_mod.ForeignKey) bool {
+    return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
+}
+
+fn primaryKeyColumnsEqual(primary_key: ?runtime_schema_mod.PrimaryKey, columns: []const []const u8) bool {
+    const key = primary_key orelse return false;
+    return stringSlicesEqual(key.columns, columns);
+}
+
+fn findUniqueConstraintByColumns(constraints: []const runtime_schema_mod.UniqueConstraint, columns: []const []const u8) ?runtime_schema_mod.UniqueConstraint {
+    for (constraints) |constraint| {
+        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
+    }
+    return null;
+}
+
+fn findRelationalColumn(columns: []const runtime_schema_mod.RelationalColumn, name: []const u8) ?runtime_schema_mod.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
 fn deriveId(name: []const u8, seed: u64) u64 {
     const id = std.hash.Wyhash.hash(seed, name);
     return if (id == 0) 1 else id;
@@ -3038,12 +3226,33 @@ test "metadata.schema update sql ddl exposes catalog target and create intent" {
     var create_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE users (id uuid PRIMARY KEY);");
     defer create_target.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("users", create_target.table_name);
-    try std.testing.expect(create_target.creates_table);
+    try std.testing.expect(create_target.createsTable());
 
     var alter_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "ALTER TABLE users ADD COLUMN status text;");
     defer alter_target.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("users", alter_target.table_name);
-    try std.testing.expect(!alter_target.creates_table);
+    try std.testing.expect(!alter_target.createsTable());
+
+    var drop_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "DROP TABLE users;");
+    defer drop_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", drop_target.table_name);
+    try std.testing.expect(drop_target.dropsTable());
+    try std.testing.expect(!drop_target.if_exists);
+    try std.testing.expect(!drop_target.cascade);
+
+    var drop_if_exists_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "DROP TABLE IF EXISTS users;");
+    defer drop_if_exists_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", drop_if_exists_target.table_name);
+    try std.testing.expect(drop_if_exists_target.dropsTable());
+    try std.testing.expect(drop_if_exists_target.if_exists);
+    try std.testing.expect(!drop_if_exists_target.cascade);
+
+    var drop_cascade_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "DROP TABLE users CASCADE;");
+    defer drop_cascade_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", drop_cascade_target.table_name);
+    try std.testing.expect(drop_cascade_target.dropsTable());
+    try std.testing.expect(!drop_cascade_target.if_exists);
+    try std.testing.expect(drop_cascade_target.cascade);
 }
 
 test "metadata.schema update sql ddl applies relational catalog changes through table record path" {
@@ -3071,22 +3280,35 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     defer altered.deinit(std.testing.allocator);
 
     try std.testing.expect(altered.requires_rebuild);
-    try std.testing.expect(altered.validation_required);
+    try std.testing.expect(!altered.validation_required);
+    try std.testing.expect(!altered.rewrite_required);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"status\":{\"type\":\"keyword\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.read_schema_json, "\"version\":0") != null);
 
-    var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
+    var generated = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &altered.table,
+        "ALTER TABLE users ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED;",
+    );
+    defer generated.deinit(std.testing.allocator);
+
+    try std.testing.expect(generated.requires_rebuild);
+    try std.testing.expect(!generated.validation_required);
+    try std.testing.expect(generated.rewrite_required);
+
+    var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &generated.table,
         "CREATE UNIQUE INDEX users_tenant_email_key ON users (tenant_id, email);",
     );
     defer indexed.deinit(std.testing.allocator);
 
     try std.testing.expect(indexed.requires_rebuild);
     try std.testing.expect(indexed.validation_required);
+    try std.testing.expect(!indexed.rewrite_required);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"users_tenant_email_key\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":2") != null);
 
     var trigger = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -3180,6 +3402,21 @@ test "metadata.schema update rejects relational storage mode and base column cha
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
         ),
     );
+}
+
+test "metadata.schema update cascade drop cleanup removes child foreign keys by parent table" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+    ;
+
+    const updated = (try schemaWithoutForeignKeysReferencingTableAlloc(alloc, schema_json, "customers")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "orders_customer_id_fkey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "orders_account_id_fkey") != null);
+
+    const unchanged = try schemaWithoutForeignKeysReferencingTableAlloc(alloc, updated, "customers");
+    try std.testing.expect(unchanged == null);
 }
 
 test "metadata.schema update rewrites foreign key validation state and preserves definition" {

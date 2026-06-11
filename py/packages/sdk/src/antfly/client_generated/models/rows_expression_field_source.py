@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class RowsExpressionSource(str, Enum):
+class RowsExpressionFieldSource(str, Enum):
     EXISTING = "existing"
     PROPOSED = "proposed"
     ROW = "row"

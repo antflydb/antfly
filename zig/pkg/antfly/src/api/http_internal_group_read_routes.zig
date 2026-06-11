@@ -294,6 +294,36 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             });
             return try http_route_helpers.jsonResponse(alloc, response);
         }
+        if (routes.Routes.matchGroupRowsSource(path)) |rows_source_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            var parsed = std.json.parseFromSlice(table_reads.RelationalRowsSourceGroupRequest, alloc, req.body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return try http_route_helpers.textResponse(alloc, 400, "invalid rows source request"),
+            };
+            defer parsed.deinit();
+
+            var result = (reads.relationalRowsSourceGroupLocal(
+                alloc,
+                rows_source_route.group_id,
+                rows_source_route.table_name,
+                parsed.value.schema_json,
+                parsed.value.topology_epoch,
+                parsed.value.req,
+                parsed.value.doc_key_range,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument => return try http_route_helpers.textResponse(alloc, 400, @errorName(err)),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer result.deinit(alloc);
+            return try http_route_helpers.jsonResponse(alloc, result);
+        }
         if (routes.Routes.matchGroupVectorWorker(path)) |vector_route| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             var envelope = query_contract.parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, req.body) catch |err| switch (err) {
@@ -616,6 +646,135 @@ test "internal group read routes map doc identity mismatch to conflict" {
 
     try std.testing.expectEqual(@as(u16, 409), resp.status);
     try std.testing.expectEqualStrings("doc identity namespace mismatch", resp.body);
+}
+
+test "internal group read routes expose relational rows source group local" {
+    const alloc = std.testing.allocator;
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .relational_rows_source_group_local = relationalRowsSourceGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: @import("../raft/mod.zig").ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn relationalRowsSourceGroupLocal(
+            _: *anyopaque,
+            alloc_inner: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            schema_json: []const u8,
+            topology_epoch: u64,
+            req_inner: db_mod.types.RelationalRowsQueryRequest,
+            doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+            consistency: @import("../raft/mod.zig").ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("{\"type\":\"object\"}", schema_json);
+            if (topology_epoch == 99) return error.TopologyChanged;
+            try std.testing.expectEqual(@as(u64, 42), topology_epoch);
+            try std.testing.expect(req_inner.select_all);
+            try std.testing.expectEqualStrings("a", doc_key_range.start);
+            try std.testing.expectEqualStrings("z", doc_key_range.end);
+            try std.testing.expectEqual(@import("../raft/mod.zig").ReadConsistency.read_index, consistency);
+
+            const rows = try alloc_inner.alloc([]const u8, 1);
+            errdefer alloc_inner.free(rows);
+            rows[0] = try alloc_inner.dupe(u8, "{\"id\":\"a\"}");
+            return .{
+                .rows = rows,
+                .total = 1,
+            };
+        }
+    };
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows:source",
+        .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":42,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}}",
+    }, "/internal/v1/groups/7/tables/docs/rows:source", "")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsQueryResult, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.total);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", parsed.value.rows[0]);
+
+    var stale_resp = (try handle(.{
+        .alloc = alloc,
+        .reads = FakeReads.source(),
+        .catalog = .{
+            .ptr = undefined,
+        },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/rows:source",
+        .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":99,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}}",
+    }, "/internal/v1/groups/7/tables/docs/rows:source", "")).?;
+    defer stale_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), stale_resp.status);
+    try std.testing.expectEqualStrings("topology changed", stale_resp.body);
 }
 
 test "internal group vector worker rejects unsupported identity generation" {
