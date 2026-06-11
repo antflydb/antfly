@@ -1847,20 +1847,20 @@ test "public document artifact range reprocess handler returns bounded summary" 
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             if (!std.mem.eql(u8, req.from_key, "doc:a")) return error.InternalFailure;
-            try std.testing.expectEqual(@as(usize, 1), req.shard_cursors.len);
-            try std.testing.expectEqual(@as(?u64, 42), req.shard_cursors[0].group_id);
-            try std.testing.expectEqualStrings("doc:b", req.shard_cursors[0].next_key);
-            try std.testing.expectEqual(@as(u32, 10), req.shard_cursors[0].limit);
+            if (req.shard_cursors.len != 1) return error.InternalFailure;
+            if (req.shard_cursors[0].group_id != 42) return error.InternalFailure;
+            if (!std.mem.eql(u8, req.shard_cursors[0].next_key, "doc:b")) return error.InternalFailure;
+            if (req.shard_cursors[0].limit != 10) return error.InternalFailure;
             if (req.limit != 10) return error.InternalFailure;
-            const failures = try alloc.alloc(db_mod.types.DocumentArtifactReprocessFailure, 1);
+            const failures = alloc.alloc(db_mod.types.DocumentArtifactReprocessFailure, 1) catch return error.InternalFailure;
             failures[0] = .{
-                .key = try alloc.dupe(u8, "doc:b"),
-                .error_code = try alloc.dupe(u8, "InvalidDataUri"),
+                .key = alloc.dupe(u8, "doc:b") catch return error.InternalFailure,
+                .error_code = alloc.dupe(u8, "InvalidDataUri") catch return error.InternalFailure,
             };
-            const shard_cursors = try alloc.alloc(db_mod.types.DocumentArtifactReprocessShardCursor, 1);
+            const shard_cursors = alloc.alloc(db_mod.types.DocumentArtifactReprocessShardCursor, 1) catch return error.InternalFailure;
             shard_cursors[0] = .{
                 .group_id = 42,
-                .next_key = try alloc.dupe(u8, "doc:b"),
+                .next_key = alloc.dupe(u8, "doc:b") catch return error.InternalFailure,
                 .scanned = 2,
                 .reprocessed = 1,
                 .skipped = 0,
@@ -1873,7 +1873,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
                 .skipped = 0,
                 .failed = 1,
                 .limit = 10,
-                .next_key = try alloc.dupe(u8, "doc:b"),
+                .next_key = alloc.dupe(u8, "doc:b") catch return error.InternalFailure,
                 .failures = failures,
                 .shard_cursors = shard_cursors,
             };

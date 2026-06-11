@@ -117,6 +117,14 @@ pub const Store = struct {
         return self.cfg.artifact_reprocess_job_retention_ms orelse 86_400_000;
     }
 
+    pub fn attachOpenedStore(self: *Store, opened: *OpenedStore) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.opened_store = opened;
+        errdefer self.opened_store = null;
+        try self.recoverPersistedJobsLocked(opened);
+    }
+
     pub fn startJob(
         self: *Store,
         alloc: std.mem.Allocator,
@@ -125,9 +133,9 @@ pub const Store = struct {
         req: StartRequest,
     ) ![]u8 {
         const now_ms = nowMillis();
-        const job_id = self.nextJobId();
+        const reserved = self.reserveJobId();
         const encoded = try encodeState(alloc, .{
-            .job_id = job_id,
+            .job_id = reserved.job_id,
             .table_name = table_name,
             .artifact_name = artifact_name,
             .phase = phaseString(.queued),
@@ -140,7 +148,7 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        try self.storeEncoded(job_id, encoded);
+        try self.storeEncoded(reserved.job_id, encoded, reserved.next_job_id);
         return encoded;
     }
 
@@ -193,7 +201,7 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        try self.storeEncoded(previous.job_id, encoded);
+        try self.storeEncoded(previous.job_id, encoded, null);
         return encoded;
     }
 
@@ -233,7 +241,7 @@ pub const Store = struct {
             .expires_at_millis = now_ms + self.retentionMillis(),
         });
         errdefer alloc.free(encoded);
-        try self.storeEncoded(previous.job_id, encoded);
+        try self.storeEncoded(previous.job_id, encoded, null);
         return encoded;
     }
 
@@ -250,38 +258,85 @@ pub const Store = struct {
             if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
             expired.append(self.alloc, entry.key_ptr.*) catch continue;
         }
+        var durable_results: []docstore_mod.OwnedKVPair = &.{};
+        var durable_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer durable_delete_keys.deinit(self.alloc);
+        if (self.opened_store) |opened| {
+            durable_results = opened.docstore.scanPrefix(self.alloc, job_key_prefix) catch &.{};
+            for (durable_results) |kv| {
+                var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+                defer parsed.deinit();
+                if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
+                expired.append(self.alloc, parsed.value.job_id) catch continue;
+                durable_delete_keys.append(self.alloc, kv.key) catch continue;
+            }
+        }
+        defer if (durable_results.len > 0) docstore_mod.DocStore.freeResults(self.alloc, durable_results);
+        if (durable_delete_keys.items.len > 0) {
+            if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, durable_delete_keys.items) catch {};
+        }
         for (expired.items) |job_id| {
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
-            self.deletePersisted(job_id);
         }
     }
 
-    fn nextJobId(self: *Store) u64 {
+    const ReservedJobId = struct {
+        job_id: u64,
+        next_job_id: u64,
+    };
+
+    fn reserveJobId(self: *Store) ReservedJobId {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const job_id = self.next_job_id;
         self.next_job_id += 1;
-        return job_id;
+        return .{
+            .job_id = job_id,
+            .next_job_id = self.next_job_id,
+        };
     }
 
-    fn storeEncoded(self: *Store, job_id: u64, encoded: []const u8) !void {
+    fn storeEncoded(self: *Store, job_id: u64, encoded: []const u8, next_job_id: ?u64) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const owned = try self.alloc.dupe(u8, encoded);
         errdefer self.alloc.free(owned);
-        if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |old| self.alloc.free(old.value);
         if (self.opened_store) |opened| {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
-            try opened.docstore.put(key, encoded);
+            if (next_job_id) |next| {
+                const next_raw = try encodeNextJobId(self.alloc, next);
+                defer self.alloc.free(next_raw);
+                const writes = [_]docstore_mod.KVPair{
+                    .{ .key = key, .value = encoded },
+                    .{ .key = next_job_id_key, .value = next_raw },
+                };
+                try opened.docstore.putBatch(&writes, &.{});
+            } else {
+                try opened.docstore.put(key, encoded);
+            }
         }
+        if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |old| self.alloc.free(old.value);
     }
 
-    fn deletePersisted(self: *Store, job_id: u64) void {
-        const opened = self.opened_store orelse return;
-        const key = jobKey(self.alloc, job_id) catch return;
-        defer self.alloc.free(key);
-        opened.docstore.delete(key) catch {};
+    fn recoverPersistedJobsLocked(self: *Store, opened: *OpenedStore) !void {
+        var recovered_max_job_id: u64 = 0;
+        const results = try opened.docstore.scanPrefix(self.alloc, job_key_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        for (results) |kv| {
+            var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            const cached = try self.alloc.dupe(u8, kv.value);
+            errdefer self.alloc.free(cached);
+            if (try self.jobs.fetchPut(self.alloc, parsed.value.job_id, cached)) |old| self.alloc.free(old.value);
+            recovered_max_job_id = @max(recovered_max_job_id, parsed.value.job_id);
+        }
+        var recovered_next_job_id = recovered_max_job_id +| 1;
+        if (loadPersistedNextJobId(self.alloc, opened.docstore)) |persisted_next| {
+            recovered_next_job_id = @max(recovered_next_job_id, persisted_next);
+        } else |_| {}
+        self.next_job_id = @max(self.next_job_id, recovered_next_job_id);
+        try persistNextJobId(opened.docstore, self.alloc, self.next_job_id);
     }
 };
 
@@ -318,7 +373,29 @@ pub fn nowMillis() u64 {
 }
 
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "__api_artifact_reprocess_jobs__:{d}", .{job_id});
+    return try std.fmt.allocPrint(alloc, "{s}{d}", .{ job_key_prefix, job_id });
+}
+
+const job_key_prefix = "__api_artifact_reprocess_jobs__:";
+const next_job_id_key = "__api_artifact_reprocess_jobs_meta__:next_job_id";
+
+fn encodeNextJobId(alloc: std.mem.Allocator, next_job_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{d}", .{next_job_id});
+}
+
+fn loadPersistedNextJobId(alloc: std.mem.Allocator, docstore: *docstore_mod.DocStore) !u64 {
+    const raw = docstore.get(alloc, next_job_id_key) catch |err| switch (err) {
+        error.NotFound => return error.NotFound,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try std.fmt.parseUnsigned(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+}
+
+fn persistNextJobId(docstore: *docstore_mod.DocStore, alloc: std.mem.Allocator, next_job_id: u64) !void {
+    const raw = try encodeNextJobId(alloc, next_job_id);
+    defer alloc.free(raw);
+    try docstore.put(next_job_id_key, raw);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -347,4 +424,92 @@ test "artifact reprocess job store starts and updates a job" {
     defer parsed_update.deinit();
     try std.testing.expectEqualStrings("succeeded", parsed_update.value.phase);
     try std.testing.expectEqual(@as(usize, 2), parsed_update.value.scanned);
+}
+
+test "artifact reprocess job store recovers durable jobs and reseeds ids" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-jobs", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        defer alloc.free(started);
+        var parsed = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u64, 1), parsed.value.job_id);
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const second = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        defer alloc.free(second);
+        var parsed_second = try std.json.parseFromSlice(JobState, alloc, second, .{ .ignore_unknown_fields = true });
+        defer parsed_second.deinit();
+        try std.testing.expectEqual(@as(u64, 2), parsed_second.value.job_id);
+
+        const first = (try store.loadJobAlloc(alloc, 1)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(first);
+        var parsed_first = try std.json.parseFromSlice(JobState, alloc, first, .{ .ignore_unknown_fields = true });
+        defer parsed_first.deinit();
+        try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
+        try std.testing.expectEqualStrings("queued", parsed_first.value.phase);
+    }
+}
+
+test "artifact reprocess job cleanup removes recovered durable expired jobs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-job-cleanup", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var opened = try OpenedStore.open(alloc, path);
+        defer opened.deinit();
+        const key = try jobKey(alloc, 42);
+        defer alloc.free(key);
+        const now_ms = nowMillis();
+        const expired = try encodeState(alloc, .{
+            .job_id = 42,
+            .table_name = "docs",
+            .artifact_name = "document_units_v1",
+            .phase = phaseString(.succeeded),
+            .reprocess_status = "complete",
+            .from_key = "",
+            .to_key = "",
+            .limit = 1,
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms,
+        });
+        defer alloc.free(expired);
+        try opened.docstore.put(key, expired);
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        store.cleanupExpiredJobs();
+        try std.testing.expect((try store.loadJobAlloc(alloc, 42)) == null);
+    }
 }
