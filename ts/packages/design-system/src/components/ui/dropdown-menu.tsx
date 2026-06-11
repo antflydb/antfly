@@ -39,7 +39,7 @@ const menuContentClasses = cn(
 
 // Shared item classes — used by Item, CheckboxItem, RadioItem, SubTrigger
 const menuItemClasses = cn(
-  "relative flex cursor-default select-none items-center gap-2 px-2 py-1.5",
+  "relative flex cursor-default select-none items-center gap-2 px-2 py-2",
   "font-mono text-[13px] outline-hidden rounded-none",
   "focus:bg-accent focus:text-accent-foreground",
   "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",

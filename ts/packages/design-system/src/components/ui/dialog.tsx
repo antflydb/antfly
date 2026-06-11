@@ -57,7 +57,7 @@ function DialogContent({
           "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] sm:max-w-lg",
           "translate-x-[-50%] translate-y-[-50%]",
           "bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong",
-          "gap-3 p-[18px] duration-200 outline-none",
+          "gap-4 p-6 duration-200 outline-none",
           "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
           "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
           className
@@ -69,7 +69,7 @@ function DialogContent({
           <DialogPrimitive.Close
             data-slot="dialog-close"
             className={cn(
-              "absolute top-[14px] right-[14px] text-muted-foreground transition-colors",
+              "absolute top-5 right-5 text-muted-foreground transition-colors",
               "hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
               "disabled:pointer-events-none",
               "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
@@ -122,7 +122,7 @@ function DialogTitle({ className, ...props }: React.ComponentProps<typeof Dialog
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-base leading-tight font-medium text-foreground", className)}
+      className={cn("text-lg leading-tight font-medium text-foreground", className)}
       {...props}
     />
   );

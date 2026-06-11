@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils";
  *   - Mono "instrument" voice (Roboto Mono, 13px, weight 500, 0.03em tracking)
  *   - Square corners (rounded-none)
  *   - token-width (--border-width) borders on outlined variants — the visual language is borders, not shadows
- *   - Amber primary fill with ink text; amber-300 hover
+ *   - Amber primary fill with ink text (no contrast border); amber-300 hover
  *   - Snappy/linear motion (no spring easing)
  */
 const buttonVariants = cva(
@@ -29,17 +29,18 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        // Primary — amber fill, ink text, darker amber border, lighter amber hover
+        // Primary — amber fill, ink text, lighter amber hover; the fill alone
+        // carries the weight (no contrast border)
         default:
-          "bg-primary text-primary-foreground border-(length:--border-width) border-amber-500 hover:bg-amber-300",
+          "bg-primary text-primary-foreground border-(length:--border-width) border-transparent hover:bg-amber-300",
         // Destructive — outlined red that fills on hover
         destructive:
           "bg-transparent text-destructive border-(length:--border-width) border-destructive hover:bg-destructive hover:text-white",
-        // Outline / Secondary — bordered, ink text, border darkens on hover
+        // Outline / Secondary — bordered, ink text, quiet background hover
         outline:
-          "bg-transparent text-foreground border-(length:--border-width) border-input hover:border-foreground hover:bg-secondary",
+          "bg-transparent text-foreground border-(length:--border-width) border-input hover:bg-secondary",
         secondary:
-          "bg-transparent text-foreground border-(length:--border-width) border-input hover:border-foreground hover:bg-secondary",
+          "bg-transparent text-foreground border-(length:--border-width) border-input hover:bg-secondary",
         // Ghost — no border, muted text, lights up on hover
         ghost:
           "bg-transparent text-muted-foreground border-(length:--border-width) border-transparent hover:text-foreground hover:bg-secondary",

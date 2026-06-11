@@ -129,7 +129,7 @@ function SelectItem({
         // mono "instrument readout" voice
         "group/item font-mono text-[13px]",
         "relative flex w-full cursor-default items-center gap-2.5 select-none",
-        "py-1.5 px-2 rounded-none outline-hidden",
+        "py-2 px-2 rounded-none outline-hidden",
         "focus:bg-accent focus:text-accent-foreground",
         "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
         "[&_svg:not([class*='text-'])]:text-muted-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
