@@ -1024,12 +1024,22 @@ fn saveCentroidDirectoryForLeafWithRadius(self: anytype, txn: anytype, node: *co
 
 fn shadowSavePostingBaseWithRadius(self: anytype, txn: anytype, node: *const types.Node, bounds_radius: f32) !void {
     if (!node.is_leaf or !shouldWritePostingBaseDelta(self)) return;
-    try posting.PostingStore.saveBase(self, txn, .{
+    try posting.PostingStore.saveBaseAndCentroidDirectoryRecord(self, txn, .{
         .posting_id = node.id,
         .generation = node.posting_state.mutation_version,
         .members = node.members,
+    }, .{
+        .posting_id = node.id,
+        .generation = node.posting_state.centroid_version,
+        .mutation_version = node.posting_state.mutation_version,
+        .payload_version = node.posting_state.payload_version,
+        .flags = centroidDirectoryFlagsFromPostingState(node.posting_state),
+        .parent = node.parent,
+        .level = node.level,
+        .member_count = node.members.len,
+        .bounds_radius = bounds_radius,
+        .centroid = node.centroid,
     });
-    try saveCentroidDirectoryForLeafWithRadius(self, txn, node, bounds_radius);
 }
 
 fn shadowSavePostingBase(self: anytype, txn: anytype, node: *const types.Node) !void {

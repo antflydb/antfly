@@ -19,6 +19,9 @@ const quantizer = @import("antfly_vector").quantizer;
 const types = @import("types.zig");
 const search_types = @import("search_types.zig");
 
+const posting_member_cache_miss_count_limit: usize = 256;
+const posting_member_cache_reuse_admit_count: u8 = 2;
+
 pub const RerankLookup = struct {
     item_index: usize,
     vector_id: u64,
@@ -36,6 +39,11 @@ pub const PostingMemberCacheResult = struct {
     admission_skips: u64 = 0,
     evictions: u64 = 0,
     member_bytes: u64 = 0,
+};
+
+pub const PostingDeltaTailCacheView = struct {
+    ids: []const u64,
+    ops: []const u8,
 };
 
 pub const SearchScratch = struct {
@@ -60,6 +68,7 @@ pub const SearchScratch = struct {
     error_bounds: []f32,
     posting_member_cache: std.ArrayListUnmanaged(PostingMemberCacheEntry) = .empty,
     posting_member_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    posting_member_cache_miss_counts: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_entry_bytes: u64 = 0,
@@ -69,6 +78,12 @@ pub const SearchScratch = struct {
     posting_overlay_appended_ids: []u64 = &.{},
     posting_overlay_appended_live: []bool = &.{},
     posting_overlay_appended_count: usize = 0,
+    posting_delta_tail_cache_posting_id: u64 = 0,
+    posting_delta_tail_cache_base_generation: u64 = 0,
+    posting_delta_tail_cache_valid: bool = false,
+    posting_delta_tail_cache_ids: []u64 = &.{},
+    posting_delta_tail_cache_ops: []u8 = &.{},
+    posting_delta_tail_cache_count: usize = 0,
 
     pub fn init(
         alloc: Allocator,
@@ -90,8 +105,6 @@ pub const SearchScratch = struct {
         errdefer alloc.free(centroid);
         const vector = try alloc.alloc(f32, dims);
         errdefer alloc.free(vector);
-        const vector_batch = try alloc.alloc(f32, dims * max_candidates);
-        errdefer alloc.free(vector_batch);
         const member_ids = try alloc.alloc(u64, max_leaf);
         errdefer alloc.free(member_ids);
         const flags = try alloc.alloc(bool, max_candidates);
@@ -107,7 +120,7 @@ pub const SearchScratch = struct {
             .transformed_query = transformed_query,
             .centroid = centroid,
             .vector = vector,
-            .vector_batch = vector_batch,
+            .vector_batch = &.{},
             .member_ids = member_ids,
             .query_storage = query_storage,
             .vector_ids = query_views.vector_ids,
@@ -132,7 +145,12 @@ pub const SearchScratch = struct {
     pub fn ensureVectorFetchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         try self.ensureQueryStorageCapacity(alloc, needed);
         try self.ensureDistanceStorageCapacity(alloc, needed);
-        if (self.vector_batch.len < self.dims * needed) self.vector_batch = try alloc.realloc(self.vector_batch, self.dims * needed);
+        try self.ensureVectorBatchCapacity(alloc, needed);
+    }
+
+    pub fn ensureVectorBatchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        const vector_count = try std.math.mul(usize, self.dims, needed);
+        if (self.vector_batch.len < vector_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_count);
     }
 
     pub fn ensureDistanceCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -198,6 +216,41 @@ pub const SearchScratch = struct {
         self.posting_overlay_appended_count = 0;
     }
 
+    pub fn cachedPostingDeltaTail(self: *SearchScratch, posting_id: u64, base_generation: u64) ?PostingDeltaTailCacheView {
+        if (!self.posting_delta_tail_cache_valid or
+            self.posting_delta_tail_cache_posting_id != posting_id or
+            self.posting_delta_tail_cache_base_generation != base_generation)
+        {
+            return null;
+        }
+        return .{
+            .ids = self.posting_delta_tail_cache_ids[0..self.posting_delta_tail_cache_count],
+            .ops = self.posting_delta_tail_cache_ops[0..self.posting_delta_tail_cache_count],
+        };
+    }
+
+    pub fn beginPostingDeltaTailCache(self: *SearchScratch, posting_id: u64, base_generation: u64) void {
+        self.posting_delta_tail_cache_posting_id = posting_id;
+        self.posting_delta_tail_cache_base_generation = base_generation;
+        self.posting_delta_tail_cache_count = 0;
+        self.posting_delta_tail_cache_valid = true;
+    }
+
+    pub fn appendPostingDeltaTailCacheRecord(self: *SearchScratch, alloc: Allocator, vector_id: u64, op: u8) !void {
+        if (!self.posting_delta_tail_cache_valid) return;
+        const needed = self.posting_delta_tail_cache_count + 1;
+        if (self.posting_delta_tail_cache_ids.len < needed) self.posting_delta_tail_cache_ids = try alloc.realloc(self.posting_delta_tail_cache_ids, needed);
+        if (self.posting_delta_tail_cache_ops.len < needed) self.posting_delta_tail_cache_ops = try alloc.realloc(self.posting_delta_tail_cache_ops, needed);
+        self.posting_delta_tail_cache_ids[self.posting_delta_tail_cache_count] = vector_id;
+        self.posting_delta_tail_cache_ops[self.posting_delta_tail_cache_count] = op;
+        self.posting_delta_tail_cache_count = needed;
+    }
+
+    pub fn invalidatePostingDeltaTailCache(self: *SearchScratch) void {
+        self.posting_delta_tail_cache_valid = false;
+        self.posting_delta_tail_cache_count = 0;
+    }
+
     pub fn setPostingMemberCacheAdmissionEnabled(self: *SearchScratch, enabled: bool) void {
         self.posting_member_cache_admission_enabled = enabled;
     }
@@ -213,6 +266,19 @@ pub const SearchScratch = struct {
 
     pub fn clearPostingMemberCache(self: *SearchScratch, alloc: Allocator) u64 {
         return self.trimPostingMemberCache(alloc, 0);
+    }
+
+    pub fn notePostingMemberCacheMiss(self: *SearchScratch, alloc: Allocator, posting_id: u64) !void {
+        if (!self.posting_member_cache_admission_enabled or self.max_posting_member_cache_bytes == 0) return;
+        if (self.posting_member_cache_miss_counts.count() >= posting_member_cache_miss_count_limit and !self.posting_member_cache_miss_counts.contains(posting_id)) {
+            self.posting_member_cache_miss_counts.clearRetainingCapacity();
+        }
+        const entry = try self.posting_member_cache_miss_counts.getOrPut(alloc, posting_id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = 1;
+        } else if (entry.value_ptr.* < posting_member_cache_reuse_admit_count) {
+            entry.value_ptr.* += 1;
+        }
     }
 
     pub fn cachedPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64) ?[]const u64 {
@@ -241,6 +307,14 @@ pub const SearchScratch = struct {
             result.member_bytes = self.posting_member_cache_bytes;
             return result;
         }
+        const would_evict = self.posting_member_cache_bytes + member_bytes > self.max_posting_member_cache_bytes and self.posting_member_cache.items.len != 0;
+        const large_entry = member_bytes > self.max_posting_member_cache_bytes / 2;
+        const miss_count = self.posting_member_cache_miss_counts.get(posting_id) orelse 0;
+        if (would_evict and large_entry and miss_count < posting_member_cache_reuse_admit_count) {
+            result.admission_skips += 1;
+            result.member_bytes = self.posting_member_cache_bytes;
+            return result;
+        }
         var evictions: u64 = 0;
         while (self.max_posting_member_cache_bytes != 0 and self.posting_member_cache_bytes + member_bytes > self.max_posting_member_cache_bytes and self.posting_member_cache.items.len != 0) {
             self.evictPostingMemberCacheEntry(alloc, 0);
@@ -253,6 +327,7 @@ pub const SearchScratch = struct {
             .members = try alloc.dupe(u64, members),
         });
         self.posting_member_cache_slots.putAssumeCapacity(posting_id, self.posting_member_cache.items.len - 1);
+        _ = self.posting_member_cache_miss_counts.remove(posting_id);
         self.posting_member_cache_bytes += member_bytes;
         result.inserted = true;
         result.evictions = evictions;
@@ -273,10 +348,18 @@ pub const SearchScratch = struct {
         alloc.free(entry.members);
     }
 
+    pub fn trimVectorBatchForRetention(self: *SearchScratch, alloc: Allocator, max_retained_bytes: u64) bool {
+        if (max_retained_bytes == 0 or self.bytes() <= max_retained_bytes or self.vector_batch.len == 0) return false;
+        alloc.free(self.vector_batch);
+        self.vector_batch = &.{};
+        return true;
+    }
+
     pub fn bytes(self: *const SearchScratch) u64 {
         const posting_member_cache_bytes =
             byteLen(self.posting_member_cache.items) +
             approximateHashMapBytes(self.posting_member_cache_slots.capacity(), @sizeOf(u64), @sizeOf(usize)) +
+            approximateHashMapBytes(self.posting_member_cache_miss_counts.capacity(), @sizeOf(u64), @sizeOf(u8)) +
             self.posting_member_cache_bytes;
         const posting_overlay_bytes =
             approximateHashMapBytes(self.posting_overlay_removed_members.capacity(), @sizeOf(u64), 0) +
@@ -292,6 +375,8 @@ pub const SearchScratch = struct {
             byteLen(self.query_storage) +
             byteLen(self.flags) +
             byteLen(self.distance_storage) +
+            byteLen(self.posting_delta_tail_cache_ids) +
+            byteLen(self.posting_delta_tail_cache_ops) +
             posting_member_cache_bytes +
             posting_overlay_bytes;
     }
@@ -313,10 +398,13 @@ pub const SearchScratch = struct {
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
         self.posting_member_cache_slots.deinit(alloc);
+        self.posting_member_cache_miss_counts.deinit(alloc);
         self.posting_overlay_removed_members.deinit(alloc);
         self.posting_overlay_appended_positions.deinit(alloc);
         alloc.free(self.posting_overlay_appended_ids);
         alloc.free(self.posting_overlay_appended_live);
+        alloc.free(self.posting_delta_tail_cache_ids);
+        alloc.free(self.posting_delta_tail_cache_ops);
         self.* = undefined;
     }
 };

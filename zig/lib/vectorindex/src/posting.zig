@@ -494,6 +494,31 @@ pub const PostingFormat = struct {
         }
     };
 
+    pub const BaseMemberIterator = struct {
+        header: PostingBaseHeader,
+        reader: BaseMemberBlockReader,
+
+        pub fn init(data: []const u8) !BaseMemberIterator {
+            const header = try decodeBaseHeader(data);
+            return .{
+                .header = header,
+                .reader = BaseMemberBlockReader.init(data, header.member_count),
+            };
+        }
+
+        pub fn memberCount(self: *const BaseMemberIterator) usize {
+            return self.header.member_count;
+        }
+
+        pub fn next(self: *BaseMemberIterator) !?VectorId {
+            return try self.reader.next();
+        }
+
+        pub fn finish(self: *const BaseMemberIterator) !void {
+            try self.reader.finish();
+        }
+    };
+
     fn readBaseBlockCount(data: []const u8, pos: *usize, remaining_members: usize) !usize {
         if (pos.* >= data.len) return error.Corrupted;
         const block_count = data[pos.*];
@@ -1273,6 +1298,9 @@ pub const PostingStore = struct {
     pub const FoldScratch = struct {
         delta_records: []PostingDeltaRecord = &.{},
         delta_record_count: usize = 0,
+        compact_delta_ids: []VectorId = &.{},
+        compact_delta_ops: []PostingDeltaOp = &.{},
+        compact_delta_count: usize = 0,
         encoded_base: []u8 = &.{},
         member_ids: []VectorId = &.{},
         removed_members: std.AutoHashMapUnmanaged(VectorId, void) = .empty,
@@ -1302,6 +1330,25 @@ pub const PostingStore = struct {
             self.delta_record_count = 0;
         }
 
+        pub fn ensureCompactDeltaCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
+            if (self.compact_delta_ids.len < needed) self.compact_delta_ids = try alloc.realloc(self.compact_delta_ids, needed);
+            if (self.compact_delta_ops.len < needed) self.compact_delta_ops = try alloc.realloc(self.compact_delta_ops, needed);
+        }
+
+        pub fn compactDeltaRecordCount(self: *const FoldScratch) usize {
+            return self.compact_delta_count;
+        }
+
+        pub fn appendCompactDeltaRecordAssumeCapacity(self: *FoldScratch, record: PostingDeltaRecord) void {
+            self.compact_delta_ids[self.compact_delta_count] = record.vector_id;
+            self.compact_delta_ops[self.compact_delta_count] = record.op;
+            self.compact_delta_count += 1;
+        }
+
+        pub fn resetCompactDeltaRecords(self: *FoldScratch) void {
+            self.compact_delta_count = 0;
+        }
+
         pub fn ensureEncodedBaseCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
             if (self.encoded_base.len < needed) self.encoded_base = try alloc.realloc(self.encoded_base, needed);
         }
@@ -1320,6 +1367,8 @@ pub const PostingStore = struct {
         }
 
         pub fn resetFoldApply(self: *FoldScratch) void {
+            self.resetDeltaRecords();
+            self.resetCompactDeltaRecords();
             self.removed_members.clearRetainingCapacity();
             self.appended_positions.clearRetainingCapacity();
             self.appended_count = 0;
@@ -1331,6 +1380,8 @@ pub const PostingStore = struct {
 
         pub fn bytes(self: *const FoldScratch) u64 {
             return byteLen(self.delta_records) +
+                byteLen(self.compact_delta_ids) +
+                byteLen(self.compact_delta_ops) +
                 byteLen(self.encoded_base) +
                 byteLen(self.member_ids) +
                 approximateHashMapBytes(self.removed_members.capacity(), @sizeOf(VectorId), 0) +
@@ -1341,6 +1392,8 @@ pub const PostingStore = struct {
 
         pub fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
             alloc.free(self.delta_records);
+            alloc.free(self.compact_delta_ids);
+            alloc.free(self.compact_delta_ops);
             alloc.free(self.encoded_base);
             alloc.free(self.member_ids);
             self.removed_members.deinit(alloc);
@@ -1396,6 +1449,7 @@ pub const PostingStore = struct {
                 return cached_member_ids;
             }
             notePostingOverlayCacheMiss(profile);
+            try notePostingMemberCacheMissIfAvailable(scratch, alloc, posting_view.id);
         }
 
         const base_data = loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
@@ -1572,19 +1626,23 @@ pub const PostingStore = struct {
         try index.deleteNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, posting_id, .posting));
     }
 
+    fn encodeBaseForIndex(index: anytype, base: PostingBase) ![]u8 {
+        const base_member_block_size = postingBaseMemberBlockSize(index);
+        if (!shouldSortBaseMembers(index)) return try PostingFormat.encodeBaseWithBlockSize(index.alloc, base, base_member_block_size);
+        const sorted_members = try index.alloc.dupe(VectorId, base.members);
+        defer index.alloc.free(sorted_members);
+        sortVectorIdsAsc(sorted_members);
+        const selected_block_size = try postingBaseMemberBlockSizeForMembers(index, sorted_members);
+        return try PostingFormat.encodeBaseWithBlockSize(index.alloc, .{
+            .posting_id = base.posting_id,
+            .generation = base.generation,
+            .members = sorted_members,
+        }, selected_block_size);
+    }
+
     pub fn saveBase(index: anytype, txn: anytype, base: PostingBase) !void {
         var key_buf: [10]u8 = undefined;
-        const base_member_block_size = postingBaseMemberBlockSize(index);
-        const encoded = if (shouldSortBaseMembers(index)) blk: {
-            const sorted_members = try index.alloc.dupe(VectorId, base.members);
-            defer index.alloc.free(sorted_members);
-            sortVectorIdsAsc(sorted_members);
-            break :blk try PostingFormat.encodeBaseWithBlockSize(index.alloc, .{
-                .posting_id = base.posting_id,
-                .generation = base.generation,
-                .members = sorted_members,
-            }, base_member_block_size);
-        } else try PostingFormat.encodeBaseWithBlockSize(index.alloc, base, base_member_block_size);
+        const encoded = try encodeBaseForIndex(index, base);
         defer index.alloc.free(encoded);
         const key = hbc.encodePostingBaseKey(&key_buf, base.posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
@@ -1598,6 +1656,22 @@ pub const PostingStore = struct {
         const key = hbc.encodeCentroidDirectoryKey(&key_buf, record.posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
         noteCentroidDirectoryPut(index, key.len, encoded.len);
+    }
+
+    pub fn saveBaseAndCentroidDirectoryRecord(index: anytype, txn: anytype, base: PostingBase, record: CentroidDirectoryRecord) !void {
+        const encoded_base = try encodeBaseForIndex(index, base);
+        defer index.alloc.free(encoded_base);
+        const encoded_centroid = try CentroidDirectoryFormat.encode(index.alloc, record);
+        defer index.alloc.free(encoded_centroid);
+
+        var base_key_buf: [10]u8 = undefined;
+        const base_key = hbc.encodePostingBaseKey(&base_key_buf, base.posting_id);
+        var centroid_key_buf: [10]u8 = undefined;
+        const centroid_key = hbc.encodeCentroidDirectoryKey(&centroid_key_buf, record.posting_id);
+        try index.putNamespaced(txn, .nodes, base_key, encoded_base);
+        try index.putNamespaced(txn, .nodes, centroid_key, encoded_centroid);
+        notePostingBasePut(index, base_key.len, encoded_base.len, base.members.len);
+        noteCentroidDirectoryPut(index, centroid_key.len, encoded_centroid.len);
     }
 
     pub fn loadCentroidDirectoryRecord(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedCentroidDirectoryRecord {
@@ -1782,6 +1856,7 @@ pub const PostingStore = struct {
     ) !AdaptiveDeltaTailScan {
         scratch.resetPostingOverlayApply();
         scratch.resetDeltaRecords();
+        scratch.resetCompactDeltaRecords();
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -1801,16 +1876,21 @@ pub const PostingStore = struct {
                 out.stats.records_after_generation += 1;
                 if (record.op == .tombstone) out.stats.tombstones_after_generation += 1;
                 if (prefer_compact_records and !out.use_overlay_plan) {
-                    if (scratch.deltaRecordCount() < compact_sorted_delta_max_records) {
-                        try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + 1);
-                        scratch.appendDeltaRecordAssumeCapacity(record);
+                    if (scratch.compactDeltaRecordCount() < compact_sorted_delta_max_records) {
+                        try scratch.ensureCompactDeltaCapacity(alloc, scratch.compactDeltaRecordCount() + 1);
+                        scratch.appendCompactDeltaRecordAssumeCapacity(record);
                         continue;
                     }
                     out.use_overlay_plan = true;
-                    for (scratch.deltaRecords()) |buffered_record| {
-                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, buffered_record);
+                    var compact_index: usize = 0;
+                    while (compact_index < scratch.compactDeltaRecordCount()) : (compact_index += 1) {
+                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, .{
+                            .sequence = 0,
+                            .op = scratch.compact_delta_ops[compact_index],
+                            .vector_id = scratch.compact_delta_ids[compact_index],
+                        });
                     }
-                    scratch.resetDeltaRecords();
+                    scratch.resetCompactDeltaRecords();
                     try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
                     continue;
                 }
@@ -1837,52 +1917,63 @@ pub const PostingStore = struct {
         return out;
     }
 
-    fn lessDeltaRecordByVectorThenSequence(_: void, lhs: PostingDeltaRecord, rhs: PostingDeltaRecord) bool {
-        if (lhs.vector_id != rhs.vector_id) return lhs.vector_id < rhs.vector_id;
-        return lhs.sequence < rhs.sequence;
+    fn stableSortCompactDeltaRecordsByVector(scratch: *FoldScratch) void {
+        var i: usize = 1;
+        while (i < scratch.compact_delta_count) : (i += 1) {
+            const id = scratch.compact_delta_ids[i];
+            const op = scratch.compact_delta_ops[i];
+            var j = i;
+            while (j > 0 and scratch.compact_delta_ids[j - 1] > id) : (j -= 1) {
+                scratch.compact_delta_ids[j] = scratch.compact_delta_ids[j - 1];
+                scratch.compact_delta_ops[j] = scratch.compact_delta_ops[j - 1];
+            }
+            scratch.compact_delta_ids[j] = id;
+            scratch.compact_delta_ops[j] = op;
+        }
     }
 
-    fn materializeSortedBaseWithDeltaRecords(
+    fn materializeSortedBaseWithCompactDeltaRecords(
         alloc: std.mem.Allocator,
         scratch: *FoldScratch,
         base_data: []const u8,
     ) !usize {
-        const base_header = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
-        const base_members = scratch.member_ids[0..base_header.member_count];
-        const records = scratch.delta_records[0..scratch.delta_record_count];
-        std.mem.sort(PostingDeltaRecord, records, {}, lessDeltaRecordByVectorThenSequence);
-        try scratch.ensureAppendCapacity(alloc, base_header.member_count + records.len);
-        const out = scratch.appended_ids;
+        var base_iter = try PostingFormat.BaseMemberIterator.init(base_data);
+        stableSortCompactDeltaRecordsByVector(scratch);
+        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + scratch.compactDeltaRecordCount());
+        const out = scratch.member_ids;
         var out_count: usize = 0;
-        var base_index: usize = 0;
+        var maybe_base = try base_iter.next();
         var record_index: usize = 0;
-        while (base_index < base_members.len or record_index < records.len) {
-            if (record_index >= records.len) {
-                out[out_count] = base_members[base_index];
+
+        while (maybe_base != null or record_index < scratch.compact_delta_count) {
+            if (record_index >= scratch.compact_delta_count) {
+                out[out_count] = maybe_base.?;
                 out_count += 1;
-                base_index += 1;
+                maybe_base = try base_iter.next();
                 continue;
             }
-            const vector_id = records[record_index].vector_id;
-            var last_op = records[record_index].op;
+
+            const vector_id = scratch.compact_delta_ids[record_index];
+            var last_op = scratch.compact_delta_ops[record_index];
             record_index += 1;
-            while (record_index < records.len and records[record_index].vector_id == vector_id) : (record_index += 1) {
-                last_op = records[record_index].op;
+            while (record_index < scratch.compact_delta_count and scratch.compact_delta_ids[record_index] == vector_id) : (record_index += 1) {
+                last_op = scratch.compact_delta_ops[record_index];
             }
 
-            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
-                out[out_count] = base_members[base_index];
+            while (maybe_base) |base_member| {
+                if (base_member >= vector_id) break;
+                out[out_count] = base_member;
                 out_count += 1;
+                maybe_base = try base_iter.next();
             }
-            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            const present_in_base = if (maybe_base) |base_member| base_member == vector_id else false;
             if (last_op != .tombstone) {
                 out[out_count] = vector_id;
                 out_count += 1;
             }
-            if (present_in_base) base_index += 1;
+            if (present_in_base) maybe_base = try base_iter.next();
         }
-        try scratch.ensureMemberIdCapacity(alloc, out_count);
-        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+        try base_iter.finish();
         return out_count;
     }
 
@@ -1964,6 +2055,53 @@ pub const PostingStore = struct {
         base_generation: u64,
     ) !usize {
         resetPostingOverlayApply(scratch);
+        const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(scratch),
+        };
+        if (comptime @hasDecl(Scratch, "cachedPostingDeltaTail")) {
+            if (scratch.cachedPostingDeltaTail(posting_id, base_generation)) |cached| {
+                var applied: usize = 0;
+                var use_overlay_plan = false;
+                var buffered: [overlay_plan_min_delta_records]PostingDeltaRecord = undefined;
+                var buffered_count: usize = 0;
+                var i: usize = 0;
+                while (i < cached.ids.len) : (i += 1) {
+                    const record = PostingDeltaRecord{
+                        .sequence = 0,
+                        .op = try cachedPostingDeltaOp(cached.ops[i]),
+                        .vector_id = cached.ids[i],
+                    };
+                    applied += 1;
+                    if (use_overlay_plan) {
+                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+                    } else if (buffered_count < buffered.len) {
+                        buffered[buffered_count] = record;
+                        buffered_count += 1;
+                    } else {
+                        use_overlay_plan = true;
+                        var buffered_index: usize = 0;
+                        while (buffered_index < buffered_count) : (buffered_index += 1) {
+                            try PostingFormat.applyPostingOverlayRecord(alloc, scratch, buffered[buffered_index]);
+                        }
+                        try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+                    }
+                }
+                if (use_overlay_plan) {
+                    member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
+                } else {
+                    try scratch.ensureMemberIdCapacity(alloc, member_count.* + buffered_count);
+                    for (buffered[0..buffered_count]) |record| {
+                        PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
+                    }
+                }
+                return applied;
+            }
+        }
+        if (comptime @hasDecl(Scratch, "beginPostingDeltaTailCache")) {
+            scratch.beginPostingDeltaTailCache(posting_id, base_generation);
+            errdefer scratch.invalidatePostingDeltaTailCache();
+        }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -1981,6 +2119,9 @@ pub const PostingStore = struct {
             while (try iterator.next()) |record| {
                 if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 applied += 1;
+                if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
+                    try scratch.appendPostingDeltaTailCacheRecord(alloc, record.vector_id, @intFromEnum(record.op));
+                }
                 if (use_overlay_plan) {
                     try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
                 } else if (buffered_count < buffered.len) {
@@ -2006,6 +2147,15 @@ pub const PostingStore = struct {
             }
         }
         return applied;
+    }
+
+    fn cachedPostingDeltaOp(raw: u8) !PostingDeltaOp {
+        return switch (raw) {
+            @intFromEnum(PostingDeltaOp.insert) => .insert,
+            @intFromEnum(PostingDeltaOp.tombstone) => .tombstone,
+            @intFromEnum(PostingDeltaOp.replace) => .replace,
+            else => error.Corrupted,
+        };
     }
 
     pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
@@ -2071,7 +2221,7 @@ pub const PostingStore = struct {
             }
         }
         const sort_base_members = shouldSortBaseMembers(index);
-        const base_member_block_size = postingBaseMemberBlockSize(index);
+        const configured_base_member_block_size = postingBaseMemberBlockSize(index);
         const adaptive_scan = try scanDeltaTailAdaptiveForFold(index, txn, posting_id, index.alloc, &scratch, base_header.generation, sort_base_members);
         const use_overlay_plan = adaptive_scan.use_overlay_plan;
         const stats = adaptive_scan.stats;
@@ -2120,6 +2270,10 @@ pub const PostingStore = struct {
                 try PostingFormat.collectSortedLiveAppended(index.alloc, &scratch)
             else
                 &.{};
+            const base_member_block_size = if (sort_base_members)
+                try postingBaseMemberBlockSizeForSortedOverlay(index, base_data, &scratch, sorted_appended)
+            else
+                configured_base_member_block_size;
             const exact_size = if (sort_base_members)
                 try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, &scratch, sorted_appended, base_member_block_size)
             else
@@ -2131,7 +2285,7 @@ pub const PostingStore = struct {
                 try PostingFormat.encodeBaseWithOverlayPlanWithBlockSize(&scratch, base_data, posting_id, next_generation, base_member_block_size);
         } else blk: {
             const materialized_len = if (sort_base_members)
-                try materializeSortedBaseWithDeltaRecords(index.alloc, &scratch, base_data)
+                try materializeSortedBaseWithCompactDeltaRecords(index.alloc, &scratch, base_data)
             else materialized: {
                 _ = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
                 var materialized_len = base_header.member_count;
@@ -2141,6 +2295,7 @@ pub const PostingStore = struct {
                 }
                 break :materialized materialized_len;
             };
+            const base_member_block_size = try postingBaseMemberBlockSizeForMembers(index, scratch.member_ids[0..materialized_len]);
             const exact_size = try PostingFormat.encodedBaseSizeForMembersWithBlockSize(scratch.member_ids[0..materialized_len], base_member_block_size);
             try scratch.ensureEncodedBaseCapacity(index.alloc, exact_size);
             break :blk .{
@@ -2665,6 +2820,41 @@ fn postingBaseMemberBlockSize(index: anytype) usize {
     return PostingFormat.normalizeBaseMemberBlockSize(index.config.posting_base_member_block_size);
 }
 
+fn postingBaseMemberBlockSizeForMembers(index: anytype, members: []const VectorId) !usize {
+    const configured = postingBaseMemberBlockSize(index);
+    if (!shouldSortBaseMembers(index) or configured != PostingFormat.base_member_default_block_size) return configured;
+    return try autoPostingBaseMemberBlockSizeForMembers(members);
+}
+
+fn postingBaseMemberBlockSizeForSortedOverlay(index: anytype, base_data: []const u8, scratch: anytype, sorted_appended: []const VectorId) !usize {
+    const configured = postingBaseMemberBlockSize(index);
+    if (!shouldSortBaseMembers(index) or configured != PostingFormat.base_member_default_block_size) return configured;
+    const size16 = try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 16);
+    const size32 = try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 32);
+    const size64 = try PostingFormat.encodedSortedBaseSizeWithPreparedAppended(base_data, scratch, sorted_appended, 64);
+    return selectAutoPostingBaseMemberBlockSize(size16.encoded_len, size32.encoded_len, size64.encoded_len);
+}
+
+fn autoPostingBaseMemberBlockSizeForMembers(members: []const VectorId) !usize {
+    const size16 = try PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 16);
+    const size32 = try PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 32);
+    const size64 = try PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 64);
+    return selectAutoPostingBaseMemberBlockSize(size16, size32, size64);
+}
+
+fn selectAutoPostingBaseMemberBlockSize(size16: usize, size32: usize, size64: usize) usize {
+    var best_size = size32;
+    var best_block: usize = 32;
+    if (size64 <= best_size) {
+        best_size = size64;
+        best_block = 64;
+    }
+    if (size16 + (size16 / 32) < best_size) {
+        best_block = 16;
+    }
+    return best_block;
+}
+
 fn sortVectorIdsAsc(ids: []VectorId) void {
     std.mem.sort(VectorId, ids, {}, comptime std.sort.asc(VectorId));
 }
@@ -2721,6 +2911,19 @@ fn cachePostingMembersIfAvailable(
     if (comptime !@hasDecl(Scratch, "cachePostingMembers")) return;
     const result = try scratch.cachePostingMembers(alloc, posting_view.id, posting_view.state.mutation_version, members);
     notePostingOverlayCacheResult(profile, result.evictions, result.admission_skips, result.member_bytes);
+}
+
+fn notePostingMemberCacheMissIfAvailable(
+    scratch: anytype,
+    alloc: std.mem.Allocator,
+    posting_id: PostingId,
+) !void {
+    const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(scratch),
+    };
+    if (comptime !@hasDecl(Scratch, "notePostingMemberCacheMiss")) return;
+    try scratch.notePostingMemberCacheMiss(alloc, posting_id);
 }
 
 fn notePostingOverlayCacheHit(profile: anytype) void {

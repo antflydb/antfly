@@ -726,6 +726,13 @@ pub fn endSearchEpoch(self: anytype) void {
 pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
     lockAtomic(&self.scratch_mu);
     defer self.scratch_mu.unlock();
+    if (handle.scratch.trimVectorBatchForRetention(self.alloc, @intCast(self.config.max_retained_search_scratch_bytes))) {
+        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+            const next = handle.scratch.bytes();
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| (handle.accounted_bytes -| next));
+            handle.accounted_bytes = next;
+        }
+    }
     if (self.cached_scratch == null and handle.scratch.shouldRetain(@intCast(self.config.max_retained_search_scratch_bytes))) {
         self.cached_scratch = handle.scratch;
     } else {
