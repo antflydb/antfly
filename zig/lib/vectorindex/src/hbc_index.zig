@@ -2096,7 +2096,7 @@ pub fn searchProfiledRequest(
     };
     const search_width = req.search_width orelse self.config.search_width;
     const epsilon = req.epsilon orelse self.config.epsilon;
-    const rerank_factor: usize = search_mod.rerankFactor(epsilon);
+    const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
@@ -2566,6 +2566,14 @@ fn scoreLeafMemberIds(
             }
             profile.approx_vectors_scored += count;
             return;
+        }
+    }
+
+    if (self.config.use_quantization) {
+        if (!leaf_has_fresh_stored_payload) {
+            profile.leaf_payload_stale += 1;
+        } else {
+            profile.leaf_payload_missing += 1;
         }
     }
 

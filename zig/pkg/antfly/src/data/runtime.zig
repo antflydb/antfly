@@ -1764,12 +1764,18 @@ pub const DataServer = struct {
     lsm_maintenance_lock_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
+    dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
     const lsm_maintenance_worker_bulk_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_pressure_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_max_steps_per_wake = 8;
+    // Dense posting repair is time-driven rather than score-driven: checking
+    // the backlog requires a posting-state scan, so the worker probes on a
+    // fixed cadence and retries quickly only while repairs are landing.
+    const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
+    const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -2256,25 +2262,36 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
         }
-        if (self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
-            const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
-            if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return;
-            if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns > 0) {
-                    self.deferLsmObsoleteReclaim(now_ns, delay_ns);
-                    return;
-                }
-            } else {
-                self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
-                return;
-            }
-        }
-        self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+        if (!self.backgroundMaintenanceDue(now_ns)) return;
         self.lsm_maintenance_wake.store(true, .release);
         if (self.lsm_maintenance_thread == null) {
             self.lsm_maintenance_stop.store(false, .release);
             self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
         }
+    }
+
+    fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
+    }
+
+    fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        if (self.densePostingMaintenanceDue(now_ns)) return true;
+        const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
+        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+            if (delay_ns > 0) {
+                self.deferLsmObsoleteReclaim(now_ns, delay_ns);
+                return false;
+            }
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+        return false;
     }
 
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
@@ -2311,27 +2328,10 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
-            if (!woke) {
-                const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
-                if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) {
-                    sleepLsmMaintenanceWorker();
-                    continue;
-                }
+            if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
+                sleepLsmMaintenanceWorker();
+                continue;
             }
-            if (!woke and self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
-                if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                    if (delay_ns > 0) {
-                        self.deferLsmObsoleteReclaim(now_ns, delay_ns);
-                        sleepLsmMaintenanceWorker();
-                        continue;
-                    }
-                } else {
-                    self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
-                    sleepLsmMaintenanceWorker();
-                    continue;
-                }
-            }
-            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
@@ -2383,6 +2383,22 @@ pub const DataServer = struct {
                 }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Bulk loads can leave leaf postings with stale quantized payloads
+            // (deferred splits), which forces exact member scoring on every
+            // query that visits them. Drain a bounded amount of that repair
+            // work alongside the regular LSM maintenance.
+            const posting_now_ns = platform_time.monotonicNs();
+            if (self.densePostingMaintenanceDue(posting_now_ns)) {
+                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const next_delay_ns: u64 = if (posting_steps > 0)
+                    dense_posting_maintenance_retry_interval_ns
+                else
+                    dense_posting_maintenance_idle_interval_ns;
+                self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
+                if (posting_steps > 0) {
+                    std.log.info("dense posting maintenance repaired steps={d}", .{posting_steps});
+                }
+            }
             self.lsm_maintenance_active.store(false, .release);
         }
         self.lsm_maintenance_active.store(false, .release);
@@ -13250,4 +13266,49 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     var reservation = try server.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, 769 * 1024 * 1024);
     defer reservation.release();
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
+}
+
+test "data runtime background maintenance is due for dense posting cadence without lsm debt" {
+    const alloc = std.testing.allocator;
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-antfly-data-runtime-dense-posting-maintenance",
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-dense-posting-maintenance", FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), server.write_source.lsmMaintenanceScoreBestEffort());
+
+    server.dense_posting_maintenance_next_eligible_ns.store(100, .release);
+    try std.testing.expect(server.backgroundMaintenanceDue(100));
+    try std.testing.expect(server.backgroundMaintenanceDue(101));
+    try std.testing.expect(!server.backgroundMaintenanceDue(99));
 }

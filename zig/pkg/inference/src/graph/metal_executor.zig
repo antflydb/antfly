@@ -1715,7 +1715,9 @@ fn runtimePrefill(
     const prepare_started_at = monotonicNowNs();
     const decode_context = try runtime_ctx.preparePrefill(request.seq_len, request.query_seq_len, request.attention_mode);
     timing_stats.prefill_prepare_nanos += @intCast(monotonicNowNs() - prepare_started_at);
-    const decoder_runtime_ready = if (decoderRuntimePrefillAfterPrepareRequested())
+    const decoder_runtime_ready = if (request.force_host_logits)
+        false
+    else if (decoderRuntimePrefillAfterPrepareRequested())
         runtime_ctx.decoderRuntimeExecutorEnabled() and (try runtime_ctx.ensureDecoderRuntimePrepared())
     else blk: {
         _ = runtime_ctx.ensureDecoderRuntimePrepared() catch false;

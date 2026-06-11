@@ -571,7 +571,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -584,7 +584,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, null, null, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, .{}, null, null, null, .{}, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -604,7 +604,7 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {
@@ -632,6 +632,7 @@ const AggregatedIndexStatus = struct {
     enrichment: db_mod.types.EnrichmentStats = .{},
     resolution: db_mod.types.ReplayStageStats = .{},
     promotion: db_mod.types.ReplayStageStats = .{},
+    resolver_replay: db_mod.types.ResolverReplayDiagnostics = .{},
     expected_group_count: u64 = 0,
     reported_group_count: u64 = 0,
     fresh_group_count: u64 = 0,
@@ -792,6 +793,7 @@ fn aggregateIndexStatus(
         aggregateEnrichmentStats(&aggregate.enrichment, runtime.stats.enrichment);
         aggregateReplayStageStats(&aggregate.resolution, runtime.stats.resolution);
         aggregateReplayStageStats(&aggregate.promotion, runtime.stats.promotion);
+        aggregateResolverReplayDiagnostics(&aggregate.resolver_replay, runtime.stats.resolver_replay);
         if (item.backfill_active) {
             aggregate.backfill_active = true;
             active_count += 1;
@@ -848,6 +850,15 @@ fn algebraicCapabilityLifecycleRank(status: []const u8) u8 {
     if (std.mem.eql(u8, status, "backfilling")) return 10;
     if (std.mem.eql(u8, status, "current")) return 0;
     return 5;
+}
+
+fn aggregateResolverReplayDiagnostics(dst: *db_mod.types.ResolverReplayDiagnostics, src: db_mod.types.ResolverReplayDiagnostics) void {
+    dst.resolver_count += src.resolver_count;
+    dst.resolution_runtime_present = dst.resolution_runtime_present or src.resolution_runtime_present;
+    dst.resolution_worker_started = dst.resolution_worker_started or src.resolution_worker_started;
+    dst.promotion_runtime_present = dst.promotion_runtime_present or src.promotion_runtime_present;
+    dst.promotion_worker_started = dst.promotion_worker_started or src.promotion_worker_started;
+    if (dst.resolvers.len == 0 and src.resolvers.len > 0) dst.resolvers = src.resolvers;
 }
 
 fn aggregateReplayStageStats(dst: *db_mod.types.ReplayStageStats, src: db_mod.types.ReplayStageStats) void {
@@ -1195,6 +1206,7 @@ fn appendSingleIndexRuntimeStatus(
     enrichment: ?db_mod.types.EnrichmentStats,
     resolution: ?db_mod.types.ReplayStageStats,
     promotion: ?db_mod.types.ReplayStageStats,
+    resolver_replay: db_mod.types.ResolverReplayDiagnostics,
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
@@ -1350,6 +1362,7 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, if (runtime_fresh) "true" else "false");
     if (resolution) |stats| try appendReplayStageStatus(alloc, out, "resolution", stats);
     if (promotion) |stats| try appendReplayStageStatus(alloc, out, "promotion", stats);
+    if (index_type == .graph) try appendResolverReplayDiagnosticsStatus(alloc, out, resolver_replay);
     if (metadata) |md| {
         try out.appendSlice(alloc, ",\"runtime_source\":");
         try appendJsonString(alloc, out, statusSourceName(md.source));
@@ -1394,6 +1407,42 @@ fn appendSingleIndexRuntimeStatus(
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
     try out.append(alloc, '}');
+}
+
+fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.ResolverReplayDiagnostics) !void {
+    try out.appendSlice(alloc, ",\"resolver_replay\":{");
+    try out.appendSlice(alloc, "\"resolver_count\":");
+    try appendIntValue(alloc, out, stats.resolver_count);
+    try out.appendSlice(alloc, ",\"resolution_runtime_present\":");
+    try out.appendSlice(alloc, if (stats.resolution_runtime_present) "true" else "false");
+    try out.appendSlice(alloc, ",\"resolution_worker_started\":");
+    try out.appendSlice(alloc, if (stats.resolution_worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"promotion_runtime_present\":");
+    try out.appendSlice(alloc, if (stats.promotion_runtime_present) "true" else "false");
+    try out.appendSlice(alloc, ",\"promotion_worker_started\":");
+    try out.appendSlice(alloc, if (stats.promotion_worker_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"resolvers\":[");
+    for (stats.resolvers, 0..) |resolver, i| {
+        if (i > 0) try out.appendSlice(alloc, ",");
+        try out.appendSlice(alloc, "{");
+        try appendJsonString(alloc, out, "name");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.name);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "table");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.table);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "source_artifact");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.source_artifact);
+        try out.appendSlice(alloc, ",");
+        try appendJsonString(alloc, out, "resolution_artifact");
+        try out.appendSlice(alloc, ":");
+        try appendJsonString(alloc, out, resolver.resolution_artifact);
+        try out.appendSlice(alloc, "}");
+    }
+    try out.appendSlice(alloc, "]}");
 }
 
 fn appendReplayStageStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, stats: db_mod.types.ReplayStageStats) !void {

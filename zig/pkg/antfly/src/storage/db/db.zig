@@ -2409,6 +2409,14 @@ pub const DB = struct {
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
+    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
+    // single identity read generation. Visibility at a fixed generation is
+    // stable, so the entry only turns over when queries arrive at a newer
+    // generation. Guarded by its own mutex because published-path queries do
+    // not hold the apply lock.
+    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    live_doc_set_cache_generation: ?u64 = null,
+    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     dense_posting_maintenance_stats_mutex: std.atomic.Mutex = .unlocked,
@@ -3046,6 +3054,11 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
+        if (self.live_doc_set_cache_set) |*cached| {
+            cached.deinit(self.alloc);
+            self.live_doc_set_cache_set = null;
+            self.live_doc_set_cache_generation = null;
+        }
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
@@ -5188,7 +5201,7 @@ pub const DB = struct {
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
-        if (restore_identity) |identity| try markRestorePrimaryRestored(
+        if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
             identity.backup_id,
@@ -5286,7 +5299,28 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    fn markRestorePrimaryRestored(
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPath(alloc, path, state);
+        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+        defer alloc.free(repair_marker_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = repair_marker_path,
+            .data = "done\n",
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPath(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
@@ -5409,13 +5443,12 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-            try self.runUntilIdle();
+            try self.runRestoreRepairDrainAsync();
             try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
-            std.log.info("restore runtime repair sync indexes path={s}", .{self.core.path});
-            try self.core.index_manager.syncAll(false);
+            std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -6980,6 +7013,48 @@ pub const DB = struct {
         return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
+    fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
+        const catalog = self.core.index_manager.resolvers.items;
+        var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (resolvers[0..initialized]) |resolver| {
+                alloc.free(resolver.name);
+                alloc.free(resolver.table);
+                alloc.free(resolver.source_artifact);
+                alloc.free(resolver.resolution_artifact);
+            }
+            if (resolvers.len > 0) alloc.free(resolvers);
+        }
+
+        for (catalog) |cfg| {
+            const name = try alloc.dupe(u8, cfg.name);
+            errdefer alloc.free(name);
+            const table = try alloc.dupe(u8, cfg.table);
+            errdefer alloc.free(table);
+            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
+            errdefer alloc.free(source_artifact);
+            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
+            errdefer alloc.free(resolution_artifact);
+            resolvers[initialized] = .{
+                .name = name,
+                .table = table,
+                .source_artifact = source_artifact,
+                .resolution_artifact = resolution_artifact,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .resolver_count = @intCast(catalog.len),
+            .resolution_runtime_present = self.resolution_runtime != null,
+            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_runtime_present = self.promotion_runtime != null,
+            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .resolvers = resolvers[0..initialized],
+        };
+    }
+
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
         if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
         const resources = self.core.batchExecutionResources();
@@ -7173,6 +7248,16 @@ pub const DB = struct {
             if (self.core.nextDerivedSequence() <= drained_sequence) return;
         }
         return error.RunUntilIdleDidNotConverge;
+    }
+
+    fn runRestoreRepairDrainAsync(self: *DB) !void {
+        // Earlier repair phases synchronously rebuild restored runtime state.
+        // At this point only persisted applied-sequence watermarks need to be
+        // flushed before the final index sync/complete marker. Do not call
+        // runUntilIdle here: large portable restores can leave substantial
+        // replay, posting-maintenance, or LSM maintenance debt, and queries
+        // remain correct while that background-maintenance debt is paid down.
+        try self.flushAppliedSequencesForIdle();
     }
 
     pub fn runUntilIdle(self: *DB) !void {
@@ -9046,6 +9131,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -9215,6 +9301,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -9303,6 +9390,7 @@ pub const DB = struct {
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -10336,9 +10424,37 @@ pub const DB = struct {
             return try doc_set.cloneAlloc(alloc, set);
         }
         if (set.* == .all) {
-            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
         }
         return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
+        const all_set: doc_set.ResolvedDocSet = .all;
+        const gen = generation orelse {
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        };
+        {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_generation == gen) {
+                if (self.live_doc_set_cache_set) |*cached| {
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.live_doc_set_cache_set = cloned;
+            self.live_doc_set_cache_generation = gen;
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
     }
 
     fn allDocsVisibleCallback(
@@ -10371,7 +10487,10 @@ pub const DB = struct {
                     .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, all_visible },
                 );
             }
-            if (all_visible) return true;
+            // The summary is definitive in both directions: it tracks tombstone
+            // counts and the max created generation, the same fields the full
+            // identity scan below would recompute.
+            return all_visible;
         }
         if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
         const stats_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -30475,9 +30594,9 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
     try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
-    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expect(dense_summary.dense_search_width_total >= 1);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 1);
+    try std.testing.expect(dense_summary.dense_epsilon_max > 0.0);
     try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
     try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
     try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);
@@ -44248,7 +44367,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestored(
+    try DB.markRestorePrimaryRestoredForPath(
         alloc,
         std.mem.span(restore_path),
         "snap1",

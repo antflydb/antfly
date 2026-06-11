@@ -1238,6 +1238,22 @@ pub const ReplayStageStats = struct {
     error_count: u64 = 0,
 };
 
+pub const ResolverReplayDiagnostic = struct {
+    name: []const u8 = "",
+    table: []const u8 = "",
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+};
+
+pub const ResolverReplayDiagnostics = struct {
+    resolver_count: u64 = 0,
+    resolution_runtime_present: bool = false,
+    resolution_worker_started: bool = false,
+    promotion_runtime_present: bool = false,
+    promotion_worker_started: bool = false,
+    resolvers: []const ResolverReplayDiagnostic = &.{},
+};
+
 pub const TransactionRecoveryStats = struct {
     enabled: bool = false,
     lease_owned: bool = false,
@@ -1370,6 +1386,7 @@ pub const DBStats = struct {
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},
+    resolver_replay: ResolverReplayDiagnostics = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
@@ -2018,7 +2035,18 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
 }
 
+pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
+    for (stats.resolvers) |resolver| {
+        alloc.free(resolver.name);
+        alloc.free(resolver.table);
+        alloc.free(resolver.source_artifact);
+        alloc.free(resolver.resolution_artifact);
+    }
+    if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
+    freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
