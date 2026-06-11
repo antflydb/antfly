@@ -8,7 +8,7 @@ export default function HomePage() {
   return (
     <div className="mx-auto max-w-5xl space-y-20">
       <Stack gap="sm">
-        <Badge variant="secondary">{totalCount} components</Badge>
+        <Badge>{totalCount} components</Badge>
         <h1 className="font-display text-5xl tracking-tight text-foreground">
           @antfly/design-system
         </h1>

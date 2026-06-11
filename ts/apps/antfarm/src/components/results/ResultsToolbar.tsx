@@ -91,14 +91,12 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
         {/* Stats */}
         <div className="flex items-center gap-2 flex-wrap">
           {totalHits !== undefined && (
-            <Badge variant="secondary" className="font-mono">
+            <Badge className="font-mono">
               {totalHits.toLocaleString()} {totalHits === 1 ? "hit" : "hits"}
             </Badge>
           )}
           {queryTime !== undefined && (
-            <Badge variant="outline" className="font-mono text-xs">
-              {formatQueryTime(queryTime)}
-            </Badge>
+            <Badge className="font-mono text-xs">{formatQueryTime(queryTime)}</Badge>
           )}
         </div>
 
@@ -143,7 +141,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="sm" className="h-8">
                   Fields
-                  <Badge variant="secondary" className="ml-2 h-5 px-1.5 text-xs">
+                  <Badge className="ml-2 h-5 px-1.5 text-xs">
                     {visibleFields.size}/{availableFields.length}
                   </Badge>
                 </Button>

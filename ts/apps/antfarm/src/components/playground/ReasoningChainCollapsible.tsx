@@ -67,9 +67,7 @@ function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?
       {/* Step content */}
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <Badge variant="outline" className="text-xs font-mono">
-            {step.name}
-          </Badge>
+          <Badge className="text-xs font-mono">{step.name}</Badge>
           {step.status && (
             <Badge variant={getStatusBadgeVariant(step.status)} className="text-xs">
               {step.status}
@@ -116,9 +114,7 @@ function ActiveStepItem({ step }: { step: SSEStepStarted }) {
       </div>
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2">
-          <Badge variant="outline" className="text-xs font-mono">
-            {step.name}
-          </Badge>
+          <Badge className="text-xs font-mono">{step.name}</Badge>
         </div>
         {step.action && (
           <p className="text-xs text-muted-foreground mt-1 truncate">{step.action}</p>

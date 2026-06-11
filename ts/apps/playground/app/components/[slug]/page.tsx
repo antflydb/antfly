@@ -19,7 +19,7 @@ export default async function ComponentPage({ params }: PageProps) {
   return (
     <div className="mx-auto max-w-5xl space-y-12">
       <div className="space-y-3">
-        <Badge variant="outline">{category}</Badge>
+        <Badge>{category}</Badge>
         <h1 className="font-display text-4xl tracking-tight text-foreground">{demo.name}</h1>
         <p className="max-w-2xl text-base text-muted-foreground">{demo.description}</p>
       </div>

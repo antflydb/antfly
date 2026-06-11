@@ -162,9 +162,9 @@ const ChatPlaygroundPage: React.FC = () => {
         {/* Active Table/Index Indicator */}
         {selectedTable ? (
           <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-            <Badge variant="secondary">{selectedTable}</Badge>
+            <Badge>{selectedTable}</Badge>
             {chatIndexes.length > 0 ? (
-              <Badge variant="outline">
+              <Badge>
                 {chatIndexes.length} index{chatIndexes.length !== 1 ? "es" : ""}
               </Badge>
             ) : (

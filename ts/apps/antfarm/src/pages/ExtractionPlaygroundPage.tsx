@@ -1006,7 +1006,6 @@ const ExtractionPlaygroundPage: React.FC = () => {
                   return (
                     <Badge
                       key={label}
-                      variant="secondary"
                       className={`${colors.bg} ${colors.text} ${colors.border} border gap-1`}
                     >
                       {label}
@@ -1167,24 +1166,24 @@ const ExtractionPlaygroundPage: React.FC = () => {
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
           {mode === "recognize" && (
             <>
-              <Badge variant="secondary" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <Hash className="h-3 w-3" />
                 {getFilteredEntities().length} entities
               </Badge>
-              <Badge variant="secondary" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <Percent className="h-3 w-3" />
                 {(confidenceThreshold * 100).toFixed(0)}% threshold
               </Badge>
             </>
           )}
           {resultModel && (
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Zap className="h-3 w-3" />
               {resultModel}
             </Badge>
           )}
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>
@@ -1254,7 +1253,6 @@ const ExtractionPlaygroundPage: React.FC = () => {
                         return (
                           <Badge
                             key={label}
-                            variant="outline"
                             className={`${colors.bg} ${colors.text} ${colors.border} text-xs`}
                           >
                             {label} ({counts[label]})
@@ -1295,7 +1293,6 @@ const ExtractionPlaygroundPage: React.FC = () => {
                                   <td className="px-3 py-2 font-mono">{entity.text}</td>
                                   <td className="px-3 py-2">
                                     <Badge
-                                      variant="secondary"
                                       className={`${colors.bg} ${colors.text} ${colors.border} border text-xs`}
                                     >
                                       {entity.label}

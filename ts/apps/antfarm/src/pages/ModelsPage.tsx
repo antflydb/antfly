@@ -553,7 +553,7 @@ const ModelDetailSheet: React.FC<{
               </span>
 
               {model.inRegistry ? (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success-500/10 text-success-600 dark:text-success-400 border border-success-500/20">
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
                   <Zap className="w-3 h-3" />
                   Ready
                 </span>
@@ -747,7 +747,7 @@ const ModelDetailSheet: React.FC<{
                       )}
                     >
                       {copiedCommand ? (
-                        <Check className="w-3.5 h-3.5 text-success-400" />
+                        <Check className="w-3.5 h-3.5 text-success" />
                       ) : (
                         <Copy className="w-3.5 h-3.5" />
                       )}

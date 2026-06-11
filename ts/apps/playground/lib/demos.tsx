@@ -219,11 +219,10 @@ demoCategories.primitives.demos = [
   {
     slug: "button",
     name: "Button",
-    description: "Clickable trigger. Six variants × four sizes.",
+    description: "Clickable trigger. Five variants × four sizes.",
     render: () => (
       <div className="flex flex-wrap gap-3">
         <Button>Primary</Button>
-        <Button variant="secondary">Secondary</Button>
         <Button variant="outline">Outline</Button>
         <Button variant="ghost">Ghost</Button>
         <Button variant="link">Link</Button>
@@ -245,9 +244,6 @@ demoCategories.primitives.demos = [
       <div className="flex flex-wrap gap-2">
         <Badge>Default</Badge>
         <Badge variant="primary">Primary</Badge>
-        <Badge variant="secondary">Secondary</Badge>
-        <Badge variant="outline">Outline</Badge>
-        <Badge variant="amber">Amber</Badge>
         <Badge variant="destructive">Destructive</Badge>
       </div>
     ),
@@ -1088,8 +1084,8 @@ demoCategories.compound.demos = [
             </DashboardPageActions>
           </DashboardPageHeader>
           <DashboardToolbar>
-            <Badge variant="secondary">12 tables</Badge>
-            <Badge variant="outline">3 indexing</Badge>
+            <Badge>12 tables</Badge>
+            <Badge>3 indexing</Badge>
             <Button variant="ghost" size="sm">
               Refresh
             </Button>

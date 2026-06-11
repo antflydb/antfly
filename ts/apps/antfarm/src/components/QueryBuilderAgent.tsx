@@ -107,9 +107,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
       <CardHeader className="pb-3">
         <CardTitle className="text-base flex items-center gap-2">
           AI Query Builder
-          <Badge variant="outline" className="font-normal text-xs">
-            Beta
-          </Badge>
+          <Badge className="font-normal text-xs">Beta</Badge>
         </CardTitle>
         <CardDescription>Describe what you want to search for in natural language</CardDescription>
       </CardHeader>
@@ -140,7 +138,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
                 <GearIcon className="h-4 w-4" />
                 Generator Settings
                 {effectiveGenerator && (
-                  <Badge variant="secondary" className="font-normal text-xs">
+                  <Badge className="font-normal text-xs">
                     {formatGeneratorSummary(effectiveGenerator)}
                   </Badge>
                 )}
@@ -230,7 +228,7 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
             )}
 
             {onQueryGenerated && (
-              <Button onClick={handleUseQuery} variant="secondary" className="w-full">
+              <Button onClick={handleUseQuery} variant="outline" className="w-full">
                 Use This Query
               </Button>
             )}

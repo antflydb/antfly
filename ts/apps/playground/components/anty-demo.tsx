@@ -296,7 +296,7 @@ export function AntyDemo() {
       <div className="space-y-3">
         <MonoLabel className="block">controls</MonoLabel>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant={isOff ? "default" : "secondary"} size="sm" onClick={togglePower}>
+          <Button variant={isOff ? "default" : "outline"} size="sm" onClick={togglePower}>
             {isOff ? "Wake Up" : "Power Off"}
           </Button>
           <Button

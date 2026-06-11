@@ -728,7 +728,6 @@ ${facetsCode}${resultsCode}
                           return (
                             <Badge
                               key={searchField}
-                              variant="secondary"
                               className="cursor-pointer"
                               onClick={() => handleRemoveSearchField(searchField)}
                               title={`Search field: ${searchField}\nSchema types: ${fieldInfo?.schemaTypes.join(", ") || "unknown"}\nAntfly types: ${fieldInfo?.antflyTypes.join(", ") || "unknown"}`}
@@ -775,7 +774,6 @@ ${facetsCode}${resultsCode}
                           .map((fieldInfo) => (
                             <Badge
                               key={fieldInfo.searchField}
-                              variant="outline"
                               className="cursor-pointer hover:bg-muted"
                               onClick={() => handleAddSearchField(fieldInfo.searchField)}
                               title={`Search field: ${fieldInfo.searchField}\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}
@@ -910,7 +908,6 @@ ${facetsCode}${resultsCode}
                                 return (
                                   <Badge
                                     key={field}
-                                    variant="secondary"
                                     className="cursor-pointer"
                                     onClick={() => handleRemoveAutosuggestField(field)}
                                     title={`Search field: ${field}\\nSchema types: ${fieldInfo?.schemaTypes.join(", ") || "unknown"}\\nAntfly types: ${fieldInfo?.antflyTypes.join(", ") || "unknown"}`}
@@ -932,7 +929,6 @@ ${facetsCode}${resultsCode}
                                 .map((fieldInfo) => (
                                   <Badge
                                     key={fieldInfo.searchField}
-                                    variant="outline"
                                     className="cursor-pointer hover:bg-muted"
                                     onClick={() => handleAddAutosuggestField(fieldInfo.searchField)}
                                     title={`Search field: ${fieldInfo.searchField}\\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}
@@ -1108,7 +1104,6 @@ ${facetsCode}${resultsCode}
                               return (
                                 <Badge
                                   key={field}
-                                  variant="secondary"
                                   className="cursor-pointer"
                                   onClick={() => handleRemoveResultField(field)}
                                   title={`Field: ${field}\\nSchema type: ${fieldInfo?.schemaType || "unknown"}`}
@@ -1128,7 +1123,6 @@ ${facetsCode}${resultsCode}
                               .map((fieldInfo) => (
                                 <Badge
                                   key={fieldInfo.fieldName}
-                                  variant="outline"
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() => handleAddResultField(fieldInfo.fieldName)}
                                   title={`Field: ${fieldInfo.fieldName}\\nSchema type: ${fieldInfo.schemaType}`}
@@ -1175,7 +1169,6 @@ ${facetsCode}${resultsCode}
                                 {thumbnailField ? (
                                   <div className="mb-3">
                                     <Badge
-                                      variant="secondary"
                                       className="cursor-pointer"
                                       onClick={handleClearThumbnailField}
                                     >
@@ -1262,7 +1255,6 @@ ${facetsCode}${resultsCode}
                             {displayTextField ? (
                               <div className="mb-3">
                                 <Badge
-                                  variant="secondary"
                                   className="cursor-pointer"
                                   onClick={handleClearDisplayTextField}
                                 >
@@ -1373,7 +1365,6 @@ ${facetsCode}${resultsCode}
                             {availableFields.map((fieldInfo) => (
                               <Badge
                                 key={fieldInfo.searchField}
-                                variant="outline"
                                 className="cursor-pointer hover:bg-muted"
                                 onClick={() => setNewFacetField(fieldInfo.searchField)}
                                 title={`Search field: ${fieldInfo.searchField}\nSchema types: ${fieldInfo.schemaTypes.join(", ")}\nAntfly types: ${fieldInfo.antflyTypes.join(", ")}`}

@@ -489,8 +489,8 @@ const EvalsPlaygroundPage: React.FC = () => {
       {/* Active Table/Index Indicator */}
       {selectedTable ? (
         <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-          <Badge variant="secondary">{selectedTable}</Badge>
-          {selectedIndex && <Badge variant="outline">{selectedIndex}</Badge>}
+          <Badge>{selectedTable}</Badge>
+          {selectedIndex && <Badge>{selectedIndex}</Badge>}
         </DashboardToolbar>
       ) : (
         <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
@@ -687,24 +687,24 @@ const EvalsPlaygroundPage: React.FC = () => {
               <div className="space-y-4">
                 {/* Summary */}
                 <div className="flex flex-wrap gap-2">
-                  <Badge variant="secondary" className="gap-1.5">
+                  <Badge className="gap-1.5">
                     <Percent className="h-3 w-3" />
                     Avg: {(results.summary.averageScore * 100).toFixed(0)}%
                   </Badge>
-                  <Badge variant="outline" className="gap-1.5 af-status-text-success">
+                  <Badge className="gap-1.5 af-status-text-success">
                     <CheckCircle className="h-3 w-3" />
                     Passed: {results.summary.passed}
                   </Badge>
-                  <Badge variant="outline" className="gap-1.5 af-status-text-error">
+                  <Badge className="gap-1.5 af-status-text-error">
                     <XCircle className="h-3 w-3" />
                     Failed: {results.summary.failed}
                   </Badge>
                   {results.summary.errors > 0 && (
-                    <Badge variant="outline" className="gap-1.5 af-status-text-warning">
+                    <Badge className="gap-1.5 af-status-text-warning">
                       Errors: {results.summary.errors}
                     </Badge>
                   )}
-                  <Badge variant="outline" className="gap-1.5">
+                  <Badge className="gap-1.5">
                     <Clock className="h-3 w-3" />
                     {(results.summary.totalDurationMs / 1000).toFixed(1)}s
                   </Badge>
@@ -736,9 +736,7 @@ const EvalsPlaygroundPage: React.FC = () => {
                             <X className="h-4 w-4 af-status-icon-error" />
                           )}
                           <span className="flex-1 truncate text-sm">{result.question}</span>
-                          <Badge variant="secondary" className="text-xs">
-                            {(result.score * 100).toFixed(0)}%
-                          </Badge>
+                          <Badge className="text-xs">{(result.score * 100).toFixed(0)}%</Badge>
                         </div>
                       </CollapsibleTrigger>
                       <CollapsibleContent>

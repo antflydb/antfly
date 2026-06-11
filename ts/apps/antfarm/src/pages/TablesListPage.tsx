@@ -141,7 +141,7 @@ const TablesListPage: React.FC = () => {
           return (
             <div className="flex items-center gap-2">
               {table.migration && (
-                <Badge variant="outline" className="af-status-badge-warning">
+                <Badge className="af-status-badge-warning">
                   Rebuilding v{table.migration.read_schema.version} → v
                   {table.schema?.version ?? "?"}
                 </Badge>

@@ -409,22 +409,22 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {results && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {results.length} documents
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Zap className="h-3 w-3" />
             {selectedModel}
           </Badge>
           {dimensions && (
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Maximize2 className="h-3 w-3" />
               {dimensions}d vectors
             </Badge>
           )}
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>
