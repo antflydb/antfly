@@ -162,7 +162,7 @@ function DropdownMenuLabel({
       data-inset={inset}
       className={cn(
         // mono kicker — matches Label / Card-head treatment
-        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70",
+        "px-2 py-1.5 font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
         "data-[inset]:pl-8",
         className
       )}
@@ -189,7 +189,7 @@ function DropdownMenuShortcut({ className, ...props }: React.ComponentProps<"spa
     <span
       data-slot="dropdown-menu-shortcut"
       className={cn(
-        "text-muted-foreground ml-auto font-mono text-[11px] tracking-[0.05em]",
+        "text-muted-foreground ml-auto font-mono text-[11px]",
         className
       )}
       {...props}

@@ -15,14 +15,12 @@ const alertVariants = cva(
   {
     variants: {
       variant: {
-        default: "border-l-foreground [&>svg]:text-foreground *:data-[slot=alert-title]:text-foreground",
-        destructive:
-          "border-l-destructive [&>svg]:text-destructive *:data-[slot=alert-title]:text-destructive",
-        success:
-          "border-l-success [&>svg]:text-success *:data-[slot=alert-title]:text-success",
-        warning:
-          "border-l-warning [&>svg]:text-warning *:data-[slot=alert-title]:text-warning",
-        info: "border-l-info [&>svg]:text-info *:data-[slot=alert-title]:text-info",
+        // one signal: the icon (and left edge) carry the state; titles stay ink
+        default: "border-l-foreground [&>svg]:text-foreground",
+        destructive: "border-l-destructive [&>svg]:text-destructive",
+        success: "border-l-success [&>svg]:text-success",
+        warning: "border-l-warning [&>svg]:text-warning",
+        info: "border-l-info [&>svg]:text-info",
       },
     },
     defaultVariants: {
@@ -52,7 +50,7 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="alert-title"
       className={cn(
         // mono uppercase callout — label register, medium weight
-        "col-start-2 font-mono uppercase tracking-[0.06em] text-[12px] font-medium leading-none mb-[2px]",
+        "col-start-2 font-mono uppercase tracking-[0.08em] text-[11px] font-medium leading-none mb-[2px] text-foreground",
         className
       )}
       {...props}

@@ -35,7 +35,7 @@ function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPr
       data-slot="tabs-trigger"
       className={cn(
         // mono kicker voice — matches the prototype's nav .eyebrow treatment
-        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium",
         "inline-flex items-center justify-center gap-2 px-3 py-2.5",
         // overlap the rail: the trigger's 2px underline sits ON the 1px rail
         "-mb-px border-b-2 border-transparent",

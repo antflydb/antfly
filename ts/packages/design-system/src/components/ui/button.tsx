@@ -33,13 +33,11 @@ const buttonVariants = cva(
         // carries the weight (no contrast border)
         default:
           "bg-primary text-primary-foreground border-(length:--border-width) border-transparent hover:bg-amber-300",
-        // Destructive — outlined red that fills on hover
+        // Destructive — red ink on a normal chassis; one signal, no shouting
         destructive:
-          "bg-transparent text-destructive border-(length:--border-width) border-destructive hover:bg-destructive hover:text-white",
-        // Outline / Secondary — bordered, ink text, quiet background hover
+          "bg-transparent text-destructive border-(length:--border-width) border-input hover:bg-destructive/10",
+        // Outline — bordered, ink text, quiet background hover
         outline:
-          "bg-transparent text-foreground border-(length:--border-width) border-input hover:bg-secondary",
-        secondary:
           "bg-transparent text-foreground border-(length:--border-width) border-input hover:bg-secondary",
         // Ghost — no border, muted text, lights up on hover
         ghost:

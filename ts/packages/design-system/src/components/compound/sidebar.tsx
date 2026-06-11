@@ -401,7 +401,7 @@ function SidebarGroupLabel({
       className={cn(
         // mono kicker — matches form labels, table headers, dropdown labels
         "ring-sidebar-ring flex h-8 shrink-0 items-center rounded-none px-2",
-        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
         "outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
         className
@@ -495,7 +495,7 @@ const sidebarMenuButtonVariants = cva(
       },
       size: {
         default: "h-8 text-[13px]",
-        sm: "h-7 text-[12px]",
+        sm: "h-7 text-[13px]",
         lg: "h-12 text-[13px] group-data-[collapsible=icon]:!h-12 group-data-[collapsible=icon]:!w-12 group-data-[collapsible=icon]:!px-0",
       },
     },
@@ -596,9 +596,9 @@ function SidebarMenuBadge({ className, ...props }: React.ComponentProps<"div">) 
       className={cn(
         // mono uppercase pill — matches Badge outline treatment
         "text-muted-foreground pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center px-1.5 select-none",
-        "font-mono uppercase tracking-[0.05em] text-[10px] font-medium tabular-nums",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium tabular-nums",
         "border-(length:--border-width) border-border rounded-none",
-        "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground peer-data-[active=true]/menu-button:border-amber-500 peer-data-[active=true]/menu-button:text-amber-600 dark:peer-data-[active=true]/menu-button:text-amber-400",
+        "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground",
         "peer-data-[size=sm]/menu-button:top-1",
         "peer-data-[size=default]/menu-button:top-1.5",
         "peer-data-[size=lg]/menu-button:top-2.5",
@@ -697,7 +697,7 @@ function SidebarMenuSubButton({
         "[&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0",
         "data-[active=true]:text-foreground data-[active=true]:bg-sidebar-accent",
         size === "sm" && "text-[11px]",
-        size === "md" && "text-[12px]",
+        size === "md" && "text-[13px]",
         "group-data-[collapsible=icon]:hidden",
         className
       )}
