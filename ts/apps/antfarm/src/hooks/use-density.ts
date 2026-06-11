@@ -1,20 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
 
-type Density = "compact" | "comfortable";
+type Density = "compact" | "default" | "comfortable";
 
 const STORAGE_KEY = "antfarm-data-density";
-const DEFAULT_DENSITY: Density = "compact";
+const DEFAULT_DENSITY: Density = "default";
+const CYCLE: Density[] = ["default", "compact", "comfortable"];
 
 function getStoredDensity(): Density {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === "compact" || stored === "comfortable") return stored;
+    if (stored === "compact" || stored === "default" || stored === "comfortable") return stored;
   } catch {}
   return DEFAULT_DENSITY;
 }
 
 function applyDensity(density: Density) {
-  document.documentElement.setAttribute("data-density", density);
+  if (density === "default") {
+    document.documentElement.removeAttribute("data-density");
+  } else {
+    document.documentElement.setAttribute("data-density", density);
+  }
 }
 
 export function useDensity() {
@@ -33,7 +38,8 @@ export function useDensity() {
   }, []);
 
   const toggleDensity = useCallback(() => {
-    setDensity(density === "compact" ? "comfortable" : "compact");
+    const next = CYCLE[(CYCLE.indexOf(density) + 1) % CYCLE.length];
+    setDensity(next);
   }, [density, setDensity]);
 
   return { density, setDensity, toggleDensity };
