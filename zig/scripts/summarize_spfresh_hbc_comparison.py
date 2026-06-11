@@ -80,6 +80,10 @@ WRITE_COLUMNS = [
     "fg_delta_legacy_value_bytes",
     "fg_delta_value_bytes_per_record",
     "fg_delta_value_bytes_vs_legacy",
+    "posting_base_value_bytes",
+    "posting_base_fixed_width_value_bytes",
+    "posting_base_value_bytes_vs_fixed_width",
+    "posting_base_value_bytes_per_member",
     "fg_route_leaf_groups",
     "fg_route_items",
     "fg_route_items_per_leaf_group",
@@ -563,6 +567,9 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "foreground_posting_delta_value_bytes",
                     "posting_delta_value_bytes",
                 ),
+                "posting_base_value_bytes": mean(group, "posting_base_value_bytes"),
+                "posting_base_fixed_width_value_bytes": mean(group, "posting_base_fixed_width_value_bytes"),
+                "posting_base_members": mean(group, "posting_base_members"),
                 "assignment_map_put_calls": mean(group, "assignment_map_put_calls"),
                 "fg_route_leaf_groups": preferred_mean(
                     group,
@@ -908,6 +915,14 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["fg_delta_value_bytes_vs_legacy"] = ratio(
             summary.get("fg_delta_value_bytes"),
             summary.get("fg_delta_legacy_value_bytes"),
+        )
+        summary["posting_base_value_bytes_vs_fixed_width"] = ratio(
+            summary.get("posting_base_value_bytes"),
+            summary.get("posting_base_fixed_width_value_bytes"),
+        )
+        summary["posting_base_value_bytes_per_member"] = safe_ratio(
+            summary.get("posting_base_value_bytes"),
+            summary.get("posting_base_members"),
         )
         summary["fg_route_items_per_leaf_group"] = safe_ratio(
             summary.get("fg_route_items"),

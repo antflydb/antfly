@@ -57,6 +57,7 @@ pub const SearchScratch = struct {
     distances: []f32,
     error_bounds: []f32,
     posting_member_cache: std.ArrayListUnmanaged(PostingMemberCacheEntry) = .empty,
+    posting_member_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_entry_bytes: u64 = 0,
@@ -193,21 +194,16 @@ pub const SearchScratch = struct {
     }
 
     pub fn cachedPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64) ?[]const u64 {
-        for (self.posting_member_cache.items, 0..) |entry, i| {
-            if (entry.posting_id == posting_id and entry.mutation_version == mutation_version) {
-                if (i + 1 != self.posting_member_cache.items.len) {
-                    const hot_entry = entry;
-                    std.mem.copyForwards(
-                        PostingMemberCacheEntry,
-                        self.posting_member_cache.items[i .. self.posting_member_cache.items.len - 1],
-                        self.posting_member_cache.items[i + 1 ..],
-                    );
-                    self.posting_member_cache.items[self.posting_member_cache.items.len - 1] = hot_entry;
-                }
-                return self.posting_member_cache.items[self.posting_member_cache.items.len - 1].members;
-            }
+        const slot = self.posting_member_cache_slots.get(posting_id) orelse return null;
+        if (slot >= self.posting_member_cache.items.len) return null;
+        if (self.posting_member_cache.items[slot].mutation_version != mutation_version) return null;
+        const last = self.posting_member_cache.items.len - 1;
+        if (slot != last) {
+            std.mem.swap(PostingMemberCacheEntry, &self.posting_member_cache.items[slot], &self.posting_member_cache.items[last]);
+            self.posting_member_cache_slots.getPtr(self.posting_member_cache.items[slot].posting_id).?.* = slot;
+            self.posting_member_cache_slots.getPtr(self.posting_member_cache.items[last].posting_id).?.* = last;
         }
-        return null;
+        return self.posting_member_cache.items[last].members;
     }
 
     pub fn cachePostingMembers(self: *SearchScratch, alloc: Allocator, posting_id: u64, mutation_version: u64, members: []const u64) !PostingMemberCacheResult {
@@ -217,14 +213,7 @@ pub const SearchScratch = struct {
             result.admission_skips += 1;
             return result;
         }
-        var existing_index: ?usize = null;
-        for (self.posting_member_cache.items, 0..) |entry, i| {
-            if (entry.posting_id == posting_id) {
-                existing_index = i;
-                break;
-            }
-        }
-        if (existing_index) |i| self.evictPostingMemberCacheEntry(alloc, i);
+        if (self.posting_member_cache_slots.get(posting_id)) |i| self.evictPostingMemberCacheEntry(alloc, i);
         if (member_bytes > self.max_posting_member_cache_entry_bytes or member_bytes > self.max_posting_member_cache_bytes) {
             result.admission_skips += 1;
             result.member_bytes = self.posting_member_cache_bytes;
@@ -235,11 +224,13 @@ pub const SearchScratch = struct {
             self.evictPostingMemberCacheEntry(alloc, 0);
             evictions += 1;
         }
+        try self.posting_member_cache_slots.ensureUnusedCapacity(alloc, 1);
         try self.posting_member_cache.append(alloc, .{
             .posting_id = posting_id,
             .mutation_version = mutation_version,
             .members = try alloc.dupe(u64, members),
         });
+        self.posting_member_cache_slots.putAssumeCapacity(posting_id, self.posting_member_cache.items.len - 1);
         self.posting_member_cache_bytes += member_bytes;
         result.inserted = true;
         result.evictions = evictions;
@@ -248,13 +239,23 @@ pub const SearchScratch = struct {
     }
 
     fn evictPostingMemberCacheEntry(self: *SearchScratch, alloc: Allocator, index: usize) void {
-        const entry = self.posting_member_cache.orderedRemove(index);
+        const entry = self.posting_member_cache.items[index];
         self.posting_member_cache_bytes -|= byteLen(entry.members);
+        _ = self.posting_member_cache_slots.remove(entry.posting_id);
+        const last = self.posting_member_cache.items.len - 1;
+        if (index != last) {
+            self.posting_member_cache.items[index] = self.posting_member_cache.items[last];
+            self.posting_member_cache_slots.getPtr(self.posting_member_cache.items[index].posting_id).?.* = index;
+        }
+        self.posting_member_cache.items.len = last;
         alloc.free(entry.members);
     }
 
     pub fn bytes(self: *const SearchScratch) u64 {
-        const posting_member_cache_bytes = byteLen(self.posting_member_cache.items) + self.posting_member_cache_bytes;
+        const posting_member_cache_bytes =
+            byteLen(self.posting_member_cache.items) +
+            approximateHashMapBytes(self.posting_member_cache_slots.capacity(), @sizeOf(u64), @sizeOf(usize)) +
+            self.posting_member_cache_bytes;
         const posting_overlay_bytes =
             approximateHashMapBytes(self.posting_overlay_removed_members.capacity(), @sizeOf(u64), 0) +
             approximateHashMapBytes(self.posting_overlay_appended_positions.capacity(), @sizeOf(u64), @sizeOf(usize)) +
@@ -303,6 +304,7 @@ pub const SearchScratch = struct {
         alloc.free(self.error_bounds);
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
+        self.posting_member_cache_slots.deinit(alloc);
         self.posting_overlay_removed_members.deinit(alloc);
         self.posting_overlay_appended_positions.deinit(alloc);
         alloc.free(self.posting_overlay_appended_ids);
