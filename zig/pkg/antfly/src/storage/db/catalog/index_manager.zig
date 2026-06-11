@@ -12029,6 +12029,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
         1;
 
     const format_defaults = denseFormatDefaults(format, version) catch return error.InvalidIndexConfig;
+    const posting_base_member_block_size = if (root.object.get("posting_base_member_block_size")) |value|
+        try parsePostingBaseMemberBlockSize(value.integer)
+    else
+        32;
 
     var cfg = DenseConfig{
         .field_name = try alloc.dupe(u8, field.string),
@@ -12246,10 +12250,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             4096,
-        .posting_base_member_block_size = if (root.object.get("posting_base_member_block_size")) |value|
-            try parsePostingBaseMemberBlockSize(value.integer)
-        else
-            32,
+        .posting_base_member_block_size = posting_base_member_block_size,
     };
     errdefer cfg.deinit(alloc);
     if (cfg.auto_posting_maintenance_allow_overfull_reassignment and
