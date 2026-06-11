@@ -99,6 +99,9 @@ pub const Routes = struct {
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
     pub const lookup_suffix = "/lookup";
     pub const lookup_marker = "/lookup/";
+    pub const documents_marker = "/documents/";
+    pub const artifacts_marker = "/artifacts/";
+    pub const artifacts_suffix = "/artifacts";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
@@ -274,6 +277,12 @@ pub const Routes = struct {
     pub const GroupJoinJobState = struct {
         group_id: u64,
         table_name: []const u8,
+    };
+
+    pub const GroupDocumentArtifacts = struct {
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
     };
 
     pub const GroupBatch = struct {
@@ -832,6 +841,24 @@ pub const Routes = struct {
         const table_name = rest[tables_prefix.len .. rest.len - secondary_index_rebuild_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, artifacts_suffix)) return null;
+        const table_rest = rest[tables_prefix.len .. rest.len - artifacts_suffix.len];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const key = table_rest[documents_index + documents_marker.len ..];
+        if (key.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+        };
     }
 
     pub fn matchGroupForeignKeyRefChildren(path: []const u8) ?GroupForeignKeyRefChildren {

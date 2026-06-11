@@ -439,6 +439,64 @@ pub const DocumentArtifactChildRangePlacementUpdate = struct {
     split_eligible: ?bool = null,
 };
 
+pub const DocumentArtifactManifest = struct {
+    document_id: []u8,
+    artifact_name: []u8,
+    artifact_id: []u8,
+    manifest_json: []u8,
+    state_json: ?[]u8 = null,
+    manifest_version: u64 = 0,
+    generation: u64 = 0,
+    source_url: []u8 = "",
+    source_fingerprint: []u8 = "",
+    content_type: []u8 = "",
+    route_type: []u8 = "",
+    unsupported_reason: ?[]u8 = null,
+    unit_count: usize = 0,
+    chunk_count: usize = 0,
+    child_ranges: []DocumentArtifactChildRange = &.{},
+    child_range_count: usize = 0,
+    merge_status: []u8 = "",
+    merge_from_generation: u64 = 0,
+    merge_to_generation: u64 = 0,
+    merge_operation_granularity: []u8 = "",
+    merge_operation_count: usize = 0,
+    last_error_code: ?[]u8 = null,
+    last_error_message: ?[]u8 = null,
+
+    pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        alloc.free(self.artifact_name);
+        alloc.free(self.artifact_id);
+        alloc.free(self.manifest_json);
+        if (self.state_json) |state_json| alloc.free(state_json);
+        if (self.source_url.len > 0) alloc.free(self.source_url);
+        if (self.source_fingerprint.len > 0) alloc.free(self.source_fingerprint);
+        if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.route_type.len > 0) alloc.free(self.route_type);
+        if (self.unsupported_reason) |unsupported_reason| alloc.free(unsupported_reason);
+        for (self.child_ranges) |*child_range| child_range.deinit(alloc);
+        if (self.child_ranges.len > 0) alloc.free(self.child_ranges);
+        if (self.merge_status.len > 0) alloc.free(self.merge_status);
+        if (self.merge_operation_granularity.len > 0) alloc.free(self.merge_operation_granularity);
+        if (self.last_error_code) |value| alloc.free(value);
+        if (self.last_error_message) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactManifestList = struct {
+    document_id: []u8,
+    artifacts: []DocumentArtifactManifest,
+
+    pub fn deinit(self: *DocumentArtifactManifestList, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        for (self.artifacts) |*artifact| artifact.deinit(alloc);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+};
+
 pub const TextBoolQuery = struct {
     must: []const TextQuery = &.{},
     should: []const TextQuery = &.{},
@@ -2229,6 +2287,8 @@ pub const SearchRequest = struct {
     expand_strategy: ?graph_query_mod.ExpandStrategy = null,
     return_mode: ReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    hierarchy_include_source: bool = false,
+    hierarchy_include_unit: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
