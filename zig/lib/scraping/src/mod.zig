@@ -249,9 +249,19 @@ fn parseDataUriAlloc(alloc: Allocator, uri: []const u8) !DownloadedContent {
         };
     }
 
+    const decoded_body_buf = try alloc.dupe(u8, body);
+    var data = decoded_body_buf;
+    errdefer alloc.free(data);
+    const decoded_body = std.Uri.percentDecodeInPlace(decoded_body_buf);
+    if (decoded_body.len != decoded_body_buf.len) {
+        const exact = try alloc.dupe(u8, decoded_body);
+        alloc.free(decoded_body_buf);
+        data = exact;
+    }
+
     return .{
         .content_type = try alloc.dupe(u8, if (meta.len > 0) meta else "text/plain"),
-        .data = try alloc.dupe(u8, body),
+        .data = data,
     };
 }
 
@@ -525,6 +535,14 @@ test "download content parses data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "download content percent decodes non-base64 data uri" {
+    const alloc = std.testing.allocator;
+    var downloaded = try downloadContentAlloc(alloc, "data:text/plain,alpha%20beta%2Bgamma", null, null);
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
+    try std.testing.expectEqualStrings("alpha beta+gamma", downloaded.data);
 }
 
 test "download content reads percent encoded file uri" {

@@ -1066,6 +1066,11 @@ components:
           items:
             type: string
           description: "Algebraic provenance labels folded into this result, when requested by an algebraic graph executor"
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Parsed evidence envelope for provenance labels and edge metadata"
         edges:
           x-go-type-skip-optional-pointer: true
           type: array

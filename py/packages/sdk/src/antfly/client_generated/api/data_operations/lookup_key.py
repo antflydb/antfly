@@ -26,7 +26,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/db/v1/tables/{table_name}/lookup/{key}".format(
+        "url": "/db/v1/tables/{table_name}/documents/{key}".format(
             table_name=quote(str(table_name), safe=""),
             key=quote(str(key), safe=""),
         ),
@@ -83,7 +83,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
 ) -> Response[Error | LookupKeyResponse200]:
-    """Lookup a key in a table
+    """Retrieve a document by key
 
     Args:
         table_name (str):
@@ -118,7 +118,7 @@ def sync(
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
 ) -> Error | LookupKeyResponse200 | None:
-    """Lookup a key in a table
+    """Retrieve a document by key
 
     Args:
         table_name (str):
@@ -148,7 +148,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
 ) -> Response[Error | LookupKeyResponse200]:
-    """Lookup a key in a table
+    """Retrieve a document by key
 
     Args:
         table_name (str):
@@ -181,7 +181,7 @@ async def asyncio(
     client: AuthenticatedClient,
     fields: str | Unset = UNSET,
 ) -> Error | LookupKeyResponse200 | None:
-    """Lookup a key in a table
+    """Retrieve a document by key
 
     Args:
         table_name (str):

@@ -45,6 +45,7 @@ pub const distributed_candidate_source = @import("distributed_candidate_source.z
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
+pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
@@ -340,6 +341,12 @@ test "api public table query rejects only top-level internal fields" {
     try std.testing.expectError(error.InvalidQueryRequest, query_contract.parseQueryRequest(alloc, null, "docs",
         \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"allow_doc_identity_reassignment":true}
     ));
+    var hierarchy_query = try query_contract.parseQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"needle","field":"content"},"hierarchy":{"return_level":"source","include":["unit","chunk"],"max_children_per_parent":2}}
+    );
+    defer hierarchy_query.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(hierarchy_query.req.return_mode), .parent_with_chunks), hierarchy_query.req.return_mode);
+    try std.testing.expectEqual(@as(u32, 2), hierarchy_query.req.max_chunks_per_parent);
     try public_graph_query.rejectInternalDocIdentityFields(alloc,
         \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}}}
     );

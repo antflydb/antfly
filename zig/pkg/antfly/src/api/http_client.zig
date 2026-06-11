@@ -32,6 +32,28 @@ fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !
     return try std.json.parseFromSlice(T, alloc, body, .{});
 }
 
+fn isUriUnreserved(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '.' or ch == '_' or ch == '~';
+}
+
+fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (value) |ch| {
+        if (isUriUnreserved(ch)) {
+            try out.append(alloc, ch);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub const LookupResponse = struct {
     version: ?[]u8 = null,
     body: []u8,
@@ -228,7 +250,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
                 field_list,
             })
@@ -236,7 +258,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
             });
         defer self.alloc.free(path);
@@ -271,7 +293,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
                 field_list,
             })
@@ -279,7 +301,7 @@ pub const ApiHttpClient = struct {
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.lookup_marker,
+                routes.Routes.documents_marker,
                 key,
             });
         defer self.alloc.free(suffix);
@@ -1405,6 +1427,246 @@ pub const ApiHttpClient = struct {
             return error.UnexpectedHttpStatus;
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupDocumentArtifactManifest(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
+        defer self.alloc.free(escaped_artifact_name);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_marker,
+            escaped_artifact_name,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactManifests(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactReprocess(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
+        defer self.alloc.free(escaped_artifact_name);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_marker,
+            escaped_artifact_name,
+            routes.Routes.reprocess_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = "{}",
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactRangeReprocess(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
+        defer self.alloc.free(escaped_artifact_name);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.artifacts_marker,
+            escaped_artifact_name,
+            routes.Routes.reprocess_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactChildRangePlacementUpdate(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
+        defer self.alloc.free(escaped_artifact_name);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_marker,
+            escaped_artifact_name,
+            routes.Routes.placement_update_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchGroupDocumentArtifactChildRangeBatchApply(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const escaped_key = try percentEncodePathComponent(self.alloc, doc_key);
+        defer self.alloc.free(escaped_key);
+        const escaped_artifact_name = try percentEncodePathComponent(self.alloc, artifact_name);
+        defer self.alloc.free(escaped_artifact_name);
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_marker,
+            escaped_key,
+            routes.Routes.artifacts_marker,
+            escaped_artifact_name,
+            routes.Routes.child_range_batch_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => return error.NotFound,
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
     }
 
     pub fn fetchGroupTxnBegin(

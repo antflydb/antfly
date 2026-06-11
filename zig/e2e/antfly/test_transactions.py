@@ -990,7 +990,7 @@ def _visibility_diagnostic(
     _append_response_diagnostic(parts, stateful_api, "table indexes", "GET", f"/tables/{table_name}/indexes")
     for key in expected:
         escaped_key = quote(key, safe="")
-        path = f"/tables/{table_name}/lookup/{escaped_key}"
+        path = f"/tables/{table_name}/documents/{escaped_key}"
         _append_response_diagnostic(parts, stateful_api, f"lookup {key}", "GET", path)
 
     server = getattr(stateful_api, "_server", None)

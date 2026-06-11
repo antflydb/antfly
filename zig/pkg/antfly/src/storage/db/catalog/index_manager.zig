@@ -2865,6 +2865,7 @@ pub const IndexManager = struct {
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
+            if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
@@ -3347,6 +3348,20 @@ pub const IndexManager = struct {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         errdefer enrichment_types.deinitGeneratedRequests(alloc, requests.items);
 
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            try requests.append(alloc, .{
+                .kind = .asset,
+                .index_name = try alloc.dupe(u8, entry.name),
+                .artifact_name = try alloc.dupe(u8, entry.name),
+                .doc_key = try alloc.dupe(u8, doc_key),
+                .source_field = try alloc.dupe(u8, entry.source_field),
+                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+            });
+        }
+
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {
@@ -3391,6 +3406,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
                     if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
@@ -3472,21 +3488,51 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                 });
+            } else if (entry.embedding_name) |embedding_name| {
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
+                if (embedding_cfg.expected_dims != 0) continue;
+                if (embedding_cfg.source_artifact_name.len > 0) {
+                    const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
+                    if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                        try requests.append(alloc, .{
+                            .kind = .chunk_text,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                            .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                    if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
+                        try requests.append(alloc, .{
+                            .kind = .sparse_embedding,
+                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                            .embedding_name = try alloc.dupe(u8, embedding_name),
+                            .doc_key = try alloc.dupe(u8, doc_key),
+                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .chunk_size = chunk_cfg.chunk_size,
+                            .chunk_overlap = chunk_cfg.chunk_overlap,
+                            .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        });
+                    }
+                } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
+                    try requests.append(alloc, .{
+                        .kind = .sparse_embedding,
+                        .index_name = try alloc.dupe(u8, entry.config.name),
+                        .artifact_name = "",
+                        .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .doc_key = try alloc.dupe(u8, doc_key),
+                        .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
+                        .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                    });
+                }
             }
-        }
-
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-            });
         }
 
         return try requests.toOwnedSlice(alloc);
@@ -4059,11 +4105,18 @@ pub const IndexManager = struct {
             .sparse_vector => {
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
                     .embedding_name = if (sparse_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else
@@ -6015,6 +6068,12 @@ pub const IndexManager = struct {
                 var backfill_ns: u64 = 0;
                 const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
                 defer sparse_cfg.deinit(self.alloc);
+                const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
+                defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
 
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -6041,13 +6100,14 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
-                    .chunk_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
-                    .embedding_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
+                    .embedding_name = if (sparse_generator) |generator| blk: {
                         break :blk if (generator.embedding_name) |embedding_name|
                             try self.alloc.dupe(u8, embedding_name)
                         else
@@ -6089,7 +6149,11 @@ pub const IndexManager = struct {
                 var graph_cfg_moved = false;
                 errdefer if (!graph_cfg_moved) graph_cfg.deinit(self.alloc);
                 if (graph_cfg.artifact_source) |source| {
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
                 if (graph_cfg.shorthand_asset) |*asset| {
                     asset.deinit(self.alloc);
@@ -6356,7 +6420,11 @@ pub const IndexManager = struct {
                     if (graph_cfg.shorthand_asset) |asset| {
                         if (!std.mem.eql(u8, asset.name, source.artifact_name)) return error.InvalidIndexConfig;
                     }
-                    if (self.getEnrichment(.asset, source.artifact_name) == null) return error.InvalidIndexConfig;
+                    if (self.getEnrichment(.asset, source.artifact_name) == null and
+                        self.getEnrichment(.chunk, source.artifact_name) == null)
+                    {
+                        return error.InvalidIndexConfig;
+                    }
                 }
             },
             else => {},
@@ -6368,6 +6436,7 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.chunk, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
                 !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json))
@@ -6418,9 +6487,11 @@ pub const IndexManager = struct {
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0) return error.InvalidEnrichmentConfig;
+                if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.asset, cfg.source_artifact_name) == null) {
+                    return error.InvalidEnrichmentConfig;
+                }
             },
             .embedding => {
-                if (cfg.expected_dims == 0) return error.InvalidEnrichmentConfig;
                 if (cfg.source_artifact_name.len > 0 and self.getEnrichment(.chunk, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
@@ -11378,8 +11449,9 @@ fn isMetadataKey(key: []const u8) bool {
 }
 
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
-    if (entry.chunk_name) |chunk_name| {
-        return internal_keys.matchesChunkArtifactName(key, chunk_name);
+    if (entry.chunk_name) |artifact_name| {
+        return internal_keys.matchesChunkArtifactName(key, artifact_name) or
+            internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
     if (isPrimaryDocumentCandidate(key)) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
@@ -12280,6 +12352,26 @@ fn hasGeneratedDenseEmbeddingRequest(
     return false;
 }
 
+fn hasGeneratedSparseEmbeddingRequest(
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    doc_key: []const u8,
+    source_field: []const u8,
+    source_template: []const u8,
+    artifact_name: []const u8,
+    embedding_name: []const u8,
+) bool {
+    for (requests) |request| {
+        if (request.kind != .sparse_embedding) continue;
+        if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
+        if (!std.mem.eql(u8, request.source_field, source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, source_template)) continue;
+        if (!std.mem.eql(u8, request.artifact_name, artifact_name)) continue;
+        if (!std.mem.eql(u8, request.embedding_name, embedding_name)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) GeneratorConfig {
     if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg| {
         return .{
@@ -12511,7 +12603,10 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     if (trimmed.len == 0) return;
     if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
-    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, expr, "_doc.key")) return;
+    if (std.mem.eql(u8, expr, "_artifact.value")) return;
+    if (std.mem.startsWith(u8, expr, "_artifact.value.")) return;
+    return error.InvalidIndexConfig;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {

@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.query_hit_hierarchy import QueryHitHierarchy
     from ..models.query_hit_index_scores import QueryHitIndexScores
     from ..models.query_hit_source import QueryHitSource
 
@@ -25,6 +26,12 @@ class QueryHit:
         field_score (float): Relevance score of the hit.
         field_index_scores (QueryHitIndexScores | Unset): Scores partitioned by index when using RRF search.
         field_source (QueryHitSource | Unset):
+        hierarchy (QueryHitHierarchy | Unset): Stable ancestry envelope for derived document hierarchy hits. Present
+            when
+            the hit is a derived unit/chunk/embedding artifact or when a source-level
+            rollup includes child chunks. Standard fields include `level`,
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+            `ancestors` with response-local or requested DB-backed source/unit context when available.
         field_sort (list[str] | Unset): Sort key values for this hit. Pass as search_after or search_before
             to paginate to the next/previous page. Only present when order_by is specified.
     """
@@ -33,6 +40,7 @@ class QueryHit:
     field_score: float
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
+    hierarchy: QueryHitHierarchy | Unset = UNSET
     field_sort: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -48,6 +56,10 @@ class QueryHit:
         field_source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_source, Unset):
             field_source = self.field_source.to_dict()
+
+        hierarchy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.hierarchy, Unset):
+            hierarchy = self.hierarchy.to_dict()
 
         field_sort: list[str] | Unset = UNSET
         if not isinstance(self.field_sort, Unset):
@@ -65,6 +77,8 @@ class QueryHit:
             field_dict["_index_scores"] = field_index_scores
         if field_source is not UNSET:
             field_dict["_source"] = field_source
+        if hierarchy is not UNSET:
+            field_dict["hierarchy"] = hierarchy
         if field_sort is not UNSET:
             field_dict["_sort"] = field_sort
 
@@ -72,6 +86,7 @@ class QueryHit:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.query_hit_hierarchy import QueryHitHierarchy
         from ..models.query_hit_index_scores import QueryHitIndexScores
         from ..models.query_hit_source import QueryHitSource
 
@@ -94,6 +109,13 @@ class QueryHit:
         else:
             field_source = QueryHitSource.from_dict(_field_source)
 
+        _hierarchy = d.pop("hierarchy", UNSET)
+        hierarchy: QueryHitHierarchy | Unset
+        if isinstance(_hierarchy, Unset):
+            hierarchy = UNSET
+        else:
+            hierarchy = QueryHitHierarchy.from_dict(_hierarchy)
+
         field_sort = cast(list[str], d.pop("_sort", UNSET))
 
         query_hit = cls(
@@ -101,6 +123,7 @@ class QueryHit:
             field_score=field_score,
             field_index_scores=field_index_scores,
             field_source=field_source,
+            hierarchy=hierarchy,
             field_sort=field_sort,
         )
 

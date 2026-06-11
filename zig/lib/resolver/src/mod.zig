@@ -664,26 +664,41 @@ pub fn parseExtractionEntities(gpa: std.mem.Allocator, json_bytes: []const u8) !
     errdefer arena.deinit();
     const a = arena.allocator();
 
+    if (isDedicatedMentionArtifact(parsed.value.object)) {
+        const out = try a.alloc(ExtractedEntity, 1);
+        out[0] = try parseExtractedEntityObject(a, parsed.value.object);
+        return .{ .arena = arena, .entities = out };
+    }
+
     const entities_v = parsed.value.object.get("entities") orelse return error.InvalidExtraction;
     if (entities_v != .array) return error.InvalidExtraction;
 
     const out = try a.alloc(ExtractedEntity, entities_v.array.items.len);
     for (entities_v.array.items, 0..) |ev, i| {
         if (ev != .object) return error.InvalidExtraction;
-        const o = ev.object;
-        out[i] = .{
-            .local_id = try a.dupe(u8, jsonString(o.get("id") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
-            .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
-            .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
-            .embedding = try parseEmbedding(a, o.get("embedding")),
-            .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 1.0 }) {
-                .float => |f| f,
-                .integer => |n| @floatFromInt(n),
-                else => 1.0,
-            },
-        };
+        out[i] = try parseExtractedEntityObject(a, ev.object);
     }
     return .{ .arena = arena, .entities = out };
+}
+
+fn isDedicatedMentionArtifact(obj: std.json.ObjectMap) bool {
+    const schema = jsonString(obj.get("_schema") orelse return false) orelse return false;
+    return std.mem.eql(u8, schema, "antfly.entity_mention.v1");
+}
+
+fn parseExtractedEntityObject(a: std.mem.Allocator, o: std.json.ObjectMap) !ExtractedEntity {
+    const id_value = o.get("id") orelse o.get("local_id") orelse return error.InvalidExtraction;
+    return .{
+        .local_id = try a.dupe(u8, jsonString(id_value) orelse return error.InvalidExtraction),
+        .label = try a.dupe(u8, jsonString(o.get("label") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+        .text = try a.dupe(u8, jsonString(o.get("text") orelse return error.InvalidExtraction) orelse return error.InvalidExtraction),
+        .embedding = try parseEmbedding(a, o.get("embedding")),
+        .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 1.0 }) {
+            .float => |f| f,
+            .integer => |n| @floatFromInt(n),
+            else => 1.0,
+        },
+    };
 }
 
 // --- Resolution replay stage ------------------------------------------------
@@ -1044,6 +1059,24 @@ test "parseExtractionEntities reads the documented extraction shape" {
     try testing.expectEqualStrings("person", parsed.entities[0].label);
     try testing.expectEqualStrings("Ada Lovelace", parsed.entities[0].text);
     try testing.expectEqualStrings("Antfly", parsed.entities[1].text);
+}
+
+test "parseExtractionEntities reads a dedicated mention artifact" {
+    var parsed = try parseExtractionEntities(testing.allocator,
+        \\{
+        \\  "_schema": "antfly.entity_mention.v1",
+        \\  "local_id": "m0",
+        \\  "label": "person",
+        \\  "text": "Ada Lovelace",
+        \\  "confidence": 0.82
+        \\}
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.entities.len);
+    try testing.expectEqualStrings("m0", parsed.entities[0].local_id);
+    try testing.expectEqualStrings("person", parsed.entities[0].label);
+    try testing.expectEqualStrings("Ada Lovelace", parsed.entities[0].text);
+    try testing.expectEqual(@as(f64, 0.82), parsed.entities[0].confidence);
 }
 
 /// Minimal in-memory ArtifactStore for tests.

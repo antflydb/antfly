@@ -286,6 +286,24 @@ fn downloadRemoteContentOutcomeAlloc(
     );
 }
 
+pub fn downloadRemoteContentOutcomeAllocWithConfig(
+    alloc: Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    var resolved = try resolveRemoteContentFetchOptions(alloc, remote_content, secret_store, url, credential_name);
+    defer resolved.deinit(alloc);
+    return try scraping.downloadContentOutcomeAllocWithHeaders(
+        alloc,
+        url,
+        &resolved.security,
+        if (resolved.s3_credentials) |*creds| creds else null,
+        resolved.http_headers,
+    );
+}
+
 const ResolvedRemoteContentFetchOptions = struct {
     security: scraping.ContentSecurityConfig = remote_fetch_security,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
