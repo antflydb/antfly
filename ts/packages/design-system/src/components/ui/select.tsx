@@ -73,8 +73,9 @@ function SelectContent({
           "bg-popover text-popover-foreground",
           "relative z-50 max-h-(--radix-select-content-available-height) min-w-[8rem] overflow-x-hidden overflow-y-auto",
           "origin-(--radix-select-content-transform-origin)",
-          // structure: square, token-width border, flat (no shadow-md)
-          "rounded-none border-(length:--border-width) border-input",
+          // structure: square, token-width border, flat (no shadow-md) — firm
+          // edge marks the floating surface
+          "rounded-none border-(length:--border-width) border-border-strong",
           // motion (snappy/linear — per design language motion rules)
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",

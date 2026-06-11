@@ -240,7 +240,7 @@ function Sidebar({
           // Adjust the padding for floating and inset variants.
           variant === "floating" || variant === "inset"
             ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
-            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[collapsible=icon]:group-data-[side=left]:border-r-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=left]:border-border-strong group-data-[collapsible=icon]:group-data-[side=right]:border-l-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=right]:border-border-strong",
+            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[collapsible=icon]:group-data-[side=left]:border-r-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=left]:border-border group-data-[collapsible=icon]:group-data-[side=right]:border-l-(length:--border-width) group-data-[collapsible=icon]:group-data-[side=right]:border-border",
           className
         )}
         {...props}
@@ -248,7 +248,7 @@ function Sidebar({
         <div
           data-sidebar="sidebar"
           data-slot="sidebar-inner"
-          className="bg-sidebar-expanded group-data-[collapsible=icon]:bg-sidebar transition-colors duration-300 ease-in-out flex h-full w-full flex-col group-data-[variant=floating]:rounded-none group-data-[variant=floating]:border-(length:--border-width) group-data-[variant=floating]:border-border-strong"
+          className="bg-sidebar-expanded group-data-[collapsible=icon]:bg-sidebar transition-colors duration-300 ease-in-out flex h-full w-full flex-col group-data-[variant=floating]:rounded-none group-data-[variant=floating]:border-(length:--border-width) group-data-[variant=floating]:border-border"
         >
           {children}
         </div>
@@ -310,7 +310,7 @@ function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
       data-slot="sidebar-inset"
       className={cn(
         "bg-background relative flex w-full min-w-0 flex-1 flex-col h-screen overflow-y-auto",
-        "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:border-(length:--border-width) md:peer-data-[variant=inset]:border-border-strong md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
+        "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:border-(length:--border-width) md:peer-data-[variant=inset]:border-border md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
         className
       )}
       {...props}
@@ -491,7 +491,7 @@ const sidebarMenuButtonVariants = cva(
       variant: {
         default: "",
         outline:
-          "bg-background border-(length:--border-width) border-border-strong hover:bg-sidebar-accent hover:text-foreground",
+          "bg-background border-(length:--border-width) border-input hover:bg-sidebar-accent hover:text-foreground",
       },
       size: {
         default: "h-8 text-[13px]",
@@ -597,7 +597,7 @@ function SidebarMenuBadge({ className, ...props }: React.ComponentProps<"div">) 
         // mono uppercase pill — matches Badge outline treatment
         "text-muted-foreground pointer-events-none absolute right-1 flex h-5 min-w-5 items-center justify-center px-1.5 select-none",
         "font-mono uppercase tracking-[0.05em] text-[10px] font-medium tabular-nums",
-        "border-(length:--border-width) border-border-strong rounded-none",
+        "border-(length:--border-width) border-border rounded-none",
         "peer-hover/menu-button:text-foreground peer-data-[active=true]/menu-button:text-foreground peer-data-[active=true]/menu-button:border-amber-500 peer-data-[active=true]/menu-button:text-amber-600 dark:peer-data-[active=true]/menu-button:text-amber-400",
         "peer-data-[size=sm]/menu-button:top-1",
         "peer-data-[size=default]/menu-button:top-1.5",

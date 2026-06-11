@@ -9,7 +9,7 @@ function Card({ className, ...props }: React.ComponentProps<"div">) {
       className={cn(
         // square, token-width bordered chassis, flat (no shadow), no internal padding —
         // header/content/footer own their padding so dividers sit edge-to-edge
-        "bg-card text-card-foreground flex flex-col rounded-none border-(length:--border-width) border-border-strong",
+        "bg-card text-card-foreground flex flex-col rounded-none border-(length:--border-width) border-border",
         className
       )}
       {...props}

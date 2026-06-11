@@ -21,7 +21,7 @@ function TabsList({ className, ...props }: React.ComponentProps<typeof TabsPrimi
       data-slot="tabs-list"
       // the rail — chassis line that runs under the triggers
       className={cn(
-        "inline-flex items-end gap-0 border-b-(length:--border-width) border-border-strong",
+        "inline-flex items-end gap-0 border-b-(length:--border-width) border-border",
         className
       )}
       {...props}
