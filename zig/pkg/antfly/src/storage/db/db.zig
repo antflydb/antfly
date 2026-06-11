@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -25383,7 +25384,7 @@ const FakePromotionSink = struct {
     fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const t = try self.alloc.dupe(u8, table);
         errdefer self.alloc.free(t);
@@ -25395,7 +25396,7 @@ const FakePromotionSink = struct {
     }
 
     fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         for (self.upserts.items) |u| {
             if (std.mem.eql(u8, u.key, key)) return u.doc;

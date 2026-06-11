@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
@@ -489,7 +490,7 @@ pub const Backend = struct {
 };
 
 fn lockBackend(backend: *Backend) void {
-    while (!backend.mutex.tryLock()) std.Thread.yield() catch {};
+    platform_sync.lockYielding(&backend.mutex);
 }
 
 fn identityNamespace(namespace: backend_types.Namespace) !backend_types.Namespace {

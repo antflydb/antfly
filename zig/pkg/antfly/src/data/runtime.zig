@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const antfly = @import("../root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
@@ -5751,21 +5752,11 @@ pub const DataServer = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    // Bounded spin, then yield: this guards the raft round (which can run for
-    // milliseconds), and a pure spin here pins a core per waiter — on
-    // CPU-constrained hosts (CI runners) that starves the very threads that
-    // would release the lock.
-    var spins: u32 = 0;
-    while (!mutex.tryLock()) {
-        if (comptime @import("builtin").os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-        } else if (spins < 64) {
-            std.atomic.spinLoopHint();
-            spins +%= 1;
-        } else {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-    }
+    // Bounded spin, then yield (platform_sync): this guards the raft round
+    // (which can run for milliseconds), and a pure spin here pins a core per
+    // waiter — on CPU-constrained hosts (CI runners) that starves the very
+    // threads that would release the lock.
+    platform_sync.lockYielding(mutex);
 }
 
 fn appendUniqueNodeId(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u64), node_id: u64) !void {

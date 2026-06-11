@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const raft_engine = @import("raft_engine");
 const core = raft_engine.core;
 
@@ -59,7 +60,7 @@ pub const RaftNdjsonTraceLogger = struct {
         if (event.event_type == .become_pre_candidate) return;
 
         const self: *RaftNdjsonTraceLogger = @ptrCast(@alignCast(ptr));
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
 
         // Pre-event synthesis: events that must appear BEFORE the main event.

@@ -36,6 +36,7 @@
 //!   4. WAL.truncate(LSN)
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
@@ -512,7 +513,7 @@ const deletions_db_name = "deletions";
 var global_storage_mu: std.atomic.Mutex = .unlocked;
 
 fn lockPersistentStorage() void {
-    while (!global_storage_mu.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(&global_storage_mu);
 }
 
 fn unlockPersistentStorage() void {

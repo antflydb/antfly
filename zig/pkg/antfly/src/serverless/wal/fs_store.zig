@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
 const wal_types = @import("types.zig");
@@ -225,7 +226,7 @@ fn fileExists(path: []const u8) bool {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 fn readFileAlloc(alloc: Allocator, path: []const u8) ![]u8 {

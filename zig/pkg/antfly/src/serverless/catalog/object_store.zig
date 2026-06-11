@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const object_storage = @import("../../storage/object_storage.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -704,7 +705,7 @@ fn findNamespaceRecord(records: []const catalog_types.NamespaceRecord, namespace
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 test "objectstore-backed catalog store persists namespace records over file uri" {

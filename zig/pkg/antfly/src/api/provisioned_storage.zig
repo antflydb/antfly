@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
@@ -49,7 +50,7 @@ const MinSmartAlgebraicTensorBytes: u64 = 32 * 1024 * 1024;
 const MaxSmartAlgebraicTensorBytes: u64 = 256 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 fn readMemoryLimitFile(path: []const u8) ?u64 {

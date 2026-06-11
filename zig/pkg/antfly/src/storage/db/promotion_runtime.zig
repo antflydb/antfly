@@ -30,7 +30,7 @@
 //! no-op. The stage advances `applied_sequence` only after the upserts return.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform_sync = @import("antfly_platform").sync;
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -539,13 +539,7 @@ pub const PromotionRuntime = struct {
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    platform_sync.lockYielding(mutex);
 }
 
 const testing = std.testing;

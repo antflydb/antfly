@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -2017,7 +2018,7 @@ pub const MemoryStorage = struct {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     if (builtin.os.tag == .freestanding) return false;
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
     return true;
 }
 

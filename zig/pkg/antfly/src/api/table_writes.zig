@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
@@ -9584,21 +9585,12 @@ fn sleepNs(duration_ns: u64) void {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    // Bounded spin, then yield: local_db_mutex guards cache bookkeeping that
-    // can take a while under contention (opens, invalidation), and a pure
-    // spin pins a core per waiter — on CPU-constrained hosts (CI runners)
-    // that starves the very threads that would release the lock.
-    var spins: u32 = 0;
-    while (!mutex.tryLock()) {
-        if (comptime builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-        } else if (spins < 64) {
-            std.atomic.spinLoopHint();
-            spins +%= 1;
-        } else {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-    }
+    // Bounded spin, then yield (platform_sync): local_db_mutex guards cache
+    // bookkeeping that can take a while under contention (opens,
+    // invalidation), and a pure spin pins a core per waiter — on
+    // CPU-constrained hosts (CI runners) that starves the very threads that
+    // would release the lock.
+    platform_sync.lockYielding(mutex);
 }
 
 fn recoverProvisionedTransactionsOnce(
