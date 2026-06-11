@@ -150,7 +150,7 @@ jobs:
           submodules: true
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -191,7 +191,7 @@ jobs:
           submodules: ${{ needs.changes.outputs.trace_validate == 'true' }}
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         if: needs.changes.outputs.trace_validate == 'true'
@@ -262,7 +262,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -279,20 +279,33 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      # The in-process cluster simulations size their thread pools from the
+      # visible CPU count, which on ARC reflects the node rather than the pod
+      # quota. The resulting burst can starve the runner agent long enough for
+      # GitHub to declare the runner lost (~10 min of missed heartbeats), which
+      # is how most full-default failures present. Bound the test steps to a
+      # fixed CPU set so pools and zig build parallelism stay within budget.
+      - name: Compute CPU bound for heavy test steps
+        id: cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
       - name: Run full Zig unit tests
-        run: make zig-unit-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
 
       - name: Run Zig simulation tests
         working-directory: zig
-        run: zig build sim-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build sim-test
 
       - name: Run Zig integration tests
         working-directory: zig
-        run: zig build integration-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build integration-test
 
       - name: Run Zig recall tests
         working-directory: zig
-        run: zig build recall-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build recall-test
 
       - name: Run Zig recall harness sweep
         working-directory: zig
@@ -313,13 +326,13 @@ jobs:
           )
           for dataset in "${datasets[@]}"; do
             echo "::group::recall-harness ${dataset}"
-            zig build recall-harness -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
+            taskset -c ${{ steps.cpus.outputs.list }} zig build recall-harness -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
             echo "::endgroup::"
           done
 
       - name: Run Zig chaos tests
         working-directory: zig
-        run: zig build chaos-test
+        run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test
 
   e2e-base:
     needs: changes
@@ -336,7 +349,7 @@ jobs:
           submodules: true
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -377,7 +390,7 @@ jobs:
           submodules: true
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2

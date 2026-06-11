@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -786,6 +787,45 @@ class MultiNodeScalingCluster:
         for handle in self.log_files:
             handle.flush()
         return "\n".join(f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths)
+
+    def native_stack_dumps(self, *, per_process_timeout_s: float = 25.0) -> str:
+        """Best-effort `gdb thread apply all bt` for every live node process.
+
+        Server-side hangs (e.g. a 30s batch-write timeout) leave no log
+        evidence when the wedged thread blocks in memory; a stack snapshot
+        taken at failure time is the only way to diagnose them from CI.
+        """
+        if shutil.which("gdb") is None:
+            return "<gdb not available>"
+        parts: list[str] = []
+        for label, procs in (("metadata", self.metadata_procs), ("data", self.data_procs)):
+            for proc in procs:
+                if proc.poll() is not None:
+                    parts.append(f"[{label} pid {proc.pid}] exited rc={proc.returncode}")
+                    continue
+                try:
+                    result = subprocess.run(
+                        [
+                            "gdb",
+                            "-p",
+                            str(proc.pid),
+                            "-batch",
+                            "-ex",
+                            "set pagination off",
+                            "-ex",
+                            "thread apply all bt 30",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=per_process_timeout_s,
+                    )
+                    body = result.stdout[-250000:]
+                    if result.returncode != 0:
+                        body += f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
+                    parts.append(f"[{label} pid {proc.pid}]\n{body}")
+                except Exception as exc:
+                    parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
+        return "\n".join(parts)
 
     def stop(self, *, timeout_s: float = 10.0) -> None:
         procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
