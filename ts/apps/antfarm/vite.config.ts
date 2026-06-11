@@ -19,6 +19,18 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
+      "/db/v1": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      "/auth/v1": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      "/ai/v1": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
       "/api": {
         target: apiProxyTarget,
         changeOrigin: true,

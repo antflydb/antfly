@@ -52,20 +52,19 @@ import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
-import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
   getDownloadCommand,
   getHardwareCapabilities,
   HARDWARE_INFO,
   type HardwareCapability,
+  type InferenceModel,
   MODEL_TYPE_DETAILS,
   MODEL_TYPE_PLAYGROUND,
   type ModelType,
   type QuantizationOption,
   type QuantizationType,
   type RecognizerCapability,
-  type InferenceModel,
   VARIANT_PRESETS,
   type VariantPreset,
 } from "@/data/inference-models";
@@ -903,7 +902,7 @@ const TypeContextBanner: React.FC<{
 // Main page component
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
-  const { apiUrl, inferenceApiUrl } = useApiConfig();
+  const { apiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
@@ -915,27 +914,17 @@ const ModelsPage: React.FC = () => {
   useEffect(() => {
     const checkDownloads = async () => {
       try {
-        if (isProductEnabled("antfly")) {
-          // Full antfarm build: check swarm_mode from antfly status
-          const response = await fetch(`${apiUrl}/status`);
-          if (response.ok) {
-            const data = await response.json();
-            setAllowDownloads(data.swarm_mode === true);
-          }
-        } else {
-          // Inference-only build: check allow_downloads from the model listing metadata.
-          const response = await fetch(`${inferenceApiUrl}/ai/v1/models`);
-          if (response.ok) {
-            const data = await response.json();
-            setAllowDownloads(data.allow_downloads === true);
-          }
+        const response = await fetch(`${apiUrl}/status`);
+        if (response.ok) {
+          const data = await response.json();
+          setAllowDownloads(data.swarm_mode === true);
         }
       } catch {
         // Default to not showing downloads on error
       }
     };
     checkDownloads();
-  }, [apiUrl, inferenceApiUrl]);
+  }, [apiUrl]);
 
   const filteredModels = useMemo(() => {
     return models.filter((model) => {

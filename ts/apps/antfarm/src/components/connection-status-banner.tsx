@@ -1,7 +1,6 @@
 import { Button } from "@antfly/design-system";
 import { AlertTriangle, RefreshCw, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { isProductEnabled } from "@/config/products";
 import { useConnectionStatus } from "@/hooks/use-connection-status";
 
 interface ServerInfo {
@@ -40,17 +39,15 @@ export function ConnectionStatusBanner() {
 
   // Determine which servers are disconnected
   const disconnectedServers: string[] = [];
-  if (isProductEnabled("antfly") && antfly === "disconnected") {
+  if (antfly === "disconnected") {
     disconnectedServers.push("antfly");
   }
-  if (isProductEnabled("inference") && inference === "disconnected") {
+  if (inference === "disconnected") {
     disconnectedServers.push("inference");
   }
 
   // Check if any server is still checking
-  const isChecking =
-    (isProductEnabled("antfly") && antfly === "checking") ||
-    (isProductEnabled("inference") && inference === "checking");
+  const isChecking = antfly === "checking" || inference === "checking";
 
   // Don't show if dismissed, checking, or all connected
   if (dismissed || isChecking || disconnectedServers.length === 0) {

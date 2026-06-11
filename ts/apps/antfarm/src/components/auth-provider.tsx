@@ -1,7 +1,6 @@
 import { AntflyClient } from "@antfly/sdk";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useState } from "react";
-import { isProductEnabled } from "../config/products";
 import type { Permission, User } from "../contexts/auth-context";
 import { AuthContext } from "../contexts/auth-context";
 import { useApiConfig } from "../hooks/use-api-config";
@@ -56,11 +55,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Check if authentication is enabled
   const checkAuthEnabled = useCallback(async (): Promise<boolean> => {
     if (isExternalAuthMode()) {
-      return false;
-    }
-
-    // Antfly inference has no auth - skip the check when Antfly data is not enabled.
-    if (!isProductEnabled("antfly")) {
       return false;
     }
 
@@ -135,6 +129,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
       try {
         setIsLoading(true);
         setError(null);
+        const isAuthEnabled = await checkAuthEnabled();
+        setAuthEnabled(isAuthEnabled);
+        if (!isAuthEnabled) {
+          clearCredentials();
+          setUser(null);
+          return;
+        }
         const userData = await fetchCurrentUser(username, password);
         storeCredentials(username, password);
         setUser(userData);
@@ -145,7 +146,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         setIsLoading(false);
       }
     },
-    [fetchCurrentUser, storeCredentials]
+    [checkAuthEnabled, clearCredentials, fetchCurrentUser, storeCredentials]
   );
 
   // Logout

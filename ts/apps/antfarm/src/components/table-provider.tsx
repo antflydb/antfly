@@ -2,7 +2,6 @@ import type { TableStatus } from "@antfly/sdk";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { isProductEnabled } from "@/config/products";
 import { TableContext } from "@/contexts/table-context";
 import { useApi } from "@/hooks/use-api-config";
 
@@ -78,7 +77,6 @@ export function TableProvider({ children }: { children: ReactNode }) {
 
   // Fetch tables on mount
   const refreshTables = useCallback(async () => {
-    if (!isProductEnabled("antfly")) return;
     setIsLoadingTables(true);
     try {
       const response = await apiClient.tables.list();

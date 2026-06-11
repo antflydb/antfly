@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isProductEnabled } from "@/config/products";
 import { useApiConfig } from "@/hooks/use-api-config";
 
 export type ServerStatus = "connected" | "disconnected" | "checking";
@@ -21,11 +20,6 @@ export function useConnectionStatus(): ConnectionStatus {
 
   const checkAntfly = useCallback(
     async (signal?: AbortSignal) => {
-      if (!isProductEnabled("antfly")) {
-        setAntflyStatus("connected"); // Skip check if product disabled
-        return;
-      }
-
       try {
         const response = await fetch(`${apiUrl}/status`, {
           method: "GET",
@@ -45,11 +39,6 @@ export function useConnectionStatus(): ConnectionStatus {
 
   const checkInference = useCallback(
     async (signal?: AbortSignal) => {
-      if (!isProductEnabled("inference")) {
-        setInferenceStatus("connected"); // Skip check if product disabled
-        return;
-      }
-
       try {
         const response = await fetch(`${inferenceApiUrl}/healthz`, {
           method: "GET",
@@ -68,12 +57,8 @@ export function useConnectionStatus(): ConnectionStatus {
   );
 
   const retry = useCallback(() => {
-    if (isProductEnabled("antfly")) {
-      setAntflyStatus("checking");
-    }
-    if (isProductEnabled("inference")) {
-      setInferenceStatus("checking");
-    }
+    setAntflyStatus("checking");
+    setInferenceStatus("checking");
     checkAntfly();
     checkInference();
   }, [checkAntfly, checkInference]);

@@ -13,7 +13,7 @@ import {
   Label,
 } from "@antfly/design-system";
 import type { FormEvent } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../hooks/use-auth";
 
@@ -26,12 +26,18 @@ interface LocationState {
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { login, isLoading } = useAuth();
+  const { login, isLoading, authEnabled } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
   const from = (location.state as LocationState)?.from?.pathname || "/";
+
+  useEffect(() => {
+    if (authEnabled === false) {
+      navigate(from, { replace: true });
+    }
+  }, [authEnabled, from, navigate]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();

@@ -1,5 +1,5 @@
 import { SidebarInset, SidebarProvider } from "@antfly/design-system";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiConfigProvider } from "@/components/api-config-provider";
 import { AuthProvider } from "@/components/auth-provider";
@@ -11,52 +11,32 @@ import { PrivateRoute } from "@/components/private-route";
 import { AppSidebar } from "@/components/sidebar";
 import { TableProvider } from "@/components/table-provider";
 import { WorkspaceHeader } from "@/components/workspace-header";
-import {
-  defaultProduct,
-  getDefaultRoute,
-  isProductEnabled,
-  type ProductId,
-  productForPath,
-} from "@/config/products";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { isExternalAuthMode } from "@/runtime-config";
-import AntflyChunkingPlaygroundPage from "./pages/AntflyChunkingPlaygroundPage";
-import AntflyEmbeddingPlaygroundPage from "./pages/AntflyEmbeddingPlaygroundPage";
-import AntflyRerankingPlaygroundPage from "./pages/AntflyRerankingPlaygroundPage";
-import ChatPlaygroundPage from "./pages/ChatPlaygroundPage";
-import ChunkingPlaygroundPage from "./pages/ChunkingPlaygroundPage";
 import ClusterPage from "./pages/ClusterPage";
 import CreateTablePage from "./pages/CreateTablePage";
-import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
-import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
-import ExtractionPlaygroundPage from "./pages/ExtractionPlaygroundPage";
-import KnowledgeGraphPlaygroundPage from "./pages/KnowledgeGraphPlaygroundPage";
+import HomePage from "./pages/HomePage";
 import { LoginPage } from "./pages/LoginPage";
+import AgentLabPage from "./pages/lab/AgentLabPage";
+import GraphLabPage from "./pages/lab/GraphLabPage";
+import IngestLabPage from "./pages/lab/IngestLabPage";
+import LabPage from "./pages/lab/LabPage";
+import ModelLabPage from "./pages/lab/ModelLabPage";
+import SearchLabPage from "./pages/lab/SearchLabPage";
 import ModelsPage from "./pages/ModelsPage";
-import RewritingPlaygroundPage from "./pages/QuestionPlaygroundPage";
-import RagPlaygroundPage from "./pages/RagPlaygroundPage";
-import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
-import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
 import { SecretsPage } from "./pages/SecretsPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
 import TablesListPage from "./pages/TablesListPage";
-import TranscribePlaygroundPage from "./pages/TranscribePlaygroundPage";
 import { UsersPage } from "./pages/UsersPage";
+
+function RedirectPreserveSearch({ to }: { to: string }) {
+  const location = useLocation();
+  return <Navigate to={`${to}${location.search}`} replace />;
+}
 
 function AppContent() {
   const [currentSection, setCurrentSection] = useState("indexes");
-  const [currentProduct, setCurrentProduct] = useState<ProductId>(defaultProduct);
-  const location = useLocation();
   const showLocalAdminRoutes = !isExternalAuthMode();
-
-  // Sync currentProduct with the current route so direct navigation
-  // (bookmarks, refresh, shared links) shows the correct sidebar.
-  useEffect(() => {
-    const product = productForPath(location.pathname);
-    if (product && isProductEnabled(product)) {
-      setCurrentProduct(product);
-    }
-  }, [location.pathname]);
 
   return (
     <Routes>
@@ -66,90 +46,87 @@ function AppContent() {
         element={
           <PrivateRoute>
             <SidebarProvider className="af-dashboard">
-              <AppSidebar
-                currentSection={currentSection}
-                onSectionChange={setCurrentSection}
-                currentProduct={currentProduct}
-                onProductChange={setCurrentProduct}
-              />
+              <AppSidebar currentSection={currentSection} onSectionChange={setCurrentSection} />
               <SidebarInset>
                 <WorkspaceHeader />
                 <ConnectionStatusBanner />
                 <div className="af-workspace-content flex-1 px-6 pt-4 pb-6">
                   <Routes>
-                    {/* Antfly routes */}
-                    {isProductEnabled("antfly") && (
-                      <>
-                        <Route path="/" element={<TablesListPage />} />
-                        <Route path="/create" element={<CreateTablePage />} />
-                        <Route
-                          path="/tables/:tableName"
-                          element={<TableDetailsPage currentSection={currentSection} />}
-                        />
-                        {showLocalAdminRoutes && <Route path="/users" element={<UsersPage />} />}
-                        {showLocalAdminRoutes && (
-                          <Route path="/secrets" element={<SecretsPage />} />
-                        )}
-                        <Route path="/cluster" element={<ClusterPage />} />
-                        <Route path="/data/playground/evals" element={<EvalsPlaygroundPage />} />
-                        <Route path="/data/playground/rag" element={<RagPlaygroundPage />} />
-                        <Route path="/data/playground/chat" element={<ChatPlaygroundPage />} />
-                        <Route
-                          path="/data/playground/embed"
-                          element={<AntflyEmbeddingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/data/playground/rerank"
-                          element={<AntflyRerankingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/data/playground/chunk"
-                          element={<AntflyChunkingPlaygroundPage />}
-                        />
-                      </>
-                    )}
-
-                    {/* Inference routes */}
-                    {isProductEnabled("inference") && (
-                      <>
-                        <Route path="/inference/models" element={<ModelsPage />} />
-                        <Route
-                          path="/inference/playground/chunk"
-                          element={<ChunkingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/extract"
-                          element={<ExtractionPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/rewrite"
-                          element={<RewritingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/rerank"
-                          element={<RerankingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/kg"
-                          element={<KnowledgeGraphPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/embed"
-                          element={<EmbeddingPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/read"
-                          element={<ReaderPlaygroundPage />}
-                        />
-                        <Route
-                          path="/inference/playground/transcribe"
-                          element={<TranscribePlaygroundPage />}
-                        />
-                      </>
-                    )}
-
-                    {/* Default redirect based on enabled products */}
-                    <Route path="*" element={<Navigate to={getDefaultRoute()} replace />} />
+                    <Route path="/" element={<HomePage />} />
+                    <Route path="/tables" element={<TablesListPage />} />
+                    <Route path="/create" element={<CreateTablePage />} />
+                    <Route
+                      path="/tables/:tableName"
+                      element={<TableDetailsPage currentSection={currentSection} />}
+                    />
+                    {showLocalAdminRoutes && <Route path="/users" element={<UsersPage />} />}
+                    {showLocalAdminRoutes && <Route path="/secrets" element={<SecretsPage />} />}
+                    <Route path="/observe" element={<ClusterPage />} />
+                    <Route path="/cluster" element={<Navigate to="/observe" replace />} />
+                    <Route path="/lab" element={<LabPage />} />
+                    <Route path="/lab/search" element={<SearchLabPage />} />
+                    <Route path="/lab/ingest" element={<IngestLabPage />} />
+                    <Route path="/lab/model" element={<ModelLabPage />} />
+                    <Route path="/lab/agent" element={<AgentLabPage />} />
+                    <Route path="/lab/graph" element={<GraphLabPage />} />
+                    <Route
+                      path="/data/playground/evals"
+                      element={<RedirectPreserveSearch to="/lab/agent" />}
+                    />
+                    <Route
+                      path="/data/playground/rag"
+                      element={<RedirectPreserveSearch to="/lab/agent" />}
+                    />
+                    <Route
+                      path="/data/playground/chat"
+                      element={<RedirectPreserveSearch to="/lab/agent" />}
+                    />
+                    <Route
+                      path="/data/playground/embed"
+                      element={<RedirectPreserveSearch to="/lab/search" />}
+                    />
+                    <Route
+                      path="/data/playground/rerank"
+                      element={<RedirectPreserveSearch to="/lab/search" />}
+                    />
+                    <Route
+                      path="/data/playground/chunk"
+                      element={<RedirectPreserveSearch to="/lab/ingest" />}
+                    />
+                    <Route path="/inference/models" element={<ModelsPage />} />
+                    <Route
+                      path="/inference/playground/chunk"
+                      element={<RedirectPreserveSearch to="/lab/ingest" />}
+                    />
+                    <Route
+                      path="/inference/playground/extract"
+                      element={<RedirectPreserveSearch to="/lab/ingest" />}
+                    />
+                    <Route
+                      path="/inference/playground/rewrite"
+                      element={<RedirectPreserveSearch to="/lab/model" />}
+                    />
+                    <Route
+                      path="/inference/playground/rerank"
+                      element={<RedirectPreserveSearch to="/lab/model" />}
+                    />
+                    <Route
+                      path="/inference/playground/kg"
+                      element={<RedirectPreserveSearch to="/lab/graph" />}
+                    />
+                    <Route
+                      path="/inference/playground/embed"
+                      element={<RedirectPreserveSearch to="/lab/model" />}
+                    />
+                    <Route
+                      path="/inference/playground/read"
+                      element={<RedirectPreserveSearch to="/lab/ingest" />}
+                    />
+                    <Route
+                      path="/inference/playground/transcribe"
+                      element={<RedirectPreserveSearch to="/lab/ingest" />}
+                    />
+                    <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </div>
               </SidebarInset>
