@@ -401,7 +401,7 @@ function SidebarGroupLabel({
       className={cn(
         // mono kicker — matches form labels, table headers, dropdown labels
         "ring-sidebar-ring flex h-8 shrink-0 items-center rounded-none px-2",
-        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70",
         "outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
         className

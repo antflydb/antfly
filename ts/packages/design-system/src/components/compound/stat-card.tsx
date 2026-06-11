@@ -27,7 +27,7 @@ export function StatCard({
 }: StatCardProps) {
   return (
     <Card className={cn("overflow-hidden", className)} {...props}>
-      <CardContent className="flex items-start justify-between gap-4 p-6">
+      <CardContent className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <p className="font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground">
             {label}

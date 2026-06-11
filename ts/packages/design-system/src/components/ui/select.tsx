@@ -109,7 +109,7 @@ function SelectLabel({ className, ...props }: React.ComponentProps<typeof Select
       data-slot="select-label"
       className={cn(
         // mono kicker — matches DropdownMenuLabel / ContextMenuLabel / Label
-        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70",
         className
       )}
       {...props}

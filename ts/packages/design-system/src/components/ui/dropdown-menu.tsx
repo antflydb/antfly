@@ -162,7 +162,7 @@ function DropdownMenuLabel({
       data-inset={inset}
       className={cn(
         // mono kicker — matches Label / Card-head treatment
-        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground/70",
         "data-[inset]:pl-8",
         className
       )}
