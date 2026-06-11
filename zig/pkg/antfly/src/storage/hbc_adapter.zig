@@ -5993,6 +5993,82 @@ test "hbc repairTreeLinks clears dangling references and restores consistency" {
     }
 }
 
+test "hbc duplicate child links are dropped by unlink and repair" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0xd00b_1e5);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 40) : (id += 1) {
+        var v: [4]f32 = undefined;
+        for (&v) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &v);
+    }
+
+    const victim_leaf = (try idx.debugLeafForVector(3)) orelse return error.TestUnexpectedResult;
+    const victim_members = try idx.debugLeafMembers(alloc, victim_leaf);
+    defer alloc.free(victim_members);
+    try std.testing.expect(victim_members.len > 0);
+
+    const corrupt = struct {
+        fn duplicateChildLink(index: *HBCIndex, leaf_id: u64) !void {
+            var txn = try index.beginWriteTxn();
+            errdefer txn.abort();
+            var leaf = try index.loadNode(&txn, leaf_id);
+            defer leaf.deinit(index.alloc);
+            const parent_id = leaf.parent;
+            try std.testing.expect(parent_id != 0);
+            var parent = try index.loadNode(&txn, parent_id);
+            defer parent.deinit(index.alloc);
+            try parent.ensureUnbacked(index.alloc);
+            const dup = try index.alloc.alloc(u64, parent.children.len + 1);
+            @memcpy(dup[0..parent.children.len], parent.children);
+            dup[parent.children.len] = leaf_id;
+            index.alloc.free(parent.children);
+            parent.children = dup;
+            try index.saveNode(&txn, &parent);
+            try txn.commit();
+        }
+    }.duplicateChildLink;
+
+    // Repair path: the sweep must drop the duplicate occurrence.
+    try corrupt(&idx, victim_leaf);
+    {
+        const broken = try idx.verifyTreeLinks();
+        try std.testing.expect(!broken.consistent());
+    }
+    const repair = try idx.repairTreeLinks(10_000);
+    try std.testing.expect(repair.completed);
+    try std.testing.expect(repair.duplicate_children_removed >= 1);
+    {
+        const healed = try idx.verifyTreeLinks();
+        try std.testing.expect(healed.consistent());
+    }
+
+    // Unlink path: emptying the leaf drives removeChildLink against the
+    // duplicated reference, which must drop BOTH occurrences — an
+    // underfilled rebuild here used to persist an uninitialized child id.
+    try corrupt(&idx, victim_leaf);
+    try idx.batchDelete(victim_members);
+    {
+        const after_delete = try idx.verifyTreeLinks();
+        if (!after_delete.consistent()) {
+            std.debug.print("tree links inconsistent after duplicate unlink: {any}\n", .{after_delete});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "default random ortho transform matches go hbc" {
     const alloc = std.testing.allocator;
     const input = [_]f32{ 1.0, 2.0, 3.0, 4.0 };

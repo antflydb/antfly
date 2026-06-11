@@ -3739,19 +3739,25 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
 /// is flagged for a repairTreeLinks sweep that clears the dangling
 /// reference instead of leaving it latent.
 fn removeChildLink(self: anytype, parent: anytype, leaf_id: u64) !bool {
-    var contains = false;
+    var match_count: usize = 0;
     for (parent.children) |cid| {
-        if (cid == leaf_id) {
-            contains = true;
-            break;
-        }
+        if (cid == leaf_id) match_count += 1;
     }
-    if (!contains) {
+    if (match_count == 0) {
         std.log.warn("hbc: leaf {d} not referenced by its recorded parent; skipping unlink", .{leaf_id});
         noteTreeLinkInconsistencyIfSupported(self);
         return false;
     }
-    var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
+    if (match_count > 1) {
+        // Duplicate links to the same child are corruption. The leaf is
+        // being unlinked for deletion, so drop every occurrence — sizing
+        // the new array by the exact match count, or the skip loop below
+        // would underfill it and persist an uninitialized child id — and
+        // flag a repair sweep for the rest of the tree.
+        std.log.warn("hbc: leaf {d} referenced {d} times by its parent; removing all links", .{ leaf_id, match_count });
+        noteTreeLinkInconsistencyIfSupported(self);
+    }
+    var new_children = try self.alloc.alloc(u64, parent.children.len - match_count);
     errdefer self.alloc.free(new_children);
     var wi_child: usize = 0;
     for (parent.children) |cid| {
@@ -3956,7 +3962,17 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
                 try self.saveNode(txn, &child);
                 report.parent_pointers_fixed += 1;
             }
+            const gop = try seen.getOrPut(self.alloc, child_id);
+            if (gop.found_existing) {
+                // Second reference to a node we already kept — either a
+                // duplicate within this children list or another visited
+                // parent legitimately holds it. Drop this occurrence.
+                report.duplicate_children_removed += 1;
+                pruned = true;
+                continue;
+            }
             kept.appendAssumeCapacity(child_id);
+            try queue.append(self.alloc, child_id);
         }
 
         if (kept.items.len == 0) {
@@ -3996,11 +4012,6 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
             try self.saveNode(txn, &node);
         }
 
-        for (kept.items) |child_id| {
-            const gop = try seen.getOrPut(self.alloc, child_id);
-            if (gop.found_existing) continue;
-            try queue.append(self.alloc, child_id);
-        }
     }
     return report;
 }
