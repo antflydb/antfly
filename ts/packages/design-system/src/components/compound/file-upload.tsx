@@ -84,7 +84,7 @@ function FileUpload({
         role="button"
         tabIndex={disabled ? -1 : 0}
         className={cn(
-          "flex min-h-36 flex-col items-center justify-center gap-3 border-[1.5px] border-dashed border-input bg-muted/20 p-6 text-center transition-colors",
+          "flex min-h-36 flex-col items-center justify-center gap-3 border-(length:--border-width) border-dashed border-input bg-muted/20 p-6 text-center transition-colors",
           dragActive && "border-ring bg-muted/40",
           disabled && "pointer-events-none opacity-50",
           error && "border-destructive",
@@ -130,7 +130,7 @@ function FileUpload({
       </div>
 
       {file ? (
-        <div className="flex items-center justify-between gap-3 border-[1.5px] border-input bg-background px-3 py-2 text-sm">
+        <div className="flex items-center justify-between gap-3 border-(length:--border-width) border-input bg-background px-3 py-2 text-sm">
           <div className="min-w-0">
             <div className="truncate font-mono text-[13px] text-foreground">{file.name}</div>
             <div className="text-muted-foreground text-xs">{formatFileSize(file.size)}</div>

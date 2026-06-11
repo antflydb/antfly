@@ -58,13 +58,13 @@ function SheetContent({
           "bg-background fixed z-50 flex flex-col",
           "transition ease-in-out data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:duration-300 data-[state=open]:duration-500",
           side === "right" &&
-            "inset-y-0 right-0 h-full w-3/4 sm:max-w-sm border-l-[1.5px] border-border-strong data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right",
+            "inset-y-0 right-0 h-full w-3/4 sm:max-w-sm border-l-(length:--border-width) border-border-strong data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right",
           side === "left" &&
-            "inset-y-0 left-0 h-full w-3/4 sm:max-w-sm border-r-[1.5px] border-border-strong data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left",
+            "inset-y-0 left-0 h-full w-3/4 sm:max-w-sm border-r-(length:--border-width) border-border-strong data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left",
           side === "top" &&
-            "inset-x-0 top-0 h-auto border-b-[1.5px] border-border-strong data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
+            "inset-x-0 top-0 h-auto border-b-(length:--border-width) border-border-strong data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
           side === "bottom" &&
-            "inset-x-0 bottom-0 h-auto border-t-[1.5px] border-border-strong data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
+            "inset-x-0 bottom-0 h-auto border-t-(length:--border-width) border-border-strong data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
           className
         )}
         {...props}
@@ -103,7 +103,7 @@ function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sheet-header"
       className={cn(
-        "shrink-0 flex flex-col gap-1.5 px-[18px] py-[14px] border-b-[1.5px] border-border",
+        "shrink-0 flex flex-col gap-1.5 px-[18px] py-[14px] border-b-(length:--border-width) border-border",
         className
       )}
       {...props}
@@ -116,7 +116,7 @@ function SheetFooter({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sheet-footer"
       className={cn(
-        "shrink-0 mt-auto flex flex-col gap-2 px-[18px] py-[14px] border-t-[1.5px] border-border",
+        "shrink-0 mt-auto flex flex-col gap-2 px-[18px] py-[14px] border-t-(length:--border-width) border-border",
         className
       )}
       {...props}

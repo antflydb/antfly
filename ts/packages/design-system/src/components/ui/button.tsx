@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
  * Buttons in the Antfly design language:
  *   - Mono "instrument" voice (Roboto Mono, 13px, weight 500, 0.03em tracking)
  *   - Square corners (rounded-none)
- *   - 1.5px borders on outlined variants — the visual language is borders, not shadows
+ *   - token-width (--border-width) borders on outlined variants — the visual language is borders, not shadows
  *   - Amber primary fill with ink text; amber-300 hover
  *   - Snappy/linear motion (no spring easing)
  */
@@ -31,20 +31,20 @@ const buttonVariants = cva(
       variant: {
         // Primary — amber fill, ink text, darker amber border, lighter amber hover
         default:
-          "bg-primary text-primary-foreground border-[1.5px] border-amber-500 hover:bg-amber-300",
+          "bg-primary text-primary-foreground border-(length:--border-width) border-amber-500 hover:bg-amber-300",
         // Destructive — outlined red that fills on hover
         destructive:
-          "bg-transparent text-destructive border-[1.5px] border-destructive hover:bg-destructive hover:text-white",
+          "bg-transparent text-destructive border-(length:--border-width) border-destructive hover:bg-destructive hover:text-white",
         // Outline / Secondary — bordered, ink text, border darkens on hover
         outline:
-          "bg-transparent text-foreground border-[1.5px] border-input hover:border-foreground hover:bg-secondary",
+          "bg-transparent text-foreground border-(length:--border-width) border-input hover:border-foreground hover:bg-secondary",
         secondary:
-          "bg-transparent text-foreground border-[1.5px] border-input hover:border-foreground hover:bg-secondary",
+          "bg-transparent text-foreground border-(length:--border-width) border-input hover:border-foreground hover:bg-secondary",
         // Ghost — no border, muted text, lights up on hover
         ghost:
-          "bg-transparent text-muted-foreground border-[1.5px] border-transparent hover:text-foreground hover:bg-secondary",
+          "bg-transparent text-muted-foreground border-(length:--border-width) border-transparent hover:text-foreground hover:bg-secondary",
         // Link — text only, underline on hover (no border)
-        link: "text-primary underline-offset-4 hover:underline border-[1.5px] border-transparent",
+        link: "text-primary underline-offset-4 hover:underline border-(length:--border-width) border-transparent",
       },
       size: {
         default: "h-9 px-4 has-[>svg]:px-3",

@@ -5,9 +5,9 @@ import { cn } from "@/lib/utils";
 
 const alertVariants = cva(
   [
-    // chassis: square, 1.5px bordered, flat. Left border bumped to 4px,
+    // chassis: square, token-width bordered, flat. Left border bumped to 4px,
     // recolored to the semantic state — the only color signal in the component.
-    "relative w-full bg-card text-card-foreground rounded-none border-[1.5px] border-border-strong border-l-4 px-[14px] py-[12px]",
+    "relative w-full bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong border-l-4 px-[14px] py-[12px]",
     // grid: icon column collapses to 0 when no svg present
     "grid has-[>svg]:grid-cols-[18px_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-[11px] gap-y-0 items-start",
     "[&>svg]:size-[18px] [&>svg]:translate-y-[1px]",

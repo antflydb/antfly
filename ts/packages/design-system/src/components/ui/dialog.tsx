@@ -53,10 +53,10 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          // chassis: square, 1.5px strong border, flat (no shadow), card surface
+          // chassis: square, token-width strong border, flat (no shadow), card surface
           "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] sm:max-w-lg",
           "translate-x-[-50%] translate-y-[-50%]",
-          "bg-card text-card-foreground rounded-none border-[1.5px] border-border-strong",
+          "bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong",
           "gap-3 p-[18px] duration-200 outline-none",
           "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
           "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",

@@ -36,8 +36,8 @@ function SelectTrigger({
         "font-mono text-[13px] text-foreground data-[placeholder]:text-muted-foreground",
         "flex w-full items-center justify-between gap-2 whitespace-nowrap",
         "data-[size=default]:h-9 data-[size=sm]:h-8 px-3 py-1.5",
-        // structure: square, 1.5px border, no shadow
-        "rounded-none border-[1.5px] border-input bg-transparent",
+        // structure: square, token-width border, no shadow
+        "rounded-none border-(length:--border-width) border-input bg-transparent",
         // focus
         "outline-none transition-[border-color,box-shadow]",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -73,8 +73,8 @@ function SelectContent({
           "bg-popover text-popover-foreground",
           "relative z-50 max-h-(--radix-select-content-available-height) min-w-[8rem] overflow-x-hidden overflow-y-auto",
           "origin-(--radix-select-content-transform-origin)",
-          // structure: square, 1.5px border, flat (no shadow-md)
-          "rounded-none border-[1.5px] border-input",
+          // structure: square, token-width border, flat (no shadow-md)
+          "rounded-none border-(length:--border-width) border-input",
           // motion (snappy/linear — per design language motion rules)
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",

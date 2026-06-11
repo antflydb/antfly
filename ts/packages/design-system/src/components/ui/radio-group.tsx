@@ -26,8 +26,8 @@ function RadioGroupItem({
     <RadioGroupPrimitive.Item
       data-slot="radio-group-item"
       className={cn(
-        // round — radio convention. 1.5px border, no shadow.
-        "aspect-square size-4 shrink-0 rounded-full border-[1.5px] border-input bg-transparent",
+        // round — radio convention. token-width border, no shadow.
+        "aspect-square size-4 shrink-0 rounded-full border-(length:--border-width) border-input bg-transparent",
         "text-primary",
         // focus
         "outline-none transition-[color,box-shadow]",

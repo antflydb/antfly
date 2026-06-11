@@ -6,9 +6,9 @@ import { cn } from "@/lib/utils";
 
 const badgeVariants = cva(
   [
-    // mono "instrument label" voice — uppercase, tracked, 11px, 1.5px square border
+    // mono "instrument label" voice — uppercase, tracked, 11px, token-width square border
     "inline-flex items-center justify-center font-mono uppercase tracking-[0.05em] text-[11px] font-medium",
-    "px-2 py-[3px] border-[1.5px] rounded-none w-fit whitespace-nowrap shrink-0",
+    "px-2 py-[3px] border-(length:--border-width) rounded-none w-fit whitespace-nowrap shrink-0",
     "[&>svg]:size-3 [&>svg]:pointer-events-none gap-1",
     "transition-colors overflow-hidden",
     "focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",

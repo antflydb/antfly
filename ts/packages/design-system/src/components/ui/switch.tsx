@@ -14,7 +14,7 @@ function Switch({ className, ...props }: React.ComponentProps<typeof SwitchPrimi
         // (compact / comfortable) doesn't distort the thumb fit. Flex centers
         // the thumb vertically; px-[1px] gives the 1px inset on each side.
         "inline-flex items-center shrink-0 w-[38px] h-[20px] px-[1px]",
-        "rounded-none border-[1.5px] border-input bg-transparent",
+        "rounded-none border-(length:--border-width) border-input bg-transparent",
         // checked: amber fill + amber-500 border
         "data-[state=checked]:bg-primary data-[state=checked]:border-amber-500",
         // focus
