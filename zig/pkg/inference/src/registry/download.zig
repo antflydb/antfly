@@ -1156,12 +1156,24 @@ pub fn downloadModel(
     // Download each file
     for (to_download.items, 0..) |file_meta, i| {
         const filename = file_meta.name;
-        const total_bytes = file_meta.size orelse (probeDownloadSize(allocator, io, owner, name, filename, config) catch null);
+        const total_bytes = if (file_meta.size) |declared_size| blk: {
+            if (shouldProbeLinkedPayloadSize(filename, declared_size)) {
+                break :blk probeDownloadSize(allocator, io, owner, name, filename, config) catch declared_size;
+            }
+            break :blk declared_size;
+        } else (probeDownloadSize(allocator, io, owner, name, filename, config) catch null);
+        const progress_total_bytes = existingFinalFileProgressSize(
+            allocator,
+            io,
+            dest_dir,
+            filename,
+            total_bytes,
+        ) catch total_bytes;
         if (progress.callback) |cb| {
             cb(.{
                 .file = filename,
                 .bytes_downloaded = 0,
-                .total_bytes = total_bytes,
+                .total_bytes = progress_total_bytes,
                 .files_done = i,
                 .files_total = to_download.items.len,
             }, progress.context);
@@ -1172,8 +1184,8 @@ pub fn downloadModel(
         if (progress.callback) |cb| {
             cb(.{
                 .file = filename,
-                .bytes_downloaded = total_bytes orelse 0,
-                .total_bytes = total_bytes,
+                .bytes_downloaded = progress_total_bytes orelse 0,
+                .total_bytes = progress_total_bytes,
                 .files_done = i + 1,
                 .files_total = to_download.items.len,
             }, progress.context);
@@ -1223,6 +1235,38 @@ fn probeDownloadSize(
         return std.fmt.parseInt(u64, value, 10) catch null;
     }
     return resp.contentLength();
+}
+
+fn shouldProbeLinkedPayloadSize(filename: []const u8, declared_size: u64) bool {
+    if (declared_size > 4096) return false;
+    return isLargeBinaryModelArtifact(filename);
+}
+
+fn isLargeBinaryModelArtifact(filename: []const u8) bool {
+    return std.mem.endsWith(u8, filename, ".gguf") or
+        std.mem.endsWith(u8, filename, ".safetensors") or
+        std.mem.endsWith(u8, filename, ".onnx") or
+        std.mem.endsWith(u8, filename, ".onnx.data") or
+        std.mem.endsWith(u8, filename, ".bin");
+}
+
+fn existingFinalFileProgressSize(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    filename: []const u8,
+    total_bytes: ?u64,
+) !?u64 {
+    const total = total_bytes orelse return null;
+    if (!shouldProbeLinkedPayloadSize(filename, total)) return total_bytes;
+    const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
+    defer allocator.free(dest_path);
+    const size = existingFileSize(std.Io.Dir.cwd(), io, dest_path) catch |err| switch (err) {
+        error.FileNotFound => return total_bytes,
+        else => return err,
+    };
+    if (size > total) return size;
+    return total_bytes;
 }
 
 /// List all files in a HuggingFace model repo.
@@ -1436,13 +1480,12 @@ fn downloadFile(
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
 ) !void {
-    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
-    defer allocator.free(url);
-
-    var client = httpx.Client.initWithConfig(allocator, io, .{
-        .keep_alive = false,
-    });
-    defer client.deinit();
+    var dest = std.Io.Dir.cwd();
+    const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
+    defer allocator.free(dest_path);
+    if (try existingFinalFileSatisfies(dest, io, dest_path, filename, total_bytes, expected_sha256)) {
+        return;
+    }
 
     var headers_buf: [4][2][]const u8 = undefined;
     var n_headers: usize = 0;
@@ -1462,6 +1505,14 @@ fn downloadFile(
         n_headers += 1;
     }
 
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/main/{s}", .{ config.base_url, owner, name, filename });
+    defer allocator.free(url);
+
+    var client = httpx.Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+    });
+    defer client.deinit();
+
     const download_url = try resolveDownloadUrl(allocator, &client, url, headers_buf[0..n_headers]);
     defer allocator.free(download_url);
 
@@ -1472,9 +1523,6 @@ fn downloadFile(
         try std.Io.Dir.cwd().createDirPath(io, parent);
     }
 
-    var dest = std.Io.Dir.cwd();
-    const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
-    defer allocator.free(dest_path);
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.part", .{dest_path});
     defer allocator.free(temp_path);
 
@@ -1564,7 +1612,34 @@ fn downloadFile(
         };
     }
 
+    dest.deleteFile(io, dest_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     try std.Io.Dir.rename(dest, temp_path, dest, dest_path, io);
+}
+
+fn existingFinalFileSatisfies(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    filename: []const u8,
+    total_bytes: ?u64,
+    expected_sha256: ?[]const u8,
+) !bool {
+    const size = existingFileSize(dir, io, path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (expected_sha256) |sum| {
+        verifyFileSha256(dir, io, path, sum) catch return false;
+        return true;
+    }
+    if (total_bytes) |total| {
+        if (size == total) return true;
+        if (shouldProbeLinkedPayloadSize(filename, total) and size > total) return true;
+    }
+    return false;
 }
 
 fn existingFileSize(dir: std.Io.Dir, io: std.Io, path: []const u8) !u64 {
@@ -2102,6 +2177,97 @@ test "downloadFile resumes from partial file with 206 response" {
     var log_buf: [128]u8 = undefined;
     const log_n = try log_file.readStreaming(io, &.{log_buf[0..]});
     try std.testing.expect(std.mem.indexOf(u8, log_buf[0..log_n], "bytes=6-") != null);
+}
+
+test "downloadFile skips existing complete destination before network" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "already downloaded";
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(final_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = payload });
+
+    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+        .base_url = "http://127.0.0.1:1",
+    }, .{}, 0, 1, payload.len, null);
+
+    const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
+    defer allocator.free(part_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, part_path, .{}));
+
+    var file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const n = try file.readStreaming(io, &.{buf[0..]});
+    try std.testing.expectEqualStrings(payload, buf[0..n]);
+}
+
+test "downloadFile skips existing large artifact with pointer-sized metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = [_]u8{'G'} ** 8192;
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(final_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = &payload });
+
+    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+        .base_url = "http://127.0.0.1:1",
+    }, .{}, 0, 1, 102, null);
+
+    const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
+    defer allocator.free(part_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, part_path, .{}));
+
+    var file = try std.Io.Dir.cwd().openFile(io, final_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    try std.testing.expectEqual(@as(u64, payload.len), stat.size);
+}
+
+test "tiny declared sizes are reprobed for large binary model artifacts" {
+    try std.testing.expect(shouldProbeLinkedPayloadSize("model.gguf", 102));
+    try std.testing.expect(shouldProbeLinkedPayloadSize("model.safetensors", 102));
+    try std.testing.expect(!shouldProbeLinkedPayloadSize("README.md", 102));
+    try std.testing.expect(!shouldProbeLinkedPayloadSize("model.gguf", 10 * 1024));
+}
+
+test "existing final file progress uses real size for pointer-sized artifacts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = [_]u8{'G'} ** 8192;
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(final_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = &payload });
+
+    try std.testing.expectEqual(
+        @as(?u64, payload.len),
+        try existingFinalFileProgressSize(allocator, io, dest_dir, "model.gguf", 102),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 102),
+        try existingFinalFileProgressSize(allocator, io, dest_dir, "README.md", 102),
+    );
 }
 
 test "downloadFile restarts cleanly when range is ignored" {

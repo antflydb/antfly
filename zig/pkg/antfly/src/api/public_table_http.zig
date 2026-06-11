@@ -508,6 +508,15 @@ pub fn handleTableBackup(
     };
     defer parsed_req.deinit();
 
+    if (parsed_req.value.format) |format| {
+        if (!std.mem.eql(u8, format, "native")) {
+            return .{
+                .status = 400,
+                .body = try alloc.dupe(u8, "portable table backups are not supported; omit format or use native"),
+            };
+        }
+    }
+
     var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -1539,6 +1548,39 @@ test "public table backup handler maps unsupported multi-range error" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("backup does not support multi-range tables", resp.body);
+}
+
+test "public table backup handler rejects portable format" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+    };
+
+    var resp = try handleTableBackup(
+        std.testing.allocator,
+        "docs",
+        "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"format\":\"portable\"}",
+        Backend.iface(),
+        null,
+    );
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("portable table backups are not supported; omit format or use native", resp.body);
 }
 
 test "public table restore handler maps target already exists" {

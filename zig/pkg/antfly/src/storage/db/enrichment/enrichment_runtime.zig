@@ -308,6 +308,20 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
     }
 }
 
+const TextBatchByteStats = struct {
+    total_bytes: usize = 0,
+    max_bytes: usize = 0,
+};
+
+fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
+    var stats = TextBatchByteStats{};
+    for (texts) |text| {
+        stats.total_bytes += text.len;
+        stats.max_bytes = @max(stats.max_bytes, text.len);
+    }
+    return stats;
+}
+
 const TransientEmbedRetryDecision = enum {
     retry_inline,
     yield_to_worker,
@@ -3124,11 +3138,16 @@ fn processChunkedDenseWindow(
         }
         if (chunk_items.items.len == 0) continue;
 
+        const batch_stats = textBatchByteStats(chunk_texts.items);
+        noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        const embed_started_ns = runtime.config.clock.nowRealtimeNs();
         const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, chunk_texts.items, seed.expected_dims) catch |err| {
+            noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             if (isRetryableEnrichmentError(err)) return err;
             for (chunk_items.items) |item| recordIsolatedRequestError(runtime, item.request, err);
             continue;
         };
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
         if (vectors.len != chunk_items.items.len) return error.InvalidEmbeddingResponse;
 
@@ -3695,7 +3714,14 @@ fn buildChunkDenseEmbeddings(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const vectors = try embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), chunk_texts.items, request.expected_dims);
+    const batch_stats = textBatchByteStats(chunk_texts.items);
+    noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), chunk_texts.items, request.expected_dims) catch |err| {
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
 
@@ -3780,7 +3806,14 @@ fn buildChunkSparseEmbeddings(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const sparse_batch = try embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), chunk_texts.items);
+    const batch_stats = textBatchByteStats(chunk_texts.items);
+    noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), chunk_texts.items) catch |err| {
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
     if (sparse_batch.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
 

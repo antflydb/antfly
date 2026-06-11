@@ -470,7 +470,7 @@ pub const HealthSource = struct {
         try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
         try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
         try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
@@ -548,6 +548,10 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls issued by snapshot reads", stats.mutable_snapshot_clone_calls);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads", stats.mutable_snapshot_clone_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_mutable_snapshot_clone_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read", stats.mutable_snapshot_clone_peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_active_bytes", "gauge", "Active bytes held by bulk-ingest current-scan mutable clones", stats.bulk_ingest_current_scan_clone_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_peak_active_bytes", "gauge", "Peak active bytes held by bulk-ingest current-scan mutable clones", stats.bulk_ingest_current_scan_clone_peak_active_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_budget_denials_total", "counter", "Bulk-ingest current-scan mutable clone fallbacks caused by clone memory budget", stats.bulk_ingest_current_scan_clone_budget_denials);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_bulk_ingest_current_scan_clone_oom_fallbacks_total", "counter", "Bulk-ingest current-scan mutable clone fallbacks caused by allocation failure", stats.bulk_ingest_current_scan_clone_oom_fallbacks);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotations_total", "counter", "LSM mutable memtable rotations triggered to serve broad read snapshots without cloning", stats.read_snapshot_mutable_rotations);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_bytes_total", "counter", "Mutable memtable bytes rotated into immutable state for broad read snapshots", stats.read_snapshot_mutable_rotation_bytes_total);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
@@ -589,7 +593,25 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_runs", "gauge", "Cached write LSM lower-level runs over configured level targets", stats.level_overflow_runs);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_level_overflow_bytes", "gauge", "Cached write LSM lower-level bytes over configured level targets", stats.level_overflow_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths", "gauge", "Cached write LSM obsolete table paths waiting for cleanup", stats.obsolete_paths);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_readers", "gauge", "Cached write LSM obsolete table paths retained by active readers", stats.obsolete_paths_pinned_by_readers);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_pinned_by_versions", "gauge", "Cached write LSM obsolete table paths retained by active versions", stats.obsolete_paths_pinned_by_versions);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_waiting_for_retry", "gauge", "Cached write LSM obsolete table paths waiting for delete retry or grace delay", stats.obsolete_paths_waiting_for_retry);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_paths_reclaimable", "gauge", "Cached write LSM obsolete table paths currently eligible for deletion", stats.obsolete_paths_reclaimable);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_failures_total", "counter", "Cached write LSM obsolete table file delete failures", stats.obsolete_delete_failures);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_obsolete_delete_retries_total", "counter", "Cached write LSM obsolete table file delete retries scheduled", stats.obsolete_delete_retries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_active_readers_by_kind", "gauge", "Cached write LSM readers currently retaining snapshots by owner class");
+    for (stats.active_readers_by_kind, 0..) |count, i| {
+        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_active_readers_by_kind", &labels, count);
+    }
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", "gauge", "Cached write LSM obsolete table paths retained by active readers by owner class");
+    for (stats.obsolete_paths_pinned_by_reader_kind, 0..) |count, i| {
+        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", &labels, count);
+    }
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_bulk_ingest_batches", "gauge", "Cached write LSM active bulk-ingest session batches", stats.active_bulk_ingest_batches);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_segments", "gauge", "Cached write LSM WAL segments still retained for replay", stats.wal_retained_segments);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_retained_bytes", "gauge", "Cached write LSM WAL bytes still retained for replay", stats.wal_retained_bytes);
@@ -1720,12 +1742,19 @@ pub const DataServer = struct {
     lsm_maintenance_bulk_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_lock_deferred: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
+    dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
     const lsm_maintenance_worker_bulk_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_pressure_defer_ns = 500 * std.time.ns_per_ms;
     const lsm_maintenance_worker_max_steps_per_wake = 8;
+    // Dense posting repair is time-driven rather than score-driven: checking
+    // the backlog requires a posting-state scan, so the worker probes on a
+    // fixed cadence and retries quickly only while repairs are landing.
+    const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
+    const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -2212,12 +2241,36 @@ pub const DataServer = struct {
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
         }
-        if (self.write_source.lsmMaintenanceScoreBestEffort() == 0) return;
+        if (!self.backgroundMaintenanceDue(now_ns)) return;
         self.lsm_maintenance_wake.store(true, .release);
         if (self.lsm_maintenance_thread == null) {
             self.lsm_maintenance_stop.store(false, .release);
             self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
         }
+    }
+
+    fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
+    }
+
+    fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        if (self.densePostingMaintenanceDue(now_ns)) return true;
+        const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
+        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+            if (delay_ns > 0) {
+                self.deferLsmObsoleteReclaim(now_ns, delay_ns);
+                return false;
+            }
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+            return true;
+        }
+        self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
+        return false;
     }
 
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
@@ -2238,6 +2291,14 @@ pub const DataServer = struct {
         self.lsm_maintenance_next_eligible_ns.store(now_ns +| delay_ns, .release);
     }
 
+    fn deferLsmObsoleteReclaim(self: *DataServer, now_ns: u64, delay_ns: u64) void {
+        const due_ns = now_ns +| delay_ns;
+        const current = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
+        if (current == 0 or due_ns < current) {
+            self.lsm_maintenance_obsolete_reclaim_due_ns.store(due_ns, .release);
+        }
+    }
+
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
@@ -2246,7 +2307,7 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
-            if (!woke and self.write_source.lsmMaintenanceScoreBestEffort() == 0) {
+            if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
@@ -2286,15 +2347,37 @@ pub const DataServer = struct {
                     if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                        if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
                     break;
                 }
             }
-            if (steps >= lsm_maintenance_worker_max_steps_per_wake and self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
-                self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+            if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
+                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
+                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
+                }
             }
             if (completed) _ = self.lsm_maintenance_completed.fetchAdd(1, .monotonic);
+            // Bulk loads can leave leaf postings with stale quantized payloads
+            // (deferred splits), which forces exact member scoring on every
+            // query that visits them. Drain a bounded amount of that repair
+            // work alongside the regular LSM maintenance.
+            const posting_now_ns = platform_time.monotonicNs();
+            if (self.densePostingMaintenanceDue(posting_now_ns)) {
+                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const next_delay_ns: u64 = if (posting_steps > 0)
+                    dense_posting_maintenance_retry_interval_ns
+                else
+                    dense_posting_maintenance_idle_interval_ns;
+                self.dense_posting_maintenance_next_eligible_ns.store(posting_now_ns +| next_delay_ns, .release);
+                if (posting_steps > 0) {
+                    std.log.info("dense posting maintenance repaired steps={d}", .{posting_steps});
+                }
+            }
             self.lsm_maintenance_active.store(false, .release);
         }
         self.lsm_maintenance_active.store(false, .release);
@@ -12679,7 +12762,23 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .level_overflow_runs = 1,
         .level_overflow_bytes = 256,
         .obsolete_paths = 1,
+        .obsolete_paths_pinned_by_readers = 2,
+        .obsolete_paths_pinned_by_versions = 3,
+        .obsolete_paths_waiting_for_retry = 4,
+        .obsolete_paths_reclaimable = 5,
+        .obsolete_delete_failures = 6,
+        .obsolete_delete_retries = 7,
         .active_readers = 6,
+        .active_readers_by_kind = blk: {
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
+            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
+            break :blk counts;
+        },
+        .obsolete_paths_pinned_by_reader_kind = blk: {
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
+            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
+            break :blk counts;
+        },
         .manifest_dirty = true,
         .obsolete_manifest_dirty = true,
         .compaction_scheduler_active_oldest_age_ns = 99,
@@ -12710,7 +12809,15 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_write_stall_l0_byte_debt 16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_level_overflow_runs 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_readers 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_versions 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_waiting_for_retry 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_reclaimable 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_failures_total 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_delete_retries_total 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_active_readers_by_kind{kind=\"compaction\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_obsolete_paths_pinned_by_reader_kind{kind=\"compaction\"} 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_manifest_dirty 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_active_oldest_age_ns 99") != null);
     try std.testing.expect(std.mem.indexOf(u8, maintenance_output, "antfly_lsm_compaction_scheduler_grants_total 3") != null);
@@ -13138,4 +13245,49 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     var reservation = try server.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, 769 * 1024 * 1024);
     defer reservation.release();
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
+}
+
+test "data runtime background maintenance is due for dense posting cadence without lsm debt" {
+    const alloc = std.testing.allocator;
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-antfly-data-runtime-dense-posting-maintenance",
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-dense-posting-maintenance", FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), server.write_source.lsmMaintenanceScoreBestEffort());
+
+    server.dense_posting_maintenance_next_eligible_ns.store(100, .release);
+    try std.testing.expect(server.backgroundMaintenanceDue(100));
+    try std.testing.expect(server.backgroundMaintenanceDue(101));
+    try std.testing.expect(!server.backgroundMaintenanceDue(99));
 }

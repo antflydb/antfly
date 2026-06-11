@@ -110,10 +110,7 @@ pub const BackgroundTextStatsResponse = struct {
     }
 };
 
-pub const LsmStorageStats = struct {
-    maintenance: lsm_backend.Backend.MaintenanceStats,
-    write: lsm_backend.Backend.WriteStats,
-};
+pub const LsmStorageStats = runtime_status.LsmStorageStats;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -1307,6 +1304,7 @@ pub const TableReadSource = struct {
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
         lsm_storage_stats: ?*const fn (
             ptr: *anyopaque,
+            alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
         document_artifact_manifest: ?*const fn (
@@ -1624,10 +1622,11 @@ pub const TableReadSource = struct {
 
     pub fn lsmStorageStats(
         self: TableReadSource,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?LsmStorageStats {
         const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
-        return try fn_ptr(self.ptr, table_name);
+        return try fn_ptr(self.ptr, alloc, table_name);
     }
 };
 
@@ -1910,13 +1909,17 @@ pub const BoundTableReadSource = struct {
 
     fn lsmStorageStats(
         ptr: *anyopaque,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?LsmStorageStats {
+        _ = alloc;
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table_name)) return null;
         return .{
             .maintenance = self.db.snapshotLsmMaintenanceStats(),
             .write = self.db.snapshotLsmWriteStats(),
+            .maintenance_score = self.db.lsmMaintenanceScore(),
+            .maintenance_debt_hint = self.db.lsmMaintenanceDebtHint(),
         };
     }
 
@@ -2335,6 +2338,7 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .lsm_storage_stats = lsmStorageStats,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
@@ -2753,6 +2757,41 @@ pub const ProvisionedTableReadSource = struct {
             return try snapshot_cache.snapshot(alloc, table_name);
         }
         return null;
+    }
+
+    fn lsmStorageStats(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?LsmStorageStats {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var out = LsmStorageStats{
+            .maintenance = .{},
+            .write = .{},
+        };
+        for (group_ids) |group_id| {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+            var db = try openProvisionedWarmStatusDbForTable(
+                alloc,
+                path,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                identity_namespace,
+            );
+            defer db.close();
+
+            lsm_backend.Backend.accumulateMaintenanceStats(&out.maintenance, db.snapshotLsmMaintenanceStats());
+            lsm_backend.Backend.accumulateWriteStats(&out.write, db.snapshotLsmWriteStats());
+            out.maintenance_score = @max(out.maintenance_score, db.lsmMaintenanceScore());
+            out.maintenance_debt_hint = @max(out.maintenance_debt_hint, db.lsmMaintenanceDebtHint());
+        }
+        return out;
     }
 };
 

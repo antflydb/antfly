@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
@@ -1074,7 +1075,17 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
+    // link against the host distro's crt startup objects. Newer glibc/binutils
+    // builds may include .sframe sections with relocation types that Zig's
+    // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
+    // target keeps user-supplied -Dtarget overrides intact while making the
+    // no-argument path use Zig's bundled libc startup objects.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -2807,6 +2818,7 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
+        "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data public API listener uses public API request body limit",
@@ -3524,6 +3536,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "api auto bulk ingest does not open sessions for normal online writes",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
@@ -3532,6 +3545,8 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
+            "provisioned table write source consistent visibility hook does not block on busy apply lock",
+            "provisioned table write source consistent visibility refreshes stale dense status",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

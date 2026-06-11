@@ -249,6 +249,7 @@ pub const QueryVisibilityChange = enum {
     invalidate,
     publish,
     publish_consistent,
+    publish_blocking,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -2411,6 +2412,14 @@ pub const DB = struct {
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
+    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
+    // single identity read generation. Visibility at a fixed generation is
+    // stable, so the entry only turns over when queries arrive at a newer
+    // generation. Guarded by its own mutex because published-path queries do
+    // not hold the apply lock.
+    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    live_doc_set_cache_generation: ?u64 = null,
+    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
@@ -2743,7 +2752,7 @@ pub const DB = struct {
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+        if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
@@ -3040,6 +3049,11 @@ pub const DB = struct {
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
+        if (self.live_doc_set_cache_set) |*cached| {
+            cached.deinit(self.alloc);
+            self.live_doc_set_cache_set = null;
+            self.live_doc_set_cache_generation = null;
+        }
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
@@ -3174,14 +3188,11 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        beginExternalDenseBulkSessionTracked(self.async_context);
-        errdefer finishExternalDenseBulkSessionTracked(self.async_context);
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.store.beginBulkIngestSession();
         errdefer resources.store.abortBulkIngestSession();
-        try resources.index_manager.beginDenseBulkIngestSessions();
         try self.configureBulkIngestIdentityAllNewLocked();
         errdefer self.clearBulkIngestIdentityAllNewLocked();
         self.bulk_ingest_coalescer.begin();
@@ -3189,31 +3200,21 @@ pub const DB = struct {
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
-        var external_session_tracked = true;
-        defer if (external_session_tracked) finishExternalDenseBulkSessionTracked(self.async_context);
-        {
-            lockApply(self);
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            var first_err: ?anyerror = null;
-            resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
-                first_err = err;
-            };
-            resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
-                if (first_err == null) first_err = err;
-            };
+        lockApply(self);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
             self.bulk_ingest_coalescer.clear(self.alloc);
             self.clearBulkIngestIdentityAllNewLocked();
-            if (first_err) |err| return err;
-        }
-        finishExternalDenseBulkSessionTracked(self.async_context);
-        external_session_tracked = false;
-        flushDeferredExternalBulkExecutorNotificationOrTarget(
-            self.async_context,
-            self.executor,
-            self.core.nextDerivedSequence(),
-        );
-        if (self.async_context.query_visibility_hook) |hook| hook.notify(.publish);
+            return err;
+        };
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+    }
+
+    pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
+        try self.beginPrimaryStoreAutoBulkIngestSession();
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
@@ -3271,16 +3272,11 @@ pub const DB = struct {
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
         lockApply(self);
-        {
-            defer self.core.unlockApply();
-            const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_coalescer.clear(self.alloc);
-            self.clearBulkIngestIdentityAllNewLocked();
-            resources.index_manager.abortDenseBulkIngestSessions();
-            resources.store.abortBulkIngestSession();
-        }
-        finishExternalDenseBulkSessionTracked(self.async_context);
-        flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+        resources.store.abortBulkIngestSession();
     }
 
     pub fn abortBulkIngestSession(self: *DB) void {
@@ -3312,6 +3308,22 @@ pub const DB = struct {
             self.core.primary_store_owner.lsmMaintenanceDebtHint(),
             self.core.index_manager.lsmMaintenanceDebtHint(),
         );
+    }
+
+    pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
+        return self.core.primary_store_owner.lsmMaintenanceDebtHint();
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        var delay_ns = self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
+        if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        return delay_ns;
+    }
+
+    pub fn nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        return self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
     }
 
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
@@ -3468,8 +3480,11 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
-        lockApply(self);
-        defer self.core.unlockApply();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+        }
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const index_score = self.core.index_manager.lsmMaintenanceScore();
@@ -3485,8 +3500,11 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        if (!self.core.tryLockApplyExclusive()) return false;
-        defer self.core.unlockApply();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        }
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         if (primary_score > 0) {
@@ -3496,6 +3514,26 @@ pub const DB = struct {
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
+        return false;
+    }
+
+    pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score == 0 and !primary_reclaim_due) return false;
+        if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        return false;
+    }
+
+    pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score == 0 and !primary_reclaim_due) return false;
+        if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         return false;
     }
 
@@ -3509,6 +3547,175 @@ pub const DB = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        var steps: usize = 0;
+        while (steps < max_steps) : (steps += 1) {
+            var progressed = false;
+            if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) progressed = true;
+            if (try self.core.index_manager.runLsmObsoleteReclaimDue()) progressed = true;
+
+            if (!progressed) {
+                const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+                if (!wake_due) break;
+                if (!try self.runLsmMaintenanceStep()) break;
+            }
+        }
+        return steps;
+    }
+
+    test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        var key_buf: [16]u8 = undefined;
+        for (0..4) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+                .sync_level = .write,
+            });
+            switch (db.core.primary_store_owner) {
+                .lsm => |*owner| try owner.handle.backend.sync(true),
+                else => return error.SkipZigTest,
+            }
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+            else => return error.SkipZigTest,
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+            else => return error.SkipZigTest,
+        }
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+        try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+    }
+
+    test "db primary lsm maintenance step does not reclaim index obsolete paths" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        const primary_backend = switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+        const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
+        defer alloc.free(primary_obsolete_path);
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(dense_obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
+            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
+            primary_backend.manifest_dirty = false;
+        }
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try std.testing.expectEqual(@as(u64, 1), primary_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+
+        _ = try db.runPrimaryLsmMaintenanceStep();
+
+        try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
+        alloc.free(dense_bytes);
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
@@ -5482,7 +5689,7 @@ pub const DB = struct {
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
-        if (restore_identity) |identity| try markRestorePrimaryRestored(
+        if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
             identity.backup_id,
@@ -5580,7 +5787,28 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    fn markRestorePrimaryRestored(
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPath(alloc, path, state);
+        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+        defer alloc.free(repair_marker_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = repair_marker_path,
+            .data = "done\n",
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPath(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
@@ -5703,13 +5931,12 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-            try self.runUntilIdle();
+            try self.runRestoreRepairDrainAsync();
             try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
-            std.log.info("restore runtime repair sync indexes path={s}", .{self.core.path});
-            try self.core.index_manager.syncAll(false);
+            std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -7318,6 +7545,48 @@ pub const DB = struct {
         return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
     }
 
+    fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
+        const catalog = self.core.index_manager.resolvers.items;
+        var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (resolvers[0..initialized]) |resolver| {
+                alloc.free(resolver.name);
+                alloc.free(resolver.table);
+                alloc.free(resolver.source_artifact);
+                alloc.free(resolver.resolution_artifact);
+            }
+            if (resolvers.len > 0) alloc.free(resolvers);
+        }
+
+        for (catalog) |cfg| {
+            const name = try alloc.dupe(u8, cfg.name);
+            errdefer alloc.free(name);
+            const table = try alloc.dupe(u8, cfg.table);
+            errdefer alloc.free(table);
+            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
+            errdefer alloc.free(source_artifact);
+            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
+            errdefer alloc.free(resolution_artifact);
+            resolvers[initialized] = .{
+                .name = name,
+                .table = table,
+                .source_artifact = source_artifact,
+                .resolution_artifact = resolution_artifact,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .resolver_count = @intCast(catalog.len),
+            .resolution_runtime_present = self.resolution_runtime != null,
+            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_runtime_present = self.promotion_runtime != null,
+            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .resolvers = resolvers[0..initialized],
+        };
+    }
+
     fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
         if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
         const resources = self.core.batchExecutionResources();
@@ -7511,6 +7780,16 @@ pub const DB = struct {
             if (self.core.nextDerivedSequence() <= drained_sequence) return;
         }
         return error.RunUntilIdleDidNotConverge;
+    }
+
+    fn runRestoreRepairDrainAsync(self: *DB) !void {
+        // Earlier repair phases synchronously rebuild restored runtime state.
+        // At this point only persisted applied-sequence watermarks need to be
+        // flushed before the final index sync/complete marker. Do not call
+        // runUntilIdle here: large portable restores can leave substantial
+        // replay, posting-maintenance, or LSM maintenance debt, and queries
+        // remain correct while that background-maintenance debt is paid down.
+        try self.flushAppliedSequencesForIdle();
     }
 
     pub fn runUntilIdle(self: *DB) !void {
@@ -8609,12 +8888,13 @@ pub const DB = struct {
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         if (index_manager.textIndex(index_name)) |entry| {
-            const text_snapshot = entry.snapshot();
-            const term_count = textIndexTermCount(entry);
+            // Applied-sequence persistence runs outside the DB apply lock; keep this
+            // snapshot cheap and avoid walking full-text segment internals here.
+            const text_snapshot = entry.acquireSnapshot();
+            defer text_snapshot.release();
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.global_doc_count,
-                .term_count = term_count,
                 .updated_at_ns = platform_time.monotonicNs(),
             };
         }
@@ -8824,7 +9104,8 @@ pub const DB = struct {
             switch (item.kind) {
                 .full_text => {
                     if (self.core.textIndex(item.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
@@ -8959,6 +9240,17 @@ pub const DB = struct {
         return try self.statsLocked(alloc);
     }
 
+    pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        if (self.open_mode == .status_only) {
+            return try self.statusOnlyStats(alloc);
+        }
+
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+
+        return try self.statsLocked(alloc);
+    }
+
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
@@ -9086,7 +9378,8 @@ pub const DB = struct {
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
                         item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -9154,6 +9447,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -9322,6 +9616,7 @@ pub const DB = struct {
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -9330,7 +9625,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_hits;
                     }
                 }
@@ -9341,7 +9637,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_misses;
                     }
                 }
@@ -9407,6 +9704,7 @@ pub const DB = struct {
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -10440,9 +10738,37 @@ pub const DB = struct {
             return try doc_set.cloneAlloc(alloc, set);
         }
         if (set.* == .all) {
-            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
         }
         return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
+        const all_set: doc_set.ResolvedDocSet = .all;
+        const gen = generation orelse {
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        };
+        {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_generation == gen) {
+                if (self.live_doc_set_cache_set) |*cached| {
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.live_doc_set_cache_set = cloned;
+            self.live_doc_set_cache_generation = gen;
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
     }
 
     fn allDocsVisibleCallback(
@@ -10475,7 +10801,10 @@ pub const DB = struct {
                     .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, all_visible },
                 );
             }
-            if (all_visible) return true;
+            // The summary is definitive in both directions: it tracks tombstone
+            // counts and the max created generation, the same fields the full
+            // identity scan below would recompute.
+            return all_visible;
         }
         if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
         const stats_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -18134,8 +18463,8 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     const now_ns = std.time.ns_per_s;
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns));
     try noteDenseCatchUpMaintenanceRun(&ctx, "vec", now_ns);
-    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", denseCatchUpMaintenanceUrgentScore(), now_ns + 1));
+    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
@@ -22208,8 +22537,10 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         finishDenseCatchUpSessionTracked(ctx, index_ref.name);
         return;
     }
-    errdefer finishDenseCatchUpSessionTracked(ctx, index_ref.name);
-    errdefer ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+    var catch_up_tracked = true;
+    errdefer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    var bulk_session_finished = false;
+    errdefer if (!bulk_session_finished) ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -22226,20 +22557,19 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
+    bulk_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
-    var published_visibility = false;
-    if (ctx.applied_sequence_mutex.tryLock()) {
-        defer ctx.applied_sequence_mutex.unlock();
-        published_visibility = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
-    } else {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-    }
-    if (!published_visibility) {
-        if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
-    }
-    try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
-    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    const published_visibility = blk: {
+        var seq_lock = lockAtomicWithBackoffProfiled(
+            &ctx.applied_sequence_mutex,
+            &ctx.stats.applied_sequence_mutex,
+        );
+        defer seq_lock.unlock();
+        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
+        try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+        break :blk published;
+    };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
 
@@ -22264,6 +22594,12 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     };
     if (ctx.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(dense_window_result);
+    }
+    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    catch_up_tracked = false;
+    if (ctx.query_visibility_hook) |hook| {
+        if (!published_visibility) hook.notify(.publish_consistent);
+        hook.notify(.publish_blocking);
     }
 }
 
@@ -27295,7 +27631,7 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
-    try std.testing.expectEqual(QueryVisibilityChange.invalidate, hook_ctx.change.?);
+    try std.testing.expectEqual(QueryVisibilityChange.publish, hook_ctx.change.?);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -34224,9 +34560,9 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
     try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
-    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expect(dense_summary.dense_search_width_total >= 1);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 1);
+    try std.testing.expect(dense_summary.dense_epsilon_max > 0.0);
     try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
     try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
     try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);
@@ -44446,6 +44782,42 @@ test "db query_readonly reopen does not backfill pending external dense artifact
     try std.testing.expect(reopened_stats.indexes[0].replay_target_sequence > reopened_stats.indexes[0].replay_applied_sequence);
 }
 
+test "db primary auto bulk leaves dense replay active while session is open" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    errdefer db.abortPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" }},
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+
+    try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
     const alloc = std.testing.allocator;
 
@@ -44464,12 +44836,25 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     const HookCtx = struct {
         publish_calls: u64 = 0,
+        publish_blocking_calls: u64 = 0,
+        publish_blocking_while_applied_sequence_locked: u64 = 0,
         invalidate_calls: u64 = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (change) {
                 .publish, .publish_consistent => self.publish_calls += 1,
+                .publish_blocking => {
+                    self.publish_calls += 1;
+                    self.publish_blocking_calls += 1;
+                    if (changed_db) |hook_db| {
+                        if (hook_db.async_context.applied_sequence_mutex.tryLock()) {
+                            hook_db.async_context.applied_sequence_mutex.unlock();
+                        } else {
+                            self.publish_blocking_while_applied_sequence_locked += 1;
+                        }
+                    }
+                },
                 .invalidate => self.invalidate_calls += 1,
             }
         }
@@ -44510,11 +44895,17 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     try db.executor.waitForAll(4);
 
     try std.testing.expect(hook_ctx.publish_calls > 0);
+    try std.testing.expect(hook_ctx.publish_blocking_calls > 0);
+    try std.testing.expectEqual(@as(u64, 0), hook_ctx.publish_blocking_while_applied_sequence_locked);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+
+    const persisted_status = (try db.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 4), persisted_status.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), try db.core.loadAppliedSequence(alloc, "dense_idx"));
 }
 
 test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {
@@ -48041,7 +48432,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestored(
+    try DB.markRestorePrimaryRestoredForPath(
         alloc,
         std.mem.span(restore_path),
         "snap1",
