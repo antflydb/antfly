@@ -545,7 +545,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             {/* Document source toggle */}
             <div className="flex gap-2">
               <Button
-                variant={docSource === "table" ? "secondary" : "ghost"}
+                variant={docSource === "table" ? "outline" : "ghost"}
                 size="sm"
                 onClick={() => setDocSource("table")}
                 disabled={!selectedTable}
@@ -554,7 +554,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                 From Table
               </Button>
               <Button
-                variant={docSource === "manual" ? "secondary" : "ghost"}
+                variant={docSource === "manual" ? "outline" : "ghost"}
                 size="sm"
                 onClick={() => setDocSource("manual")}
               >

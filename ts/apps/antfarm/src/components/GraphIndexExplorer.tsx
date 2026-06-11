@@ -740,7 +740,7 @@ export function GraphIndexExplorer({
                       className="rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2 text-xs"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <Badge variant={edge.pathEdge ? "default" : "secondary"}>
+                        <Badge variant={edge.pathEdge ? "default" : "default"}>
                           {edge.type ?? "edge"}
                         </Badge>
                         <span className="text-muted-foreground">w {formatNumber(edge.weight)}</span>

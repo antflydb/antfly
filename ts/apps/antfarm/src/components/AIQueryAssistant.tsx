@@ -109,9 +109,9 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   };
 
   const getConfidenceColor = (confidence: number | undefined) => {
-    if (confidence === undefined) return "secondary";
+    if (confidence === undefined) return "default";
     if (confidence >= 0.8) return "default";
-    if (confidence >= 0.5) return "secondary";
+    if (confidence >= 0.5) return "default";
     return "destructive";
   };
 

@@ -808,7 +808,7 @@ ${facetsCode}${resultsCode}
                               return (
                                 <Badge
                                   key={index}
-                                  variant={isSelected ? "default" : "outline"}
+                                  variant={isSelected ? "default" : "default"}
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() =>
                                     isSelected
@@ -959,7 +959,7 @@ ${facetsCode}${resultsCode}
                                   return (
                                     <Badge
                                       key={index}
-                                      variant={isSelected ? "default" : "outline"}
+                                      variant={isSelected ? "default" : "default"}
                                       className="cursor-pointer hover:bg-muted"
                                       onClick={() =>
                                         isSelected
@@ -1188,7 +1188,7 @@ ${facetsCode}${resultsCode}
                                       variant={
                                         thumbnailField === fieldInfo.fieldName
                                           ? "default"
-                                          : "outline"
+                                          : "default"
                                       }
                                       className="cursor-pointer hover:bg-muted"
                                       onClick={() => handleSetThumbnailField(fieldInfo.fieldName)}
@@ -1208,7 +1208,7 @@ ${facetsCode}${resultsCode}
                                   {(["small", "medium", "large"] as const).map((size) => (
                                     <Badge
                                       key={size}
-                                      variant={thumbnailSize === size ? "default" : "outline"}
+                                      variant={thumbnailSize === size ? "default" : "default"}
                                       className="cursor-pointer hover:bg-muted capitalize"
                                       onClick={() => setThumbnailSize(size)}
                                     >
@@ -1272,7 +1272,7 @@ ${facetsCode}${resultsCode}
                                 <Badge
                                   key={fieldInfo.fieldName}
                                   variant={
-                                    displayTextField === fieldInfo.fieldName ? "default" : "outline"
+                                    displayTextField === fieldInfo.fieldName ? "default" : "default"
                                   }
                                   className="cursor-pointer hover:bg-muted"
                                   onClick={() => handleSetDisplayTextField(fieldInfo.fieldName)}

@@ -35,19 +35,8 @@ function getStepIcon(stepName: string) {
   return STEP_ICONS[stepName] ?? <Search className="h-3.5 w-3.5" />;
 }
 
-function getStatusBadgeVariant(
-  status?: string
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (status) {
-    case "success":
-      return "secondary";
-    case "error":
-      return "destructive";
-    case "skipped":
-      return "outline";
-    default:
-      return "default";
-  }
+function getStatusBadgeVariant(status?: string): "default" | "destructive" {
+  return status === "error" ? "destructive" : "default";
 }
 
 function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?: boolean }) {

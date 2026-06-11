@@ -60,7 +60,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
   // Render boolean
   if (typeof value === "boolean") {
     return (
-      <Badge variant={value ? "default" : "secondary"} className="font-mono text-xs">
+      <Badge variant={value ? "default" : "default"} className="font-mono text-xs">
         {value.toString()}
       </Badge>
     );
