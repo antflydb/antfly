@@ -192,17 +192,20 @@ pub const ArtifactSourceRef = struct {
     kind: ArtifactKind,
     name: []u8,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
         return .{
             .kind = self.kind,
             .name = try alloc.dupe(u8, self.name),
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
     }
 
     pub fn deinit(self: *ArtifactSourceRef, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;
     }
 };
@@ -212,6 +215,7 @@ pub const ArtifactRef = struct {
     name: []u8,
     kind: ArtifactKind,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
@@ -220,6 +224,7 @@ pub const ArtifactRef = struct {
             .name = try alloc.dupe(u8, self.name),
             .kind = self.kind,
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -227,6 +232,7 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
     }
@@ -393,6 +399,45 @@ pub const ArtifactWrite = struct {
 };
 
 pub const ArtifactRecord = ArtifactWrite;
+
+pub const DocumentArtifactChildRange = struct {
+    range_id: []u8,
+    range_kind: []u8,
+    artifact_name: []u8,
+    split_boundary: []u8,
+    placement: []u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]u8 = null,
+    split_eligible: ?bool = null,
+    start_key: []u8,
+    end_key_exclusive: []u8,
+    last_key: []u8,
+    child_count: usize = 0,
+    text_bytes: ?usize = null,
+
+    pub fn deinit(self: *DocumentArtifactChildRange, alloc: Allocator) void {
+        alloc.free(self.range_id);
+        alloc.free(self.range_kind);
+        alloc.free(self.artifact_name);
+        alloc.free(self.split_boundary);
+        alloc.free(self.placement);
+        if (self.route_status) |value| alloc.free(value);
+        alloc.free(self.start_key);
+        alloc.free(self.end_key_exclusive);
+        alloc.free(self.last_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactChildRangePlacementUpdate = struct {
+    range_id: []const u8,
+    placement: []const u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]const u8 = null,
+    split_eligible: ?bool = null,
+};
 
 pub const TextBoolQuery = struct {
     must: []const TextQuery = &.{},
