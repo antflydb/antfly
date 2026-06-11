@@ -1439,6 +1439,9 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Error name recorded when the index's persisted artifacts failed to
+    // load (e.g. "UnsupportedVersion"); null for healthy indexes.
+    load_error: ?[]const u8 = null,
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
@@ -1933,6 +1936,7 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        if (item.load_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);

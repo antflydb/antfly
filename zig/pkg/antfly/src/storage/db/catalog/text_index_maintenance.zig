@@ -131,8 +131,8 @@ fn buildSegmentInfosAlloc(
             .index = i,
             .size = seg.data.bytes().len,
             .doc_count = seg.reader.doc_count,
-            .deleted_count = if (seg.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-            .has_deletions = seg.deleted != null,
+            .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
+            .has_deletions = seg.shared.deleted != null,
         };
     }
     return infos;

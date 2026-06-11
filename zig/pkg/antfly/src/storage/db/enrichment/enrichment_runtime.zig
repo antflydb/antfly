@@ -207,6 +207,25 @@ fn transientEmbedRetrySleepNs(attempt: u32) u64 {
     return @min(transient_embed_retry_base_sleep_ns << @intCast(shift), transient_embed_retry_max_sleep_ns);
 }
 
+const query_yield_poll_ns: u64 = 25 * std.time.ns_per_ms;
+const query_yield_max_ns: u64 = 5 * std.time.ns_per_s;
+
+// yieldToInteractiveEmbeds briefly defers the next embed batch while a
+// query-time embed is in flight, so interactive embeds aren't starved by
+// backfill. The flag covers only the embed call itself (milliseconds), so
+// the wait normally clears on the first poll; the 5s cap is a safety bound —
+// backfill must always make progress.
+fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    if (enrichment_types.interactive_embed_inflight.load(.monotonic) == 0) return;
+    const start_ns = runtime.config.clock.nowRealtimeNs();
+    while (enrichment_types.interactive_embed_inflight.load(.monotonic) > 0) {
+        if (elapsedNsSince(runtime, start_ns) >= query_yield_max_ns) return;
+        if (runtimeShuttingDown(runtime)) return;
+        sleepRetryBackoff(query_yield_poll_ns);
+    }
+}
+
 fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
     if (comptime builtin.os.tag == .freestanding) return false;
     const io_impl = runtime.io_impl orelse return runtime.shutdown;
@@ -2326,6 +2345,7 @@ fn flushPlainDenseItems(
         max_source_bytes = @max(max_source_bytes, item.source_text.len);
     }
 
+    yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStarted(runtime, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {

@@ -2363,6 +2363,11 @@ pub const DB = struct {
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
+    // Spawned at open only when the load left failures behind; exits once all
+    // quarantined indexes recover or the DB closes.
+    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -2618,6 +2623,9 @@ pub const DB = struct {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
+            }
+            if (optional_runtimes_enabled and opts.open_mode == .writer) {
+                db.startQuarantineRetryWorkerIfNeeded();
             }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
@@ -3002,6 +3010,9 @@ pub const DB = struct {
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        // Stop the quarantine retry worker first: it takes the catalog lock
+        // and opens indexes, which must not race the teardown below.
+        self.stopQuarantineRetryWorker();
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -5722,7 +5733,10 @@ pub const DB = struct {
         min_weight: f64,
         max_weight: f64,
     ) !?paths_mod.Path {
-        const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        const entry = self.core.index_manager.graphIndex(index_name) orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
         const params = graph_query_mod.QueryParams{
             .edge_types = edge_types,
             .direction = direction,
@@ -7201,6 +7215,57 @@ pub const DB = struct {
         return error.RunUntilIdleDidNotConverge;
     }
 
+    /// Re-attempts opening quarantined indexes (artifacts that failed to
+    /// load at open time). `force` ignores per-index backoff — used by tests
+    /// and operator-triggered recovery. Runs the same detached-open path as
+    /// the initial load, so a recovered full-text/sparse/graph index resumes
+    /// its persisted rebuild state and catches up before registering.
+    pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        return try self.core.index_manager.retryFailedIndexLoads(self.core.store, monotonicTimeNs(), force);
+    }
+
+    const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
+    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
+
+    fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        // Tests drive retries deterministically via retryQuarantinedIndexLoads;
+        // a background worker racing them turns every quarantine-shaped test
+        // into a timing assumption.
+        if (comptime builtin.is_test) return;
+        if (!self.core.index_manager.hasLoadFailures()) return;
+        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+            // Self-healing is best-effort: the quarantine still recovers on
+            // the next open or via drop+recreate.
+            std.log.warn("quarantine retry worker spawn failed: {}", .{err});
+            return;
+        };
+    }
+
+    fn stopQuarantineRetryWorker(self: *DB) void {
+        self.quarantine_retry_stop.store(true, .release);
+        if (self.quarantine_retry_thread) |thread| {
+            thread.join();
+            self.quarantine_retry_thread = null;
+        }
+    }
+
+    fn quarantineRetryWorkerMain(self: *DB) void {
+        while (true) {
+            var slept: u64 = 0;
+            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
+                if (self.quarantine_retry_stop.load(.acquire)) return;
+                sleepNs(quarantine_retry_sleep_slice_ns);
+            }
+            if (self.quarantine_retry_stop.load(.acquire)) return;
+            const result = self.retryQuarantinedIndexLoads(false) catch |err| {
+                std.log.warn("quarantine retry pass failed: {}", .{err});
+                continue;
+            };
+            if (result.remaining == 0) return;
+        }
+    }
+
     fn runRestoreRepairDrainAsync(self: *DB) !void {
         // Earlier repair phases synchronously rebuild restored runtime state.
         // At this point only persisted applied-sequence watermarks need to be
@@ -8070,6 +8135,7 @@ pub const DB = struct {
 
     fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
         alloc.free(item.name);
+        if (item.load_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -8792,6 +8858,12 @@ pub const DB = struct {
                 );
                 item.backfill_active = applied_sequence < target_sequence;
             }
+            if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                item.load_error = try alloc.dupe(u8, load_error);
+                // A quarantined index has no runtime; it is broken, not warming.
+                item.backfill_active = false;
+                item.catch_up_active = false;
+            }
 
             switch (cfg.kind) {
                 .full_text => {
@@ -9102,6 +9174,12 @@ pub const DB = struct {
                     @as(f64, @floatFromInt(applied_sequence)) / @as(f64, @floatFromInt(target_sequence)),
                 );
                 item.backfill_active = applied_sequence < target_sequence;
+            }
+            if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                item.load_error = try alloc.dupe(u8, load_error);
+                // A quarantined index has no runtime; it is broken, not warming.
+                item.backfill_active = false;
+                item.catch_up_active = false;
             }
             if (try self.loadIndexStatusSnapshot(alloc, cfg.name)) |status_snapshot| {
                 applyIndexStatusSnapshot(&item, status_snapshot);
@@ -9982,7 +10060,16 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.textIndexEntry(index_name);
+    }
+
+    /// Queries that explicitly reference an index whose persisted artifacts
+    /// failed to load get a distinct error instead of IndexNotFound, so
+    /// clients can tell "broken, drop+recreate to recover" from "missing".
+    fn failIfIndexQuarantined(self: *DB, index_name: ?[]const u8) !void {
+        const name = index_name orelse return;
+        if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
     }
 
     fn textIndexIsChunkBackedCallback(
@@ -10455,7 +10542,10 @@ pub const DB = struct {
             .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
             else => null,
         };
-        const access_path = selected_path orelse return error.IndexNotFound;
+        const access_path = selected_path orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
         var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
         defer planned.deinit(self.alloc);
         if (planned.access_paths.len != 1 or
@@ -11018,6 +11108,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.denseIndex(index_name);
     }
 
@@ -11058,6 +11149,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.sparseIndex(index_name);
     }
 
@@ -11592,7 +11684,10 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
     ) !graph_query_mod.GraphQueryResult {
-        const entry = self.core.graphIndex(graph_query.index_name) orelse return error.IndexNotFound;
+        const entry = self.core.graphIndex(graph_query.index_name) orelse {
+            try self.failIfIndexQuarantined(graph_query.index_name);
+            return error.IndexNotFound;
+        };
         if (entry.index.supportsAlgebraicSemiringTraversal()) {
             try self.proveGraphTraversalProgram(graph_query.index_name, target_keys.len > 0);
         }
@@ -27574,6 +27669,255 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+test "db open quarantines dense index with unsupported artifact version" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_quarantine",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_quarantine\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "quarantine-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), open_options);
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        // Persist an HBC metadata record with a version this build does not
+        // support, simulating an artifact written by an incompatible build.
+        const entry = db.core.denseIndex("dv_quarantine") orelse return error.TestUnexpectedResult;
+        var bad_meta = entry.index.metadata;
+        bad_meta.version = 99;
+        var meta_buf: [vectorindex_mod.hbc.IndexMetadata.encoded_size]u8 = undefined;
+        const encoded = bad_meta.encode(&meta_buf);
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, vectorindex_mod.hbc.meta_key, encoded);
+        try txn.commit();
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), open_options);
+    defer db.close();
+
+    // The broken dense index is quarantined: absent from the runtime, its
+    // load error recorded, and the rest of the table fully usable.
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") == null);
+    const recorded = db.core.index_manager.loadFailure("dv_quarantine") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("UnsupportedVersion", recorded);
+
+    var ft_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer ft_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ft_result.total_hits);
+
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        var found = false;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "dv_quarantine")) continue;
+            found = true;
+            const load_error = item.load_error orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("UnsupportedVersion", load_error);
+            try std.testing.expect(!item.backfill_active);
+        }
+        try std.testing.expect(found);
+    }
+
+    // Queries that explicitly reference the quarantined index get a distinct
+    // error instead of IndexNotFound or a stall.
+    const query_vec = [_]f32{ 0.1, 0.2, 0.3 };
+    try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = &query_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }));
+
+    // Drop + recreate recovers and clears the recorded failure.
+    try std.testing.expect(try db.deleteIndex("dv_quarantine"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_quarantine") == null);
+    try db.addIndex(dense_cfg);
+    try db.runUntilIdle();
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") != null);
+
+    const recovered_vec = try deterministic.interface().embedDense(alloc, "dv_quarantine", "alpha concept overview", 3);
+    defer alloc.free(recovered_vec);
+    var recovered = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = recovered_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }, 1);
+    defer recovered.deinit();
+    try std.testing.expect(recovered.total_hits >= 1);
+}
+
+test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..300) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    index_manager_mod.test_abort_text_backfill_after_batches = 1;
+    defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") == null);
+
+    // Writes keep flowing while the index is quarantined; the heal's resumed
+    // backfill must pick them up. They also guarantee the next backfill
+    // attempt flushes at least once, so the still-set abort knob fires.
+    {
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (300..400) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+    }
+
+    // While the cause persists, a forced retry fails and applies backoff.
+    {
+        const result = try db.retryQuarantinedIndexLoads(true);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+    // Cause fixed — but the failed attempt set a backoff deadline, so a
+    // non-forced retry is skipped without re-attempting the open (it would
+    // recover if it attempted).
+    index_manager_mod.test_abort_text_backfill_after_batches = null;
+    {
+        const result = try db.retryQuarantinedIndexLoads(false);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+
+    // Forced retry recovers the index in-process — no reopen, no
+    // drop+recreate — resuming the persisted rebuild state.
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
+
+    try db.runUntilIdle();
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .limit = 500,
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db read-only open propagates transient index load errors instead of quarantining" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    // A read-only (replica) open must NOT quarantine a transient read race
+    // (e.g. the writer reclaiming obsolete LSM runs mid-open): the error
+    // propagates so the query layer reopens against a fresh manifest and
+    // retries. A quarantined replica would instead serve IndexUnavailable
+    // until the read cache next invalidates it — the quarantine retry
+    // worker only runs on the writer.
+    try std.testing.expectError(error.FileNotFound, DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    }));
+
+    // The writer open quarantines the same error: the writer cannot race
+    // its own (not yet started) reclaim, so a missing artifact there is
+    // persistent damage — and the in-process retry recovers it once the
+    // cause clears.
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const recorded = db.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("FileNotFound", recorded);
+
+    index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+}
+
 test "db managed dense enrichment delete recreate recovers after corrupt artifact" {
     const alloc = std.testing.allocator;
 
@@ -32150,7 +32494,14 @@ test "db full-text backfill resumes after interrupted reopen" {
 
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);
@@ -32218,7 +32569,14 @@ test "db sparse backfill resumes after interrupted reopen" {
     defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("sp_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);
@@ -35556,7 +35914,14 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
 
     graph_mod.test_abort_reverse_rebuild_after_batches = 1;
     defer graph_mod.test_abort_reverse_rebuild_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("gr_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/gr_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);

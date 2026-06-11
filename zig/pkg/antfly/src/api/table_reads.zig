@@ -158,12 +158,45 @@ pub const ProvisionedTableReadCache = struct {
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
     ready: Io.Condition = .init,
-    epoch: u64 = 1,
+    // Exact per-table invalidation epochs. A single global epoch made every
+    // open of table A "stale" whenever table B was written — under
+    // continuous background writes (enrichment, status persistence) opens
+    // of an UNCHANGED table never looked fresh, which livelocked queries
+    // (pre-bounded-retry) or served permanently generation-stale DBs
+    // (post). Keying epochs by exact table name scopes staleness to the
+    // table actually invalidated, with no hash-collision false positives at
+    // any table count. Slots are created (fallibly) by getOrOpen before an
+    // open starts; invalidateTable only bumps an existing slot, so
+    // invalidation stays infallible — a missing slot means no open is in
+    // flight and nothing read the old epoch. Slots are never removed: one
+    // u64 + the name per distinct table ever read through this cache.
+    table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
 
     const max_cached_tables = 64;
+
+    /// Current epoch for `table_name`, creating its slot on first use. The
+    /// key is duped on insert and owned by the map. Must be called with the
+    /// cache mutex held.
+    fn epochForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) !u64 {
+        const gop = try self.table_epochs.getOrPut(self.alloc, table_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.alloc.dupe(u8, table_name) catch |err| {
+                self.table_epochs.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = 1;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Infallible epoch bump. A missing slot means no open ever started for
+    /// this table, so there is no in-flight epoch comparison to invalidate.
+    fn bumpEpochLocked(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        if (self.table_epochs.getPtr(table_name)) |epoch| epoch.* +%= 1;
+    }
 
     pub const CacheStats = struct {
         hit_count: u64 = 0,
@@ -231,6 +264,9 @@ pub const ProvisionedTableReadCache = struct {
         self.retired_entries.deinit(self.alloc);
         for (self.pending_opens.items) |*pending| pending.deinit(self.alloc);
         self.pending_opens.deinit(self.alloc);
+        var epoch_keys = self.table_epochs.keyIterator();
+        while (epoch_keys.next()) |key| self.alloc.free(key.*);
+        self.table_epochs.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -251,11 +287,19 @@ pub const ProvisionedTableReadCache = struct {
         lsm_root_generation: u64,
         table_name: []const u8,
     ) !Lease {
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
         const io = self.threaded.io();
+        var stale_epoch_retries: u8 = 0;
         while (true) {
+            // Reloaded every attempt: a stale-epoch retry usually means the
+            // table was dropped/recreated or moved mid-open, which changes
+            // the identity namespace — retrying with the first attempt's
+            // namespace would open (and cache) the wrong identity.
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
-            const open_epoch = self.epoch;
+            const open_epoch = self.epochForTableLocked(table_name) catch |err| {
+                self.mutex.unlock(io);
+                return err;
+            };
             if (self.findEntryForNamespaceLocked(group_id, lsm_root_generation, identity_namespace, table_name)) |entry| {
                 entry.active_leases += 1;
                 _ = self.hit_count.fetchAdd(1, .monotonic);
@@ -308,8 +352,27 @@ pub const ProvisionedTableReadCache = struct {
 
             self.mutex.lockUncancelable(io);
             self.removePendingOpenForNamespaceLocked(group_id, identity_namespace, table_name);
-            if (self.epoch != open_epoch) {
+            if ((self.table_epochs.get(table_name) orelse open_epoch +% 1) != open_epoch) {
+                // This table was invalidated while we were opening (dropped,
+                // recreated, or the writer published). Epochs are exact
+                // per-table, so this only fires under genuine same-table
+                // churn (catch-up, heal backfill). Retry a bounded number of
+                // times; if the table churns faster than an open completes,
+                // fail with TableReadChurn — classified as transient by the
+                // query layer, which retries with backoff — instead of
+                // either livelocking every query behind this open (observed
+                // in the field as ~100s of queries timing out and flushing
+                // at once) or serving/caching a stale-epoch DB (poisons
+                // identity read-generation checks and leaves the
+                // runtime-status cache empty, which hides index load errors
+                // from clients).
+                stale_epoch_retries += 1;
                 self.ready.broadcast(io);
+                if (stale_epoch_retries > 2) {
+                    self.mutex.unlock(io);
+                    // errdefer closes the just-opened db.
+                    return error.TableReadChurn;
+                }
                 db.close();
                 self.mutex.unlock(io);
                 continue;
@@ -391,7 +454,7 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        self.bumpEpochLocked(table_name);
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
     }
@@ -411,7 +474,8 @@ pub const ProvisionedTableReadCache = struct {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.epoch +%= 1;
+        var epochs = self.table_epochs.valueIterator();
+        while (epochs.next()) |epoch| epoch.* +%= 1;
         for (self.entries.items) |entry| self.retireEntryLocked(entry);
         self.entries.clearRetainingCapacity();
         self.ready.broadcast(io);
@@ -18792,10 +18856,15 @@ test "provisioned read cache clear preserves in-flight pending opens and bumps e
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    // Seed the table's epoch slot the way an in-flight open would, then
+    // verify clear() bumps it (epochs are per-table, not global).
+    const io = cache.threaded.io();
+    cache.mutex.lockUncancelable(io);
+    const before_epoch = try cache.epochForTableLocked("docs");
+    cache.mutex.unlock(io);
     cache.clear();
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 1), cache.pending_opens.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
@@ -18863,10 +18932,12 @@ test "provisioned read cache invalidate removes entries without dropping pending
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    // getOrOpen above created the table's epoch slot; invalidateTable must
+    // bump that slot (epochs are per-table, not global).
+    const before_epoch = cache.table_epochs.get("docs").?;
     cache.invalidateTable("docs");
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
 }

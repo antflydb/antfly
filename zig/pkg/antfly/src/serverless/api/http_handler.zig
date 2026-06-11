@@ -2869,6 +2869,11 @@ pub const HttpHandler = struct {
         const semantic_search = plan.request.semantic_search orelse return;
         if (plan.request.vector != null) return error.InvalidQueryRequest;
 
+        // Signal background enrichment to yield the embedder while this
+        // query-time embed runs (see enrichment_types.interactive_embed_inflight).
+        _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+        defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
+
         const index_name = (plan.vectorSource() orelse return error.InvalidQueryRequest).index_name;
         if (table_name) |name| {
             var table = (try self.catalog.getTableAlloc(self.alloc, name)) orelse return error.InvalidQueryRequest;

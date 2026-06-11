@@ -609,6 +609,7 @@ fn appendIndexRuntimeStatus(
 
 const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
+    load_error: ?[]const u8 = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -723,6 +724,7 @@ fn aggregateIndexStatus(
         const item = findIndexStatus(runtime.stats.indexes, index_name) orelse continue;
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
+        if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -1211,6 +1213,17 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
+    // An index whose persisted artifacts failed to load is broken, not
+    // rebuilding/warming: report the load error and suppress activity flags
+    // so clients classify it as needing a drop+recreate.
+    const load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    if (load_error != null) {
+        backfill_active = false;
+        catch_up_active = false;
+        replay_catch_up_required = false;
+        catch_up_phase = .idle;
+    }
+
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
         try appendJsonString(alloc, out, "index_type");
@@ -1244,7 +1257,17 @@ fn appendSingleIndexRuntimeStatus(
     defer alloc.free(progress);
     try out.appendSlice(alloc, progress);
     try out.appendSlice(alloc, ",\"backfill_state\":");
-    try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+    if (load_error != null) {
+        try appendJsonString(alloc, out, "failed");
+    } else {
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
+    }
+    if (load_error) |err_name| {
+        const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
+        defer alloc.free(msg);
+        try out.appendSlice(alloc, ",\"error\":");
+        try appendJsonString(alloc, out, msg);
+    }
     try out.appendSlice(alloc, ",\"doc_count\":");
     try appendIntValue(alloc, out, item.doc_count);
     try out.appendSlice(alloc, ",\"term_count\":");

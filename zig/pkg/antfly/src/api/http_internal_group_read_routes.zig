@@ -119,6 +119,12 @@ pub fn planSemanticQuery(
     });
     defer runtime.deinit();
 
+    // Signal background enrichment to yield the embedder while this
+    // query-time embed runs (see enrichment_types.interactive_embed_inflight).
+    // Scoped to the embed call only: BM25-only queries never set it, so
+    // steady full-text traffic does not stall enrichment throughput.
+    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
     return .{
         .vector = if (embedding_template) |value|
             try runtime.embedQueryWithTemplate(alloc, index_name, semantic_search, value)
