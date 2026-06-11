@@ -5138,9 +5138,21 @@ pub const DB = struct {
         defer producer_cfg.deinit(alloc);
         if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
 
-        const limit = if (req.limit == 0) @as(u32, 100) else req.limit;
+        var effective_req = req;
+        if (req.shard_cursors.len > 0) {
+            if (req.shard_cursors.len != 1) return error.InvalidArgument;
+            const cursor = req.shard_cursors[0];
+            if (cursor.group_id != null) return error.InvalidArgument;
+            effective_req = .{
+                .from_key = cursor.next_key,
+                .to_key = req.to_key,
+                .limit = if (cursor.limit != 0) cursor.limit else req.limit,
+            };
+        }
+
+        const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
         const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
-        var scanned = try self.scan(alloc, req.from_key, req.to_key, .{
+        var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
             .include_documents = true,
             .limit = scan_limit,
         });

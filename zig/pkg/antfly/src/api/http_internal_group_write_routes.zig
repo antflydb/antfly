@@ -253,6 +253,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             from_key: []const u8 = "",
             to_key: []const u8 = "",
             limit: u32 = 100,
+            shard_cursors: []const db_mod.types.DocumentArtifactReprocessShardResume = &.{},
         };
         const FailureResponse = struct {
             key: []const u8,
@@ -294,6 +295,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 .from_key = parsed.value.from_key,
                 .to_key = parsed.value.to_key,
                 .limit = parsed.value.limit,
+                .shard_cursors = parsed.value.shard_cursors,
             },
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid document artifact reprocess request"),

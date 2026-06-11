@@ -923,10 +923,17 @@ pub const ScanResult = struct {
     }
 };
 
+pub const DocumentArtifactReprocessShardResume = struct {
+    group_id: ?u64 = null,
+    next_key: []const u8,
+    limit: u32 = 0,
+};
+
 pub const DocumentArtifactTableReprocessRequest = struct {
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     limit: u32 = 100,
+    shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
 };
 
 pub const DocumentArtifactReprocessFailure = struct {

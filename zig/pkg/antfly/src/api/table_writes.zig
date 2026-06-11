@@ -221,6 +221,17 @@ fn mergeDocumentArtifactTableReprocessResult(
     }
 }
 
+fn documentArtifactReprocessRequestForCursor(
+    req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    cursor: db_mod.types.DocumentArtifactReprocessShardResume,
+) db_mod.types.DocumentArtifactTableReprocessRequest {
+    return .{
+        .from_key = cursor.next_key,
+        .to_key = req.to_key,
+        .limit = if (cursor.limit != 0) cursor.limit else req.limit,
+    };
+}
+
 fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactTableReprocessResult {
     const RemoteFailure = struct {
         key: []const u8,
@@ -6751,18 +6762,6 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            req.from_key,
-            req.to_key,
-            5 * std.time.ns_per_s,
-            10,
-        );
-        defer alloc.free(group_ids);
-        if (group_ids.len == 0) return null;
-
         var result = db_mod.types.DocumentArtifactTableReprocessResult{};
         errdefer result.deinit(alloc);
         var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
@@ -6775,11 +6774,34 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var handled_any = false;
-        for (group_ids) |group_id| {
-            var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
-            defer group_result.deinit(alloc);
-            handled_any = true;
-            try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
+        if (req.shard_cursors.len > 0) {
+            for (req.shard_cursors) |cursor| {
+                const group_id = cursor.group_id orelse return error.InvalidArgument;
+                const group_req = documentArtifactReprocessRequestForCursor(req, cursor);
+                var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue;
+                defer group_result.deinit(alloc);
+                handled_any = true;
+                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
+            }
+        } else {
+            const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+                alloc,
+                self.catalog,
+                table_name,
+                req.from_key,
+                req.to_key,
+                5 * std.time.ns_per_s,
+                10,
+            );
+            defer alloc.free(group_ids);
+            if (group_ids.len == 0) return null;
+
+            for (group_ids) |group_id| {
+                var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
+                defer group_result.deinit(alloc);
+                handled_any = true;
+                try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
+            }
         }
         if (!handled_any) return null;
         result.failures = try failures.toOwnedSlice(alloc);
@@ -7710,25 +7732,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
-            alloc,
-            self.catalog,
-            table_name,
-            req.from_key,
-            req.to_key,
-            5 * std.time.ns_per_s,
-            10,
-        );
-        defer alloc.free(group_ids);
-        if (group_ids.len == 0) return null;
-
-        const body = try std.json.Stringify.valueAlloc(alloc, .{
-            .from_key = req.from_key,
-            .to_key = req.to_key,
-            .limit = req.limit,
-        }, .{});
-        defer alloc.free(body);
-
         var result = db_mod.types.DocumentArtifactTableReprocessResult{};
         errdefer result.deinit(alloc);
         var failures = std.ArrayListUnmanaged(db_mod.types.DocumentArtifactReprocessFailure).empty;
@@ -7741,12 +7744,42 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
 
         var handled_any = false;
-        for (group_ids) |group_id| {
+        const group_ids = if (req.shard_cursors.len > 0) blk: {
+            const ids = try alloc.alloc(u64, req.shard_cursors.len);
+            errdefer alloc.free(ids);
+            for (req.shard_cursors, ids) |cursor, *id| id.* = cursor.group_id orelse return error.InvalidArgument;
+            break :blk ids;
+        } else blk: {
+            break :blk try table_catalog.resolveGroupsForSpanEventually(
+                alloc,
+                self.catalog,
+                table_name,
+                req.from_key,
+                req.to_key,
+                5 * std.time.ns_per_s,
+                10,
+            );
+        };
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        for (group_ids, 0..) |group_id, i| {
+            const group_req = if (req.shard_cursors.len > 0)
+                documentArtifactReprocessRequestForCursor(req, req.shard_cursors[i])
+            else
+                req;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{
+                .from_key = group_req.from_key,
+                .to_key = group_req.to_key,
+                .limit = group_req.limit,
+            }, .{});
+            defer alloc.free(body);
+
             var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
             if (resolved_route) |*route| {
                 defer route.deinit(alloc);
                 var group_result = switch (route.*) {
-                    .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue,
+                    .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue,
                     .remote => |remote| blk: {
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
                         var response = client.fetchGroupDocumentArtifactRangeReprocess(remote.base_uri, group_id, table_name, artifact_name, body) catch |err| switch (err) {
@@ -7762,7 +7795,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
                 continue;
             }
-            var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, req)) orelse continue;
+            var group_result = (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue;
             defer group_result.deinit(alloc);
             handled_any = true;
             try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);

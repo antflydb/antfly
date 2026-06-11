@@ -1724,6 +1724,11 @@ components:
           format: uint32
           description: Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
           default: 100
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+          items:
+            $ref: "#/components/schemas/DocumentArtifactReprocessShardCursor"
     DocumentArtifactReprocessFailure:
       type: object
       required:
@@ -7320,8 +7325,9 @@ paths:
         Runs a bounded operational repair pass for a derived document artifact
         across source rows in key order. Use `next_key` from the response as
         the next request's `from_key` for simple single-cursor continuation.
-        Distributed repair controllers should persist `shard_cursors` and
-        resume each shard independently when scanning large sharded tables.
+        Distributed repair controllers should persist `shard_cursors` from the
+        response and pass them back on the next request to resume each shard
+        independently when scanning large sharded tables.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifactRange

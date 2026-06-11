@@ -89,16 +89,6 @@ pub const DocumentArtifactReprocessResponse = struct {
     reprocess: []const u8,
 };
 
-/// Bounded request for reprocessing a derived artifact across source rows in key order.
-pub const DocumentArtifactTableReprocessRequest = struct {
-    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
-    from_key: ?[]const u8 = null,
-    /// Inclusive upper bound source document key, or empty for the end of the table/range.
-    to_key: ?[]const u8 = null,
-    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
-};
-
 pub const DocumentArtifactReprocessFailure = struct {
     /// Source document key that failed during reprocessing.
     key: []const u8,
@@ -1494,6 +1484,18 @@ pub const DocumentArtifactManifest = struct {
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: ?[]const u8 = null,
+};
+
+/// Bounded request for reprocessing a derived artifact across source rows in key order.
+pub const DocumentArtifactTableReprocessRequest = struct {
+    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 };
 
 pub const DocumentArtifactTableReprocessResponse = struct {

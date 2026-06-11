@@ -884,6 +884,7 @@ pub fn handleReprocessDocumentArtifactRange(
         from_key: []const u8 = "",
         to_key: []const u8 = "",
         limit: u32 = 100,
+        shard_cursors: []const db_mod.types.DocumentArtifactReprocessShardResume = &.{},
     };
     const FailureResponse = struct {
         key: []const u8,
@@ -920,6 +921,7 @@ pub fn handleReprocessDocumentArtifactRange(
         .from_key = parsed.value.from_key,
         .to_key = parsed.value.to_key,
         .limit = parsed.value.limit,
+        .shard_cursors = parsed.value.shard_cursors,
     }) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -1793,6 +1795,10 @@ test "public document artifact range reprocess handler returns bounded summary" 
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             if (!std.mem.eql(u8, req.from_key, "doc:a")) return error.InternalFailure;
+            try std.testing.expectEqual(@as(usize, 1), req.shard_cursors.len);
+            try std.testing.expectEqual(@as(?u64, 42), req.shard_cursors[0].group_id);
+            try std.testing.expectEqualStrings("doc:b", req.shard_cursors[0].next_key);
+            try std.testing.expectEqual(@as(u32, 10), req.shard_cursors[0].limit);
             if (req.limit != 10) return error.InternalFailure;
             const failures = try alloc.alloc(db_mod.types.DocumentArtifactReprocessFailure, 1);
             failures[0] = .{
@@ -1826,7 +1832,7 @@ test "public document artifact range reprocess handler returns bounded summary" 
         std.testing.allocator,
         "docs",
         "document_units_v1",
-        "{\"from_key\":\"doc:a\",\"limit\":10}",
+        "{\"from_key\":\"doc:a\",\"limit\":10,\"shard_cursors\":[{\"group_id\":42,\"next_key\":\"doc:b\",\"limit\":10}]}",
         Backend.iface(),
     );
     defer resp.deinit(std.testing.allocator);
