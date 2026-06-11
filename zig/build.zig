@@ -2259,6 +2259,24 @@ pub fn build(b: *std.Build) void {
     const lib_api_json_helpers_test_step = b.step("lib-api-json-helpers-test", "Run standalone api/json_helpers tests");
     lib_api_json_helpers_test_step.dependOn(&run_api_json_helpers_tests.step);
 
+    const api_artifact_reprocess_jobs_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
+    const api_artifact_reprocess_jobs_tests = b.addTest(.{
+        .root_module = api_artifact_reprocess_jobs_test_mod,
+        .filters = &.{
+            "artifact reprocess job store starts and updates a job",
+            "artifact reprocess job store recovers durable jobs and reseeds ids",
+            "artifact reprocess job cleanup removes recovered durable expired jobs",
+        },
+    });
+    const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
+    const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
+    lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
+
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
     });
@@ -3344,6 +3362,7 @@ pub fn build(b: *std.Build) void {
             "auth row filter resolver rejects unsupported auth paths",
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
+            "artifact operations apply source document row filter visibility",
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
@@ -3576,6 +3595,8 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps doc identity unavailable errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public document artifact manifest handler returns summary and raw state",
+            "public document artifact reprocess handler returns accepted",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4103,6 +4124,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);

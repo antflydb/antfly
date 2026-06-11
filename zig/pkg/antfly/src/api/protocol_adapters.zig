@@ -28,7 +28,7 @@ const McpToolKind = enum {
     create_index,
     drop_index,
     list_indexes,
-    lookup,
+    get_document,
     query,
     backup,
     restore,
@@ -107,9 +107,9 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
-        .kind = .lookup,
-        .name = "lookup",
-        .description = "Look up an Antfly document by key",
+        .kind = .get_document,
+        .name = "get_document",
+        .description = "Get an Antfly document by key",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
@@ -184,7 +184,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
-                .lookup => try ctx.lookup(alloc, args),
+                .get_document => try ctx.getDocument(alloc, args),
                 .query => try ctx.query(alloc, args),
                 .backup => try ctx.backupRestore(alloc, args, "backup"),
                 .restore => try ctx.backupRestore(alloc, args, "restore"),
@@ -235,7 +235,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             return try ctx.simpleRoute(alloc, .GET, uri, "");
         }
 
-        fn lookup(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
 
@@ -244,7 +244,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             try uri.appendSlice(alloc, routes.Routes.tables);
             try uri.append(alloc, '/');
             try uri.appendSlice(alloc, table_name);
-            try uri.appendSlice(alloc, routes.Routes.lookup_marker);
+            try uri.appendSlice(alloc, routes.Routes.documents_marker);
             try appendUriPathSegment(alloc, &uri, key);
 
             if (jsonValueArg(args, "fields")) |fields| {
@@ -395,7 +395,7 @@ fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype)
     const identity = authenticated_identity orelse return true;
     return switch (kind) {
         .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .lookup, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
+        .query, .get_document, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };

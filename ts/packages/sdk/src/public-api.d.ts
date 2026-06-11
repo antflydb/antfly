@@ -937,22 +937,241 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/lookup/{key}": {
+    "/db/v1/tables/{tableName}/documents/{key}": {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Key of the record to lookup */
+                /** @description Key of the document to retrieve */
                 key: string;
             };
             cookie?: never;
         };
-        /** Lookup a key in a table */
+        /** Retrieve a document by key */
         get: operations["lookupKey"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List derived document artifact manifests
+         * @description Returns the derived document artifact manifests currently available for
+         *     a source document. This lets clients discover artifact names before
+         *     inspecting a single manifest or triggering reprocessing.
+         */
+        get: operations["listDocumentArtifactManifests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reprocess a derived document artifact across a table range
+         * @description Runs a bounded operational repair pass for a derived document artifact
+         *     across source rows in key order. Use `next_key` from the response as
+         *     the next request's `from_key` for simple single-cursor continuation.
+         *     Distributed repair controllers should persist `shard_cursors` from the
+         *     response and pass them back on the next request to resume each shard
+         *     independently when scanning large sharded tables.
+         */
+        post: operations["reprocessDocumentArtifactRange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a derived document artifact reprocess job
+         * @description Creates a durable user-facing repair job for a derived document
+         *     artifact. The job advances through the same bounded per-shard repair
+         *     primitive used by `:reprocess`, and stores returned continuation
+         *     cursors so hosted controllers can resume large sharded table repairs
+         *     without collapsing progress into a single global key cursor.
+         */
+        post: operations["startDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get derived document artifact reprocess job status */
+        get: operations["getDocumentArtifactReprocessJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a derived document artifact reprocess job
+         * @description Runs one bounded repair pass and persists the resulting job state.
+         */
+        post: operations["advanceDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a derived document artifact reprocess job */
+        post: operations["cancelDocumentArtifactReprocessJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Inspect a derived document artifact manifest
+         * @description Returns manifest and processing state for a derived document artifact,
+         *     such as the document-unit hierarchy extracted from a PDF, HTML page, or
+         *     text field. The route is shard-aware; hosted deployments route the
+         *     request to the data group that owns the source document key.
+         */
+        get: operations["getDocumentArtifactManifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reprocess a derived document artifact
+         * @description Invalidates the current artifact state and requests the producer to
+         *     rebuild the derived document hierarchy for the source document.
+         */
+        post: operations["reprocessDocumentArtifact"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1869,6 +2088,299 @@ export interface components {
             ranges?: components["schemas"]["ClusterDataRangeStatus"][];
             replicas?: components["schemas"]["ClusterDataReplicaStatus"][];
             groups?: components["schemas"]["ClusterDataGroupStatus"][];
+        };
+        /** @description Parsed child-range descriptor from a derived document artifact manifest. */
+        DocumentArtifactChildRange: {
+            /** @description Stable range identifier within the artifact manifest generation. */
+            range_id: string;
+            /** @description Kind of children covered by this range, such as unit or chunk. */
+            range_kind: string;
+            /** @description Artifact namespace covered by this range. */
+            artifact_name: string;
+            /** @description Logical boundary used for splitting this range. */
+            split_boundary: string;
+            /** @description Current placement summary for the range. */
+            placement: string;
+            /**
+             * Format: uint64
+             * @description Owner group for this child artifact range, when assigned.
+             */
+            owner_group_id?: number | null;
+            /**
+             * Format: uint64
+             * @description Placement generation for range ownership metadata.
+             */
+            placement_generation?: number | null;
+            /** @description Current routing status for child writes in this range. */
+            route_status?: string | null;
+            /** @description Whether this range may split at its configured split boundary. */
+            split_eligible?: boolean | null;
+            /** @description Inclusive first internal child key covered by this range. */
+            start_key: string;
+            /** @description Exclusive end internal child key, or empty for the final range. */
+            end_key_exclusive: string;
+            /** @description Inclusive last internal child key covered by this range. */
+            last_key: string;
+            /** @description Number of child records covered by this range. */
+            child_count: number;
+            /** @description Approximate extracted text bytes covered by this range when available. */
+            text_bytes?: number | null;
+        };
+        /**
+         * @description Inspection view for a derived document artifact produced from a source
+         *     table row. The typed fields form the stable summary contract. The
+         *     embedded manifest/state JSON fields are optional raw detail intended
+         *     for admin/debug inspection so producers can evolve their internal unit
+         *     schema without changing this route contract.
+         */
+        DocumentArtifactManifest: {
+            /** @description Stable identity of the source document. */
+            document_id: string;
+            /**
+             * @description Name of the derived artifact.
+             * @example document_units_v1
+             */
+            artifact_name: string;
+            /** @description Stable identity of this artifact under the document. */
+            artifact_id: string;
+            /**
+             * Format: uint64
+             * @description Version of the opaque manifest payload schema.
+             */
+            manifest_version: number;
+            /**
+             * Format: uint64
+             * @description Monotonic generation for the current artifact state.
+             */
+            generation: number;
+            /** @description Source URL or source identifier used to derive this artifact. */
+            source_url: string;
+            /** @description Fingerprint of the source bytes and extractor configuration. */
+            source_fingerprint: string;
+            /** @description Effective source content type selected during extraction. */
+            content_type: string;
+            /**
+             * @description Producer route selected for the source content.
+             * @example pdf
+             */
+            route_type: string;
+            /** @description Reason extraction was skipped, when the source type is unsupported. */
+            unsupported_reason?: string | null;
+            /** @description Number of extracted document units. */
+            unit_count: number;
+            /** @description Number of indexable chunks derived from the units. */
+            chunk_count: number;
+            /** @description Parsed child range descriptors for this artifact generation. */
+            child_ranges: components["schemas"]["DocumentArtifactChildRange"][];
+            /** @description Number of storage child ranges used by this artifact. */
+            child_range_count: number;
+            /** @description Current materialization or merge status. */
+            merge_status: string;
+            /**
+             * Format: uint64
+             * @description Previous artifact generation used by the current merge plan.
+             */
+            merge_from_generation: number;
+            /**
+             * Format: uint64
+             * @description Target artifact generation produced by the current merge plan.
+             */
+            merge_to_generation: number;
+            /** @description Granularity used when computing merge-plan operations. */
+            merge_operation_granularity: string;
+            /** @description Number of merge operations recorded for this artifact. */
+            merge_operation_count: number;
+            /** @description Last extraction or materialization error code, when the current artifact generation failed. */
+            last_error_code?: string | null;
+            /** @description Human-readable last extraction or materialization error summary, when available. */
+            last_error_message?: string | null;
+            /** @description Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. */
+            manifest_json?: string;
+            /** @description Optional opaque JSON state for incremental processing. Present only for raw detail responses. */
+            state_json?: string | null;
+        };
+        /** @description Available derived document artifact manifests for a source document. */
+        DocumentArtifactManifestList: {
+            /** @description Stable identity of the source document. */
+            document_id: string;
+            artifacts: components["schemas"]["DocumentArtifactManifest"][];
+        };
+        DocumentArtifactReprocessResponse: {
+            /**
+             * @description Indicates that reprocessing was accepted.
+             * @enum {string}
+             */
+            reprocess: "triggered";
+        };
+        /** @description Bounded request for reprocessing a derived artifact across source rows in key order. */
+        DocumentArtifactTableReprocessRequest: {
+            /**
+             * @description Exclusive lower bound source document key. Use the prior response next_key to continue.
+             * @default
+             */
+            from_key?: string;
+            /**
+             * @description Inclusive upper bound source document key, or empty for the end of the table/range.
+             * @default
+             */
+            to_key?: string;
+            /**
+             * Format: uint32
+             * @description Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+             * @default 100
+             */
+            limit?: number;
+            /** @description Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span. */
+            shard_cursors?: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+        };
+        DocumentArtifactReprocessFailure: {
+            /** @description Source document key that failed during reprocessing. */
+            key: string;
+            /** @description Stable error code for the failed document reprocess attempt. */
+            error_code: string;
+        };
+        DocumentArtifactReprocessShardCursor: {
+            /**
+             * Format: uint64
+             * @description Physical table group that produced this cursor, when known.
+             */
+            group_id?: number | null;
+            /** @description Source key cursor for resuming this shard-local repair pass. */
+            next_key: string;
+            /** @description Number of source rows scanned by this shard-local pass. */
+            scanned: number;
+            /** @description Number of source rows whose artifact was reprocessed by this shard-local pass. */
+            reprocessed: number;
+            /** @description Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass. */
+            skipped: number;
+            /** @description Number of scanned source rows that failed in this shard-local pass. */
+            failed: number;
+            /**
+             * Format: uint32
+             * @description Effective scan limit used by this shard-local pass.
+             */
+            limit: number;
+        };
+        DocumentArtifactTableReprocessResponse: {
+            /**
+             * @description Indicates that reprocessing was accepted.
+             * @enum {string}
+             */
+            reprocess: "triggered";
+            /**
+             * @description Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+             * @enum {string}
+             */
+            reprocess_status: "in_progress" | "complete";
+            /** @description Name of the derived artifact that was reprocessed. */
+            artifact_name: string;
+            /** @description Number of source rows scanned by this bounded pass. */
+            scanned: number;
+            /** @description Number of source rows whose artifact was reprocessed. */
+            reprocessed: number;
+            /** @description Number of scanned source rows that no longer had a reprocessable source document. */
+            skipped: number;
+            /** @description Number of scanned source rows that failed before recording a normal artifact manifest. */
+            failed: number;
+            /**
+             * Format: uint32
+             * @description Effective scan limit used by the bounded pass.
+             */
+            limit: number;
+            /** @description Source key cursor for the next bounded pass, when more rows may remain. */
+            next_key?: string | null;
+            /** @description Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete. */
+            pending_shards: number;
+            failures: components["schemas"]["DocumentArtifactReprocessFailure"][];
+            /** @description Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor. */
+            shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+        };
+        /** @description Request to create a durable table artifact reprocess job. */
+        DocumentArtifactReprocessJobStartRequest: {
+            /**
+             * @description Exclusive lower bound source document key.
+             * @default
+             */
+            from_key?: string;
+            /**
+             * @description Inclusive upper bound source document key, or empty for the end of the table/range.
+             * @default
+             */
+            to_key?: string;
+            /**
+             * Format: uint32
+             * @description Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description When true, immediately runs the first bounded pass before returning the job state.
+             * @default true
+             */
+            advance?: boolean;
+        };
+        DocumentArtifactReprocessJob: {
+            /**
+             * Format: uint64
+             * @description Server-assigned durable repair job identifier.
+             */
+            job_id: number;
+            /** @description Table containing the source documents being repaired. */
+            table_name: string;
+            /** @description Name of the derived artifact being repaired. */
+            artifact_name: string;
+            /**
+             * @description Lifecycle phase of the repair job.
+             * @enum {string}
+             */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /**
+             * @description User-facing completion status derived from the phase and remaining cursors.
+             * @enum {string}
+             */
+            reprocess_status: "in_progress" | "complete" | "stopped";
+            /** @description Original exclusive lower bound for the job. */
+            from_key: string;
+            /** @description Original inclusive upper bound for the job, or empty for the end of the table/range. */
+            to_key: string;
+            /**
+             * Format: uint32
+             * @description Current per-shard bounded pass limit.
+             */
+            limit: number;
+            /** @description Single-shard continuation key when no shard cursors are present. */
+            next_key?: string | null;
+            /** @description Cumulative source rows scanned by completed passes. */
+            scanned: number;
+            /** @description Cumulative source rows whose artifact was reprocessed. */
+            reprocessed: number;
+            /** @description Cumulative source rows skipped by completed passes. */
+            skipped: number;
+            /** @description Cumulative source rows that failed during completed passes. */
+            failed: number;
+            /** @description Number of shard-local continuations still pending. */
+            pending_shards: number;
+            /** @description Failures from the most recent completed pass. */
+            failures: components["schemas"]["DocumentArtifactReprocessFailure"][];
+            /** @description Per-shard continuation cursors to resume on the next advance operation. */
+            shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
+            /** @description Last terminal or transient job error, when available. */
+            last_error?: string | null;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp when the job was created.
+             */
+            created_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp when the job was last updated.
+             */
+            last_updated_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Monotonic server timestamp after which the retained job status may be removed.
+             */
+            expires_at_millis: number;
         };
         ClusterDataNodeStatus: {
             /** Format: uint64 */
@@ -4593,6 +5105,38 @@ export interface components {
                 [key: string]: unknown;
             };
             _source?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description Stable ancestry envelope for derived document hierarchy hits. Present when
+             *     the hit is a derived unit/chunk/embedding artifact or when a source-level
+             *     rollup includes child chunks. Standard fields include `level`,
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+             *     `ancestors` with response-local or requested DB-backed source/unit context when available.
+             */
+            hierarchy?: {
+                /**
+                 * @description Hierarchy level represented by this hit.
+                 * @enum {string}
+                 */
+                level?: "source" | "unit" | "chunk" | "artifact" | "embedding";
+                /** @description Source document key that owns this derived hit. */
+                parent_doc_key?: string;
+                /** @description Unit identifier when the hit is attached to a document unit. */
+                parent_unit_id?: string;
+                /** @description Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`. */
+                artifact?: {
+                    [key: string]: unknown;
+                };
+                /** @description Ancestor context. Includes `source.id` for derived hits, `source.document` for materialized source rollups or requested source hydration, and `unit.document` for direct unit hits or requested unit hydration when the unit payload is present. */
+                ancestors?: {
+                    [key: string]: unknown;
+                };
+                /** @description Child chunk hits included for source-level rollups. */
+                chunks?: {
+                    [key: string]: unknown;
+                }[];
+            } & {
                 [key: string]: unknown;
             };
             /**
@@ -8031,6 +8575,10 @@ export interface components {
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Parsed evidence envelope for provenance labels and edge metadata */
+            evidence?: {
+                [key: string]: unknown;
+            };
             /** @description Connected edges (when include_edges=true) */
             edges?: components["schemas"]["Edge"][];
         };
@@ -9413,6 +9961,24 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Method not allowed for this resource */
+        MethodNotAllowed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Service is temporarily unavailable */
+        ServiceUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Unsupported request media or content encoding */
         UnsupportedMediaType: {
             headers: {
@@ -10634,7 +11200,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Key of the record to lookup */
+                /** @description Key of the document to retrieve */
                 key: string;
             };
             cookie?: never;
@@ -10661,6 +11227,280 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listDocumentArtifactManifests: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Response detail level. `summary` returns typed manifest fields only.
+                 *     `raw` also includes opaque manifest/state JSON and requires table
+                 *     admin permission when authentication is enabled.
+                 */
+                detail?: "summary" | "raw";
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact manifest list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactManifestList"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reprocessDocumentArtifactRange: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DocumentArtifactTableReprocessRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded reprocessing pass was accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactTableReprocessResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    startDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DocumentArtifactReprocessJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Reprocess job was created */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job was already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            /** @description Reprocess job advanced */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    cancelDocumentArtifactReprocessJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+                /** @description Reprocess job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocess job was cancelled or already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getDocumentArtifactManifest: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Response detail level. `summary` returns typed manifest fields only.
+                 *     `raw` also includes opaque manifest/state JSON and requires table
+                 *     admin permission when authentication is enabled.
+                 */
+                detail?: "summary" | "raw";
+            };
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact manifest found */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactManifest"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reprocessDocumentArtifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Percent-encoded source document key. */
+                key: string;
+                /** @description Name of the derived document artifact. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reprocessing was accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     listIndexes: {

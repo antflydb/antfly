@@ -258,17 +258,111 @@ pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.js
     return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Lookup a key in a table
+/// Retrieve a document by key
 pub const LookupKeyPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Key of the record to lookup
+    /// Key of the document to retrieve
     key: []const u8,
 };
 
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+};
+
+/// List derived document artifact manifests
+pub const ListDocumentArtifactManifestsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+};
+
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+/// Reprocess a derived document artifact across a table range
+pub const ReprocessDocumentArtifactRangePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for reprocessDocumentArtifactRange.
+pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Create a derived document artifact reprocess job
+pub const StartDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for startDocumentArtifactReprocessJob.
+pub fn parseStartDocumentArtifactReprocessJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactReprocessJobStartRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactReprocessJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get derived document artifact reprocess job status
+pub const GetDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a derived document artifact reprocess job
+pub const AdvanceDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Cancel a derived document artifact reprocess job
+pub const CancelDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Inspect a derived document artifact manifest
+pub const GetDocumentArtifactManifestPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+pub const GetDocumentArtifactManifestParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+/// Reprocess a derived document artifact
+pub const ReprocessDocumentArtifactPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
 };
 
 /// List all indexes for a table
@@ -351,7 +445,15 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/lookup/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifactRange" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel", .operation_id = "cancelDocumentArtifactReprocessJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
@@ -407,6 +509,14 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
+        if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
+        if (!@hasDecl(Impl, "reprocessDocumentArtifactRange")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifactRange'");
+        if (!@hasDecl(Impl, "startDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'startDocumentArtifactReprocessJob'");
+        if (!@hasDecl(Impl, "getDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactReprocessJob'");
+        if (!@hasDecl(Impl, "advanceDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'advanceDocumentArtifactReprocessJob'");
+        if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
+        if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
+        if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -462,7 +572,15 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/restore", restoreTable);
             try server.put("/tables/:tableName/schema", updateSchema);
             try server.post("/tables/:tableName/lookup", scanKeys);
-            try server.get("/tables/:tableName/lookup/:key", lookupKey);
+            try server.get("/tables/:tableName/documents/:key", lookupKey);
+            try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
+            try server.post("/tables/:tableName/artifacts/:artifactName:reprocess", reprocessDocumentArtifactRange);
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs", startDocumentArtifactReprocessJob);
+            try server.get("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId", getDocumentArtifactReprocessJob);
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId:advance", advanceDocumentArtifactReprocessJob);
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId:cancel", cancelDocumentArtifactReprocessJob);
+            try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", getDocumentArtifactManifest);
+            try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName:reprocess", reprocessDocumentArtifact);
             try server.get("/tables/:tableName/indexes", listIndexes);
             try server.get("/tables/:tableName/indexes/:indexName", getIndex);
             try server.post("/tables/:tableName/indexes/:indexName", createIndex);
@@ -760,8 +878,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.scanKeys(ctx, table_name);
         }
 
-        /// Lookup a key in a table
-        /// GET /tables/{tableName}/lookup/{key}
+        /// Retrieve a document by key
+        /// GET /tables/{tableName}/documents/{key}
         fn lookupKey(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
@@ -770,6 +888,89 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .fields = ctx.query("fields"),
             };
             return impl.lookupKey(ctx, table_name, key, query_params);
+        }
+
+        /// List derived document artifact manifests
+        /// GET /tables/{tableName}/documents/{key}/artifacts
+        fn listDocumentArtifactManifests(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = ListDocumentArtifactManifestsParams{
+                .detail = ctx.query("detail"),
+            };
+            return impl.listDocumentArtifactManifests(ctx, table_name, key, query_params);
+        }
+
+        /// Reprocess a derived document artifact across a table range
+        /// POST /tables/{tableName}/artifacts/{artifactName}:reprocess
+        fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.reprocessDocumentArtifactRange(ctx, table_name, artifact_name);
+        }
+
+        /// Create a derived document artifact reprocess job
+        /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs
+        fn startDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.startDocumentArtifactReprocessJob(ctx, table_name, artifact_name);
+        }
+
+        /// Get derived document artifact reprocess job status
+        /// GET /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}
+        fn getDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.getDocumentArtifactReprocessJob(ctx, table_name, artifact_name, job_id);
+        }
+
+        /// Advance a derived document artifact reprocess job
+        /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance
+        fn advanceDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.advanceDocumentArtifactReprocessJob(ctx, table_name, artifact_name, job_id);
+        }
+
+        /// Cancel a derived document artifact reprocess job
+        /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel
+        fn cancelDocumentArtifactReprocessJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.cancelDocumentArtifactReprocessJob(ctx, table_name, artifact_name, job_id);
+        }
+
+        /// Inspect a derived document artifact manifest
+        /// GET /tables/{tableName}/documents/{key}/artifacts/{artifactName}
+        fn getDocumentArtifactManifest(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            const query_params = GetDocumentArtifactManifestParams{
+                .detail = ctx.query("detail"),
+            };
+            return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
+        }
+
+        /// Reprocess a derived document artifact
+        /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+        fn reprocessDocumentArtifact(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
         }
 
         /// List all indexes for a table
@@ -849,6 +1050,14 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
+//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
+//   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
