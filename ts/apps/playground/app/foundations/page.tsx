@@ -510,7 +510,7 @@ export default function FoundationsPage() {
 
       <section className="space-y-4">
         <SectionHeading eyebrow="Typography" title="Heading elements" />
-        <div className="border-[1.5px] border-border-strong bg-muted/30 p-4 text-sm text-muted-foreground">
+        <div className="border-(length:--border-width) border-border-strong bg-muted/30 p-4 text-sm text-muted-foreground">
           Tailwind's preflight resets <code className="font-mono text-xs">h1</code>&ndash;
           <code className="font-mono text-xs">h6</code> to inherit font-size. Our base styles apply
           Aeonik / bold / tight tracking to every heading automatically, but{" "}
@@ -590,7 +590,7 @@ export default function FoundationsPage() {
           {RADII.map((r) => (
             <div key={r.varName} className="flex flex-col items-center gap-3">
               <div
-                className="size-24 border-[1.5px] border-border-strong bg-muted"
+                className="size-24 border-(length:--border-width) border-border-strong bg-muted"
                 style={{ borderRadius: `var(${r.varName})` }}
               />
               <div className="text-center">
@@ -629,7 +629,7 @@ export default function FoundationsPage() {
           {SHADOWS.map((s) => (
             <div key={s.varName} className="flex flex-col items-center gap-3">
               <div
-                className="flex size-28 items-center justify-center border-[1.5px] border-border-strong bg-card"
+                className="flex size-28 items-center justify-center border-(length:--border-width) border-border-strong bg-card"
                 style={{ boxShadow: `var(${s.varName})` }}
               >
                 <span className="font-mono text-xs text-muted-foreground">{s.name}</span>
@@ -720,7 +720,7 @@ export default function FoundationsPage() {
         </p>
 
         <div className="grid gap-6 md:grid-cols-2">
-          <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
+          <div className="space-y-4 border-(length:--border-width) border-border-strong bg-card p-6">
             <Kicker>Square — 12×12 · low-res</Kicker>
             <div className="flex items-end gap-6">
               {(["sm", "md", "lg", "xl"] as const).map((s) => (
@@ -732,7 +732,7 @@ export default function FoundationsPage() {
             </div>
           </div>
 
-          <div className="space-y-4 border-[1.5px] border-border-strong bg-card p-6">
+          <div className="space-y-4 border-(length:--border-width) border-border-strong bg-card p-6">
             <Kicker>Diagonal — 24×24 · high-fidelity</Kicker>
             <div className="flex items-end gap-6">
               {(["sm", "md", "lg", "xl"] as const).map((s) => (
@@ -766,7 +766,7 @@ export default function FoundationsPage() {
 
         <div className="space-y-3">
           <Kicker>Size scale</Kicker>
-          <div className="flex items-end gap-8 border-[1.5px] border-border-strong p-6">
+          <div className="flex items-end gap-8 border-(length:--border-width) border-border-strong p-6">
             {(
               [
                 { size: "sm" as const, px: "24px", use: "inline, badges" },
@@ -788,7 +788,7 @@ export default function FoundationsPage() {
 
         <div className="space-y-3">
           <Kicker>Lockup</Kicker>
-          <div className="flex flex-wrap items-center gap-10 border-[1.5px] border-border-strong p-6">
+          <div className="flex flex-wrap items-center gap-10 border-(length:--border-width) border-border-strong p-6">
             <Lockup>
               <Logo src="/af-logo.svg" srcDark="/af-logo-dark.svg" alt="Antfly" />
               <Wordmark className="text-lg">Antfly</Wordmark>
@@ -878,7 +878,7 @@ export default function FoundationsPage() {
           container.
         </p>
 
-        <div className="border-[1.5px] border-border-strong bg-muted/30 p-4 text-xs text-muted-foreground">
+        <div className="border-(length:--border-width) border-border-strong bg-muted/30 p-4 text-xs text-muted-foreground">
           <p className="font-mono">
             compact = 0.22rem · default = 0.25rem (Tailwind) · comfortable = 0.3rem
           </p>
@@ -904,7 +904,7 @@ function DensitySample({
   return (
     <div
       data-density={density}
-      className="flex h-full flex-col gap-4 border-[1.5px] border-border-strong bg-card p-6"
+      className="flex h-full flex-col gap-4 border-(length:--border-width) border-border-strong bg-card p-6"
     >
       <Kicker>{label}</Kicker>
       <Card>
@@ -954,7 +954,7 @@ function SectionHeading({
  */
 function ColorSwatch({ name, varName, light, dark, description }: TokenDef) {
   return (
-    <div className="overflow-hidden border-[1.5px] border-border-strong">
+    <div className="overflow-hidden border-(length:--border-width) border-border-strong">
       <div className="grid grid-cols-2">
         <Chip mode="light" color={light} />
         <Chip mode="dark" color={dark} />
@@ -1002,7 +1002,7 @@ function Chip({ mode, color }: { mode: "light" | "dark"; color: string }) {
 
 function TokenScaleSwatch({ scale }: { scale: TokenScale }) {
   return (
-    <div className="border-[1.5px] border-border-strong p-4">
+    <div className="border-(length:--border-width) border-border-strong p-4">
       <div className="mb-3">
         <p className="text-sm font-medium">{scale.name}</p>
         <p className="text-xs text-muted-foreground">{scale.description}</p>
@@ -1081,7 +1081,7 @@ function FontSpecimen({
   caption?: string;
 }) {
   return (
-    <div className="space-y-3 border-[1.5px] border-border-strong p-6">
+    <div className="space-y-3 border-(length:--border-width) border-border-strong p-6">
       <div className="flex items-baseline justify-between gap-4">
         <Kicker>{label}</Kicker>
         <code className="font-mono text-xs text-muted-foreground">{varName}</code>

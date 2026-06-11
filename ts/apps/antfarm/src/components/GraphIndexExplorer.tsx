@@ -605,7 +605,7 @@ export function GraphIndexExplorer({
             {availableEdgeTypes.length > 0 && (
               <div className="space-y-2">
                 <Label>Edge types</Label>
-                <div className="grid gap-2 rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2">
+                <div className="grid gap-2 rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2">
                   {availableEdgeTypes.map((edgeType) => {
                     const checkboxId = controlId("graph-edge-type", edgeType);
                     return (
@@ -737,7 +737,7 @@ export function GraphIndexExplorer({
                   {graph.edges.slice(0, 40).map((edge) => (
                     <div
                       key={edge.id}
-                      className="rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2 text-xs"
+                      className="rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <Badge variant={edge.pathEdge ? "default" : "default"}>
