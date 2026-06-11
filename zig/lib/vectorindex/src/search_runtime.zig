@@ -60,6 +60,7 @@ pub const SearchScratch = struct {
     posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_entry_bytes: u64 = 0,
+    posting_member_cache_admission_enabled: bool = true,
 
     pub fn init(
         alloc: Allocator,
@@ -158,6 +159,10 @@ pub const SearchScratch = struct {
         if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
     }
 
+    pub fn setPostingMemberCacheAdmissionEnabled(self: *SearchScratch, enabled: bool) void {
+        self.posting_member_cache_admission_enabled = enabled;
+    }
+
     pub fn cachedPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64) ?[]const u64 {
         for (self.posting_member_cache.items, 0..) |entry, i| {
             if (entry.posting_id == posting_id and entry.mutation_version == mutation_version) {
@@ -179,7 +184,7 @@ pub const SearchScratch = struct {
     pub fn cachePostingMembers(self: *SearchScratch, alloc: Allocator, posting_id: u64, mutation_version: u64, members: []const u64) !PostingMemberCacheResult {
         const member_bytes = byteLen(members);
         var result = PostingMemberCacheResult{ .member_bytes = self.posting_member_cache_bytes };
-        if (self.max_posting_member_cache_bytes == 0 or self.max_posting_member_cache_entry_bytes == 0) {
+        if (!self.posting_member_cache_admission_enabled or self.max_posting_member_cache_bytes == 0 or self.max_posting_member_cache_entry_bytes == 0) {
             result.admission_skips += 1;
             return result;
         }

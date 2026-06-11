@@ -665,9 +665,13 @@ pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
     defer self.scratch_mu.unlock();
     if (self.cached_scratch) |scratch| {
         self.cached_scratch = null;
-        return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
+        var configured = scratch;
+        if (comptime @hasDecl(@TypeOf(self.*), "configureSearchScratch")) {
+            self.configureSearchScratch(&configured);
+        }
+        return .{ .scratch = configured, .from_cache = true, .accounted_bytes = configured.bytes() };
     }
-    const scratch = try SearchScratch.init(
+    var scratch = try SearchScratch.init(
         self.alloc,
         @intCast(self.metadata.dims),
         @intCast(self.metadata.branching_factor),
@@ -675,6 +679,9 @@ pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
         @intCast(self.config.max_posting_overlay_cache_bytes),
         @intCast(self.config.max_posting_overlay_cache_entry_bytes),
     );
+    if (comptime @hasDecl(@TypeOf(self.*), "configureSearchScratch")) {
+        self.configureSearchScratch(&scratch);
+    }
     if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
         self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + scratch.bytes());
     }

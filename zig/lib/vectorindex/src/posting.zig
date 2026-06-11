@@ -526,7 +526,7 @@ pub const PostingFormat = struct {
         return base_sequence;
     }
 
-    fn encodedDeltaTailSize(records: []const PostingDeltaRecord) !usize {
+    pub fn encodedDeltaTailSize(records: []const PostingDeltaRecord) !usize {
         var total: usize = delta_header_size;
         const base_sequence = baseSequenceForDeltaTail(records);
         for (records) |record| {
@@ -672,11 +672,15 @@ pub const PostingFormat = struct {
         switch (record.op) {
             .insert, .replace => {
                 removeMemberFromEncodedBase(out, member_count, record.vector_id);
-                writeEncodedBaseMember(out, base_header_size + member_count.* * @sizeOf(u64), record.vector_id);
-                member_count.* += 1;
+                appendEncodedBaseMemberAssumeCapacity(out, member_count, record.vector_id);
             },
             .tombstone => removeMemberFromEncodedBase(out, member_count, record.vector_id),
         }
+    }
+
+    pub fn appendEncodedBaseMemberAssumeCapacity(out: []u8, member_count: *usize, vector_id: VectorId) void {
+        writeEncodedBaseMember(out, base_header_size + member_count.* * @sizeOf(u64), vector_id);
+        member_count.* += 1;
     }
 
     fn removeMemberFromEncodedBase(out: []u8, member_count: *usize, vector_id: VectorId) void {
@@ -810,39 +814,59 @@ pub const PostingStore = struct {
         }
     };
 
-    const FoldScratch = struct {
+    pub const FoldScratch = struct {
         delta_records: []PostingDeltaRecord = &.{},
         delta_record_count: usize = 0,
         encoded_base: []u8 = &.{},
+        removed_members: std.AutoHashMapUnmanaged(VectorId, void) = .empty,
+        appended_positions: std.AutoHashMapUnmanaged(VectorId, usize) = .empty,
+        appended_ids: []VectorId = &.{},
+        appended_live: []bool = &.{},
+        appended_count: usize = 0,
 
-        fn ensureDeltaRecordCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
+        pub fn ensureDeltaRecordCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
             if (self.delta_records.len < needed) self.delta_records = try alloc.realloc(self.delta_records, needed);
         }
 
-        fn deltaRecordCount(self: *const FoldScratch) usize {
+        pub fn deltaRecordCount(self: *const FoldScratch) usize {
             return self.delta_record_count;
         }
 
-        fn appendDeltaRecordAssumeCapacity(self: *FoldScratch, record: PostingDeltaRecord) void {
+        pub fn appendDeltaRecordAssumeCapacity(self: *FoldScratch, record: PostingDeltaRecord) void {
             self.delta_records[self.delta_record_count] = record;
             self.delta_record_count += 1;
         }
 
-        fn deltaRecords(self: *const FoldScratch) []const PostingDeltaRecord {
+        pub fn deltaRecords(self: *const FoldScratch) []const PostingDeltaRecord {
             return self.delta_records[0..self.delta_record_count];
         }
 
-        fn resetDeltaRecords(self: *FoldScratch) void {
+        pub fn resetDeltaRecords(self: *FoldScratch) void {
             self.delta_record_count = 0;
         }
 
-        fn ensureEncodedBaseCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
+        pub fn ensureEncodedBaseCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
             if (self.encoded_base.len < needed) self.encoded_base = try alloc.realloc(self.encoded_base, needed);
         }
 
-        fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
+        pub fn ensureAppendCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
+            if (self.appended_ids.len < needed) self.appended_ids = try alloc.realloc(self.appended_ids, needed);
+            if (self.appended_live.len < needed) self.appended_live = try alloc.realloc(self.appended_live, needed);
+        }
+
+        pub fn resetFoldApply(self: *FoldScratch) void {
+            self.removed_members.clearRetainingCapacity();
+            self.appended_positions.clearRetainingCapacity();
+            self.appended_count = 0;
+        }
+
+        pub fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
             alloc.free(self.delta_records);
             alloc.free(self.encoded_base);
+            self.removed_members.deinit(alloc);
+            self.appended_positions.deinit(alloc);
+            alloc.free(self.appended_ids);
+            alloc.free(self.appended_live);
             self.* = .{};
         }
     };
@@ -1150,6 +1174,32 @@ pub const PostingStore = struct {
 
     pub fn appendDeltaRecords(index: anytype, txn: anytype, posting_id: PostingId, records: []const PostingDeltaRecord) !void {
         if (records.len == 0) return;
+        const max_value_bytes = maxPostingDeltaTailValueBytes(index);
+        if (max_value_bytes != 0 and records.len > 1) {
+            var start: usize = 0;
+            while (start < records.len) {
+                var end = start + 1;
+                while (end < records.len) : (end += 1) {
+                    const candidate = records[start .. end + 1];
+                    const candidate_bytes = PostingFormat.encodedDeltaTailSize(candidate) catch break;
+                    if (candidate_bytes > max_value_bytes) break;
+                }
+                try appendDeltaRecordChunk(index, txn, posting_id, records[start..end]);
+                start = end;
+            }
+            return;
+        }
+        try appendDeltaRecordChunk(index, txn, posting_id, records);
+    }
+
+    fn maxPostingDeltaTailValueBytes(index: anytype) usize {
+        if (comptime @hasField(@TypeOf(index.config), "max_posting_delta_tail_value_bytes")) {
+            return index.config.max_posting_delta_tail_value_bytes;
+        }
+        return 0;
+    }
+
+    fn appendDeltaRecordChunk(index: anytype, txn: anytype, posting_id: PostingId, records: []const PostingDeltaRecord) !void {
         var key_buf: [18]u8 = undefined;
         const encoded = try PostingFormat.encodeDeltaTail(index.alloc, records);
         defer index.alloc.free(encoded);
@@ -1304,6 +1354,72 @@ pub const PostingStore = struct {
         notePostingBasePut(index, key.len, encoded.len);
     }
 
+    fn foldShouldUseIndexedApply(base_member_count: usize, delta_record_count: usize) bool {
+        return base_member_count >= 128 or delta_record_count >= 32;
+    }
+
+    fn removeAppendedMemberIfPresent(scratch: *FoldScratch, vector_id: VectorId) void {
+        if (scratch.appended_positions.fetchRemove(vector_id)) |removed| {
+            scratch.appended_live[removed.value] = false;
+        }
+    }
+
+    fn appendLiveMember(alloc: std.mem.Allocator, scratch: *FoldScratch, vector_id: VectorId) !void {
+        try scratch.ensureAppendCapacity(alloc, scratch.appended_count + 1);
+        const pos = scratch.appended_count;
+        scratch.appended_count += 1;
+        scratch.appended_ids[pos] = vector_id;
+        scratch.appended_live[pos] = true;
+        try scratch.appended_positions.put(alloc, vector_id, pos);
+    }
+
+    fn applyIndexedFoldPlan(
+        alloc: std.mem.Allocator,
+        scratch: *FoldScratch,
+        base_header: PostingBaseHeader,
+        records: []const PostingDeltaRecord,
+    ) !usize {
+        scratch.resetFoldApply();
+        try scratch.removed_members.ensureTotalCapacity(alloc, @intCast(records.len));
+        try scratch.appended_positions.ensureTotalCapacity(alloc, @intCast(records.len));
+        try scratch.ensureAppendCapacity(alloc, records.len);
+
+        for (records) |record| {
+            removeAppendedMemberIfPresent(scratch, record.vector_id);
+            try scratch.removed_members.put(alloc, record.vector_id, {});
+            switch (record.op) {
+                .insert, .replace => try appendLiveMember(alloc, scratch, record.vector_id),
+                .tombstone => {},
+            }
+        }
+
+        var member_count: usize = 0;
+        var read_index: usize = 0;
+        while (read_index < base_header.member_count) : (read_index += 1) {
+            const member = PostingFormat.readEncodedBaseMember(
+                scratch.encoded_base,
+                PostingFormat.base_header_size + read_index * @sizeOf(VectorId),
+            );
+            if (scratch.removed_members.contains(member)) continue;
+            PostingFormat.appendEncodedBaseMemberAssumeCapacity(scratch.encoded_base, &member_count, member);
+        }
+
+        var append_index: usize = 0;
+        while (append_index < scratch.appended_count) : (append_index += 1) {
+            if (!scratch.appended_live[append_index]) continue;
+            PostingFormat.appendEncodedBaseMemberAssumeCapacity(scratch.encoded_base, &member_count, scratch.appended_ids[append_index]);
+        }
+        return member_count;
+    }
+
+    fn applyDirectFoldPlan(scratch: *FoldScratch, base_member_count: usize, records: []const PostingDeltaRecord) usize {
+        var materialized_len = base_member_count;
+        for (records) |record| {
+            PostingFormat.applyDeltaRecordToEncodedBase(scratch.encoded_base, &materialized_len, record);
+        }
+        return materialized_len;
+    }
+
     pub fn foldDeltaTailIntoBaseWithOptions(
         index: anytype,
         txn: anytype,
@@ -1313,8 +1429,17 @@ pub const PostingStore = struct {
     ) !FoldDeltaTailResult {
         const base_data = try loadBaseData(index, txn, posting_id, is_not_found);
         const base_header = try PostingFormat.decodeBaseHeader(base_data);
-        var scratch = FoldScratch{};
-        defer scratch.deinit(index.alloc);
+        var scratch = if (comptime @hasDecl(@TypeOf(index.*), "acquirePostingFoldScratch"))
+            try index.acquirePostingFoldScratch()
+        else
+            FoldScratch{};
+        defer {
+            if (comptime @hasDecl(@TypeOf(index.*), "releasePostingFoldScratch")) {
+                index.releasePostingFoldScratch(&scratch);
+            } else {
+                scratch.deinit(index.alloc);
+            }
+        }
         const stats = try scanDeltaTailForFold(index, txn, posting_id, index.alloc, &scratch, base_header.generation);
         if (stats.records == 0) {
             return .{
@@ -1346,10 +1471,10 @@ pub const PostingStore = struct {
         try scratch.ensureEncodedBaseCapacity(index.alloc, encoded_capacity);
         const next_generation = base_header.generation +| 1;
         _ = try PostingFormat.initializeEncodedBaseFromBaseData(scratch.encoded_base, base_data, posting_id, next_generation);
-        var materialized_len = base_header.member_count;
-        for (scratch.deltaRecords()) |record| {
-            PostingFormat.applyDeltaRecordToEncodedBase(scratch.encoded_base, &materialized_len, record);
-        }
+        const materialized_len = if (foldShouldUseIndexedApply(base_header.member_count, scratch.deltaRecordCount()))
+            try applyIndexedFoldPlan(index.alloc, &scratch, base_header, scratch.deltaRecords())
+        else
+            applyDirectFoldPlan(&scratch, base_header.member_count, scratch.deltaRecords());
         const encoded = try PostingFormat.finishEncodedBase(scratch.encoded_base, materialized_len);
         var base_key_buf: [10]u8 = undefined;
         const written_base_key_bytes = hbc.encodePostingBaseKey(&base_key_buf, posting_id).len;
@@ -2817,6 +2942,37 @@ test "posting store can append multiple delta records in one key" {
     try std.testing.expectEqual(@as(u64, 49), index.write_profile.posting_delta_fold_written_base_value_bytes);
 }
 
+test "posting store chunks grouped delta records by encoded value target" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{
+        .alloc = alloc,
+        .config = .{
+            .dims = 2,
+            .max_posting_delta_tail_value_bytes = 24,
+        },
+    };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 5) << 32) | 1, .op = .insert, .vector_id = 1 },
+        .{ .sequence = (@as(u64, 5) << 32) | 2, .op = .insert, .vector_id = 2 },
+        .{ .sequence = (@as(u64, 5) << 32) | 3, .op = .insert, .vector_id = 3 },
+        .{ .sequence = (@as(u64, 5) << 32) | 4, .op = .insert, .vector_id = 4 },
+    };
+    try PostingStore.appendDeltaRecords(&index, &txn, 9, records[0..]);
+    try std.testing.expectEqual(@as(usize, 2), index.delta_entries.items.len);
+
+    const deltas = try PostingStore.loadDeltaTail(&index, &txn, 9);
+    defer alloc.free(deltas);
+    try std.testing.expectEqual(@as(usize, records.len), deltas.len);
+    for (records, 0..) |record, i| {
+        try std.testing.expectEqual(record.sequence, deltas[i].sequence);
+        try std.testing.expectEqual(record.op, deltas[i].op);
+        try std.testing.expectEqual(record.vector_id, deltas[i].vector_id);
+    }
+}
+
 test "assignment map shadow record increments version while preserving legacy mapping" {
     const alloc = std.testing.allocator;
     var index = PostingPersistenceTestIndex{
@@ -3086,6 +3242,44 @@ test "posting store skips delta fold when materialized member cap would be excee
     const deltas_after_skip = try PostingStore.loadDeltaTail(&index, &txn, 9);
     defer alloc.free(deltas_after_skip);
     try std.testing.expectEqual(@as(usize, 1), deltas_after_skip.len);
+}
+
+test "posting store indexed delta fold compacts tombstones and repeated inserts" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{ .alloc = alloc };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    var members: [130]VectorId = undefined;
+    for (&members, 0..) |*member, i| member.* = @intCast(i + 1);
+    try PostingStore.saveBase(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = members[0..],
+    });
+
+    try PostingStore.appendDeltaRecords(&index, &txn, 9, &.{
+        .{ .sequence = (@as(u64, 5) << 32) | 1, .op = .tombstone, .vector_id = 2 },
+        .{ .sequence = (@as(u64, 5) << 32) | 2, .op = .insert, .vector_id = 200 },
+        .{ .sequence = (@as(u64, 5) << 32) | 3, .op = .insert, .vector_id = 200 },
+        .{ .sequence = (@as(u64, 5) << 32) | 4, .op = .replace, .vector_id = 3 },
+        .{ .sequence = (@as(u64, 5) << 32) | 5, .op = .tombstone, .vector_id = 200 },
+        .{ .sequence = (@as(u64, 5) << 32) | 6, .op = .insert, .vector_id = 201 },
+    });
+
+    const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
+        .min_delta_records = 1,
+    });
+    try std.testing.expect(!folded.skipped);
+
+    var base_after_fold = try PostingStore.loadBase(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer base_after_fold.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 5), base_after_fold.generation);
+    try std.testing.expectEqual(@as(usize, 130), base_after_fold.members.len);
+    try std.testing.expect(std.mem.indexOfScalar(VectorId, base_after_fold.members, 2) == null);
+    try std.testing.expect(std.mem.indexOfScalar(VectorId, base_after_fold.members, 200) == null);
+    try std.testing.expectEqual(@as(VectorId, 3), base_after_fold.members[base_after_fold.members.len - 2]);
+    try std.testing.expectEqual(@as(VectorId, 201), base_after_fold.members[base_after_fold.members.len - 1]);
 }
 
 test "posting store query member copy overlays base and delta tail in shadow mode" {

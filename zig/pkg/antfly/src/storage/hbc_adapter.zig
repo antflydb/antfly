@@ -1285,6 +1285,8 @@ pub const HBCIndex = struct {
     hilbert: ?vec.Hilbert,
     scratch_mu: std.atomic.Mutex,
     cached_scratch: ?SearchScratch,
+    posting_fold_scratch_mu: std.atomic.Mutex,
+    cached_posting_fold_scratch: ?vectorindex_posting.PostingStore.FoldScratch,
     routing_scratch_mu: std.atomic.Mutex,
     cached_routing_scratch: ?RoutingScratch,
     flat_centroid_mu: std.atomic.Mutex,
@@ -1844,6 +1846,8 @@ pub const HBCIndex = struct {
             .hilbert = null,
             .scratch_mu = .unlocked,
             .cached_scratch = null,
+            .posting_fold_scratch_mu = .unlocked,
+            .cached_posting_fold_scratch = null,
             .routing_scratch_mu = .unlocked,
             .cached_routing_scratch = null,
             .flat_centroid_mu = .unlocked,
@@ -2363,6 +2367,9 @@ pub const HBCIndex = struct {
         if (self.hilbert) |*hilbert| hilbert.deinit();
         if (self.cached_scratch) |*scratch| {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());
+            scratch.deinit(self.alloc);
+        }
+        if (self.cached_posting_fold_scratch) |*scratch| {
             scratch.deinit(self.alloc);
         }
         if (self.cached_routing_scratch) |*scratch| {
@@ -3508,6 +3515,36 @@ pub const HBCIndex = struct {
 
     pub fn refreshSearchScratchAccounting(self: *HBCIndex, handle: *ScratchHandle) void {
         vectorindex_hbc_runtime.refreshSearchScratchAccounting(self, handle);
+    }
+
+    pub fn configureSearchScratch(self: *HBCIndex, scratch: *SearchScratch) void {
+        const manager = self.resource_manager orelse {
+            scratch.setPostingMemberCacheAdmissionEnabled(true);
+            return;
+        };
+        const resource_stats = manager.sliceStats(.dense_search_working_set);
+        scratch.setPostingMemberCacheAdmissionEnabled(resource_stats.pressure == .normal);
+    }
+
+    pub fn acquirePostingFoldScratch(self: *HBCIndex) !vectorindex_posting.PostingStore.FoldScratch {
+        lockAtomic(&self.posting_fold_scratch_mu);
+        defer self.posting_fold_scratch_mu.unlock();
+        if (self.cached_posting_fold_scratch) |scratch| {
+            self.cached_posting_fold_scratch = null;
+            return scratch;
+        }
+        return .{};
+    }
+
+    pub fn releasePostingFoldScratch(self: *HBCIndex, scratch: *vectorindex_posting.PostingStore.FoldScratch) void {
+        lockAtomic(&self.posting_fold_scratch_mu);
+        defer self.posting_fold_scratch_mu.unlock();
+        if (self.cached_posting_fold_scratch == null) {
+            self.cached_posting_fold_scratch = scratch.*;
+            scratch.* = .{};
+        } else {
+            scratch.deinit(self.alloc);
+        }
     }
 
     pub fn transformVector(self: *HBCIndex, original: []const f32, transformed: []f32) []const f32 {
