@@ -5,9 +5,9 @@ import { cn } from "@/lib/utils";
 
 const alertVariants = cva(
   [
-    // chassis: square, token-width bordered, flat. Left border bumped to 4px,
-    // recolored to the semantic state — the only color signal in the component.
-    "relative w-full bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong border-l-4 px-[14px] py-[12px]",
+    // quiet panel: tinted-neutral surface, no outer chassis — a 2px semantic
+    // left edge plus icon/title color carry the state.
+    "relative w-full bg-background-secondary text-foreground rounded-none border-0 border-l-2 px-4 py-3.5",
     // grid: icon column collapses to 0 when no svg present
     "grid has-[>svg]:grid-cols-[18px_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-[11px] gap-y-0 items-start",
     "[&>svg]:size-[18px] [&>svg]:translate-y-[1px]",
@@ -51,8 +51,8 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="alert-title"
       className={cn(
-        // mono uppercase callout — the loud register inside the chassis
-        "col-start-2 font-mono uppercase tracking-[0.06em] text-[12px] font-bold leading-none mb-[2px]",
+        // mono uppercase callout — label register, medium weight
+        "col-start-2 font-mono uppercase tracking-[0.06em] text-[12px] font-medium leading-none mb-[2px]",
         className
       )}
       {...props}
