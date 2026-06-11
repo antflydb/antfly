@@ -849,6 +849,7 @@ pub fn convertPatternMatchesToGraphMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             if (path.len > 0) alloc.free(path);
         }

@@ -11,7 +11,7 @@ function Label({ className, ...props }: React.ComponentProps<typeof LabelPrimiti
       data-slot="label"
       className={cn(
         // mono-label voice — same family as table headers and section eyebrows
-        "font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground",
         "leading-none select-none",
         "flex items-center gap-2",
         "group-data-[disabled=true]:pointer-events-none group-data-[disabled=true]:opacity-50",

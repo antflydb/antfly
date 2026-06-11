@@ -44,8 +44,8 @@ function TooltipContent({
         className={cn(
           // ink-on-paper inverted: dark fill, light text, mono readout voice
           "bg-foreground text-background z-50 w-fit",
-          "font-mono text-[11px] tracking-[0.02em] px-2 py-1 text-balance",
-          "rounded-none border-[1.5px] border-foreground",
+          "font-mono text-[11px] px-2 py-1 text-balance",
+          "rounded-none border-(length:--border-width) border-foreground",
           "origin-(--radix-tooltip-content-transform-origin)",
           "animate-in fade-in-0 zoom-in-95",
           "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",

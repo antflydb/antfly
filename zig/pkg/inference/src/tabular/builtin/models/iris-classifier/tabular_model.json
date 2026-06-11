@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "name": "iris-classifier",
+    "source_framework": "antfly_builtin",
+    "task": "multiclass",
+    "num_features": 4,
+    "num_classes": 3,
+    "feature_names": ["sepal_length", "sepal_width", "petal_length", "petal_width"]
+  },
+  "output": { "activation": "softmax", "num_outputs": 3 },
+  "pipeline": [
+    {
+      "type": "linear",
+      "linear": {
+        "weights": [
+          [ 0.41,  1.46, -2.26, -1.04],
+          [ 0.42, -1.61,  0.56, -1.39],
+          [-1.71, -1.53,  2.47,  2.55]
+        ],
+        "biases": [0.27, 1.45, -1.72]
+      }
+    }
+  ]
+}

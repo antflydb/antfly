@@ -99,7 +99,7 @@ export function NoModelsGuide({
                       <div className="flex items-center gap-2 mb-1">
                         <span className="text-xs font-medium truncate">{model.name}</span>
                         {model.size && (
-                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 shrink-0">
+                          <Badge className="text-[10px] px-1.5 py-0 h-4 shrink-0">
                             {model.size}
                           </Badge>
                         )}

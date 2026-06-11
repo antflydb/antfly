@@ -38,6 +38,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
 const table_reads = @import("table_reads.zig");
@@ -52,6 +53,7 @@ const retrieval_agent = @import("retrieval_agent.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -254,6 +256,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
+    artifact_reprocess_job_store_path: ?[]const u8 = null,
+    artifact_reprocess_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -866,6 +870,7 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
+    artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
 
@@ -903,6 +908,10 @@ pub const ApiHttpServer = struct {
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
+            }),
+            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(alloc, .{
+                .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
+                .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -957,6 +966,18 @@ pub const ApiHttpServer = struct {
             opened.* = try distributed_join.OpenedJoinJobStore.open(alloc, join_job_path);
             server.join_job_store.opened_join_job_store = opened;
         }
+        if (cfg.artifact_reprocess_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.artifact_reprocess_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.artifact_reprocess_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(artifact_reprocess_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.artifact_reprocess_job_store.attachOpenedStore(opened);
+        }
         return server;
     }
 
@@ -987,6 +1008,7 @@ pub const ApiHttpServer = struct {
             self.alloc.destroy(opened);
         }
         self.join_job_store.deinit();
+        self.artifact_reprocess_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
@@ -1080,6 +1102,7 @@ pub const ApiHttpServer = struct {
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
+        self.artifact_reprocess_job_store.cleanupExpiredJobs();
     }
 
     fn localTableRuntimeStatuses(
@@ -1100,19 +1123,20 @@ pub const ApiHttpServer = struct {
             items.deinit(self.alloc);
         }
 
+        var read_needs_refresh = false;
         if (self.table_reads) |source| {
             if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
                 errdefer owned.deinit(self.alloc);
+                read_needs_refresh = runtimeStatusesNeedDenseVisibilityRefresh(owned.items);
                 try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
             }
-        } else {
-            if (self.table_writes) |source| {
-                if (try source.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
-                    var owned = statuses;
-                    errdefer owned.deinit(self.alloc);
-                    try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, .append);
-                }
+        }
+        if ((self.table_reads == null or read_needs_refresh) and self.table_writes != null) {
+            if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
+                var owned = statuses;
+                errdefer owned.deinit(self.alloc);
+                try self.appendLocalRuntimeStatuses(table_name, snapshot, &items, &owned, if (read_needs_refresh) .replace_existing else .append);
             }
         }
         if (snapshot) |admin_snapshot| {
@@ -1123,6 +1147,29 @@ pub const ApiHttpServer = struct {
             return null;
         }
         return .{ .items = try items.toOwnedSlice(self.alloc) };
+    }
+
+    fn indexHasDenseVisibilityFacts(item: db_mod.types.DBIndexStats) bool {
+        return item.doc_count > 0 or item.term_count > 0 or item.edge_count > 0 or item.node_count > 0 or item.root_node > 0;
+    }
+
+    fn runtimeStatusNeedsDenseVisibilityRefresh(status: runtime_status.LocalTableRuntimeStatus) bool {
+        const has_primary_facts = status.stats.doc_identity.live_ordinals != 0 or status.stats.doc_count != 0;
+        for (status.stats.indexes) |item| {
+            if (item.kind != .dense_vector) continue;
+            if (indexHasDenseVisibilityFacts(item)) continue;
+            if (item.replay_applied_sequence != 0 or item.replay_target_sequence != 0) continue;
+            if (has_primary_facts) return true;
+            return status.metadata.source == .live_writer_publish;
+        }
+        return false;
+    }
+
+    fn runtimeStatusesNeedDenseVisibilityRefresh(statuses: []const runtime_status.LocalTableRuntimeStatus) bool {
+        for (statuses) |status| {
+            if (runtimeStatusNeedsDenseVisibilityRefresh(status)) return true;
+        }
+        return false;
     }
 
     const LocalRuntimeAppendMode = enum {
@@ -1436,17 +1483,35 @@ pub const ApiHttpServer = struct {
 
         var doc_count: u64 = 0;
         for (local_statuses.items) |item| doc_count +|= item.stats.doc_count;
+        const direct_lsm_status = try self.bestEffortLsmStorageStatus(table_name);
         return .{
             .table_name = table_name,
             .empty = doc_count == 0,
-            .lsm = try self.bestEffortLsmStorageStatus(table_name),
+            .lsm = direct_lsm_status orelse liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
         };
+    }
+
+    fn liveLsmStorageStatusFromRuntimeStatuses(
+        statuses: []const runtime_status.LocalTableRuntimeStatus,
+    ) ?tables_api.LsmStorageStatus {
+        var saw_lsm_stats = false;
+        var aggregate = runtime_status.LsmStorageStats{};
+        for (statuses) |status| {
+            const stats = status.lsm_storage_stats orelse continue;
+            saw_lsm_stats = true;
+            lsm_backend.Backend.accumulateMaintenanceStats(&aggregate.maintenance, stats.maintenance);
+            lsm_backend.Backend.accumulateWriteStats(&aggregate.write, stats.write);
+            aggregate.maintenance_score = @max(aggregate.maintenance_score, stats.maintenance_score);
+            aggregate.maintenance_debt_hint = @max(aggregate.maintenance_debt_hint, stats.maintenance_debt_hint);
+        }
+        if (!saw_lsm_stats) return null;
+        return tables_api.lsmStorageStatusFromStats(aggregate);
     }
 
     fn bestEffortLsmStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.LsmStorageStatus {
         const source = self.table_reads orelse return null;
-        const stats = (try source.lsmStorageStats(table_name)) orelse return null;
-        return tables_api.lsmStorageStatusFromMaintenanceStats(stats.maintenance);
+        const stats = (try source.lsmStorageStats(self.alloc, table_name)) orelse return null;
+        return tables_api.lsmStorageStatusFromStats(stats);
     }
 
     pub fn bestEffortSingleTableStorageStatuses(
@@ -3123,6 +3188,23 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
+                return try self.handlePublicStartDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
+                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
+                return try self.handlePublicCancelDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifactRange(artifact_route.table_name, artifact_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicReprocessDocumentArtifact(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
                 return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
             }
@@ -3338,6 +3420,21 @@ pub const ApiHttpServer = struct {
                         .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
                     },
                 });
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
+                return try self.handlePublicDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
@@ -3622,6 +3719,37 @@ pub const ApiHttpServer = struct {
         return group_ids;
     }
 
+    fn restoreManifestGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+    ) ![]u64 {
+        _ = self;
+        var manifest = try backups_api.readManifestFromLocation(alloc, backup_location, backup_id);
+        defer manifest.deinit(alloc);
+        const group_ids = try alloc.alloc(u64, manifest.shards.len);
+        for (manifest.shards, 0..) |shard, i| group_ids[i] = shard.group_id;
+        return group_ids;
+    }
+
+    fn overwriteRestoreDropGroupIdsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        backup_location: *backups_api.BackupLocation,
+        table_name: []const u8,
+        backup_id: []const u8,
+    ) ![]u64 {
+        if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const group_ids = try tableGroupIdsFromSnapshot(alloc, &snapshot, table_name);
+            if (group_ids.len > 0) return group_ids;
+            alloc.free(group_ids);
+        }
+        return try self.restoreManifestGroupIdsAlloc(alloc, backup_location, backup_id);
+    }
+
     pub fn loadOwnedTableRecord(self: *ApiHttpServer, table_name: []const u8) !?metadata_table_manager.TableRecord {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -3648,6 +3776,19 @@ pub const ApiHttpServer = struct {
         row_filter_json: []const u8,
     ) !bool {
         return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
+    }
+
+    pub fn sourceDocumentVisibleToIdentity(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        key: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        const filter = row_filter_json orelse return true;
+        const source = self.table_reads orelse return false;
+        return try self.docMatchesRowFilter(source, table_name, key, filter);
     }
 
     pub fn filterScanResultByRowFilter(
@@ -3945,6 +4086,25 @@ pub const ApiHttpServer = struct {
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
     }
 
+    pub fn documentArtifactManifestOptionsForRequest(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !public_table_http.DocumentArtifactManifestOptions {
+        var opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        if (self.cfg.auth_enabled and parseSimpleQueryParam(query, "detail") == null) opts.detail = .summary;
+        if (opts.detail == .raw and self.cfg.auth_enabled) {
+            const identity = authenticated_identity orelse return error.Forbidden;
+            if (!permissionsAllow(identity.permissions, .table, table_name, .admin) and
+                !permissionsAllow(identity.permissions, .@"*", "*", .admin))
+            {
+                return error.Forbidden;
+            }
+        }
+        return opts;
+    }
+
     pub fn waitForTableVisibility(self: *ApiHttpServer, table_name: []const u8, expected: TableVisibility) !void {
         const handled = try self.source.waitTableLifecycle(table_name, expected);
         if (handled) return;
@@ -4235,12 +4395,22 @@ pub const ApiHttpServer = struct {
             for (manifest.shards) |shard| {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
-                try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
             }
         }
 
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ns = 50 * std.time.ns_per_ms;
+        var portable_restore = false;
+        for (manifest.shards) |shard| {
+            if (std.mem.endsWith(u8, shard.snapshot_path, ".afb")) {
+                portable_restore = true;
+                break;
+            }
+        }
         var restore_attempt: usize = 0;
         while (restore_attempt < 3) : (restore_attempt += 1) {
             const start_ns = platform_time.monotonicNs();
@@ -4260,6 +4430,8 @@ pub const ApiHttpServer = struct {
                 if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
                 sleepNs(poll_interval_ns);
             }
+
+            if (portable_restore) return;
 
             // Wait until the read path can see the restored data. A null probe
             // means the catalog hasn't propagated the table yet; keep polling
@@ -4283,6 +4455,60 @@ pub const ApiHttpServer = struct {
             });
             if (restore_attempt + 1 >= 3) return error.TableVisibilityTimeout;
             sleepNs(500 * std.time.ns_per_ms);
+        }
+    }
+
+    fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        defer manifest.deinit(self.alloc);
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+        };
+        if (switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            for (manifest.shards) |shard| {
+                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+                defer self.alloc.free(dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+            }
+        }
+
+        self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
+            else => return err,
+        };
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            if ((table_writes_source.restoreTable(self.alloc, table_name, .{
+                .backup_root = local_backup_root,
+                .manifest = &manifest,
+            }) catch |err| switch (err) {
+                error.UnsupportedOperation => return error.UnsupportedOperation,
+                error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
+                else => {
+                    std.log.err("restoreLocalTableDataFromManifest restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    return err;
+                },
+            }) != null) return;
+
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
         }
     }
 
@@ -4481,6 +4707,10 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
+                .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
+                .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
+                .execute_reprocess_document_artifact_range = executePublicReprocessDocumentArtifactRange,
             },
         };
     }
@@ -5022,7 +5252,12 @@ pub const ApiHttpServer = struct {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.EndOfStream => {
+                // FileNotFound surfaces when a read-only replica open races
+                // with the writer reclaiming obsolete LSM runs; reopening
+                // picks up a fresh manifest. TableReadChurn: the read cache
+                // gave up opening a table that was being invalidated faster
+                // than an open completes.
+                error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
                     sleepNs(retry_poll_ns);
@@ -5116,7 +5351,15 @@ pub const ApiHttpServer = struct {
                 return error.InvalidBackupRequest;
             },
             else => return mapExecuteRestoreError(err),
-        }) return;
+        }) {
+            if (self.cfg.swarm_mode) {
+                self.restoreLocalTableDataFromManifest(table_name, location, backup_id) catch |err| {
+                    std.log.err("swarm local restore data apply failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    return mapExecuteRestoreError(err);
+                };
+            }
+            return;
+        }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -5286,6 +5529,84 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn executePublicDocumentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
+    fn executePublicDocumentArtifactManifests(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+    ) public_table_http.TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_reads orelse return error.NotFound;
+        return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.NotFound;
+    }
+
+    fn executePublicReprocessDocumentArtifact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactError!void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.NotFound,
+            else => {
+                std.log.err("public document artifact reprocess failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
+                return error.InternalFailure;
+            },
+        };
+        if (handled == null) return error.MethodNotAllowed;
+        if (!handled.?) return error.NotFound;
+    }
+
+    fn executePublicReprocessDocumentArtifactRange(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        req: db_mod.types.DocumentArtifactTableReprocessRequest,
+    ) public_table_http.TableApi.ExecuteReprocessDocumentArtifactRangeError!db_mod.types.DocumentArtifactTableReprocessResult {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const source = self.table_writes orelse return error.NotFound;
+        return (source.reprocessDocumentArtifactRange(alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.InvalidArgument => return error.InvalidRequest,
+            error.NotFound => return error.NotFound,
+            else => {
+                std.log.err("public document artifact range reprocess failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                return error.InternalFailure;
+            },
+        }) orelse error.MethodNotAllowed;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5407,22 +5728,20 @@ pub const ApiHttpServer = struct {
                 const exists = self.tableExists(table_name) catch return error.InternalFailure;
                 if (!exists) continue;
 
+                const table_backup_id = backups_api.findClusterTable(&manifest, table_name).?.table_backup_id;
                 var local_drop_group_ids: ?[]u64 = null;
                 defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
                 if (self.table_writes != null) {
-                    if ((self.source.adminSnapshot() catch return error.InternalFailure)) |snapshot_value| {
-                        var snapshot = snapshot_value;
-                        defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = tableGroupIdsFromSnapshot(alloc, &snapshot, table_name) catch return error.InternalFailure;
-                    }
+                    local_drop_group_ids = self.overwriteRestoreDropGroupIdsAlloc(alloc, location, table_name, table_backup_id) catch return error.InternalFailure;
                 }
 
                 self.source.dropTable(alloc, table_name) catch |err| {
                     statuses[i].@"error" = switch (err) {
+                        error.TableNotFound => null,
                         error.UnsupportedOperation => "method not allowed",
                         else => "failed to remove existing table",
                     };
-                    continue;
+                    if (statuses[i].@"error" != null) continue;
                 };
                 if (self.table_writes) |write_source| {
                     const group_ids = local_drop_group_ids orelse &.{};
@@ -5470,6 +5789,25 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
+                    if (self.cfg.swarm_mode) {
+                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
+                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
+                                table_name,
+                                table_backup_id,
+                                err,
+                            });
+                            statuses[i].@"error" = switch (err) {
+                                error.UnsupportedOperation => "method not allowed",
+                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
+                                error.TableAlreadyExists => "table already exists",
+                                error.TableNotFound => "not found",
+                                error.InvalidBackupRequest => "invalid restore request",
+                                else => "restore failed",
+                            };
+                            continue;
+                        };
+                    }
                     statuses[i].status = "triggered";
                     continue;
                 }
@@ -5680,6 +6018,223 @@ pub const ApiHttpServer = struct {
             },
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
+    }
+
+    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, opts, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, opts, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try textResponse(self.alloc, 400, "invalid request");
+        };
+        defer parsed.deinit();
+
+        const encoded = try self.artifact_reprocess_job_store.startJob(self.alloc, table_name, artifact_name, parsed.value);
+        defer self.alloc.free(encoded);
+        if (parsed.value.advance) {
+            var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+    }
+
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+    }
+
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
+    }
+
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        defer self.alloc.free(cancelled);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+    }
+
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+        if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+
+        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid job state");
+        };
+        defer parsed_running.deinit();
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
+
+        const source = self.table_writes orelse {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        };
+
+        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
+        defer self.alloc.free(shard_resumes);
+        for (running_state.shard_cursors, shard_resumes) |cursor, *out_resume| {
+            out_resume.* = .{
+                .group_id = cursor.group_id,
+                .next_key = cursor.next_key,
+                .limit = cursor.limit,
+            };
+        }
+        const req = db_mod.types.DocumentArtifactTableReprocessRequest{
+            .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
+            .to_key = running_state.to_key,
+            .limit = running_state.limit,
+            .shard_cursors = shard_resumes,
+        };
+        const result = source.reprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 503, "doc identity unavailable");
+            },
+            error.InvalidArgument => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 400, "invalid request");
+            },
+            error.NotFound => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            else => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, running_state.job_id, err });
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            },
+        };
+        if (result == null) {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        }
+        var pass = result.?;
+        defer pass.deinit(self.alloc);
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, pass);
+        defer self.alloc.free(updated);
+        return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -6021,6 +6576,11 @@ pub const RequiredPermission = struct {
     permission_type: usermgr.PermissionType,
 };
 
+fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
+    if (encoded_job_id.len == 0) return error.InvalidJobId;
+    return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
+}
+
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
@@ -6039,6 +6599,70 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .resource_type = .table,
         .resource = query.table_name,
         .permission_type = .read,
+    };
+    if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableDocumentArtifact(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
+    };
+    if (routes.Routes.matchTableArtifactReprocess(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .POST => .admin,
+            .GET, .PUT, .DELETE => return null,
+        },
     };
     if (routes.Routes.matchTablePath(path)) |table_path| {
         return .{
@@ -6123,6 +6747,58 @@ pub fn permissionsAllow(
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
     return false;
+}
+
+test "document artifact routes declare read and admin permissions" {
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1:reprocess").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:cancel").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    try std.testing.expect(requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1:reprocess") == null);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -7031,6 +7707,88 @@ test "effective resolved row filter prefers table filter before wildcard" {
     defer alloc.free(resolved);
 
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
+}
+
+test "artifact operations apply source document row filter visibility" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            const json = if (std.mem.eql(u8, key, "doc:public"))
+                "{\"tenant\":\"acme\"}"
+            else if (std.mem.eql(u8, key, "doc:private"))
+                "{\"tenant\":\"other\"}"
+            else
+                return null;
+            return .{
+                .json = try inner_alloc.dupe(u8, json),
+                .version = 1,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    var row_filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"acme\"}}"),
+    };
+    defer row_filters[0].deinit(alloc);
+    const identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters[0..],
+    };
+    defer alloc.free(identity.username);
+
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:public", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:private", identity));
+    try std.testing.expect(!try server.sourceDocumentVisibleToIdentity("docs", "doc:missing", identity));
+    try std.testing.expect(try server.sourceDocumentVisibleToIdentity("docs", "doc:private", null));
 }
 
 test "join auth applies read permission and row filters to joined tables" {
@@ -8776,7 +9534,7 @@ test "api http server serves table lookup with version header" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/doc:a?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
@@ -8852,7 +9610,7 @@ test "api http server decodes percent-encoded lookup keys" {
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
-    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/lookup/docs%2Fgetting-started.md?fields=title" });
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/docs%2Fgetting-started.md?fields=title" });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var parsed = try std.json.parseFromSlice(LookupResponse, std.testing.allocator, resp.body, .{});
@@ -8860,9 +9618,9 @@ test "api http server decodes percent-encoded lookup keys" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
-test "api http server serves lookup through mcp tool" {
+test "api http server serves document lookup through mcp tool" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-mcp-lookup";
+    const path = "/tmp/antfly-api-http-mcp-get-document";
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -8916,7 +9674,7 @@ test "api http server serves lookup through mcp tool" {
     };
 
     var source = FakeSource{};
-    const trusted_principal_secret = "mcp-lookup-trusted-principal-secret";
+    const trusted_principal_secret = "mcp-get-document-trusted-principal-secret";
     const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
     const payload = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -8967,14 +9725,15 @@ test "api http server serves lookup through mcp tool" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"get_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"lookup\"") == null);
 
     var call_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.mcp_v1,
         .headers = &mcp_session_headers,
         .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get_document\",\"arguments\":{\"tableName\":\"docs\",\"key\":\"docs/getting-started.md\",\"fields\":[\"title\"]}}}",
     });
     defer call_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
@@ -12135,7 +12894,7 @@ test "api http server handleInternalRoute matches handle for internal group look
 
     const req: http_common.HttpRequest = .{
         .method = .GET,
-        .uri = "/internal/v1/groups/7/tables/docs/lookup/doc:a?fields=title",
+        .uri = "/internal/v1/groups/7/tables/docs/documents/doc:a?fields=title",
     };
 
     var via_handle = try server.handle(req);
@@ -13028,6 +13787,110 @@ test "api http server table status uses runtime stats without probing storage" {
     var parsed = try std.json.parseFromSlice(TableStatusResponse, alloc, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed.value.storage_status.empty);
+}
+
+test "api http server storage status prefers direct lsm stats over runtime cache" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        runtime_status_calls: std.atomic.Value(u32) = .init(0),
+        lsm_status_calls: std.atomic.Value(u32) = .init(0),
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .local_runtime_statuses = localRuntimeStatuses,
+                    .lsm_storage_stats = lsmStorageStats,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn localRuntimeStatuses(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?runtime_status.LocalTableRuntimeStatuses {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.runtime_status_calls.fetchAdd(1, .monotonic);
+            const items = try allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+            items[0] = .{
+                .group_id = 7,
+                .stats = .{ .doc_count = 5 },
+                .lsm_storage_stats = .{
+                    .maintenance = .{
+                        .total_runs = 72,
+                        .total_run_bytes = 8246715092,
+                        .obsolete_paths = 133,
+                        .obsolete_paths_pinned_by_readers = 133,
+                    },
+                    .write = .{},
+                    .maintenance_score = 387208,
+                    .maintenance_debt_hint = 387209,
+                },
+            };
+            return .{ .items = items };
+        }
+
+        fn lsmStorageStats(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8) !?table_reads.LsmStorageStats {
+            _ = allocator;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            _ = self.lsm_status_calls.fetchAdd(1, .monotonic);
+            return .{
+                .maintenance = .{
+                    .total_runs = 9,
+                    .total_run_bytes = 4235293264,
+                    .obsolete_paths = 0,
+                    .obsolete_paths_pinned_by_readers = 0,
+                },
+                .write = .{},
+                .maintenance_score = 0,
+                .maintenance_debt_hint = 0,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+
+    const status = (try server.bestEffortSingleTableStorageStatus("docs")).?;
+    try std.testing.expectEqual(@as(u32, 1), reads.runtime_status_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), reads.lsm_status_calls.load(.monotonic));
+    try std.testing.expectEqual(false, status.empty);
+    try std.testing.expectEqual(@as(u64, 9), status.lsm.?.run_count);
+    try std.testing.expectEqual(@as(u64, 4235293264), status.lsm.?.run_bytes);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_path_count);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.obsolete_paths_pinned_by_readers);
+    try std.testing.expectEqual(@as(u64, 0), status.lsm.?.maintenance_score);
 }
 
 test "api http server serves local index runtime backfill status" {
@@ -15713,6 +16576,377 @@ test "api http server backs up and restores a table through public routes" {
     defer parsed_stored.deinit();
     const stored = parsed_stored.value;
     try std.testing.expectEqualStrings("alpha", stored.title);
+}
+
+test "api http server table restore is triggered when read path is still empty" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-out", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = 1,
+        .start_key = try alloc.dupe(u8, ""),
+        .end_key = null,
+        .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, "snap1", 1),
+    };
+    defer freeBackupShards(alloc, shards);
+
+    var manifest = try backups_api.createManifest(alloc, "snap1", &.{
+        .table_id = 1,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root_abs, &manifest);
+
+    const FakeSource = struct {
+        created: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = if (self.created)
+                @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..])
+            else
+                @constCast((&[_]metadata_table_manager.TableRecord{})[0..]);
+            const ranges = if (self.created)
+                @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 1,
+                    .table_id = 1,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..])
+            else
+                @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = ranges,
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.created = true;
+        }
+    };
+
+    const EmptyReadSource = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{ .ndjson = try inner_alloc.dupe(u8, "") };
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    const RestoreWrites = struct {
+        restored: bool = false,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("snap1", plan.manifest.backup_id);
+            self.restored = true;
+        }
+    };
+
+    var source = FakeSource{};
+    var read_source = EmptyReadSource{};
+    var write_source = RestoreWrites{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(alloc, "{{\"backup_id\":\"snap1\",\"location\":\"{s}\"}}", .{location_uri});
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(write_source.restored);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"triggered\"") != null);
+}
+
+test "api http server cluster overwrite restore tolerates already absent metadata drop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-overwrite", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    const table_backup_id = try backups_api.clusterTableBackupId(alloc, "snap-cluster", "docs");
+    defer alloc.free(table_backup_id);
+
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = 42,
+        .start_key = try alloc.dupe(u8, ""),
+        .end_key = null,
+        .snapshot_path = try backups_api.shardSnapshotRelPath(alloc, table_backup_id, 42),
+    };
+    defer freeBackupShards(alloc, shards);
+
+    var table_manifest = try backups_api.createManifest(alloc, table_backup_id, &.{
+        .table_id = 1,
+        .name = "docs",
+        .description = "docs table",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = tables_api.default_indexes_json,
+        .replication_sources_json = "[]",
+    }, shards);
+    defer table_manifest.deinit(alloc);
+    try backups_api.writeManifest(alloc, backup_root_abs, &table_manifest);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, table_backup_id),
+    };
+    defer cluster_entry.deinit(alloc);
+    var cluster_manifest = try backups_api.createClusterManifest(alloc, "snap-cluster", location_uri, &.{cluster_entry});
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        present: bool = true,
+        restored: bool = false,
+        local_drop_used_manifest_group: bool = false,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = if (self.state.present)
+                @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..])
+            else
+                @constCast((&[_]metadata_table_manager.TableRecord{})[0..]);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = true;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.state.present = false;
+            return error.TableNotFound;
+        }
+    };
+
+    const FakeReads = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            const body = if (self.state.restored) "{\"_id\":\"doc:1\"}\n" else "";
+            return .{ .ndjson = try inner_alloc.dupe(u8, body) };
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    const FakeWrites = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .drop_table = dropTable,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), group_ids.len);
+            try std.testing.expectEqual(@as(u64, 42), group_ids[0]);
+            self.state.local_drop_used_manifest_group = true;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, plan: backups_api.TableRestorePlan) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("docs-snap-cluster", plan.manifest.backup_id);
+            self.state.restored = true;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var read_source = FakeReads{ .state = &state };
+    var write_source = FakeWrites{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\",\"restore_mode\":\"overwrite\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(state.local_drop_used_manifest_group);
+    try std.testing.expect(state.restored);
+    try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"triggered\"") != null);
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {

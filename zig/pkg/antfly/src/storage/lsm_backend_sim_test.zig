@@ -220,7 +220,7 @@ fn runCompactionChaosCampaign(seed: u64, steps: usize) !void {
         .flush_threshold = 6,
         .compact_threshold_runs = 2,
         .level_target_runs_base = 2,
-        .obsolete_retention_ns = 0,
+        .obsolete_delete_retry_ns = 0,
     };
 
     var mem_backend = mem_backend_mod.Backend.init(std.testing.allocator, .{});
@@ -579,6 +579,7 @@ test "lsm backend simulation obsolete run cleanup fault recovers previous manife
         .compact_threshold_runs = 1,
         .foreground_soft_compaction = true,
         .obsolete_retention_ns = 0,
+        .obsolete_delete_retry_ns = 0,
     };
 
     var mem_backend = mem_backend_mod.Backend.init(std.testing.allocator, .{});
@@ -598,7 +599,10 @@ test "lsm backend simulation obsolete run cleanup fault recovers previous manife
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
     try modeled_device.injectDeleteFailureForPathContains("runs/1.tbl");
-    try std.testing.expectError(error.InjectedDeleteFault, lsm_backend.sync(true));
+    try lsm_backend.sync(true);
+    const cleanup_stats = lsm_backend.snapshotMaintenanceStats();
+    try std.testing.expect(cleanup_stats.obsolete_delete_failures > 0);
+    try std.testing.expect(cleanup_stats.obsolete_delete_retries > 0);
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
     try crashReopenLsm(&lsm_backend, &modeled_device, root_dir, open_options);

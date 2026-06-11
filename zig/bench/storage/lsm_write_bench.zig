@@ -85,6 +85,7 @@ const ValuePattern = enum {
 
 const WorkloadSet = enum {
     all,
+    ingest_compact,
     hot_overwrite,
     l0_pressure,
 };
@@ -628,6 +629,18 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
+                if (cfg.workload_set == .ingest_compact) {
+                    var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "ingest_compact");
+                    defer scenario.deinit();
+
+                    try runTimed(out, &stdout_writer, &scenario, "ingest_compact", random_keys.len, struct {
+                        fn run(ctx: *Scenario, local_keys: []const []u8, local_value: []const u8) !void {
+                            try benchIngestCompact(ctx, local_keys, local_value);
+                        }
+                    }.run, random_keys, value);
+                    continue;
+                }
+
                 {
                     const hot_len = @min(cfg.hot_keys, keys.keys.len);
                     var scenario = try Scenario.init(alloc, cfg, sample_index, storage_mode, batch_mode, "hot_overwrite");
@@ -751,6 +764,14 @@ fn benchL0PressureLoad(scenario: *Scenario, keys: []const []u8, value: []const u
         try scenario.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true });
         start = end;
     }
+}
+
+fn benchIngestCompact(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    try benchLoad(scenario, keys, value, false);
+    const start = nanotime();
+    while (try scenario.backend.runMaintenanceStep()) {}
+    try scenario.backend.finalizeDeferredStorageWork();
+    scenario.last_finalize_ns +|= nanotime() - start;
 }
 
 fn benchOverwrite(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
@@ -1145,6 +1166,7 @@ fn logicalValueWriteBytes(workload: []const u8, ops: usize, value_size: usize) u
         std.mem.eql(u8, workload, "load_random") or
         std.mem.eql(u8, workload, "load_base") or
         std.mem.eql(u8, workload, "load_l0_runs") or
+        std.mem.eql(u8, workload, "ingest_compact") or
         std.mem.eql(u8, workload, "overwrite_strided") or
         std.mem.eql(u8, workload, "overwrite_hotset"))
     {

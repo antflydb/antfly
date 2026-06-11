@@ -52,6 +52,16 @@ pub const LookupKeyParams = struct {
     fields: ?[]const u8 = null,
 };
 
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+pub const GetDocumentArtifactManifestParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
 pub const RemovePermissionFromUserParams = struct {
     /// The name of the resource for the permission to be removed.
     resource: []const u8,
@@ -520,10 +530,10 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
     }
 
-    /// Lookup a key in a table
-    /// GET /db/v1/tables/{tableName}/lookup/{key}
+    /// Retrieve a document by key
+    /// GET /db/v1/tables/{tableName}/documents/{key}
     pub fn lookupKey(self: *@This(), table_name: []const u8, key: []const u8, params: LookupKeyParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lookup/{s}", .{ self.base_url, table_name, key });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}", .{ self.base_url, table_name, key });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -541,6 +551,110 @@ pub const Client = struct {
         }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// List derived document artifact manifests
+    /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts
+    pub fn listDocumentArtifactManifests(self: *@This(), table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !ApiResponse(types.DocumentArtifactManifestList) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, table_name, key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.detail) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "detail=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
+    }
+
+    /// Reprocess a derived document artifact across a table range
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess
+    pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, artifact_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactTableReprocessResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create a derived document artifact reprocess job
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs
+    pub fn startDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactReprocessJobStartRequest) !ApiResponse(types.DocumentArtifactReprocessJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs", .{ self.base_url, table_name, artifact_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get derived document artifact reprocess job status
+    /// GET /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}
+    pub fn getDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}", .{ self.base_url, table_name, artifact_name, job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Advance a derived document artifact reprocess job
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance
+    pub fn advanceDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:advance", .{ self.base_url, table_name, artifact_name, job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Cancel a derived document artifact reprocess job
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel
+    pub fn cancelDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:cancel", .{ self.base_url, table_name, artifact_name, job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect a derived document artifact manifest
+    /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
+    pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !ApiResponse(types.DocumentArtifactManifest) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, table_name, key, artifact_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.detail) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "detail=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Reprocess a derived document artifact
+    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+    pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, key, artifact_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List all indexes for a table
@@ -967,6 +1081,26 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List Traditional ML predictors
+    /// GET /ml/v1/models
+    pub fn listPredictors(self: *@This()) !ApiResponse(types.InferencePredictorsResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/models", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferencePredictorsResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Run a traditional ML predictor
+    /// POST /ml/v1/predict
+    pub fn predict(self: *@This(), body: types.InferencePredictRequest) !ApiResponse(types.InferencePredictResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/predict", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferencePredictResponse).fromResponse(self.allocator, &resp);
     }
 
     fn authHeaders(self: *const @This()) ?[]const [2][]const u8 {

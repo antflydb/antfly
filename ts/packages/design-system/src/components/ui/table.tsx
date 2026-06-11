@@ -21,7 +21,7 @@ function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
     <thead
       data-slot="table-header"
       className={cn(
-        "[&>tr]:border-b-[1.5px] [&>tr]:border-border-strong [&>tr:hover]:bg-transparent",
+        "[&>tr]:border-b-(length:--border-width) [&>tr]:border-border [&>tr:hover]:bg-transparent",
         className
       )}
       {...props}
@@ -67,10 +67,10 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        // mono uppercase "instrument readout" voice (same family as MonoLabel)
-        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground",
-        // compact band sized for the smaller type
-        "h-10 px-4 text-left align-middle whitespace-nowrap",
+        // mono uppercase "instrument readout" voice (same family as MonoLabel),
+        // dimmed so the heads recede behind the data
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        "h-11 px-4 text-left align-middle whitespace-nowrap",
         // checkbox handling preserved
         "[&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className
@@ -85,7 +85,7 @@ function TableCell({ className, ...props }: React.ComponentProps<"td">) {
     <td
       data-slot="table-cell"
       className={cn(
-        "py-3 px-4 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px] text-foreground",
+        "py-4 px-4 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px] text-foreground",
         className
       )}
       {...props}

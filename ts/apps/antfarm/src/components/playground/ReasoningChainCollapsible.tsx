@@ -35,19 +35,8 @@ function getStepIcon(stepName: string) {
   return STEP_ICONS[stepName] ?? <Search className="h-3.5 w-3.5" />;
 }
 
-function getStatusBadgeVariant(
-  status?: string
-): "default" | "secondary" | "destructive" | "outline" {
-  switch (status) {
-    case "success":
-      return "secondary";
-    case "error":
-      return "destructive";
-    case "skipped":
-      return "outline";
-    default:
-      return "default";
-  }
+function getStatusBadgeVariant(status?: string): "default" | "destructive" {
+  return status === "error" ? "destructive" : "default";
 }
 
 function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?: boolean }) {
@@ -67,9 +56,7 @@ function StepItem({ step, defaultOpen = false }: { step: AgentStep; defaultOpen?
       {/* Step content */}
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <Badge variant="outline" className="text-xs font-mono">
-            {step.name}
-          </Badge>
+          <Badge className="text-xs font-mono">{step.name}</Badge>
           {step.status && (
             <Badge variant={getStatusBadgeVariant(step.status)} className="text-xs">
               {step.status}
@@ -116,9 +103,7 @@ function ActiveStepItem({ step }: { step: SSEStepStarted }) {
       </div>
       <div className="flex-1 pb-3 min-w-0">
         <div className="flex items-center gap-2">
-          <Badge variant="outline" className="text-xs font-mono">
-            {step.name}
-          </Badge>
+          <Badge className="text-xs font-mono">{step.name}</Badge>
         </div>
         {step.action && (
           <p className="text-xs text-muted-foreground mt-1 truncate">{step.action}</p>

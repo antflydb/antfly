@@ -36,12 +36,36 @@ export function AntyDemo() {
   const [activeScale, setActiveScale] = useState(1);
   const [offScale, setOffScale] = useState(0.65);
   const [eyeStyle, setEyeStyle] = useState<EyeStyle>("alive");
+  const [pixelated, setPixelated] = useState(false);
+  const [cycling, setCycling] = useState(false);
 
   const play = (name: ExpressionName) => {
     antyRef.current?.playEmotion?.(name);
     setLastEmotion(name);
   };
 
+  const pixelate = () => {
+    antyRef.current?.pixelate?.();
+    setPixelated(true);
+    setCycling(false);
+  };
+  const depixelate = () => {
+    antyRef.current?.depixelate?.();
+    setPixelated(false);
+    setCycling(false);
+  };
+  const startCycle = (mode: "waves" | "pulse") => {
+    antyRef.current?.startPixelateCycle?.({ mode });
+    setPixelated(true);
+    setCycling(true);
+  };
+  const stopCycle = () => {
+    antyRef.current?.stopPixelateCycle?.();
+    setPixelated(false);
+    setCycling(false);
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyboard listeners are bound once on mount; handlers read the latest refs/state via closures over stable refs
   useEffect(() => {
     const downKeys = new Set<string>();
 
@@ -52,6 +76,14 @@ export function AntyDemo() {
       if (hotkey) {
         e.preventDefault();
         play(hotkey.name);
+        return;
+      }
+
+      if (e.key === "p") {
+        e.preventDefault();
+        antyRef.current?.togglePixelate?.();
+        setPixelated((v) => !v);
+        setCycling(false);
         return;
       }
 
@@ -224,9 +256,47 @@ export function AntyDemo() {
       </div>
 
       <div className="space-y-3">
+        <MonoLabel className="block">pixelate</MonoLabel>
+        <p className="text-xs text-muted-foreground">
+          Ripples Anty into a true pixel form and back (WebGL). It composes with everything — try{" "}
+          <strong>Pixelate</strong>, then play an emotion above (e.g. Excited) and watch the pixel
+          mark jump & spin. <strong>Cycle</strong> loops it as a waiting animation. Press{" "}
+          <kbd className="rounded border border-border bg-background px-1 py-0.5 font-mono">p</kbd>{" "}
+          to toggle.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant={pixelated && !cycling ? "default" : "outline"}
+            size="sm"
+            onClick={pixelate}
+            disabled={isOff}
+          >
+            Pixelate
+          </Button>
+          <Button variant="outline" size="sm" onClick={depixelate} disabled={isOff}>
+            Depixelate
+          </Button>
+          <Button
+            variant={cycling ? "default" : "outline"}
+            size="sm"
+            onClick={() => startCycle("waves")}
+            disabled={isOff}
+          >
+            Cycle · waves
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => startCycle("pulse")} disabled={isOff}>
+            Cycle · pulse
+          </Button>
+          <Button variant="ghost" size="sm" onClick={stopCycle} disabled={isOff || !cycling}>
+            Stop cycle
+          </Button>
+        </div>
+      </div>
+
+      <div className="space-y-3">
         <MonoLabel className="block">controls</MonoLabel>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant={isOff ? "default" : "secondary"} size="sm" onClick={togglePower}>
+          <Button variant={isOff ? "default" : "outline"} size="sm" onClick={togglePower}>
             {isOff ? "Wake Up" : "Power Off"}
           </Button>
           <Button

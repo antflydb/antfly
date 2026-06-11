@@ -191,17 +191,20 @@ pub const ArtifactSourceRef = struct {
     kind: ArtifactKind,
     name: []u8,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
         return .{
             .kind = self.kind,
             .name = try alloc.dupe(u8, self.name),
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
     }
 
     pub fn deinit(self: *ArtifactSourceRef, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;
     }
 };
@@ -211,6 +214,7 @@ pub const ArtifactRef = struct {
     name: []u8,
     kind: ArtifactKind,
     chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
@@ -219,6 +223,7 @@ pub const ArtifactRef = struct {
             .name = try alloc.dupe(u8, self.name),
             .kind = self.kind,
             .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -226,6 +231,7 @@ pub const ArtifactRef = struct {
     pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
         alloc.free(self.document_id);
         alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
         if (self.source) |*source| source.deinit(alloc);
         self.* = undefined;
     }
@@ -392,6 +398,103 @@ pub const ArtifactWrite = struct {
 };
 
 pub const ArtifactRecord = ArtifactWrite;
+
+pub const DocumentArtifactChildRange = struct {
+    range_id: []u8,
+    range_kind: []u8,
+    artifact_name: []u8,
+    split_boundary: []u8,
+    placement: []u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]u8 = null,
+    split_eligible: ?bool = null,
+    start_key: []u8,
+    end_key_exclusive: []u8,
+    last_key: []u8,
+    child_count: usize = 0,
+    text_bytes: ?usize = null,
+
+    pub fn deinit(self: *DocumentArtifactChildRange, alloc: Allocator) void {
+        alloc.free(self.range_id);
+        alloc.free(self.range_kind);
+        alloc.free(self.artifact_name);
+        alloc.free(self.split_boundary);
+        alloc.free(self.placement);
+        if (self.route_status) |value| alloc.free(value);
+        alloc.free(self.start_key);
+        alloc.free(self.end_key_exclusive);
+        alloc.free(self.last_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactChildRangePlacementUpdate = struct {
+    range_id: []const u8,
+    placement: []const u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]const u8 = null,
+    split_eligible: ?bool = null,
+};
+
+pub const DocumentArtifactManifest = struct {
+    document_id: []u8,
+    artifact_name: []u8,
+    artifact_id: []u8,
+    manifest_json: []u8,
+    state_json: ?[]u8 = null,
+    manifest_version: u64 = 0,
+    generation: u64 = 0,
+    source_url: []u8 = "",
+    source_fingerprint: []u8 = "",
+    content_type: []u8 = "",
+    route_type: []u8 = "",
+    unsupported_reason: ?[]u8 = null,
+    unit_count: usize = 0,
+    chunk_count: usize = 0,
+    child_ranges: []DocumentArtifactChildRange = &.{},
+    child_range_count: usize = 0,
+    merge_status: []u8 = "",
+    merge_from_generation: u64 = 0,
+    merge_to_generation: u64 = 0,
+    merge_operation_granularity: []u8 = "",
+    merge_operation_count: usize = 0,
+    last_error_code: ?[]u8 = null,
+    last_error_message: ?[]u8 = null,
+
+    pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        alloc.free(self.artifact_name);
+        alloc.free(self.artifact_id);
+        alloc.free(self.manifest_json);
+        if (self.state_json) |state_json| alloc.free(state_json);
+        if (self.source_url.len > 0) alloc.free(self.source_url);
+        if (self.source_fingerprint.len > 0) alloc.free(self.source_fingerprint);
+        if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.route_type.len > 0) alloc.free(self.route_type);
+        if (self.unsupported_reason) |unsupported_reason| alloc.free(unsupported_reason);
+        for (self.child_ranges) |*child_range| child_range.deinit(alloc);
+        if (self.child_ranges.len > 0) alloc.free(self.child_ranges);
+        if (self.merge_status.len > 0) alloc.free(self.merge_status);
+        if (self.merge_operation_granularity.len > 0) alloc.free(self.merge_operation_granularity);
+        if (self.last_error_code) |value| alloc.free(value);
+        if (self.last_error_message) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactManifestList = struct {
+    document_id: []u8,
+    artifacts: []DocumentArtifactManifest,
+
+    pub fn deinit(self: *DocumentArtifactManifestList, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        for (self.artifacts) |*artifact| artifact.deinit(alloc);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+};
 
 pub const TextBoolQuery = struct {
     must: []const TextQuery = &.{},
@@ -820,6 +923,65 @@ pub const ScanResult = struct {
     }
 };
 
+pub const DocumentArtifactReprocessShardResume = struct {
+    group_id: ?u64 = null,
+    next_key: []const u8,
+    limit: u32 = 0,
+};
+
+pub const DocumentArtifactTableReprocessRequest = struct {
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    limit: u32 = 100,
+    shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    key: []u8,
+    error_code: []u8,
+
+    pub fn deinit(self: *DocumentArtifactReprocessFailure, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.error_code);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactReprocessShardCursor = struct {
+    group_id: ?u64 = null,
+    next_key: []u8,
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+
+    pub fn deinit(self: *DocumentArtifactReprocessShardCursor, alloc: Allocator) void {
+        alloc.free(self.next_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactTableReprocessResult = struct {
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+    next_key: ?[]u8 = null,
+    failures: []DocumentArtifactReprocessFailure = &.{},
+    shard_cursors: []DocumentArtifactReprocessShardCursor = &.{},
+
+    pub fn deinit(self: *DocumentArtifactTableReprocessResult, alloc: Allocator) void {
+        if (self.next_key) |value| alloc.free(value);
+        for (self.failures) |*failure| failure.deinit(alloc);
+        if (self.failures.len > 0) alloc.free(self.failures);
+        for (self.shard_cursors) |*cursor| cursor.deinit(alloc);
+        if (self.shard_cursors.len > 0) alloc.free(self.shard_cursors);
+        self.* = undefined;
+    }
+};
+
 pub const TxnId = transactions_mod.TxnId;
 pub const TxnStatus = transactions_mod.TxnStatus;
 pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
@@ -926,6 +1088,8 @@ pub const SearchRequest = struct {
     expand_strategy: ?graph_query_mod.ExpandStrategy = null,
     return_mode: ReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    hierarchy_include_source: bool = false,
+    hierarchy_include_unit: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
@@ -1012,6 +1176,8 @@ pub const SearchHit = struct {
     score: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
 
@@ -1022,6 +1188,8 @@ pub const SearchHit = struct {
             .score = self.score,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
         };
@@ -1029,6 +1197,8 @@ pub const SearchHit = struct {
             alloc.free(cloned.id);
             freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.ancestor_source_data) |data| alloc.free(data);
+            if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
 
@@ -1051,6 +1221,8 @@ pub const SearchHit = struct {
         alloc.free(self.id);
         freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
         if (self.chunk_hits.len > 0) alloc.free(self.chunk_hits);
@@ -1085,6 +1257,8 @@ pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
@@ -1092,6 +1266,8 @@ pub const ChunkHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
         };
     }
@@ -1099,6 +1275,8 @@ pub const ChunkHit = struct {
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         self.* = undefined;
     }
@@ -1170,6 +1348,7 @@ pub const GraphPatternMatch = struct {
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
         self.* = undefined;
@@ -1236,6 +1415,22 @@ pub const ReplayStageStats = struct {
     blocked: bool = false,
     blocked_reason: []const u8 = "",
     error_count: u64 = 0,
+};
+
+pub const ResolverReplayDiagnostic = struct {
+    name: []const u8 = "",
+    table: []const u8 = "",
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+};
+
+pub const ResolverReplayDiagnostics = struct {
+    resolver_count: u64 = 0,
+    resolution_runtime_present: bool = false,
+    resolution_worker_started: bool = false,
+    promotion_runtime_present: bool = false,
+    promotion_worker_started: bool = false,
+    resolvers: []const ResolverReplayDiagnostic = &.{},
 };
 
 pub const TransactionRecoveryStats = struct {
@@ -1370,6 +1565,7 @@ pub const DBStats = struct {
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},
+    resolver_replay: ResolverReplayDiagnostics = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
@@ -1422,6 +1618,9 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Error name recorded when the index's persisted artifacts failed to
+    // load (e.g. "UnsupportedVersion"); null for healthy indexes.
+    load_error: ?[]const u8 = null,
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
@@ -1902,9 +2101,21 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
 }
 
+pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
+    for (stats.resolvers) |resolver| {
+        alloc.free(resolver.name);
+        alloc.free(resolver.table);
+        alloc.free(resolver.source_artifact);
+        alloc.free(resolver.resolution_artifact);
+    }
+    if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
+    freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        if (item.load_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);

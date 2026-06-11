@@ -2732,7 +2732,7 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
-test "docstore runtime lsm hint replay iteration does not clone mutable snapshots" {
+test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2793,7 +2793,9 @@ test "docstore runtime lsm hint replay iteration does not clone mutable snapshot
     try std.testing.expectEqual(@as(usize, 1), replay_stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, 1), replay_stats.matched_entries);
     try std.testing.expectEqual(@as(usize, 0), replay_stats.hint_filter_skips);
-    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.namespace_read_txn)].calls);
 }
 
 test "docstore runtime lsm persists replay rows across namespace reopen" {

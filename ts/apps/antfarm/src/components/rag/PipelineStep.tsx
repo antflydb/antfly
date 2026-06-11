@@ -171,9 +171,7 @@ function renderStepContent(
             </div>
           )}
           <div className="flex items-center gap-2">
-            <Badge variant="secondary" className="text-xs">
-              {data.hits.length} documents retrieved
-            </Badge>
+            <Badge className="text-xs">{data.hits.length} documents retrieved</Badge>
           </div>
           {data.hits.length > 0 && (
             <div className="space-y-1 max-h-48 overflow-y-auto">
@@ -181,9 +179,7 @@ function renderStepContent(
                 <div key={hit._id || i} className="p-2 rounded-none border bg-background text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-medium truncate">{hit._id}</span>
-                    <Badge variant="secondary" className="text-[10px]">
-                      {hit._score?.toFixed(3)}
-                    </Badge>
+                    <Badge className="text-[10px]">{hit._score?.toFixed(3)}</Badge>
                   </div>
                   {hit._source && (
                     <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap mt-1 line-clamp-3">
@@ -214,7 +210,7 @@ function renderStepContent(
       return (
         <div className="space-y-2">
           {data.provider && data.model && (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge className="text-[10px]">
               {data.provider}/{data.model}
             </Badge>
           )}

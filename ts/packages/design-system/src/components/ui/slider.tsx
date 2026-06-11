@@ -55,7 +55,7 @@ function Slider({
             // square ink-bordered handle — sits on top of the amber range,
             // bg-background gives high contrast in both light and dark modes
             "block size-[14px] shrink-0 rounded-none",
-            "bg-background border-[1.5px] border-amber-500",
+            "bg-background border-(length:--border-width) border-amber-500",
             "transition-[box-shadow,border-color] outline-none",
             "hover:border-ring focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
             "disabled:pointer-events-none disabled:opacity-50"

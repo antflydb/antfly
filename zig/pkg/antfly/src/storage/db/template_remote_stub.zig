@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const template_mod = @import("template_stub.zig");
+const scraping = @import("antfly_scraping");
+const common_secrets = @import("../../common/secrets.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,6 +25,11 @@ pub const RenderError = error{
 };
 
 pub const RenderConfig = struct {};
+
+const remote_fetch_security = scraping.ContentSecurityConfig{
+    .block_private_ips = true,
+    .max_download_size_bytes = 4 << 20,
+};
 
 pub const RenderJsonToTextFn = *const fn (
     ctx: ?*anyopaque,
@@ -126,6 +133,46 @@ pub fn renderJsonToPartsWithConfig(
     const rendered = try template_mod.renderDocument(alloc, template_source, json_doc);
     defer alloc.free(@constCast(rendered));
     return try template_mod.textToParts(alloc, rendered);
+}
+
+pub fn downloadRemoteContentOutcomeAllocWithConfig(
+    alloc: Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !scraping.DownloadOutcome {
+    _ = secret_store;
+    if (credential_name != null) return error.UnsupportedRemoteContentCredential;
+    const security = try effectiveRemoteContentSecurity(remote_content);
+    return try scraping.downloadContentOutcomeAllocWithHeaders(
+        alloc,
+        url,
+        &security,
+        null,
+        null,
+    );
+}
+
+fn effectiveRemoteContentSecurity(remote_content: ?*const scraping.RemoteContentConfig) !scraping.ContentSecurityConfig {
+    const cfg = remote_content orelse return remote_fetch_security;
+    if (cfg.default_s3 != null or cfg.s3.count() > 0 or cfg.http.count() > 0) return error.UnsupportedRemoteContentCredential;
+    var effective = remote_fetch_security;
+    if (cfg.security) |security| applyContentSecurityOverride(&effective, security);
+    return effective;
+}
+
+fn applyContentSecurityOverride(
+    effective: *scraping.ContentSecurityConfig,
+    override: scraping.ContentSecurityConfig,
+) void {
+    if (override.allowed_hosts) |value| effective.allowed_hosts = value;
+    if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
+    if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
+    if (override.max_image_dimension) |value| effective.max_image_dimension = value;
+    if (override.allowed_paths) |value| effective.allowed_paths = value;
+    if (override.user_agent) |value| effective.user_agent = value;
 }
 
 test "template remote stub renders local template parts" {

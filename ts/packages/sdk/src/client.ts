@@ -895,7 +895,7 @@ export class AntflyClient {
      * @param options.fields - Comma-separated list of fields to include (e.g., "title,author,metadata.tags")
      */
     lookup: async (tableName: string, key: string, options?: { fields?: string }) => {
-      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/lookup/{key}", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/documents/{key}", {
         params: {
           path: { tableName, key },
           query: options?.fields ? { fields: options.fields } : undefined,

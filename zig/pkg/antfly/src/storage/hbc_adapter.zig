@@ -1236,6 +1236,10 @@ pub const HBCIndex = struct {
     published_node_count: AtomicU64,
     published_generation: AtomicU64,
     rng: go_rand.GoPcg,
+    // Set when a write path observes a tree-link inconsistency (stale parent
+    // pointer, dangling node reference); background maintenance runs a
+    // bounded repairTreeLinks sweep and clears it on completion.
+    link_repair_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quantizer: quantizer_mod.RaBitQuantizer,
     rot: vec.RandomOrthogonalTransformer,
     node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
@@ -1514,6 +1518,13 @@ pub const HBCIndex = struct {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
             .lmdb => 0,
+        };
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
+        return switch (self.env_owner) {
+            .lsm => |handle| handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lmdb => null,
         };
     }
 
@@ -5643,6 +5654,39 @@ pub const HBCIndex = struct {
     }
 
     // ========================================================================
+    // Tree link consistency
+    // ========================================================================
+
+    pub fn noteTreeLinkInconsistency(self: *HBCIndex) void {
+        self.link_repair_pending.store(true, .release);
+    }
+
+    pub fn treeLinkRepairPending(self: *const HBCIndex) bool {
+        return self.link_repair_pending.load(.acquire);
+    }
+
+    /// Read-only structural invariant check (see hbc_index.verifyTreeLinks).
+    pub fn verifyTreeLinks(self: *HBCIndex) !vectorindex_hbc_index.TreeLinkReport {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        return try vectorindex_hbc_index.verifyTreeLinks(self, &txn);
+    }
+
+    /// Bounded repair sweep (see hbc_index.repairTreeLinks). Clears the
+    /// pending flag once a sweep completes within budget.
+    pub fn repairTreeLinks(self: *HBCIndex, max_nodes: usize) !vectorindex_hbc_index.TreeLinkRepairReport {
+        const report = try vectorindex_hbc_index.repairLinks(self, max_nodes);
+        if (report.completed) self.link_repair_pending.store(false, .release);
+        return report;
+    }
+
+    /// Runs a repair sweep only when a write path flagged an inconsistency.
+    pub fn maybeRepairTreeLinks(self: *HBCIndex, max_nodes: usize) !?vectorindex_hbc_index.TreeLinkRepairReport {
+        if (!self.treeLinkRepairPending()) return null;
+        return try self.repairTreeLinks(max_nodes);
+    }
+
+    // ========================================================================
     // Stats
     // ========================================================================
 
@@ -5807,6 +5851,221 @@ test "create and open index" {
         var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
         defer idx.close();
         try std.testing.expectEqual(@as(u32, 4), idx.stats().dims);
+    }
+}
+
+test "hbc randomized insert delete churn preserves tree link invariants" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    // Small fanout forces frequent splits, sibling merges, and single-child
+    // collapses — the maintenance operations that rewrite parent/child links.
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0x5eed_11ab);
+    const random = prng.random();
+
+    var live = std.ArrayListUnmanaged(u64).empty;
+    defer live.deinit(alloc);
+    var next_id: u64 = 1;
+
+    var op: usize = 0;
+    while (op < 1200) : (op += 1) {
+        const do_insert = live.items.len < 8 or random.intRangeLessThan(u8, 0, 100) < 60;
+        if (do_insert) {
+            var v: [4]f32 = undefined;
+            for (&v) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+            try idx.insert(next_id, &v);
+            try live.append(alloc, next_id);
+            next_id += 1;
+        } else if (random.boolean() or live.items.len < 4) {
+            const pick = random.intRangeLessThan(usize, 0, live.items.len);
+            const vid = live.swapRemove(pick);
+            try idx.delete(vid);
+        } else {
+            var batch: [6]u64 = undefined;
+            const want = @min(live.items.len, random.intRangeLessThan(usize, 2, 7));
+            var i: usize = 0;
+            while (i < want) : (i += 1) {
+                const pick = random.intRangeLessThan(usize, 0, live.items.len);
+                batch[i] = live.swapRemove(pick);
+            }
+            try idx.batchDelete(batch[0..want]);
+        }
+
+        if (op % 50 == 49) {
+            const report = try idx.verifyTreeLinks();
+            if (!report.consistent()) {
+                std.debug.print("tree links inconsistent after op {d}: {any}\n", .{ op, report });
+                return error.TestUnexpectedResult;
+            }
+            try std.testing.expect(!idx.treeLinkRepairPending());
+        }
+    }
+
+    const final_report = try idx.verifyTreeLinks();
+    if (!final_report.consistent()) {
+        std.debug.print("tree links inconsistent at end: {any}\n", .{final_report});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u64, @intCast(live.items.len)), idx.stats().active_count);
+}
+
+test "hbc repairTreeLinks clears dangling references and restores consistency" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0xfee1_600d);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 60) : (id += 1) {
+        var v: [4]f32 = undefined;
+        for (&v) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &v);
+    }
+
+    // Corrupt the tree the way the field incident did: a leaf node vanishes
+    // while its parent still lists it and vec→leaf entries still point at it.
+    const victim_leaf = (try idx.debugLeafForVector(7)) orelse return error.TestUnexpectedResult;
+    const victim_members = try idx.debugLeafMembers(alloc, victim_leaf);
+    defer alloc.free(victim_members);
+    try std.testing.expect(victim_members.len > 0);
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        try idx.deleteNode(&txn, victim_leaf);
+        try txn.commit();
+    }
+
+    const broken = try idx.verifyTreeLinks();
+    try std.testing.expect(!broken.consistent());
+    try std.testing.expect(broken.dangling_children >= 1);
+
+    // Search still serves while the tree is inconsistent (tolerant descent).
+    {
+        const query = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+        var results = try idx.search(&query, 5);
+        defer results.deinit();
+        try std.testing.expect(results.getHits().len > 0);
+    }
+
+    // Deleting a vector whose leaf is gone cleans up instead of erroring,
+    // and flags the index for repair.
+    try idx.delete(victim_members[0]);
+    try std.testing.expect(idx.treeLinkRepairPending());
+
+    const repair = try idx.repairTreeLinks(10_000);
+    try std.testing.expect(repair.completed);
+    try std.testing.expect(repair.dangling_children_removed >= 1);
+    try std.testing.expect(!idx.treeLinkRepairPending());
+
+    const healed = try idx.verifyTreeLinks();
+    if (!healed.consistent()) {
+        std.debug.print("tree links inconsistent after repair: {any}\n", .{healed});
+        return error.TestUnexpectedResult;
+    }
+
+    // The index stays fully usable after repair.
+    const probe = [_]f32{ 0.5, -0.25, 0.75, -0.5 };
+    try idx.insert(1000, &probe);
+    {
+        var results = try idx.search(&probe, 3);
+        defer results.deinit();
+        const hits = results.getHits();
+        try std.testing.expect(hits.len > 0);
+        try std.testing.expectEqual(@as(u64, 1000), hits[0].vector_id);
+    }
+}
+
+test "hbc duplicate child links are dropped by unlink and repair" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0xd00b_1e5);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 40) : (id += 1) {
+        var v: [4]f32 = undefined;
+        for (&v) |*x| x.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &v);
+    }
+
+    const victim_leaf = (try idx.debugLeafForVector(3)) orelse return error.TestUnexpectedResult;
+    const victim_members = try idx.debugLeafMembers(alloc, victim_leaf);
+    defer alloc.free(victim_members);
+    try std.testing.expect(victim_members.len > 0);
+
+    const corrupt = struct {
+        fn duplicateChildLink(index: *HBCIndex, leaf_id: u64) !void {
+            var txn = try index.beginWriteTxn();
+            errdefer txn.abort();
+            var leaf = try index.loadNode(&txn, leaf_id);
+            defer leaf.deinit(index.alloc);
+            const parent_id = leaf.parent;
+            try std.testing.expect(parent_id != 0);
+            var parent = try index.loadNode(&txn, parent_id);
+            defer parent.deinit(index.alloc);
+            try parent.ensureUnbacked(index.alloc);
+            const dup = try index.alloc.alloc(u64, parent.children.len + 1);
+            @memcpy(dup[0..parent.children.len], parent.children);
+            dup[parent.children.len] = leaf_id;
+            index.alloc.free(parent.children);
+            parent.children = dup;
+            try index.saveNode(&txn, &parent);
+            try txn.commit();
+        }
+    }.duplicateChildLink;
+
+    // Repair path: the sweep must drop the duplicate occurrence.
+    try corrupt(&idx, victim_leaf);
+    {
+        const broken = try idx.verifyTreeLinks();
+        try std.testing.expect(!broken.consistent());
+    }
+    const repair = try idx.repairTreeLinks(10_000);
+    try std.testing.expect(repair.completed);
+    try std.testing.expect(repair.duplicate_children_removed >= 1);
+    {
+        const healed = try idx.verifyTreeLinks();
+        try std.testing.expect(healed.consistent());
+    }
+
+    // Unlink path: emptying the leaf drives removeChildLink against the
+    // duplicated reference, which must drop BOTH occurrences — an
+    // underfilled rebuild here used to persist an uninitialized child id.
+    try corrupt(&idx, victim_leaf);
+    try idx.batchDelete(victim_members);
+    {
+        const after_delete = try idx.verifyTreeLinks();
+        if (!after_delete.consistent()) {
+            std.debug.print("tree links inconsistent after duplicate unlink: {any}\n", .{after_delete});
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

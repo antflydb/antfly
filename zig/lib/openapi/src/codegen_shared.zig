@@ -81,6 +81,20 @@ pub fn getRequestBodyType(
     return null;
 }
 
+/// Return true when an operation accepts a raw application/octet-stream body.
+/// These bodies are passed through as `[]const u8` by the generated client and
+/// are intentionally not parsed by the generated server router.
+pub fn hasOctetStreamRequestBody(
+    resolver: *Resolver,
+    rb_or: types.RequestBodyOrRef,
+) bool {
+    const rb = switch (rb_or) {
+        .request_body => |r| r,
+        .ref => |ref| resolver.resolveRequestBody(.{ .ref = ref }) catch return false,
+    };
+    return rb.content.get("application/octet-stream") != null;
+}
+
 /// Prefix generated type names with `types.` for use in client.zig / server.zig.
 pub fn qualifyType(arena: Allocator, zig_type: []const u8) ![]const u8 {
     // Optional types: qualify the inner type

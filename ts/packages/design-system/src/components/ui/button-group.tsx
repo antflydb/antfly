@@ -7,6 +7,10 @@ export type ButtonGroupProps = HTMLAttributes<HTMLDivElement> & {
   orientation?: "horizontal" | "vertical";
 };
 
+/**
+ * Adjacent buttons with merged borders. Children overlap by the chassis
+ * border width (1px) so shared edges read as a single line.
+ */
 export const ButtonGroup = ({
   className,
   orientation = "horizontal",
@@ -16,8 +20,8 @@ export const ButtonGroup = ({
     role="group"
     className={cn(
       "inline-flex items-center",
-      orientation === "vertical" && "flex-col",
-      "[&>*:not(:first-child)]:rounded-l-none [&>*:not(:last-child)]:rounded-r-none [&>*:not(:first-child)]:-ml-px",
+      orientation === "horizontal" && "[&>*:not(:first-child)]:-ml-px",
+      orientation === "vertical" && "flex-col [&>*:not(:first-child)]:-mt-px",
       className
     )}
     {...props}

@@ -5,9 +5,9 @@ import { cn } from "@/lib/utils";
 
 const alertVariants = cva(
   [
-    // chassis: square, 1.5px bordered, flat. Left border bumped to 4px,
-    // recolored to the semantic state — the only color signal in the component.
-    "relative w-full bg-card text-card-foreground rounded-none border-[1.5px] border-border-strong border-l-4 px-[14px] py-[12px]",
+    // quiet panel: tinted-neutral surface, no outer chassis — a 2px semantic
+    // left edge plus icon/title color carry the state.
+    "relative w-full bg-background-secondary text-foreground rounded-none border-0 border-l-2 px-4 py-3.5",
     // grid: icon column collapses to 0 when no svg present
     "grid has-[>svg]:grid-cols-[18px_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-[11px] gap-y-0 items-start",
     "[&>svg]:size-[18px] [&>svg]:translate-y-[1px]",
@@ -15,14 +15,12 @@ const alertVariants = cva(
   {
     variants: {
       variant: {
-        default: "border-l-foreground [&>svg]:text-foreground *:data-[slot=alert-title]:text-foreground",
-        destructive:
-          "border-l-destructive [&>svg]:text-destructive *:data-[slot=alert-title]:text-destructive",
-        success:
-          "border-l-success [&>svg]:text-success *:data-[slot=alert-title]:text-success",
-        warning:
-          "border-l-warning [&>svg]:text-warning *:data-[slot=alert-title]:text-warning",
-        info: "border-l-info [&>svg]:text-info *:data-[slot=alert-title]:text-info",
+        // one signal: the icon (and left edge) carry the state; titles stay ink
+        default: "border-l-foreground [&>svg]:text-foreground",
+        destructive: "border-l-destructive [&>svg]:text-destructive",
+        success: "border-l-success [&>svg]:text-success",
+        warning: "border-l-warning [&>svg]:text-warning",
+        info: "border-l-info [&>svg]:text-info",
       },
     },
     defaultVariants: {
@@ -51,8 +49,8 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="alert-title"
       className={cn(
-        // mono uppercase callout — the loud register inside the chassis
-        "col-start-2 font-mono uppercase tracking-[0.06em] text-[12px] font-bold leading-none mb-[2px]",
+        // mono uppercase callout — label register, medium weight
+        "col-start-2 font-mono uppercase tracking-[0.08em] text-[11px] font-medium leading-none mb-[2px] text-foreground",
         className
       )}
       {...props}
@@ -65,7 +63,7 @@ function AlertDescription({ className, ...props }: React.ComponentProps<"div">) 
     <div
       data-slot="alert-description"
       className={cn(
-        "text-foreground col-start-2 grid justify-items-start gap-1 text-[13px] [&_p]:leading-relaxed",
+        "text-foreground col-start-2 grid justify-items-start gap-1 text-[13px] leading-relaxed [&_p]:leading-relaxed",
         className
       )}
       {...props}

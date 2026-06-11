@@ -15,6 +15,10 @@ import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger,
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupTextarea,
   Select,
   SelectContent,
   SelectItem,
@@ -50,12 +54,6 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  InputGroup,
-  InputGroupAddon,
-  InputGroupButton,
-  InputGroupTextarea,
-} from "@/components/input-group";
 import { Spinner } from "@/components/spinner";
 import { cn } from "@/lib/utils";
 

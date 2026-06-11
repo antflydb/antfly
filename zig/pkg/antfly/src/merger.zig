@@ -169,7 +169,7 @@ pub fn mergeSegments(
         const seg = &snap.segments[si];
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.deleted,
+            .deleted = seg.shared.deleted,
         };
     }
     return try segment_mod.mergeSegmentInputs(alloc, inputs);
@@ -194,7 +194,7 @@ pub fn mergeSegmentsBounded(
         total_input_bytes += seg.data.bytes().len;
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.deleted,
+            .deleted = seg.shared.deleted,
         };
     }
 
@@ -484,8 +484,8 @@ test "merge policy picks small segments and applyMerge replaces them" {
             .index = i,
             .size = seg.data.bytes().len,
             .doc_count = seg.reader.doc_count,
-            .deleted_count = if (seg.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-            .has_deletions = seg.deleted != null,
+            .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
+            .has_deletions = seg.shared.deleted != null,
         };
     }
 
@@ -683,11 +683,12 @@ test "merge mapper-built multi-field text segments" {
     try std.testing.expectEqualStrings("doc2", doc1.id);
     try std.testing.expectEqualStrings("doc3", doc2.id);
 
+    var seg_shared = index_mod.SegmentShared{ .ref_count = 1 };
     var seg_entry: index_mod.SegmentEntry = .{
         .id = 0,
         .data = index_mod.SegmentData.fromOwnedHeap(try alloc.dupe(u8, merged)),
         .reader = reader,
-        .deleted = null,
+        .shared = &seg_shared,
     };
     defer seg_entry.data.deinit(alloc);
     const phrase = query_mod.Filter{ .phrase = .{

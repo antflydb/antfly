@@ -119,6 +119,12 @@ pub fn planSemanticQuery(
     });
     defer runtime.deinit();
 
+    // Signal background enrichment to yield the embedder while this
+    // query-time embed runs (see enrichment_types.interactive_embed_inflight).
+    // Scoped to the embed call only: BM25-only queries never set it, so
+    // steady full-text traffic does not stall enrichment throughput.
+    _ = db_mod.enrichment_types.interactive_embed_inflight.fetchAdd(1, .monotonic);
+    defer _ = db_mod.enrichment_types.interactive_embed_inflight.fetchSub(1, .monotonic);
     return .{
         .vector = if (embedding_template) |value|
             try runtime.embedQueryWithTemplate(alloc, index_name, semantic_search, value)
@@ -179,6 +185,77 @@ const SemanticStatusResolver = struct {
     }
 };
 
+const DocumentArtifactManifestResponse = struct {
+    const ChildRange = struct {
+        range_id: []const u8,
+        range_kind: []const u8,
+        artifact_name: []const u8,
+        split_boundary: []const u8,
+        placement: []const u8,
+        owner_group_id: ?u64,
+        placement_generation: ?u64,
+        route_status: ?[]const u8,
+        split_eligible: ?bool,
+        start_key: []const u8,
+        end_key_exclusive: []const u8,
+        last_key: []const u8,
+        child_count: usize,
+        text_bytes: ?usize,
+    };
+
+    document_id: []const u8,
+    artifact_name: []const u8,
+    artifact_id: []const u8,
+    manifest_version: u64,
+    generation: u64,
+    source_url: []const u8,
+    source_fingerprint: []const u8,
+    content_type: []const u8,
+    route_type: []const u8,
+    unsupported_reason: ?[]const u8,
+    unit_count: usize,
+    chunk_count: usize,
+    child_ranges: []const ChildRange,
+    child_range_count: usize,
+    merge_status: []const u8,
+    merge_from_generation: u64,
+    merge_to_generation: u64,
+    merge_operation_granularity: []const u8,
+    merge_operation_count: usize,
+    last_error_code: ?[]const u8,
+    last_error_message: ?[]const u8,
+    manifest_json: []const u8,
+    state_json: ?[]const u8,
+};
+
+const DocumentArtifactManifestsResponse = struct {
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifestResponse,
+};
+
+fn childRangeResponsesAlloc(alloc: std.mem.Allocator, child_ranges: []const db_mod.types.DocumentArtifactChildRange) ![]DocumentArtifactManifestResponse.ChildRange {
+    const out = try alloc.alloc(DocumentArtifactManifestResponse.ChildRange, child_ranges.len);
+    for (child_ranges, out) |child_range, *item| {
+        item.* = .{
+            .range_id = child_range.range_id,
+            .range_kind = child_range.range_kind,
+            .artifact_name = child_range.artifact_name,
+            .split_boundary = child_range.split_boundary,
+            .placement = child_range.placement,
+            .owner_group_id = child_range.owner_group_id,
+            .placement_generation = child_range.placement_generation,
+            .route_status = child_range.route_status,
+            .split_eligible = child_range.split_eligible,
+            .start_key = child_range.start_key,
+            .end_key_exclusive = child_range.end_key_exclusive,
+            .last_key = child_range.last_key,
+            .child_count = child_range.child_count,
+            .text_bytes = child_range.text_bytes,
+        };
+    }
+    return out;
+}
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, query: []const u8) !?http_common.HttpResponse {
     const alloc = ctx.alloc;
     const source = ctx.reads;
@@ -208,6 +285,122 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                     .name = "X-Antfly-Version",
                     .value = try std.fmt.allocPrint(alloc, "{d}", .{result.version}),
                 },
+            });
+        }
+    }
+
+    if (req.method == .GET) {
+        if (routes.Routes.matchGroupDocumentArtifacts(path)) |artifact_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.key);
+            defer alloc.free(decoded_key);
+
+            var list = (reads.documentArtifactManifestsGroupLocal(
+                alloc,
+                artifact_route.group_id,
+                artifact_route.table_name,
+                decoded_key,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer list.deinit(alloc);
+
+            const artifacts = try alloc.alloc(DocumentArtifactManifestResponse, list.artifacts.len);
+            defer alloc.free(artifacts);
+            var child_range_sets = std.ArrayListUnmanaged([]DocumentArtifactManifestResponse.ChildRange).empty;
+            defer {
+                for (child_range_sets.items) |child_ranges| alloc.free(child_ranges);
+                child_range_sets.deinit(alloc);
+            }
+            for (list.artifacts, artifacts) |manifest, *out| {
+                const child_ranges = try childRangeResponsesAlloc(alloc, manifest.child_ranges);
+                errdefer alloc.free(child_ranges);
+                try child_range_sets.append(alloc, child_ranges);
+                out.* = .{
+                    .document_id = manifest.document_id,
+                    .artifact_name = manifest.artifact_name,
+                    .artifact_id = manifest.artifact_id,
+                    .manifest_version = manifest.manifest_version,
+                    .generation = manifest.generation,
+                    .source_url = manifest.source_url,
+                    .source_fingerprint = manifest.source_fingerprint,
+                    .content_type = manifest.content_type,
+                    .route_type = manifest.route_type,
+                    .unsupported_reason = manifest.unsupported_reason,
+                    .unit_count = manifest.unit_count,
+                    .chunk_count = manifest.chunk_count,
+                    .child_ranges = child_ranges,
+                    .child_range_count = manifest.child_range_count,
+                    .merge_status = manifest.merge_status,
+                    .merge_from_generation = manifest.merge_from_generation,
+                    .merge_to_generation = manifest.merge_to_generation,
+                    .merge_operation_granularity = manifest.merge_operation_granularity,
+                    .merge_operation_count = manifest.merge_operation_count,
+                    .last_error_code = manifest.last_error_code,
+                    .last_error_message = manifest.last_error_message,
+                    .manifest_json = manifest.manifest_json,
+                    .state_json = manifest.state_json,
+                };
+            }
+
+            return try http_route_helpers.jsonResponse(alloc, DocumentArtifactManifestsResponse{
+                .document_id = list.document_id,
+                .artifacts = artifacts,
+            });
+        }
+
+        if (routes.Routes.matchGroupDocumentArtifact(path)) |artifact_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.key);
+            defer alloc.free(decoded_key);
+            const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_route.artifact_name);
+            defer alloc.free(decoded_artifact_name);
+
+            var manifest = (reads.documentArtifactManifestGroupLocal(
+                alloc,
+                artifact_route.group_id,
+                artifact_route.table_name,
+                decoded_key,
+                decoded_artifact_name,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer manifest.deinit(alloc);
+
+            const child_ranges = try childRangeResponsesAlloc(alloc, manifest.child_ranges);
+            defer alloc.free(child_ranges);
+            return try http_route_helpers.jsonResponse(alloc, DocumentArtifactManifestResponse{
+                .document_id = manifest.document_id,
+                .artifact_name = manifest.artifact_name,
+                .artifact_id = manifest.artifact_id,
+                .manifest_version = manifest.manifest_version,
+                .generation = manifest.generation,
+                .source_url = manifest.source_url,
+                .source_fingerprint = manifest.source_fingerprint,
+                .content_type = manifest.content_type,
+                .route_type = manifest.route_type,
+                .unsupported_reason = manifest.unsupported_reason,
+                .unit_count = manifest.unit_count,
+                .chunk_count = manifest.chunk_count,
+                .child_ranges = child_ranges,
+                .child_range_count = manifest.child_range_count,
+                .merge_status = manifest.merge_status,
+                .merge_from_generation = manifest.merge_from_generation,
+                .merge_to_generation = manifest.merge_to_generation,
+                .merge_operation_granularity = manifest.merge_operation_granularity,
+                .merge_operation_count = manifest.merge_operation_count,
+                .last_error_code = manifest.last_error_code,
+                .last_error_message = manifest.last_error_message,
+                .manifest_json = manifest.manifest_json,
+                .state_json = manifest.state_json,
             });
         }
     }

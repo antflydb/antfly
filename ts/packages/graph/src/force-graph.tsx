@@ -185,7 +185,7 @@ function ForceGraphInner<M = Record<string, unknown>>({
       <div
         ref={containerRef}
         className={cn(
-          "antfly-graph flex items-center justify-center rounded-none border-[1.5px] border-border-strong bg-muted/30 text-sm text-muted-foreground",
+          "antfly-graph flex items-center justify-center rounded-none border-(length:--border-width) border-border-strong bg-muted/30 text-sm text-muted-foreground",
           className
         )}
         style={{ minHeight }}
@@ -200,7 +200,7 @@ function ForceGraphInner<M = Record<string, unknown>>({
       data-graph={graphId}
       ref={containerRef}
       className={cn(
-        "antfly-graph relative w-full overflow-hidden rounded-none border-[1.5px] border-border-strong bg-muted/30",
+        "antfly-graph relative w-full overflow-hidden rounded-none border-(length:--border-width) border-border-strong bg-muted/30",
         !explicitHeight && "h-full",
         className
       )}

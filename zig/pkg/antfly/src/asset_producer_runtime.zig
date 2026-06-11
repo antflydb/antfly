@@ -96,6 +96,7 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
+            .document_extraction => error.UnsupportedAssetProducer,
             .generator => try self.generate(alloc, request),
             .reader => try self.read(alloc, request),
             .transcriber => try self.transcribe(alloc, request),

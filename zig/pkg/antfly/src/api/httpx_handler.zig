@@ -1958,6 +1958,122 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_openapi.server.GetDocumentArtifactManifestParams) !httpx.Response {
+        _ = params;
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
+        defer alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        const opts = self.api_server.documentArtifactManifestOptionsForRequest(table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => {
+                _ = ctx.status(400);
+                return ctx.text("invalid artifact detail");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            },
+        };
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, table_name, decoded_key, decoded_artifact_name, opts, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.ListDocumentArtifactManifestsParams) !httpx.Response {
+        _ = params;
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
+        defer alloc.free(decoded_key);
+        const opts = self.api_server.documentArtifactManifestOptionsForRequest(table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => {
+                _ = ctx.status(400);
+                return ctx.text("invalid artifact detail");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            },
+        };
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
+        var resp = try public_table_http.handleDocumentArtifactManifests(alloc, table_name, decoded_key, opts, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
+        defer alloc.free(decoded_key);
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        }
+        var resp = try public_table_http.handleReprocessDocumentArtifact(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn reprocessDocumentArtifactRange(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
+        defer alloc.free(decoded_artifact_name);
+        const body_data = (try ctx.body()) orelse "";
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(alloc, table_name, decoded_artifact_name, body_data, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn startDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse "";
+        var response = try self.api_server.handlePublicStartDocumentArtifactReprocessJob(table_name, artifact_name, body_data);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn getDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var response = try self.api_server.handlePublicDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn advanceDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var response = try self.api_server.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
+    pub fn cancelDocumentArtifactReprocessJob(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var response = try self.api_server.handlePublicCancelDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+        return respondWithAllocator(ctx, &response, self.api_server.alloc);
+    }
+
     pub fn listIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -3036,7 +3152,7 @@ test "httpx antfly lookup route preserves projection and headers" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/doc:a?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents/doc:a?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);
@@ -3092,7 +3208,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 
     const base_url = try e2e_server.baseUrl(alloc);
     defer alloc.free(base_url);
-    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/lookup/docs%2Fgetting-started.md?fields=title", .{base_url});
+    const lookup_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/documents/docs%2Fgetting-started.md?fields=title", .{base_url});
     defer alloc.free(lookup_url);
 
     var resp = try getWithRetry(&client, client_io.io(), lookup_url, null, 20);

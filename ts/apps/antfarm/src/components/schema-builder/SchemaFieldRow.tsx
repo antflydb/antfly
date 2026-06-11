@@ -79,18 +79,16 @@ const SchemaFieldRow: React.FC<SchemaFieldRowProps> = ({
           {fieldNameError && <span className="text-destructive ml-2 text-xs">*</span>}
         </TableCell>
         <TableCell>
-          <Badge variant="secondary">{type}</Badge>
+          <Badge>{type}</Badge>
         </TableCell>
         <TableCell>
-          {detectionInfo && (
-            <Badge variant="outline">{Math.round(detectionInfo.frequency * 100)}%</Badge>
-          )}
+          {detectionInfo && <Badge>{Math.round(detectionInfo.frequency * 100)}%</Badge>}
         </TableCell>
         <TableCell>
           <div className="flex gap-1 flex-wrap">
             {antflyTypes.length > 0 ? (
               antflyTypes.map((t: string) => (
-                <Badge key={t} variant="secondary" className="text-xs">
+                <Badge key={t} className="text-xs">
                   {t}
                 </Badge>
               ))

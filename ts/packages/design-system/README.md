@@ -68,6 +68,34 @@ export function SignInCard() {
 - `./examples` — reserved for non-canonical examples
 - `./fonts/*` — raw Aeonik TTFs if you need to serve them yourself
 
+## Borders
+
+Every component chassis routes its border width through `--border-width`
+(default `1px`, declared in `tokens/borders.css`), referenced in classes as
+`border-(length:--border-width)`. Color follows one doctrine:
+
+- **In-flow surfaces** (Card, table rails, Tabs rail, toolbar, Sidebar) use
+  `--border` — quiet separators that recede into the page.
+- **Floating surfaces** (Dialog, Popover, menus, Sheet, Select content) use
+  `--border-strong` — the system is shadowless, so the firmer edge is the
+  elevation cue.
+- **Interactive controls** (Input, Textarea, Select trigger, Checkbox,
+  outline Buttons) use `--input`, a step firmer than `--border`, so controls
+  read as affordances while chrome melts away.
+
+The default Button is an ink fill that contrasts the theme (dark on light,
+light on dark) — the everyday primary. The amber fill lives on
+`variant="brand"` (Button and Badge alike) and is reserved for special,
+infrequent actions — creating a table, not applying a filter — at most once
+per screen. The default Badge is a quiet hairline chip.
+
+## Layout
+
+`Stack`, `Inline`, and `Section` encode the system's whitespace rhythm so
+pages don't hand-roll margins: `Stack`/`Inline` take `gap="sm" | "md" | "lg"`
+(0.75rem / 1.5rem / 2.5rem), and `Section` is a page band (`py-10 md:py-12`;
+`size="lg"` gives the `py-16 md:py-24` marketing scale).
+
 ## Typography
 
 The library ships three type registers: **Aeonik** (display / brand moments), **Mono** (labels, IDs, instrument readouts), and **Inter** (headings, body, paragraphs). The decision rule:

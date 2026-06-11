@@ -2,6 +2,8 @@
 
 import {
   Button,
+  ButtonGroup,
+  ButtonGroupText,
   Tooltip,
   TooltipContent,
   TooltipProvider,
@@ -16,7 +18,6 @@ import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
-import { ButtonGroup, ButtonGroupText } from "@/components/button-group";
 import { cn } from "@/lib/utils";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {

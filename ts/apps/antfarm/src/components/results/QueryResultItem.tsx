@@ -126,7 +126,7 @@ const QueryResultItem: React.FC<QueryResultItemProps> = ({
                 {scoreDisplay && (
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Badge variant="outline" className="gap-1 cursor-help">
+                      <Badge className="gap-1 cursor-help">
                         <span className="text-muted-foreground">Score:</span>
                         {scoreDisplay.value}
                       </Badge>

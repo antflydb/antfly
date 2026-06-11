@@ -1402,6 +1402,18 @@ pub const Reader = struct {
         return try self.extractPageBoxFromObject(&page);
     }
 
+    pub fn extractPageRotation(self: *const Reader, page_num: usize) !?i32 {
+        var page = try self.readPageObject(page_num);
+        defer page.deinit(self.alloc);
+        if (try self.findInheritedPageValue(&page, "Rotate")) |rotation_value| {
+            var rotation = rotation_value;
+            defer rotation.deinit(self.alloc);
+            const value = rotation.asInteger() orelse return null;
+            return std.math.cast(i32, value);
+        }
+        return null;
+    }
+
     fn extractPageBoxFromObject(self: *const Reader, page: *const syntax.Object) !PageBox {
         if (try self.findInheritedPageValue(page, "CropBox")) |box_value| {
             var box = box_value;
@@ -10836,6 +10848,41 @@ test "reader extracts page box from mediabox" {
     try std.testing.expectApproxEqAbs(@as(f64, 20), box.min_y, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 210), box.max_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 320), box.max_y, 0.001);
+}
+
+test "reader extracts inherited page rotation" {
+    const alloc = std.testing.allocator;
+    const content = "BT\n(Hello) Tj\nET\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] /Rotate 90 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+    };
+    defer alloc.free(objects[3]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 5\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 5 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(?i32, 90), try reader.extractPageRotation(1));
 }
 
 test "reader extracts filled rectangle shape runs" {

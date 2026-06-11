@@ -405,9 +405,7 @@ export function GraphIndexExplorer({
           <Network className="size-4 text-muted-foreground" />
           <h2 className="font-display text-xl tracking-tight">Graph Explorer</h2>
           {selectedIndex?.status?.rebuilding && (
-            <Badge variant="outline" className="af-status-badge-warning">
-              Rebuilding
-            </Badge>
+            <Badge className="af-status-badge-warning">Rebuilding</Badge>
           )}
         </div>
         <Button variant="outline" size="sm" onClick={onRefreshIndexes}>
@@ -607,7 +605,7 @@ export function GraphIndexExplorer({
             {availableEdgeTypes.length > 0 && (
               <div className="space-y-2">
                 <Label>Edge types</Label>
-                <div className="grid gap-2 rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2">
+                <div className="grid gap-2 rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2">
                   {availableEdgeTypes.map((edgeType) => {
                     const checkboxId = controlId("graph-edge-type", edgeType);
                     return (
@@ -620,7 +618,7 @@ export function GraphIndexExplorer({
                         <Label htmlFor={checkboxId} className="font-normal">
                           {edgeType}
                         </Label>
-                        <Badge variant="secondary" className="ml-auto">
+                        <Badge className="ml-auto">
                           {formatNumber(selectedIndex?.status?.edge_types?.[edgeType], "0")}
                         </Badge>
                       </div>
@@ -659,8 +657,8 @@ export function GraphIndexExplorer({
               {selectedIndexName || "Graph"}
             </CardTitle>
             <div className="flex gap-2">
-              <Badge variant="secondary">{graph.nodes.length} nodes</Badge>
-              <Badge variant="secondary">{graph.edges.length} edges</Badge>
+              <Badge>{graph.nodes.length} nodes</Badge>
+              <Badge>{graph.edges.length} edges</Badge>
             </div>
           </CardHeader>
           <CardContent className="h-[560px] p-0">
@@ -714,7 +712,7 @@ export function GraphIndexExplorer({
                     <div className="mb-1 text-xs text-muted-foreground">Path</div>
                     <div className="space-y-1">
                       {selectedNode.metadata.path.map((key) => (
-                        <Badge key={key} variant="secondary" className="mr-1 max-w-full">
+                        <Badge key={key} className="mr-1 max-w-full">
                           {displayKey(key)}
                         </Badge>
                       ))}
@@ -739,10 +737,10 @@ export function GraphIndexExplorer({
                   {graph.edges.slice(0, 40).map((edge) => (
                     <div
                       key={edge.id}
-                      className="rounded-none border-[1.5px] border-border-strong bg-muted/30 p-2 text-xs"
+                      className="rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <Badge variant={edge.pathEdge ? "default" : "secondary"}>
+                        <Badge variant={edge.pathEdge ? "default" : "default"}>
                           {edge.type ?? "edge"}
                         </Badge>
                         <span className="text-muted-foreground">w {formatNumber(edge.weight)}</span>

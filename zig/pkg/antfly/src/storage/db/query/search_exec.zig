@@ -367,6 +367,8 @@ pub const DenseSearchProfile = struct {
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
     hbc_exact_vectors_scored: u64 = 0,
+    hbc_leaf_payload_stale: u64 = 0,
+    hbc_leaf_payload_missing: u64 = 0,
     hbc_reranked_vectors: u64 = 0,
     hbc_approx_candidate_count: u64 = 0,
     hbc_rerank_candidate_count: u64 = 0,
@@ -1955,8 +1957,13 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     var owned_filter = filter;
     defer owned_filter.deinit(alloc);
 
+    // The include set came from the live filter itself; re-running the live
+    // filter over it would redo one visibility probe per document.
+    var already_filtered_executor = executor;
+    already_filtered_executor.live_filter_doc_set = null;
+
     const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
-    try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, executor);
+    try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
     out.resolved_stored_filters = resolved_stored_filters_before_live_filter;
 }
 
@@ -3791,7 +3798,7 @@ fn textDocNumsForDocIdsAlloc(
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
             const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.deleted) |deleted| {
+            if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
             const stored = seg.reader.storedDoc(local_doc) orelse continue;
@@ -3950,7 +3957,7 @@ fn collectFilteredExplicitTextStats(
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
             const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.deleted) |deleted| {
+            if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
             const doc_id = doc_offset + local_doc;
@@ -4451,6 +4458,7 @@ fn searchDenseInternal(
         .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
         .search_width = resolved_search_width,
         .epsilon = resolved_epsilon,
+        .rerank_factor = resolveRerankFactor(effort),
         .filter_prefix = req.filter_prefix,
         .distance_over = req.distance_over,
         .distance_under = req.distance_under,
@@ -4481,6 +4489,8 @@ fn searchDenseInternal(
         profile.hbc_leaves_explored = profiled.profile.leaves_explored;
         profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
         profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
+        profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
+        profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
         profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
         profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
         profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
@@ -4781,13 +4791,15 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
+        "antfly_bench_dense_query_hbc index={s} nodes_visited={d} leaves={d} approx_vectors={d} exact_vectors={d} payload_stale={d} payload_missing={d} reranked={d} approx_candidates={d} rerank_candidates={d} ambiguous_top_k={d} ambiguous_boundary={d} distance_over_hits={d} distance_under_hits={d} full_rerank={any} top_k_count={d} min_distance_gap={d:.6} min_interval_gap={d:.6} rerank_vector_load_us={d} rerank_metadata_us={d} rerank_artifact_key_us={d} rerank_artifact_read_us={d} rerank_artifact_decode_us={d} rerank_artifact_distance_us={d} rerank_lsm_cache_hits={d} rerank_lsm_cache_misses={d} rerank_distance_us={d} inline_meta={d} fetched_meta={d} lookup_doc_key={d}",
         .{
             req.index_name orelse "",
             profile.hbc_nodes_visited,
             profile.hbc_leaves_explored,
             profile.hbc_approx_vectors_scored,
             profile.hbc_exact_vectors_scored,
+            profile.hbc_leaf_payload_stale,
+            profile.hbc_leaf_payload_missing,
             profile.hbc_reranked_vectors,
             profile.hbc_approx_candidate_count,
             profile.hbc_rerank_candidate_count,
@@ -4854,38 +4866,101 @@ fn estimateLeafCount(stats: vectorindex_mod.IndexStats) u32 {
     return @intCast(@min(estimated, @as(u64, std.math.maxInt(u32))));
 }
 
+// Search policy: effort 0..1 maps to a leaf-visit budget (search width), a
+// dynamic-pruning epsilon, and a rerank candidate multiplier. The width floor
+// scales with how many leaves are needed to cover k oversampled results, not
+// with k itself, and the ramp between floor and ceiling is geometric so the
+// knob behaves sensibly across index sizes. Epsilon stays small enough that
+// the SPANN-style "skip leaves whose centroid is (1+eps) x the best" pruning
+// actually fires. The constants can be overridden through environment
+// variables (read once per process) for offline tuning.
+const SearchPolicy = struct {
+    epsilon_base: f32 = 0.90,
+    epsilon_span: f32 = 1.10,
+    width_k_factor: f32 = 4.0,
+    width_min_leaves: u32 = 4,
+    // Fraction of the leaf ceiling visited at balanced (0.5) effort. On the
+    // 50K OpenAI case, recall at the default effort tracks this anchor; the
+    // current HBC tree needs most of its leaves for ~0.98 recall, so the
+    // default anchor sits high and the low-effort range is where the policy
+    // saves work.
+    width_mid_fraction: f32 = 0.70,
+    // Absolute ceiling on the balanced-effort anchor so the default leaf
+    // budget does not grow linearly with corpus size (matches the legacy
+    // behavior at the 1M scale; no effect at 50K-scale trees).
+    width_mid_cap: f32 = 2048.0,
+    rerank_factor_base: f32 = 6.0,
+    rerank_factor_span: f32 = 6.0,
+};
+
+var search_policy: SearchPolicy = .{};
+var search_policy_loaded = std.atomic.Value(bool).init(false);
+
+fn ensureSearchPolicyLoaded() void {
+    if (search_policy_loaded.load(.acquire)) return;
+    // Benign race: concurrent first callers recompute identical values from
+    // the environment before either publishes the flag.
+    loadSearchPolicyEnv();
+    search_policy_loaded.store(true, .release);
+}
+
+fn searchPolicyEnvF32(name: [*:0]const u8, default_value: f32) f32 {
+    const raw = getenv(name) orelse return default_value;
+    return std.fmt.parseFloat(f32, raw) catch default_value;
+}
+
+fn loadSearchPolicyEnv() void {
+    search_policy.epsilon_base = searchPolicyEnvF32("ANTFLY_SEARCH_EPSILON_BASE", search_policy.epsilon_base);
+    search_policy.epsilon_span = searchPolicyEnvF32("ANTFLY_SEARCH_EPSILON_SPAN", search_policy.epsilon_span);
+    search_policy.width_k_factor = searchPolicyEnvF32("ANTFLY_SEARCH_WIDTH_K_FACTOR", search_policy.width_k_factor);
+    search_policy.width_mid_fraction = searchPolicyEnvF32("ANTFLY_SEARCH_WIDTH_MID_FRACTION", search_policy.width_mid_fraction);
+    search_policy.width_mid_cap = searchPolicyEnvF32("ANTFLY_SEARCH_WIDTH_MID_CAP", search_policy.width_mid_cap);
+    search_policy.rerank_factor_base = searchPolicyEnvF32("ANTFLY_SEARCH_RERANK_BASE", search_policy.rerank_factor_base);
+    search_policy.rerank_factor_span = searchPolicyEnvF32("ANTFLY_SEARCH_RERANK_SPAN", search_policy.rerank_factor_span);
+}
+
 pub fn resolveSearchWidth(k: u32, effort: f32, stats: vectorindex_mod.IndexStats) u32 {
-    const min_width = @max(k, @as(u32, 64));
-    const legacy_max_width = @max(min_width * 20, @as(u32, 4096));
-    const legacy_balanced_width = min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(legacy_max_width - min_width)) * default_balanced_search_effort));
+    ensureSearchPolicyLoaded();
+    const leaf_size = @max(stats.leaf_size, 1);
     const estimated_leaf_count = estimateLeafCount(stats);
+    const legacy_max_width = @max(@max(k, @as(u32, 64)) * 20, @as(u32, 4096));
     const max_width = if (estimated_leaf_count > 0)
-        @max(min_width, @max(estimated_leaf_count, if (stats.node_count > 0 and stats.node_count <= std.math.maxInt(u32)) @as(u32, @intCast(stats.node_count)) else estimated_leaf_count))
+        estimated_leaf_count
     else if (stats.node_count > legacy_max_width and stats.node_count <= std.math.maxInt(u32))
         @as(u32, @intCast(stats.node_count))
     else
         legacy_max_width;
-    const balanced_cap = if (estimated_leaf_count > 0) @max(min_width, estimated_leaf_count) else max_width;
-    const leaf_balanced_width = min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(balanced_cap - min_width)) * default_balanced_search_effort));
-    const balanced_width = @min(legacy_balanced_width, leaf_balanced_width);
 
-    if (effort <= default_balanced_search_effort) {
-        if (balanced_width <= min_width) return min_width;
-        const ratio = effort / default_balanced_search_effort;
-        return min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(balanced_width - min_width)) * ratio));
-    }
+    const k_leaves_u64 = std.math.divCeil(u64, @as(u64, @intFromFloat(@max(1.0, @ceil(@as(f32, @floatFromInt(k)) * search_policy.width_k_factor)))), leaf_size) catch 1;
+    const k_leaves: u32 = @intCast(@min(k_leaves_u64, @as(u64, std.math.maxInt(u32))));
+    const min_width = @min(max_width, @max(k_leaves, search_policy.width_min_leaves));
+    if (min_width >= max_width) return max_width;
+    if (effort <= 0) return min_width;
+    if (effort >= 1) return max_width;
 
-    if (max_width <= balanced_width) return max_width;
-    const ratio = (effort - default_balanced_search_effort) / (1 - default_balanced_search_effort);
-    const width = balanced_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(max_width - balanced_width)) * ratio));
-    return @min(width, max_width);
+    // Two geometric segments anchored at width_mid_fraction x ceiling for the
+    // balanced effort, so the default recall stays calibrated while the floor
+    // and the low-effort range scale with k instead of the corpus.
+    const min_f = @as(f32, @floatFromInt(min_width));
+    const max_f = @as(f32, @floatFromInt(max_width));
+    const mid_f = @min(@min(max_f, search_policy.width_mid_cap), @max(min_f, max_f * search_policy.width_mid_fraction));
+    const width_f = if (effort <= 0.5)
+        min_f * std.math.pow(f32, mid_f / min_f, effort * 2.0)
+    else
+        mid_f * std.math.pow(f32, max_f / mid_f, (effort - 0.5) * 2.0);
+    const width: u32 = @intFromFloat(@min(width_f, max_f));
+    return @max(min_width, @min(width, max_width));
 }
 
 pub fn resolveSearchEpsilon(effort: f32) f32 {
-    if (effort < default_balanced_search_effort) {
-        return 1.0 + (effort * 12.0);
-    }
-    return 7.0 + ((effort - default_balanced_search_effort) * 186.0);
+    ensureSearchPolicyLoaded();
+    return search_policy.epsilon_base + (effort * search_policy.epsilon_span);
+}
+
+pub fn resolveRerankFactor(effort: f32) usize {
+    ensureSearchPolicyLoaded();
+    const factor = search_policy.rerank_factor_base + (effort * search_policy.rerank_factor_span);
+    return @max(1, @as(usize, @intFromFloat(@round(factor))));
 }
 
 fn sparseHitParentOrdinal(
@@ -5869,24 +5944,41 @@ test "resolveSearchEffort maps effort to leaf-aware HBC width" {
     try std.testing.expectApproxEqAbs(@as(f32, default_balanced_search_effort), resolvedSearchEffort(null), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), resolvedSearchEffort(0.5), 0.0001);
 
-    try std.testing.expectEqual(@as(u32, 2080), resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(0, 0, 128)));
-    try std.testing.expectEqual(@as(u32, 64), resolveSearchWidth(10, 0.0, testIndexStats(0, 0, 128)));
+    // Width floor scales with leaves needed for oversampled k, not with k.
+    try std.testing.expectEqual(@as(u32, 4), resolveSearchWidth(10, 0.0, testIndexStats(0, 0, 128)));
+    try std.testing.expectEqual(@as(u32, 16), resolveSearchWidth(500, 0.0, testIndexStats(0, 0, 128)));
+    // Effort 1.0 reaches the ceiling: all leaves when stats are known,
+    // node count or the legacy cap otherwise.
     try std.testing.expectEqual(@as(u32, 4096), resolveSearchWidth(10, 1.0, testIndexStats(0, 0, 128)));
     try std.testing.expectEqual(@as(u32, 17_591), resolveSearchWidth(10, 1.0, testIndexStats(0, 17_591, 128)));
-    try std.testing.expectEqual(@as(u32, 2080), resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(0, 17_591, 128)));
-    try std.testing.expectEqual(@as(u32, 879), resolveSearchWidth(10, 1.0, testIndexStats(879, 879, 128)));
-    try std.testing.expectEqual(@as(u32, 500), resolveSearchWidth(500, 0.0, testIndexStats(0, 0, 128)));
+    try std.testing.expectEqual(@as(u32, 7), resolveSearchWidth(10, 1.0, testIndexStats(879, 879, 128)));
 
     try std.testing.expectEqual(@as(u32, 391), estimateLeafCount(testIndexStats(50_000, 879, 128)));
-    try std.testing.expectEqual(@as(u32, 161), resolveSearchWidth(10, 0.3, testIndexStats(50_000, 879, 128)));
-    try std.testing.expectEqual(@as(u32, 227), resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(50_000, 879, 128)));
-    try std.testing.expectEqual(@as(u32, 879), resolveSearchWidth(10, 1.0, testIndexStats(50_000, 879, 128)));
-    try std.testing.expectEqual(@as(u32, 2080), resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(1_000_000, 17_591, 128)));
-    try std.testing.expectEqual(@as(u32, 17_591), resolveSearchWidth(10, 1.0, testIndexStats(1_000_000, 17_591, 128)));
+    try std.testing.expectEqual(@as(u32, 391), resolveSearchWidth(10, 1.0, testIndexStats(50_000, 879, 128)));
 
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), resolveSearchEpsilon(0.0), 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), resolveSearchEpsilon(default_balanced_search_effort), 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), resolveSearchEpsilon(1.0), 0.01);
+    // The ramp is geometric on both sides of the balanced anchor, monotonic,
+    // and the balanced effort lands at the calibrated mid fraction (~50% of
+    // the leaf ceiling).
+    const w03 = resolveSearchWidth(10, 0.3, testIndexStats(50_000, 879, 128));
+    const w05 = resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(50_000, 879, 128));
+    const w07 = resolveSearchWidth(10, 0.7, testIndexStats(50_000, 879, 128));
+    try std.testing.expect(4 < w03 and w03 < w05 and w05 < w07 and w07 < 391);
+    try std.testing.expect(w05 >= 391 * 3 / 5 and w05 <= 391 * 4 / 5);
+
+    // At large corpora the balanced anchor is capped instead of growing
+    // linearly with the leaf count, while effort 1.0 still reaches them all.
+    const w05_1m = resolveSearchWidth(10, default_balanced_search_effort, testIndexStats(1_000_000, 17_591, 128));
+    try std.testing.expect(w05_1m <= 2048);
+    try std.testing.expectEqual(@as(u32, 7813), resolveSearchWidth(10, 1.0, testIndexStats(1_000_000, 17_591, 128)));
+
+    // Epsilon ramps from mild pruning toward effectively unpruned.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.90), resolveSearchEpsilon(0.0), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.45), resolveSearchEpsilon(default_balanced_search_effort), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.00), resolveSearchEpsilon(1.0), 0.01);
+
+    try std.testing.expectEqual(@as(usize, 6), resolveRerankFactor(0.0));
+    try std.testing.expectEqual(@as(usize, 9), resolveRerankFactor(default_balanced_search_effort));
+    try std.testing.expectEqual(@as(usize, 12), resolveRerankFactor(1.0));
 }
 
 test "multi_match bool_prefix index prefix uses trailing shingle window" {

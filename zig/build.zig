@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
@@ -1115,7 +1116,17 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
+    // link against the host distro's crt startup objects. Newer glibc/binutils
+    // builds may include .sframe sections with relocation types that Zig's
+    // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
+    // target keeps user-supplied -Dtarget overrides intact while making the
+    // no-argument path use Zig's bundled libc startup objects.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const test_filter_override = b.option(
         []const []const u8,
@@ -1554,6 +1565,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const ml_tabular_mod = b.addModule("ml_tabular", .{
+        .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const termite_onnx_graph_mod = b.addModule("termite_onnx_graph", .{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = target,
@@ -1621,6 +1637,7 @@ pub fn build(b: *std.Build) void {
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = termite_ml_mod,
+            .ml_tabular = ml_tabular_mod,
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
@@ -2154,6 +2171,24 @@ pub fn build(b: *std.Build) void {
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
 
+    const lib_ml_tabular_tests = b.addTest(.{
+        .root_module = ml_tabular_mod,
+    });
+    const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
+    const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
+    lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
+
+    const fuzz_tabular_loader = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_fuzz_tabular_loader = b.addRunArtifact(fuzz_tabular_loader);
+    const fuzz_tabular_loader_step = b.step("fuzz-tabular-loader", "Fuzz the tabular_model.json loader (--fuzz to keep running)");
+    fuzz_tabular_loader_step.dependOn(&run_fuzz_tabular_loader.step);
+
     const lib_toon_tests = b.addTest(.{
         .root_module = toon_mod,
     });
@@ -2264,6 +2299,24 @@ pub fn build(b: *std.Build) void {
     const run_api_json_helpers_tests = b.addRunArtifact(api_json_helpers_tests);
     const lib_api_json_helpers_test_step = b.step("lib-api-json-helpers-test", "Run standalone api/json_helpers tests");
     lib_api_json_helpers_test_step.dependOn(&run_api_json_helpers_tests.step);
+
+    const api_artifact_reprocess_jobs_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
+    const api_artifact_reprocess_jobs_tests = b.addTest(.{
+        .root_module = api_artifact_reprocess_jobs_test_mod,
+        .filters = &.{
+            "artifact reprocess job store starts and updates a job",
+            "artifact reprocess job store recovers durable jobs and reseeds ids",
+            "artifact reprocess job cleanup removes recovered durable expired jobs",
+        },
+    });
+    const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
+    const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
+    lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -2827,6 +2880,7 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
+        "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
         "data public API listener uses public API request body limit",
@@ -3345,6 +3399,7 @@ pub fn build(b: *std.Build) void {
             "auth row filter resolver rejects unsupported auth paths",
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
+            "artifact operations apply source document row filter visibility",
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
@@ -3543,6 +3598,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "api auto bulk ingest does not open sessions for normal online writes",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "provisioned table restore rejects mismatched doc identity namespace",
@@ -3551,6 +3607,8 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write coalescer isolates failed waiters",
+            "provisioned table write source consistent visibility hook does not block on busy apply lock",
+            "provisioned table write source consistent visibility refreshes stale dense status",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3574,6 +3632,8 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps doc identity unavailable errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public document artifact manifest handler returns summary and raw state",
+            "public document artifact reprocess handler returns accepted",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3998,13 +4058,14 @@ pub fn build(b: *std.Build) void {
             "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "swarm runtime registers internal group routes explicitly",
             "parse cli accepts config path",
+            "parse cli accepts secret store path",
             "parse cli accepts canonical host port and models dir flags",
-            "termite config uses cli override before common config",
+            "antfly config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
             "swarm public api body limit matches common http listener",
             "swarm public HTTP server uses public API request body limit",
-            "parse cli accepts termite budget overrides",
-            "termite config falls back to common config",
+            "parse cli accepts inference budget overrides",
+            "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
         },
     });
@@ -4043,6 +4104,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_toon_tests.step);

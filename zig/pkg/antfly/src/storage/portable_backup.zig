@@ -349,7 +349,7 @@ fn flushIdentityBatch(
     batch.clearRetainingCapacity();
 }
 
-/// Parse an embedding artifact's JSON value and collect into the appropriate batch.
+/// Parse an embedding artifact value and collect into the appropriate batch.
 fn collectEmbedding(
     alloc: Allocator,
     batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
@@ -360,31 +360,36 @@ fn collectEmbedding(
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
 
-    // Parse JSON value: {"dims": N, "vector": [...]}
-    const EmbPayload = struct {
-        dims: u32,
-        vector: []f32,
+    const vector = if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |decoded|
+        decoded
+    else |_| blk: {
+        // Legacy imported portable data used JSON: {"dims": N, "vector": [...]}.
+        const EmbPayload = struct {
+            dims: u32,
+            vector: []f32,
+        };
+        const json_parsed = std.json.parseFromSlice(EmbPayload, alloc, value, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return; // skip malformed embeddings
+        defer json_parsed.deinit();
+        break :blk try alloc.dupe(f32, json_parsed.value.vector);
     };
-    const json_parsed = std.json.parseFromSlice(EmbPayload, alloc, value, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return; // skip malformed embeddings
-    defer json_parsed.deinit();
+    errdefer alloc.free(vector);
 
     const idx_name = try alloc.dupe(u8, parsed_key.artifact_name);
     const gop = try batches.getOrPut(alloc, idx_name);
     if (!gop.found_existing) {
         gop.value_ptr.* = EmbeddingBatch.init();
-        gop.value_ptr.dimension = @intCast(json_parsed.value.dims);
+        gop.value_ptr.dimension = @intCast(vector.len);
     } else {
         alloc.free(idx_name);
     }
 
-    const vec = try alloc.dupe(f32, json_parsed.value.vector);
     try gop.value_ptr.entries.append(alloc, .{
         .doc_key = try alloc.dupe(u8, parsed_key.doc_key),
         .hash_id = 0, // Zig doesn't store hash_id in embedding values
-        .vector = vec,
+        .vector = vector,
     });
 }
 
@@ -435,8 +440,15 @@ fn appendEdgeBatchEntry(
 // ============================================================================
 
 pub const ImportOptions = struct {
+    pub const EmbeddingSourceField = struct {
+        index_name: []const u8,
+        field_name: []const u8,
+    };
+
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
+    import_derived_indexes: bool = true,
+    embedding_source_fields: []const EmbeddingSourceField = &.{},
 };
 
 /// Import AFB data into the DocStore.
@@ -459,8 +471,6 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload),
-            .edge_batch => try importEdgeBatch(alloc, store, block.payload),
             // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
@@ -470,6 +480,21 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
     if (imported_identity) {
         try doc_identity.validateStoreAlloc(alloc, store);
         try validateImportedIdentityNamespace(store, opts);
+    }
+
+    if (opts.import_derived_indexes) {
+        var derived_reader = backup_codec.SliceReader.init(data);
+        _ = try derived_reader.readHeader();
+        while (derived_reader.pos < derived_reader.data.len) {
+            const block = try derived_reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+
+            switch (block.block_type) {
+                .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
+                .edge_batch => try importEdgeBatch(alloc, store, block.payload),
+                else => {},
+            }
+        }
     }
 }
 
@@ -502,7 +527,12 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     for (entries) |e| {
         const store_key = try internal_keys.documentKeyAlloc(alloc, e.key);
         try owned_keys.append(alloc, store_key);
-        try writes.append(alloc, .{ .key = store_key, .value = e.value });
+        const value = if (e.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            try backup_codec.decompressZstd(alloc, e.value)
+        else
+            try alloc.dupe(u8, e.value);
+        try owned_keys.append(alloc, value);
+        try writes.append(alloc, .{ .key = store_key, .value = value });
     }
 
     if (writes.items.len > 0) {
@@ -535,7 +565,12 @@ fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     }
 }
 
-fn importEmbeddingBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+fn importEmbeddingBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    source_fields: []const ImportOptions.EmbeddingSourceField,
+) !void {
     const result = try backup_codec.decodeEmbeddingBatch(alloc, payload);
     defer {
         alloc.free(result.index_name);
@@ -563,22 +598,54 @@ fn importEmbeddingBatch(alloc: Allocator, store: *DocStore, payload: []const u8)
         const store_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, e.doc_key, result.index_name);
         try owned_keys.append(alloc, store_key);
 
-        // Encode as JSON: {"dims": N, "vector": [...]}
-        const EmbPayload = struct {
-            dims: u32,
-            vector: []const f32,
-        };
-        const json_val = try std.json.Stringify.valueAlloc(alloc, EmbPayload{
-            .dims = result.dimension,
-            .vector = e.vector,
-        }, .{});
-        try owned_vals.append(alloc, json_val);
-        try writes.append(alloc, .{ .key = store_key, .value = json_val });
+        const source_hash = try embeddingSourceHashForDocument(alloc, store, e.doc_key, result.index_name, source_fields);
+        const artifact_value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, e.vector);
+        try owned_vals.append(alloc, artifact_value);
+        try writes.append(alloc, .{ .key = store_key, .value = artifact_value });
     }
 
     if (writes.items.len > 0) {
         try store.putBatch(writes.items, &.{});
     }
+}
+
+fn embeddingSourceHashForDocument(
+    alloc: Allocator,
+    store: *DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source_fields: []const ImportOptions.EmbeddingSourceField,
+) !?u64 {
+    var field_name: ?[]const u8 = null;
+    for (source_fields) |field| {
+        if (std.mem.eql(u8, field.index_name, index_name)) {
+            field_name = field.field_name;
+            break;
+        }
+    }
+    const field = field_name orelse return null;
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(store_key);
+    const raw_doc = store.get(alloc, store_key) catch |err| switch (err) {
+        error.KeyNotFound => return null,
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw_doc);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{}) catch return null;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const source_value = root.get(field) orelse return null;
+    const source_text = switch (source_value) {
+        .string => |text| text,
+        else => return null,
+    };
+    return enrichment_artifact_codec.hashSource(source_text);
 }
 
 fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
@@ -1010,17 +1077,11 @@ test "export and import embeddings round trip" {
         const val = try dst.get(alloc, restored_key);
         defer alloc.free(val);
 
-        // Parse restored JSON
-        const EmbPayload = struct { dims: u32, vector: []f32 };
-        const parsed = try std.json.parseFromSlice(EmbPayload, alloc, val, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        try std.testing.expectEqual(@as(u32, 4), parsed.value.dims);
-        try std.testing.expectEqual(@as(usize, 4), parsed.value.vector.len);
-        try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.value.vector[0], 1e-6);
-        try std.testing.expectApproxEqAbs(@as(f32, 0.4), parsed.value.vector[3], 1e-6);
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, val);
+        defer alloc.free(vector);
+        try std.testing.expectEqual(@as(usize, 4), vector.len);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.1), vector[0], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.4), vector[3], 1e-6);
     }
 }
 

@@ -36,8 +36,8 @@ function SelectTrigger({
         "font-mono text-[13px] text-foreground data-[placeholder]:text-muted-foreground",
         "flex w-full items-center justify-between gap-2 whitespace-nowrap",
         "data-[size=default]:h-9 data-[size=sm]:h-8 px-3 py-1.5",
-        // structure: square, 1.5px border, no shadow
-        "rounded-none border-[1.5px] border-input bg-transparent",
+        // structure: square, token-width border, no shadow
+        "rounded-none border-(length:--border-width) border-input bg-transparent",
         // focus
         "outline-none transition-[border-color,box-shadow]",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -73,8 +73,9 @@ function SelectContent({
           "bg-popover text-popover-foreground",
           "relative z-50 max-h-(--radix-select-content-available-height) min-w-[8rem] overflow-x-hidden overflow-y-auto",
           "origin-(--radix-select-content-transform-origin)",
-          // structure: square, 1.5px border, flat (no shadow-md)
-          "rounded-none border-[1.5px] border-input",
+          // structure: square, token-width border, flat (no shadow-md) — firm
+          // edge marks the floating surface
+          "rounded-none border-(length:--border-width) border-border-strong",
           // motion (snappy/linear — per design language motion rules)
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
@@ -108,7 +109,7 @@ function SelectLabel({ className, ...props }: React.ComponentProps<typeof Select
       data-slot="select-label"
       className={cn(
         // mono kicker — matches DropdownMenuLabel / ContextMenuLabel / Label
-        "px-2 py-1.5 font-mono uppercase tracking-[0.1em] text-[11px] font-medium text-muted-foreground",
+        "px-2 py-1.5 font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
         className
       )}
       {...props}
@@ -128,7 +129,7 @@ function SelectItem({
         // mono "instrument readout" voice
         "group/item font-mono text-[13px]",
         "relative flex w-full cursor-default items-center gap-2.5 select-none",
-        "py-1.5 px-2 rounded-none outline-hidden",
+        "py-2 px-2 rounded-none outline-hidden",
         "focus:bg-accent focus:text-accent-foreground",
         "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
         "[&_svg:not([class*='text-'])]:text-muted-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
@@ -139,7 +140,7 @@ function SelectItem({
     >
       <span
         aria-hidden
-        className="size-1.5 shrink-0 bg-transparent group-data-[state=checked]/item:bg-primary"
+        className="size-1.5 shrink-0 bg-transparent group-data-[state=checked]/item:bg-foreground"
       />
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
     </SelectPrimitive.Item>

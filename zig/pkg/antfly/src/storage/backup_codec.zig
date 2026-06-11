@@ -238,7 +238,7 @@ pub const SliceReader = struct {
     }
 };
 
-fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
+pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     const Reader = std.Io.Reader;
     var input = Reader.fixed(compressed);
     var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;

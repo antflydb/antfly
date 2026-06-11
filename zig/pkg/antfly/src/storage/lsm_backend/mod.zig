@@ -37,6 +37,9 @@ pub const Cache = impl.Cache;
 pub const DefaultCacheSizeBytes = impl.DefaultCacheSizeBytes;
 pub const TableEntry = impl.TableEntry;
 pub const MutableSnapshotReason = impl.MutableSnapshotReason;
+pub const ReaderPinKind = impl.ReaderPinKind;
+pub const reader_pin_kind_count = impl.reader_pin_kind_count;
+pub const readerPinKindName = impl.readerPinKindName;
 pub const mutableSnapshotReasonName = impl.mutableSnapshotReasonName;
 
 test {

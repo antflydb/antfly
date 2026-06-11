@@ -1,6 +1,6 @@
 import { Button } from "@antfly/design-system";
 import { MoonIcon, SunIcon } from "@radix-ui/react-icons";
-import { Monitor, Rows3, Rows4, Search } from "lucide-react";
+import { Monitor, Rows2, Rows3, Rows4, Search } from "lucide-react";
 import type * as React from "react";
 import { useCommandPalette } from "@/components/command-palette-provider";
 import { DashboardGeneratorControl } from "@/components/playground/DashboardGeneratorControl";
@@ -72,9 +72,15 @@ export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderP
           variant="ghost"
           size="icon"
           onClick={toggleDensity}
-          title={density === "compact" ? "Switch to Comfortable" : "Switch to Compact"}
+          title={`Density: ${density} (click to cycle)`}
         >
-          {density === "compact" ? <Rows3 className="size-4" /> : <Rows4 className="size-4" />}
+          {density === "compact" ? (
+            <Rows4 className="size-4" />
+          ) : density === "comfortable" ? (
+            <Rows2 className="size-4" />
+          ) : (
+            <Rows3 className="size-4" />
+          )}
         </Button>
       </div>
     </header>

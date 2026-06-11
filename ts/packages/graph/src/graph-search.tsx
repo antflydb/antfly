@@ -59,7 +59,7 @@ export function GraphSearch({ nodes, onSelect, className }: GraphSearchProps) {
         )}
       </div>
       {open && results.length > 0 && (
-        <div className="mt-1 overflow-hidden rounded-none border-[1.5px] border-border-strong bg-background/95 backdrop-blur-sm">
+        <div className="mt-1 overflow-hidden rounded-none border-(length:--border-width) border-border-strong bg-background/95 backdrop-blur-sm">
           {results.map((node) => (
             <button
               type="button"
