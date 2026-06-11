@@ -21,7 +21,7 @@ Animated brand character. Ported from the archived `@antfly/anty-embed` package 
 />
 ```
 
-Imperative handle (ref): `playEmotion`, `killAll`, `pauseIdle`, `resumeIdle`, `startLook('left'|'right')`, `endLook`, `powerOff`, `wakeUp`.
+Imperative handle (ref): `playEmotion`, `killAll`, `pauseIdle`, `resumeIdle`, `startLook('left'|'right')`, `endLook`, `powerOff`, `wakeUp`, `pixelate`, `depixelate`, `togglePixelate`, `startPixelateCycle`, `stopPixelateCycle`, `isPixelated`. Declarative prop: `pixelated`.
 
 ## Emotions (9)
 
@@ -33,6 +33,35 @@ To add an emotion:
 3. Add it to `validEmotions` in `anty.tsx` so it's reachable from `playEmotion()`.
 
 Cut during the port (do not re-introduce without a use case): `smize`, `pleased`, `happy`, `celebrate`, `sad`, `angry`, `spin`, `jump`, `idea`, `super`. Search-bar morph, chat panel, feeding/hearts, particle canvas, and super mode also cut.
+
+## Pixelate (`pixelate/`)
+
+Ripples the smooth mark into a genuine pixel form and back (and a looping
+"waiting" animation). It is an **orthogonal visual subsystem**, modeled on
+`glow-system`/`shadow` — NOT a state in the priority machine — so it composes
+with idle/emotions/transitions instead of blocking them.
+
+- **How it composes:** a `<canvas>` lives *inside* `characterRef` (the single
+  GSAP transform target), wrapped alongside a `vectorLayer` div. While pixelated
+  the vector layer is hidden and the canvas shown; since the canvas is under
+  `characterRef`, it inherits every jump/spin/float/scale — so a pixelated Anty
+  can still `playEmotion('excited')`.
+- **Renderer:** raw WebGL (no dep), nearest-neighbor pixel quantization + sine
+  displacement ripple, diagonal **TL→BR** wavefront. The GL loop runs only during
+  sweeps/cycles; when settled it draws one frame and stops (CSS transforms then
+  move the static bitmap). One lazily-created GL context per `<Anty>`.
+- **Texture = the canonical logo**, theme-recolored — the 4 `af-logo.svg` paths
+  embedded in `pixelate/logo-mark.ts` (the package can't import app `public/`
+  assets). It is NOT a live DOM snapshot, so the pixel form is the brand mark
+  with triangle eyes and does not capture a live eye expression. Showcase Anty
+  with `eyeStyle="original"` so the vector↔pixel cross-fade matches.
+- **Files:** `pixelate/logo-mark.ts` (paths + SVG/data-url builder),
+  `pixelate/webgl.ts` (quad program helper), `pixelate/pixelate-system.ts`
+  (`createPixelateSystem` — sweeps, `waves`/`pulse` cycle, lifecycle). Owned by
+  `use-animation-controller.ts` (`pixelateSystemRef`), exposed on the handle.
+- **Limitations:** character-level transforms compose; sub-element morphs (eye
+  blink, the `shocked` bracket-split) freeze in the pixel snapshot. Reduced
+  motion → instant cut, cycle disabled.
 
 ## Logo parity
 

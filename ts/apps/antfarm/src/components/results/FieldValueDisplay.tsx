@@ -54,17 +54,13 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
 
   // Render null/undefined
   if (value === null || value === undefined) {
-    return (
-      <Badge variant="secondary" className="font-mono text-xs">
-        null
-      </Badge>
-    );
+    return <Badge className="font-mono text-xs">null</Badge>;
   }
 
   // Render boolean
   if (typeof value === "boolean") {
     return (
-      <Badge variant={value ? "default" : "secondary"} className="font-mono text-xs">
+      <Badge variant={value ? "default" : "default"} className="font-mono text-xs">
         {value.toString()}
       </Badge>
     );
@@ -100,11 +96,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
       }
 
       if (Array.isArray(parsed) && parsed.every((v) => typeof v === "number")) {
-        return (
-          <Badge variant="outline" className="font-mono text-xs">
-            Vector ({parsed.length}D)
-          </Badge>
-        );
+        return <Badge className="font-mono text-xs">Vector ({parsed.length}D)</Badge>;
       }
     }
 
@@ -207,20 +199,12 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
         fieldName.toLowerCase().includes("vector")) &&
       value.every((v) => typeof v === "number")
     ) {
-      return (
-        <Badge variant="outline" className="font-mono text-xs">
-          Vector ({value.length}D)
-        </Badge>
-      );
+      return <Badge className="font-mono text-xs">Vector ({value.length}D)</Badge>;
     }
 
     // Handle empty arrays
     if (value.length === 0) {
-      return (
-        <Badge variant="secondary" className="font-mono text-xs">
-          []
-        </Badge>
-      );
+      return <Badge className="font-mono text-xs">[]</Badge>;
     }
 
     // Handle simple arrays (strings, numbers, booleans)
@@ -233,7 +217,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
         <div className="flex flex-wrap gap-1">
           {value.map((item, idx) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: array items may have duplicate values
-            <Badge key={idx} variant="outline" className="text-xs">
+            <Badge key={idx} className="text-xs">
               {String(item)}
             </Badge>
           ))}
@@ -252,9 +236,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
               ) : (
                 <ChevronRight className="h-4 w-4" />
               )}
-              <Badge variant="secondary" className="ml-1 font-mono text-xs">
-                Array ({value.length})
-              </Badge>
+              <Badge className="ml-1 font-mono text-xs">Array ({value.length})</Badge>
             </Button>
           </CollapsibleTrigger>
           <Button
@@ -287,11 +269,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
 
     // Handle empty objects
     if (entries.length === 0) {
-      return (
-        <Badge variant="secondary" className="font-mono text-xs">
-          {"{}"}
-        </Badge>
-      );
+      return <Badge className="font-mono text-xs">{"{}"}</Badge>;
     }
 
     // Show as JSON with syntax highlighting for complex objects
@@ -309,9 +287,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
                 ) : (
                   <ChevronRight className="h-4 w-4" />
                 )}
-                <Badge variant="secondary" className="ml-1 font-mono text-xs">
-                  Object ({entries.length} fields)
-                </Badge>
+                <Badge className="ml-1 font-mono text-xs">Object ({entries.length} fields)</Badge>
               </Button>
             </CollapsibleTrigger>
             <Button

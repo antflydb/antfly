@@ -425,7 +425,15 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, inferenceApiUrl]);
+  }, [
+    inputText,
+    selectedModel,
+    isRebelModel,
+    entityLabels,
+    relationLabels,
+    config,
+    inferenceApiUrl,
+  ]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -748,7 +756,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   {entityLabels.map((label) => (
                     <Badge
                       key={label}
-                      variant="secondary"
                       style={{
                         backgroundColor: `${getNodeColor(label)}20`,
                         borderColor: getNodeColor(label),
@@ -795,7 +802,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 <Label>Relation Labels</Label>
                 <div className="flex flex-wrap gap-2 mb-2">
                   {relationLabels.map((label) => (
-                    <Badge key={label} variant="outline" className="gap-1">
+                    <Badge key={label} className="gap-1">
                       {label}
                       <button
                         type="button"
@@ -898,20 +905,20 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.nodes.length} nodes
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <GitBranch className="h-3 w-3" />
             {result.edges.length} edges
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Zap className="h-3 w-3" />
             {result.model}
           </Badge>
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>
@@ -1008,7 +1015,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                             </td>
                             <td className="px-3 py-2">
                               <Badge
-                                variant="outline"
                                 style={{
                                   backgroundColor: `${getNodeColor(node.type)}20`,
                                   borderColor: getNodeColor(node.type),
@@ -1045,7 +1051,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                               {nodeMap.get(edge.source_id)?.canonical_name || edge.source_id}
                             </td>
                             <td className="px-3 py-2">
-                              <Badge variant="outline">{edge.type}</Badge>
+                              <Badge>{edge.type}</Badge>
                             </td>
                             <td className="px-3 py-2">
                               {nodeMap.get(edge.target_id)?.canonical_name || edge.target_id}

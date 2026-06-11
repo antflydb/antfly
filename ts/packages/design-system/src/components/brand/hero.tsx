@@ -1,6 +1,5 @@
 import type * as React from "react";
 import { cn } from "@/lib/utils";
-import { GraphPaperBg } from "./graph-paper-bg";
 import { Kicker } from "./kicker";
 import { MonoLabel } from "./mono-label";
 import { TypeOn } from "./type-on";
@@ -35,8 +34,6 @@ interface HeroProps extends Omit<React.HTMLAttributes<HTMLElement>, "title"> {
    * the hero lays out as a two-column grid on `md+`.
    */
   aside?: React.ReactNode;
-  /** Wrap the hero in a subtle hexagonal graph-paper background. @default true */
-  graphPaper?: boolean;
   /** Center the content horizontally. @default "start" */
   align?: "start" | "center";
 }
@@ -48,7 +45,6 @@ interface HeroProps extends Omit<React.HTMLAttributes<HTMLElement>, "title"> {
  *   - Optional {@link TypeOn} typewriter tagline
  *   - Restrained description in muted-foreground
  *   - Flat square buttons (the visual language is borders + amber accent, not gradients)
- *   - Optional hexagonal graph-paper background
  *   - Optional `aside` slot (right column) for an `<AntyPixel>` or other brand asset
  *
  * Deliberately sparse — the whitespace and the amber accent do the work.
@@ -61,7 +57,6 @@ export function Hero({
   description,
   actions,
   aside,
-  graphPaper = true,
   align = "start",
   className,
   ...props
@@ -113,6 +108,5 @@ export function Hero({
     </section>
   );
 
-  if (graphPaper) return <GraphPaperBg>{inner}</GraphPaperBg>;
   return inner;
 }

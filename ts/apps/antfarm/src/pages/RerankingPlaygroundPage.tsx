@@ -446,16 +446,16 @@ const RerankingPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.data.length} documents
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Zap className="h-3 w-3" />
             {result.model}
           </Badge>
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>

@@ -1,0 +1,17 @@
+/**
+ * Border tokens.
+ *
+ * One tunable width for every component chassis. Components reference it via
+ * Tailwind v4 arbitrary-length syntax: `border-(length:--border-width)`.
+ *
+ * Border doctrine:
+ *   - in-flow surfaces (card, table, tabs rail, toolbar) use --border
+ *   - floating surfaces (dialog, popover, menus, sheet) use --border-strong —
+ *     with zero shadows, the firmer edge is the elevation cue
+ *   - interactive controls (input, select, checkbox, outline button) use
+ *     --input, which sits a step firmer than --border
+ */
+
+:root {
+  --border-width: 1px;
+}

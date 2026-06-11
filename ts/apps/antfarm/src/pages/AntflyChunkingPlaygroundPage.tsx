@@ -504,22 +504,22 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.data.length} chunks
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Zap className="h-3 w-3" />
             {result.model}
           </Badge>
           {documentId && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Database className="h-3 w-3" />
               {documentId}
             </Badge>
           )}
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>
@@ -545,7 +545,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             {/* Document source toggle */}
             <div className="flex gap-2">
               <Button
-                variant={docSource === "table" ? "secondary" : "ghost"}
+                variant={docSource === "table" ? "outline" : "ghost"}
                 size="sm"
                 onClick={() => setDocSource("table")}
                 disabled={!selectedTable}
@@ -554,7 +554,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                 From Table
               </Button>
               <Button
-                variant={docSource === "manual" ? "secondary" : "ghost"}
+                variant={docSource === "manual" ? "outline" : "ghost"}
                 size="sm"
                 onClick={() => setDocSource("manual")}
               >

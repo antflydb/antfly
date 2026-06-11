@@ -883,24 +883,24 @@ const TranscribePlaygroundPage: React.FC = () => {
         {/* Stats */}
         {doneSegments.length > 0 && (
           <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Zap className="h-3 w-3" />
               {selectedTranscriberModel}
             </Badge>
             {segments.length > 1 && (
-              <Badge variant="secondary" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <AudioLines className="h-3 w-3" />
                 {segments.length} segments
               </Badge>
             )}
             {useLLMCleanup && selectedGeneratorModel && doneSegments.some((s) => s.cleanedText) && (
-              <Badge variant="secondary" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <Sparkles className="h-3 w-3" />
                 {selectedGeneratorModel}
               </Badge>
             )}
             {processingTime != null && (
-              <Badge variant="outline" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <Clock className="h-3 w-3" />
                 {processingTime.toFixed(0)}ms
               </Badge>

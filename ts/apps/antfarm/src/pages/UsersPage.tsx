@@ -251,11 +251,7 @@ export function UsersPage() {
             onClick={() => setSelectedUser(row.original.username)}
           >
             {row.original.username}
-            {currentUser?.username === row.original.username && (
-              <Badge variant="secondary" className="ml-2">
-                You
-              </Badge>
-            )}
+            {currentUser?.username === row.original.username && <Badge className="ml-2">You</Badge>}
           </button>
         ),
       },
@@ -539,8 +535,8 @@ export function UsersPage() {
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
-                            <Badge variant="outline">{perm.type}</Badge>
-                            <Badge variant="secondary">{perm.resource_type}</Badge>
+                            <Badge>{perm.type}</Badge>
+                            <Badge>{perm.resource_type}</Badge>
                           </div>
                           <p className="text-sm font-mono">{perm.resource}</p>
                         </div>

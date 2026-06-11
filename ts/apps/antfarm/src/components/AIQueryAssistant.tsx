@@ -109,9 +109,9 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
   };
 
   const getConfidenceColor = (confidence: number | undefined) => {
-    if (confidence === undefined) return "secondary";
+    if (confidence === undefined) return "default";
     if (confidence >= 0.8) return "default";
-    if (confidence >= 0.5) return "secondary";
+    if (confidence >= 0.5) return "default";
     return "destructive";
   };
 
@@ -129,9 +129,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
           <CardTitle className="text-base flex items-center gap-2">
             <Sparkles className="h-4 w-4" />
             AI Query Builder
-            <Badge variant="outline" className="font-normal text-xs">
-              Beta
-            </Badge>
+            <Badge className="font-normal text-xs">Beta</Badge>
           </CardTitle>
           <Popover>
             <PopoverTrigger asChild>
@@ -226,7 +224,7 @@ const AIQueryAssistant: React.FC<AIQueryAssistantProps> = ({
               <Button onClick={handleApplyAndRun} size="sm" className="flex-1">
                 Apply & Run
               </Button>
-              <Button onClick={handleApply} variant="secondary" size="sm" className="flex-1">
+              <Button onClick={handleApply} variant="outline" size="sm" className="flex-1">
                 Apply
               </Button>
               <Button onClick={handleDiscard} variant="ghost" size="sm">

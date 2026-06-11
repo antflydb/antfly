@@ -7,10 +7,11 @@ function Textarea({ className, ...props }: React.ComponentProps<"textarea">) {
     <textarea
       data-slot="textarea"
       className={cn(
-        // mono "instrument readout" voice
-        "font-mono text-[13px] text-foreground placeholder:text-muted-foreground",
-        // structure: square, 1.5px border, no shadow
-        "field-sizing-content flex min-h-20 w-full rounded-none border-[1.5px] border-input bg-transparent",
+        // body voice — what the user types is a phrase, not an instrument
+        // readout. Code-like fields can opt back in with font-mono.
+        "font-sans text-sm text-foreground placeholder:text-muted-foreground",
+        // structure: square, token-width border, no shadow
+        "field-sizing-content flex min-h-20 w-full rounded-none border-(length:--border-width) border-input bg-transparent",
         "px-3 py-2",
         // focus
         "outline-none transition-[border-color,box-shadow]",

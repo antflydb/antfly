@@ -2351,11 +2351,167 @@ export interface components {
             /** Format: uint64 */
             l0_bytes?: number;
             /** Format: uint64 */
+            lower_level_run_count?: number;
+            /** Format: uint64 */
+            lower_level_bytes?: number;
+            /** Format: uint64 */
+            max_level?: number;
+            /** Format: uint64 */
+            compactable_l0_run_count?: number;
+            /** Format: uint64 */
+            overlapping_l0_run_count?: number;
+            /** Format: uint64 */
+            soft_limit_l0_run_count?: number;
+            /** Format: uint64 */
+            hard_limit_l0_run_count?: number;
+            /** Format: uint64 */
+            write_stall_l0_run_debt?: number;
+            /** Format: uint64 */
+            soft_limit_l0_bytes?: number;
+            /** Format: uint64 */
+            hard_limit_l0_bytes?: number;
+            /** Format: uint64 */
+            write_stall_l0_byte_debt?: number;
+            /** Format: uint64 */
+            level_overflow_run_count?: number;
+            /** Format: uint64 */
+            level_overflow_bytes?: number;
+            /** Format: uint64 */
+            obsolete_path_count?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_readers?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_versions?: number;
+            /** Format: uint64 */
+            obsolete_paths_waiting_for_retry?: number;
+            /** Format: uint64 */
+            obsolete_paths_reclaimable?: number;
+            /** Format: uint64 */
+            obsolete_delete_failures?: number;
+            /** Format: uint64 */
+            obsolete_delete_retries?: number;
+            /** Format: uint64 */
+            current_manifest_bytes?: number;
+            /** Format: uint64 */
+            mutable_entry_count?: number;
+            /** Format: uint64 */
+            mutable_bytes?: number;
+            /** Format: uint64 */
+            immutable_memtable_count?: number;
+            /** Format: uint64 */
+            immutable_entry_count?: number;
+            /** Format: uint64 */
+            immutable_bytes?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_count?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_bytes?: number;
+            /** Format: uint64 */
+            mutable_snapshot_clone_peak_bytes?: number;
+            /** Format: uint64 */
+            read_snapshot_mutable_rotation_count?: number;
+            /** Format: uint64 */
+            read_snapshot_mutable_rotation_bytes?: number;
+            /** Format: uint64 */
             wal_retained_bytes?: number;
             /** Format: uint64 */
             compaction_backlog_bytes?: number;
             /** Format: uint64 */
             active_readers?: number;
+            /** Format: uint64 */
+            active_readers_bound_read_txn?: number;
+            /** Format: uint64 */
+            active_readers_namespace_read_txn?: number;
+            /** Format: uint64 */
+            active_readers_probe_txn?: number;
+            /** Format: uint64 */
+            active_readers_current_scan?: number;
+            /** Format: uint64 */
+            active_readers_write_txn?: number;
+            /** Format: uint64 */
+            active_readers_compaction?: number;
+            /** Format: uint64 */
+            active_readers_other?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_bound_read_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_namespace_read_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_probe_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_current_scan?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_write_txn?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_compaction?: number;
+            /** Format: uint64 */
+            obsolete_paths_pinned_by_reader_other?: number;
+            /** Format: uint64 */
+            active_bulk_ingest_batches?: number;
+            manifest_dirty?: boolean;
+            obsolete_manifest_dirty?: boolean;
+            /** Format: uint64 */
+            maintenance_score?: number;
+            /** Format: uint64 */
+            maintenance_debt_hint?: number;
+            /** Format: uint64 */
+            flush_count?: number;
+            /** Format: uint64 */
+            flush_output_run_count?: number;
+            /** Format: uint64 */
+            flush_output_bytes?: number;
+            /** Format: uint64 */
+            sorted_ingest_run_count?: number;
+            /** Format: uint64 */
+            sorted_ingest_bytes?: number;
+            /** Format: uint64 */
+            manifest_write_count?: number;
+            /** Format: uint64 */
+            manifest_bytes?: number;
+            /** Format: uint64 */
+            write_pressure_event_count?: number;
+            /** Format: uint64 */
+            write_pressure_compaction_count?: number;
+            /** Format: uint64 */
+            write_pressure_compaction_step_count?: number;
+            /** Format: uint64 */
+            write_pressure_overload_count?: number;
+            /** Format: uint64 */
+            write_pressure_overload_l0_run_debt?: number;
+            /** Format: uint64 */
+            immutable_rotation_count?: number;
+            /** Format: uint64 */
+            immutable_flush_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_attempt_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_success_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_attempt_count?: number;
+            /** Format: uint64 */
+            bulk_append_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_direct_success_count?: number;
+            /** Format: uint64 */
+            bulk_append_direct_entry_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_backend_pending_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_below_threshold_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_duplicate_key_count?: number;
+            /** Format: uint64 */
+            bulk_append_fallback_to_mutable_entry_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_direct_entry_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_unsupported_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_backend_mutable_count?: number;
+            /** Format: uint64 */
+            direct_bulk_ingest_fallback_below_threshold_count?: number;
         };
         StorageStatus: {
             /**

@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   Backend,
+  InferenceModel,
   ModelType,
   ModelTypeInfo,
   QuantizationOption,
   RecognizerCapability,
-  InferenceModel,
 } from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
 
@@ -317,7 +317,8 @@ export function useInferenceRegistry(): InferenceRegistryState {
         if (signal?.aborted) return;
         if (!isMountedRef.current) return;
 
-        const message = err instanceof Error ? err.message : "Failed to fetch Antfly inference models";
+        const message =
+          err instanceof Error ? err.message : "Failed to fetch Antfly inference models";
         setError(message);
         setLoading(false);
       } finally {

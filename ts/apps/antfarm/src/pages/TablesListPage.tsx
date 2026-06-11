@@ -15,7 +15,6 @@ import {
   DialogDescription,
   DialogTitle,
   DialogTrigger,
-  GraphPaperBg,
 } from "@antfly/design-system";
 import type { Table as AntflyTable, TableStatus } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -141,7 +140,7 @@ const TablesListPage: React.FC = () => {
           return (
             <div className="flex items-center gap-2">
               {table.migration && (
-                <Badge variant="outline" className="af-status-badge-warning">
+                <Badge className="af-status-badge-warning">
                   Rebuilding v{table.migration.read_schema.version} → v
                   {table.schema?.version ?? "?"}
                 </Badge>
@@ -181,7 +180,6 @@ const TablesListPage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-none" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>
