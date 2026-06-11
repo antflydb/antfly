@@ -668,6 +668,28 @@ pub fn isAssetArtifactKey(key: []const u8) bool {
     return name_term + 2 == key.len;
 }
 
+pub fn matchesAssetArtifactName(key: []const u8, artifact_name: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "asset")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (!componentEquals(key, pos, artifact_name)) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (pos == key.len) return true;
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return false;
+        return unit_term + 2 == key.len;
+    }
+    return false;
+}
+
 /// Returns true if key is a summary artifact: [0x01][doc][0x00 0x00][0x20]["summary"][0x00 0x00][name][0x00 0x00]
 pub fn isSummaryArtifactKey(key: []const u8) bool {
     if (!isInternalUserKey(key)) return false;
@@ -1254,6 +1276,21 @@ test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
     const res = try resolutionArtifactKeyAlloc(alloc, "doc:article-123", "resolution_v1");
     defer alloc.free(res);
     try std.testing.expect((try parseAssetArtifactKeyAlloc(alloc, res)) == null);
+}
+
+test "matchesAssetArtifactName matches top-level and document unit assets" {
+    const alloc = std.testing.allocator;
+    const asset = try artifactNamedPrefixAlloc(alloc, "doc:article-123", "asset", "document_units_v1");
+    defer alloc.free(asset);
+    const unit = try documentUnitArtifactKeyAlloc(alloc, "doc:article-123", "document_units_v1", "page:000001");
+    defer alloc.free(unit);
+    const chunk = try documentUnitChunkArtifactKeyAlloc(alloc, "doc:article-123", "document_units_v1", "page:000001", 0);
+    defer alloc.free(chunk);
+
+    try std.testing.expect(matchesAssetArtifactName(asset, "document_units_v1"));
+    try std.testing.expect(matchesAssetArtifactName(unit, "document_units_v1"));
+    try std.testing.expect(!matchesAssetArtifactName(unit, "other_units_v1"));
+    try std.testing.expect(!matchesAssetArtifactName(chunk, "document_units_v1"));
 }
 
 test "asset artifact source index keys group by source artifact" {

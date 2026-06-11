@@ -3180,6 +3180,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
                     if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
@@ -3266,6 +3267,7 @@ pub const IndexManager = struct {
                 if (embedding_cfg.expected_dims != 0) continue;
                 if (embedding_cfg.source_artifact_name.len > 0) {
                     const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
+                    if (chunk_cfg.source_artifact_name.len > 0) continue;
                     if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                         try requests.append(alloc, .{
                             .kind = .chunk_text,
@@ -3877,11 +3879,18 @@ pub const IndexManager = struct {
             .sparse_vector => {
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
                     .embedding_name = if (sparse_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else
@@ -5803,6 +5812,12 @@ pub const IndexManager = struct {
                 var backfill_ns: u64 = 0;
                 const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
                 defer sparse_cfg.deinit(self.alloc);
+                const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
+                defer if (sparse_generator) |generator| generator.deinit(self.alloc);
+                const referenced_embedding = if (sparse_generator == null)
+                    self.getEnrichment(.embedding, cfg.name)
+                else
+                    null;
 
                 const path = try self.indexPath(cfg.name);
                 defer self.alloc.free(path);
@@ -5829,13 +5844,14 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
-                    .chunk_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
-                    } else null,
-                    .embedding_name = if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| blk: {
-                        defer generator.deinit(self.alloc);
+                    } else if (referenced_embedding) |embedding_cfg|
+                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
+                    else
+                        null,
+                    .embedding_name = if (sparse_generator) |generator| blk: {
                         break :blk if (generator.embedding_name) |embedding_name|
                             try self.alloc.dupe(u8, embedding_name)
                         else
@@ -11177,8 +11193,9 @@ fn isMetadataKey(key: []const u8) bool {
 }
 
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
-    if (entry.chunk_name) |chunk_name| {
-        return internal_keys.matchesChunkArtifactName(key, chunk_name);
+    if (entry.chunk_name) |artifact_name| {
+        return internal_keys.matchesChunkArtifactName(key, artifact_name) or
+            internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
     if (isPrimaryDocumentCandidate(key)) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;

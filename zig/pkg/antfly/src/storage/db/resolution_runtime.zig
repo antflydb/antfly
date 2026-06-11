@@ -148,7 +148,10 @@ const ParsedSourceArtifactKey = struct {
 };
 
 fn parseSourceArtifactKeyAlloc(alloc: std.mem.Allocator, key: []const u8) !?ParsedSourceArtifactKey {
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => return null,
+        else => return err,
+    }) orelse return null;
     defer artifact_ref.deinit(alloc);
     if (artifact_ref.kind != .asset and artifact_ref.kind != .chunk) return null;
 

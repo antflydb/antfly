@@ -374,6 +374,43 @@ const ChunkAncestorInfo = struct {
     }
 };
 
+fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) !?[]u8 {
+    if (artifact_ref.kind == .chunk) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+    if (artifact_ref.kind != .embedding) return null;
+    const source = artifact_ref.source orelse return null;
+    if (source.kind != .chunk) return null;
+    const chunk_ref = types.ArtifactRef{
+        .document_id = artifact_ref.document_id,
+        .name = source.name,
+        .kind = .chunk,
+        .chunk_id = source.chunk_id,
+        .unit_id = source.unit_id,
+    };
+    return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, chunk_ref);
+}
+
+fn chunkStorageKeyForHitAlloc(alloc: Allocator, hit: types.SearchHit) !?[]u8 {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref)) |chunk_key| return chunk_key;
+    }
+
+    if (internal_keys.isChunkArtifactRecordKey(hit.id)) return try alloc.dupe(u8, hit.id);
+
+    const maybe_embedding_identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
+    if (maybe_embedding_identity) |identity_value| {
+        var identity = identity_value;
+        defer identity.deinit(alloc);
+        if (internal_keys.isChunkArtifactRecordKey(identity.doc_key)) return try alloc.dupe(u8, identity.doc_key);
+    }
+
+    var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    return try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref);
+}
+
 fn hydrateDirectChunkAncestors(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -401,9 +438,10 @@ fn hydrateDirectChunkAncestors(
     var source_count: usize = 0;
     var unit_count: usize = 0;
     for (owned.hits, 0..) |hit, i| {
-        if (!internal_keys.isChunkArtifactRecordKey(hit.id)) continue;
+        const chunk_key = (try chunkStorageKeyForHitAlloc(alloc, hit)) orelse continue;
+        defer alloc.free(chunk_key);
         const payload = chunk_payloads[i] orelse hit.stored_data orelse continue;
-        const info = parseChunkAncestorInfoAlloc(alloc, hit.id, payload) catch |err| switch (err) {
+        const info = parseChunkAncestorInfoAlloc(alloc, chunk_key, payload) catch |err| switch (err) {
             error.InvalidChunkArtifact, error.InvalidInternalUserKey => continue,
             else => return err,
         };
@@ -413,7 +451,7 @@ fn hydrateDirectChunkAncestors(
     }
 
     if (req.hierarchy_include_source and source_count > 0) {
-        try hydrateDirectChunkSourceAncestors(alloc, req, &owned, infos, source_count, shaper);
+        try hydrateDirectChunkSourceAncestors(alloc, &owned, infos, source_count, shaper);
     }
     if (req.hierarchy_include_unit and unit_count > 0) {
         try hydrateDirectChunkUnitAncestors(alloc, &owned, infos, unit_count, shaper);
@@ -433,9 +471,18 @@ fn loadDirectChunkPayloads(
     }
     @memset(loaded, null);
 
+    const storage_keys = try alloc.alloc(?[]u8, hits.len);
+    defer {
+        for (storage_keys) |maybe_key| if (maybe_key) |key| alloc.free(key);
+        alloc.free(storage_keys);
+    }
+    @memset(storage_keys, null);
     var missing_count: usize = 0;
-    for (hits) |hit| {
-        if (internal_keys.isChunkArtifactRecordKey(hit.id)) missing_count += 1;
+    for (hits, 0..) |hit, i| {
+        if (try chunkStorageKeyForHitAlloc(alloc, hit)) |chunk_key| {
+            storage_keys[i] = chunk_key;
+            missing_count += 1;
+        }
     }
     if (missing_count == 0) return loaded;
 
@@ -443,9 +490,9 @@ fn loadDirectChunkPayloads(
         const keys = try alloc.alloc([]const u8, missing_count);
         defer alloc.free(keys);
         var key_index: usize = 0;
-        for (hits) |hit| {
-            if (!internal_keys.isChunkArtifactRecordKey(hit.id)) continue;
-            keys[key_index] = hit.id;
+        for (storage_keys) |maybe_key| {
+            const key = maybe_key orelse continue;
+            keys[key_index] = key;
             key_index += 1;
         }
         var many = try load_many(shaper.ctx, alloc, keys);
@@ -454,8 +501,8 @@ fn loadDirectChunkPayloads(
             if (many.len > 0) alloc.free(many);
         }
         key_index = 0;
-        for (hits, 0..) |hit, i| {
-            if (!internal_keys.isChunkArtifactRecordKey(hit.id)) continue;
+        for (storage_keys, 0..) |maybe_key, i| {
+            if (maybe_key == null) continue;
             if (many[key_index]) |bytes| {
                 loaded[i] = bytes;
                 many[key_index] = null;
@@ -466,9 +513,9 @@ fn loadDirectChunkPayloads(
     }
 
     const load_one = shaper.load_stored orelse return loaded;
-    for (hits, 0..) |hit, i| {
-        if (!internal_keys.isChunkArtifactRecordKey(hit.id)) continue;
-        loaded[i] = try load_one(shaper.ctx, alloc, hit.id);
+    for (storage_keys, 0..) |maybe_key, i| {
+        const key = maybe_key orelse continue;
+        loaded[i] = try load_one(shaper.ctx, alloc, key);
     }
     return loaded;
 }
@@ -514,12 +561,15 @@ fn jsonObjectStringDupe(alloc: Allocator, object: std.json.ObjectMap, key: []con
 
 fn hydrateDirectChunkSourceAncestors(
     alloc: Allocator,
-    req: types.SearchRequest,
     result: *types.SearchResult,
     infos: []const ?ChunkAncestorInfo,
     source_count: usize,
     shaper: ChunkParentResultShaper,
 ) !void {
+    const load_many = shaper.load_many_stored;
+    const load_one = shaper.load_stored;
+    if (load_many == null and load_one == null) return;
+
     const parent_ids = try alloc.alloc([]const u8, source_count);
     defer alloc.free(parent_ids);
     var index: usize = 0;
@@ -529,14 +579,14 @@ fn hydrateDirectChunkSourceAncestors(
         index += 1;
     }
 
-    var loaded = if (shaper.load_parent_stored_many) |load_many|
-        try load_many(shaper.ctx, alloc, req, parent_ids)
+    var loaded = if (load_many) |load_many_fn|
+        try load_many_fn(shaper.ctx, alloc, parent_ids)
     else blk: {
         const out = try alloc.alloc(?[]u8, source_count);
         errdefer freeOptionalOwnedBytes(alloc, out);
         @memset(out, null);
         for (parent_ids, 0..) |parent_id, i| {
-            out[i] = try shaper.load_parent_stored(shaper.ctx, alloc, req, parent_id);
+            out[i] = try load_one.?(shaper.ctx, alloc, parent_id);
         }
         break :blk out;
     };
@@ -1525,6 +1575,9 @@ const TestDirectChunkAncestorLoader = struct {
 
     fn loadStored(ctx: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
         const self: *const TestDirectChunkAncestorLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (std.mem.eql(u8, key, "doc:a")) {
+            return try alloc.dupe(u8, "{\"title\":\"source\"}");
+        }
         if (std.mem.eql(u8, key, self.chunk_key)) {
             return try alloc.dupe(u8,
                 \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1"}

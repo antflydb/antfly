@@ -442,10 +442,10 @@ pub fn extractDownloadedAlloc(
         return try extractZipArchiveAlloc(alloc, downloaded.data, content_type);
     }
     if (isImageContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "image", "image", "image", "ocr_pending", "pending_ocr", false, false);
+        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "image", "image:000001", "image", "ocr_pending", "pending_ocr", false, false);
     }
     if (isAudioContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "audio", "audio", "audio", "transcript_pending", "pending_transcription", false, false);
+        return try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "audio", "audio:000001", "audio", "transcript_pending", "pending_transcription", false, false);
     }
     if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "document:000001", "document", "text", false);

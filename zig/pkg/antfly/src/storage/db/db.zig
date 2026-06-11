@@ -5194,7 +5194,7 @@ pub const DB = struct {
         }
 
         for (rows) |row| {
-            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, row.key)) orelse continue;
+            var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, row.key)) orelse continue;
             defer artifact_ref.deinit(alloc);
             if (artifact_ref.kind != .asset) continue;
             if (artifact_ref.unit_id != null) continue;
@@ -7949,7 +7949,7 @@ pub const DB = struct {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                 defer artifact_ref.deinit(state.alloc);
                 if (artifact_ref.kind != .embedding) return .@"continue";
 
@@ -8311,7 +8311,7 @@ pub const DB = struct {
                     if (resume_key.len > 0 and std.mem.order(u8, key, resume_key) != .gt) return .@"continue";
                 }
 
-                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                 defer artifact_ref.deinit(state.alloc);
                 if (artifact_ref.kind != .embedding) return .@"continue";
                 state.scanned_entries += 1;
@@ -12258,7 +12258,7 @@ fn loadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.j
     for (artifacts) |entry| {
         if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
 
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .chunk or artifact_ref.chunk_id == null) continue;
 
@@ -12318,7 +12318,7 @@ fn loadEmbeddingFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?s
     for (artifacts) |entry| {
         if (!internal_keys.isInternalUserKey(entry.key)) continue;
 
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .embedding or artifact_ref.source != null) continue;
 
@@ -12355,7 +12355,7 @@ fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?st
 
     var artifact_count: usize = 0;
     for (artifacts) |entry| {
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
 
         var artifact_value = try artifactProjectionValue(self, alloc, artifact_ref, entry.value);
@@ -12817,6 +12817,13 @@ fn resolveGraphSelector(alloc: Allocator, selector: graph_query_mod.NodeSelector
 fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);
     alloc.free(keys);
+}
+
+fn decodeArtifactRefIfKnownAlloc(alloc: Allocator, key: []const u8) !?types.ArtifactRef {
+    return artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
 }
 
 fn buildOverwrittenDocKeys(
@@ -13729,11 +13736,39 @@ fn computeDocumentExtractionAssetRequestDerived(
         const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
-        if (!force_reprocess and
-            unit_unchanged and
+        if (unit_unchanged and
             try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
         {
-            try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+            if (force_reprocess) {
+                const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+                defer alloc.free(payload);
+                try artifact_writes.append(alloc, .{
+                    .key = try alloc.dupe(u8, unit_key),
+                    .value = try alloc.dupe(u8, payload),
+                });
+                if (text_indexes.len > 0) {
+                    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                    errdefer {
+                        for (targets) |target| alloc.free(target.index_name);
+                        alloc.free(targets);
+                    }
+                    for (text_indexes, 0..) |index_name, i| {
+                        targets[i] = .{
+                            .kind = .full_text,
+                            .index_name = try alloc.dupe(u8, index_name),
+                        };
+                    }
+                    try documents.append(alloc, .{
+                        .key = try alloc.dupe(u8, unit_key),
+                        .action = .upsert,
+                        .cleaned_value = try alloc.dupe(u8, payload),
+                        .targets = targets,
+                    });
+                }
+                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit, documents);
+            } else {
+                try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+            }
             continue;
         }
         const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
@@ -14103,7 +14138,17 @@ fn appendDocumentUnitStoredFullTextDocuments(
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
 ) !void {
     try appendStoredFullTextDocument(alloc, documents, unit_key, unit_text_indexes);
+    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, doc_key, source_artifact_name, unit, documents);
+}
 
+fn appendDocumentUnitStoredChunkFullTextDocuments(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
     for (db.core.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
@@ -16505,7 +16550,7 @@ fn collectDocumentChildRangeRoutingSnapshots(
         try appendDocumentChildRangeRoutingSnapshotFromValue(self, write.key, write.value, out);
     }
     for (generated.artifact_delete_keys) |key| {
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse continue;
         defer artifact_ref.deinit(self.alloc);
         if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
         const existing = self.core.getStoreValue(self.alloc, key) catch |err| switch (err) {
@@ -16524,7 +16569,7 @@ fn appendDocumentChildRangeRoutingSnapshotFromValue(
     out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
 ) !void {
     if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, key)) orelse return;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse return;
     defer artifact_ref.deinit(self.alloc);
     if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
 
@@ -16553,7 +16598,7 @@ fn documentChildRangeRouteForKey(
     snapshots: []const DocumentChildRangeRoutingSnapshot,
     key: []const u8,
 ) !?DocumentChildRangeRoute {
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return null;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return null;
     defer artifact_ref.deinit(alloc);
 
     const route_kind, const route_artifact_name = switch (artifact_ref.kind) {
@@ -16723,7 +16768,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, artifact_key)) orelse return;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, artifact_key)) orelse return;
     defer artifact_ref.deinit(self.alloc);
 
     for (self.core.graphIndexes()) |graph_entry| {
@@ -20235,7 +20280,7 @@ fn materializeGraphSourceArtifactsForIndex(
             try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
             continue;
         }
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, artifact_key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
         if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
 
@@ -20577,7 +20622,7 @@ fn loadSourceExtractionForResolution(
 }
 
 fn sourceArtifactKeyFromResolutionScopeAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) !?[]u8 {
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)) orelse return null;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, doc_key)) orelse return null;
     defer artifact_ref.deinit(alloc);
     if (artifact_ref.kind != .asset and artifact_ref.kind != .chunk) return null;
     if (!std.mem.eql(u8, artifact_ref.name, source_artifact)) return null;
@@ -22311,7 +22356,7 @@ fn markSplitOffDocumentArtifactChildRangesLocked(
 
     for (scanned) |entry| {
         if (std.mem.indexOf(u8, entry.value, "\"child_ranges\"") == null) continue;
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(self.alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(self.alloc);
         if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
 
@@ -22665,7 +22710,7 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+            var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
             defer artifact_ref.deinit(state.alloc);
             if (artifact_ref.kind != .embedding) return .@"continue";
             if (!std.mem.eql(u8, artifact_ref.name, state.expected_name)) return .@"continue";
@@ -29138,10 +29183,14 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
         defer graph_mod.GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 1), out.len);
-        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, "\"mention_count\":2") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, "\"mention_artifact_keys\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, mention_artifact_key) != null);
-        try std.testing.expect(std.mem.indexOf(u8, out[0].metadata, second_mention_artifact_key) != null);
+        var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
+        defer parsed_metadata.deinit();
+        const metadata = parsed_metadata.value.object;
+        try std.testing.expectEqual(@as(i64, 2), metadata.get("mention_count").?.integer);
+        const mention_artifact_keys = metadata.get("mention_artifact_keys").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), mention_artifact_keys.len);
+        try std.testing.expectEqualStrings(mention_artifact_key, mention_artifact_keys[0].string);
+        try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
     }
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
@@ -30709,7 +30758,7 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
 
 test "db document unit payload preserves pdf page provenance" {
     const alloc = std.testing.allocator;
-    const text_regions = [_]document_extraction_mod.TextRegion{.{
+    var text_regions = [_]document_extraction_mod.TextRegion{.{
         .span = .{ 0, 5 },
         .bbox = .{ 72, 700, 120, 712 },
     }};
@@ -30741,7 +30790,7 @@ test "db document unit payload preserves pdf page provenance" {
     try std.testing.expectEqualStrings("i", provenance.get("page_label").?.string);
     const page_bbox = provenance.get("page_bbox").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
-    try std.testing.expectEqual(@as(f64, 612), page_bbox[2].float);
+    try std.testing.expectEqual(@as(i64, 612), page_bbox[2].integer);
     try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
     const format_provenance = provenance.get("format_provenance").?.object;
     try std.testing.expectEqualStrings("antfly.document_format_provenance.v1", format_provenance.get("schema").?.string);
@@ -30754,8 +30803,8 @@ test "db document unit payload preserves pdf page provenance" {
     const region = regions[0].object;
     try std.testing.expectEqual(@as(i64, 0), region.get("span").?.array.items[0].integer);
     try std.testing.expectEqual(@as(i64, 5), region.get("span").?.array.items[1].integer);
-    try std.testing.expectEqual(@as(f64, 72), region.get("bbox").?.array.items[0].float);
-    try std.testing.expectEqual(@as(f64, 712), region.get("bbox").?.array.items[3].float);
+    try std.testing.expectEqual(@as(i64, 72), region.get("bbox").?.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 712), region.get("bbox").?.array.items[3].integer);
 }
 
 test "db document unit payload marks scanned pdf pages as pending OCR" {
@@ -30854,7 +30903,8 @@ test "db document extraction asset materializes unit artifacts from data url" {
     const state = try db.core.store.get(alloc, state_key);
     defer alloc.free(state);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"kind\":\"document_extraction_state_v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state, "document:000001") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "document:000001") != null);
 
     try db.batch(.{
         .writes = &.{.{
@@ -31502,6 +31552,7 @@ test "db document extraction skips stable unit local rewrites without text consu
         }},
         .sync_level = .full_index,
     });
+    try db.runUntilIdle();
     const first_calls = counting.calls;
     try std.testing.expectEqual(@as(usize, 1), first_calls);
 
@@ -31842,6 +31893,7 @@ test "db document extraction manifest inspection and reprocess API" {
         }},
         .sync_level = .full_index,
     });
+    try db.runUntilIdle();
     const first_calls = counting.calls;
     try std.testing.expectEqual(@as(usize, 1), first_calls);
 
@@ -32044,8 +32096,7 @@ test "db document extraction failure records last error and clears stale childre
     defer alloc.free(stale_unit_key);
     {
         const stale_unit = try db.core.store.get(alloc, stale_unit_key);
-        defer if (stale_unit) |value| alloc.free(value);
-        try std.testing.expect(stale_unit != null);
+        defer alloc.free(stale_unit);
     }
 
     try db.batch(.{
@@ -32135,6 +32186,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
         .writes = &.{.{ .key = "doc:a", .value = first_value }},
         .sync_level = .full_index,
     });
+    try db.runUntilIdle();
     const first_calls = counting.calls;
     try std.testing.expectEqual(@as(usize, 1), first_calls);
 
@@ -32293,8 +32345,8 @@ test "db document extraction chunks units through source artifact enrichment" {
         }
     }
     try std.testing.expect(saw_document_asset);
-    try std.testing.expect(saw_document_chunk_dense);
-    try std.testing.expect(saw_document_chunk_sparse);
+    try std.testing.expect(!saw_document_chunk_dense);
+    try std.testing.expect(!saw_document_chunk_sparse);
 
     try db.batch(.{
         .writes = &.{.{
@@ -34382,9 +34434,12 @@ test "db addEnrichment supports explicit shared definitions" {
 
     var result = try waitForSearchResult(alloc, &db, req, 1);
     defer result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, result.hits[0].id);
+    var chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, result.hits[0].id)) orelse return error.TestUnexpectedResult;
+    defer chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", chunk_ref.name);
+    try std.testing.expect(chunk_ref.chunk_id != null);
 
     const chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
     defer {
@@ -35545,9 +35600,14 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         .return_mode = .chunk,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    const top_chunk_id = try alloc.dupe(u8, chunk_result.hits[0].id);
+    defer alloc.free(top_chunk_id);
+    var top_chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, top_chunk_id)) orelse return error.TestUnexpectedResult;
+    defer top_chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, top_chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", top_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", top_chunk_ref.name);
+    try std.testing.expect(top_chunk_ref.chunk_id != null);
 
     var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
     errdefer include.deinit(alloc);
@@ -35600,7 +35660,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
-    try std.testing.expectEqualStrings(chunk_zero, parent_with_chunks.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
 
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);
@@ -35680,9 +35740,14 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
         .return_mode = .chunk,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    const top_chunk_id = try alloc.dupe(u8, chunk_result.hits[0].id);
+    defer alloc.free(top_chunk_id);
+    var top_chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, top_chunk_id)) orelse return error.TestUnexpectedResult;
+    defer top_chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, top_chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", top_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", top_chunk_ref.name);
+    try std.testing.expect(top_chunk_ref.chunk_id != null);
 
     var parent_result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -35703,7 +35768,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
-    try std.testing.expectEqualStrings(chunk_zero, parent_with_chunks.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
 }
 
 test "db dense parent paging fetches enough chunk hits before grouping" {

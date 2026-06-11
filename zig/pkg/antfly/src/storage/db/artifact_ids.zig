@@ -96,6 +96,7 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
         if (try decodeChunkArtifactSourceAlloc(alloc, base_key)) |source| {
             identity.source_artifact_name = source.name;
             identity.chunk_id = source.chunk_id;
+            if (source.unit_id) |unit_id| alloc.free(unit_id);
         }
 
         return identity;
@@ -321,7 +322,7 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
     }
 
     var marker = parts.next();
-    if (artifact_ref.kind == .chunk and marker != null and std.mem.eql(u8, marker.?, "unit")) {
+    if ((artifact_ref.kind == .chunk or artifact_ref.kind == .asset) and marker != null and std.mem.eql(u8, marker.?, "unit")) {
         const unit_raw = parts.next() orelse return error.InvalidArgument;
         artifact_ref.unit_id = try decodeBase64UrlComponentAlloc(alloc, unit_raw);
         marker = parts.next();
