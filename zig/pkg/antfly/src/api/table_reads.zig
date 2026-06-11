@@ -18856,10 +18856,15 @@ test "provisioned read cache clear preserves in-flight pending opens and bumps e
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    // Seed the table's epoch slot the way an in-flight open would, then
+    // verify clear() bumps it (epochs are per-table, not global).
+    const io = cache.threaded.io();
+    cache.mutex.lockUncancelable(io);
+    const before_epoch = try cache.epochForTableLocked("docs");
+    cache.mutex.unlock(io);
     cache.clear();
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 1), cache.pending_opens.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
@@ -18927,10 +18932,12 @@ test "provisioned read cache invalidate removes entries without dropping pending
         .table_name = try alloc.dupe(u8, "docs"),
     });
 
-    const before_epoch = cache.epoch;
+    // getOrOpen above created the table's epoch slot; invalidateTable must
+    // bump that slot (epochs are per-table, not global).
+    const before_epoch = cache.table_epochs.get("docs").?;
     cache.invalidateTable("docs");
 
-    try std.testing.expectEqual(before_epoch +% 1, cache.epoch);
+    try std.testing.expectEqual(before_epoch +% 1, cache.table_epochs.get("docs").?);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expect(cache.hasPendingOpenLocked(7001, "docs"));
 }

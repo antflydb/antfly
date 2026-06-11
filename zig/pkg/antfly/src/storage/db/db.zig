@@ -5163,7 +5163,7 @@ pub const DB = struct {
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
-        if (restore_identity) |identity| try markRestorePrimaryRestored(
+        if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
             identity.backup_id,
@@ -5261,7 +5261,28 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    fn markRestorePrimaryRestored(
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPath(alloc, path, state);
+        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+        defer alloc.free(repair_marker_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = repair_marker_path,
+            .data = "done\n",
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPath(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
@@ -5384,13 +5405,12 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-            try self.runUntilIdle();
+            try self.runRestoreRepairDrainAsync();
             try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
-            std.log.info("restore runtime repair sync indexes path={s}", .{self.core.path});
-            try self.core.index_manager.syncAll(false);
+            std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -7244,6 +7264,16 @@ pub const DB = struct {
             };
             if (result.remaining == 0) return;
         }
+    }
+
+    fn runRestoreRepairDrainAsync(self: *DB) !void {
+        // Earlier repair phases synchronously rebuild restored runtime state.
+        // At this point only persisted applied-sequence watermarks need to be
+        // flushed before the final index sync/complete marker. Do not call
+        // runUntilIdle here: large portable restores can leave substantial
+        // replay, posting-maintenance, or LSM maintenance debt, and queries
+        // remain correct while that background-maintenance debt is paid down.
+        try self.flushAppliedSequencesForIdle();
     }
 
     pub fn runUntilIdle(self: *DB) !void {
@@ -43433,7 +43463,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestored(
+    try DB.markRestorePrimaryRestoredForPath(
         alloc,
         std.mem.span(restore_path),
         "snap1",

@@ -4278,9 +4278,101 @@ pub const ApiHttpServer = struct {
             for (manifest.shards) |shard| {
                 const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(dest_root);
-                try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
             }
         }
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        var portable_restore = false;
+        for (manifest.shards) |shard| {
+            if (std.mem.endsWith(u8, shard.snapshot_path, ".afb")) {
+                portable_restore = true;
+                break;
+            }
+        }
+        var restore_attempt: usize = 0;
+        while (restore_attempt < 3) : (restore_attempt += 1) {
+            const start_ns = platform_time.monotonicNs();
+            while (true) {
+                if ((table_writes_source.restoreTable(self.alloc, table_name, .{
+                    .backup_root = local_backup_root,
+                    .manifest = &manifest,
+                }) catch |err| switch (err) {
+                    error.UnsupportedOperation => return error.UnsupportedOperation,
+                    error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
+                    else => {
+                        std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                        return err;
+                    },
+                }) != null) break;
+
+                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+                sleepNs(poll_interval_ns);
+            }
+
+            if (portable_restore) return;
+
+            // Wait until the read path can see the restored data. A null probe
+            // means the catalog hasn't propagated the table yet; keep polling
+            // rather than optimistically assuming success.
+            const verify_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            while (true) {
+                const storage_status = self.probeTableStorageStatus(table_name) catch null;
+                if (storage_status) |status| {
+                    if (!status.empty) break;
+                }
+                if (platform_time.monotonicNs() >= verify_deadline_ns) break;
+                sleepNs(poll_interval_ns);
+            }
+
+            const storage_status = self.probeTableStorageStatus(table_name) catch null;
+            if (storage_status != null and !storage_status.?.empty) return;
+            std.log.info("restoreOwnedTable data not visible via read path table={s} backup_id={s} attempt={d}", .{
+                table_name,
+                backup_id,
+                restore_attempt + 1,
+            });
+            if (restore_attempt + 1 >= 3) return error.TableVisibilityTimeout;
+            sleepNs(500 * std.time.ns_per_ms);
+        }
+    }
+
+    fn restoreLocalTableDataFromManifest(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
+        var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
+        defer manifest.deinit(self.alloc);
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => try createBackupStagingRoot(self.alloc, backup_id),
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => destroyBackupStagingRoot(self.alloc, local_backup_root),
+        };
+        if (switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            for (manifest.shards) |shard| {
+                const dest_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+                defer self.alloc.free(dest_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root)
+                else
+                    try backups_api.copyDirectoryFromLocation(self.alloc, backup_location, shard.snapshot_path, dest_root);
+            }
+        }
+
+        self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
+            else => return err,
+        };
 
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ns = 50 * std.time.ns_per_ms;
@@ -4293,20 +4385,13 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedOperation => return error.UnsupportedOperation,
                 error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
                 else => {
-                    std.log.err("restoreOwnedTable restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    std.log.err("restoreLocalTableDataFromManifest restoreTable failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
                     return err;
                 },
-            }) != null) break;
+            }) != null) return;
 
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             sleepNs(poll_interval_ns);
-        }
-
-        // The public restore contract is "triggered": index/read-path repair can
-        // lag behind the local restore call and callers already poll visibility.
-        const storage_status = self.probeTableStorageStatus(table_name) catch null;
-        if (storage_status == null or storage_status.?.empty) {
-            std.log.info("restoreOwnedTable data not yet visible via read path table={s} backup_id={s}", .{ table_name, backup_id });
         }
     }
 
@@ -5142,7 +5227,15 @@ pub const ApiHttpServer = struct {
                 return error.InvalidBackupRequest;
             },
             else => return mapExecuteRestoreError(err),
-        }) return;
+        }) {
+            if (self.cfg.swarm_mode) {
+                self.restoreLocalTableDataFromManifest(table_name, location, backup_id) catch |err| {
+                    std.log.err("swarm local restore data apply failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
+                    return mapExecuteRestoreError(err);
+                };
+            }
+            return;
+        }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -5496,6 +5589,25 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
+                    if (self.cfg.swarm_mode) {
+                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
+                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
+                                table_name,
+                                table_backup_id,
+                                err,
+                            });
+                            statuses[i].@"error" = switch (err) {
+                                error.UnsupportedOperation => "method not allowed",
+                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
+                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
+                                error.TableAlreadyExists => "table already exists",
+                                error.TableNotFound => "not found",
+                                error.InvalidBackupRequest => "invalid restore request",
+                                else => "restore failed",
+                            };
+                            continue;
+                        };
+                    }
                     statuses[i].status = "triggered";
                     continue;
                 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
@@ -1074,7 +1075,17 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
+    // link against the host distro's crt startup objects. Newer glibc/binutils
+    // builds may include .sframe sections with relocation types that Zig's
+    // linker cannot yet handle. Defaulting Linux builds to an explicit GNU
+    // target keeps user-supplied -Dtarget overrides intact while making the
+    // no-argument path use Zig's bundled libc startup objects.
+    const default_target: std.Target.Query = if (builtin.os.tag == .linux)
+        .{ .cpu_arch = builtin.cpu.arch, .os_tag = .linux, .abi = .gnu }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
