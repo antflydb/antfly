@@ -3350,12 +3350,12 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, authenticated_identity);
+                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
+                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
@@ -3974,6 +3974,25 @@ pub const ApiHttpServer = struct {
         if (!self.cfg.auth_enabled) return true;
         const identity = authenticated_identity orelse return false;
         return permissionsAllow(identity.permissions, .@"*", "*", .admin);
+    }
+
+    pub fn documentArtifactManifestOptionsForRequest(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !public_table_http.DocumentArtifactManifestOptions {
+        var opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        if (self.cfg.auth_enabled and parseSimpleQueryParam(query, "detail") == null) opts.detail = .summary;
+        if (opts.detail == .raw and self.cfg.auth_enabled) {
+            const identity = authenticated_identity orelse return error.Forbidden;
+            if (!permissionsAllow(identity.permissions, .table, table_name, .admin) and
+                !permissionsAllow(identity.permissions, .@"*", "*", .admin))
+            {
+                return error.Forbidden;
+            }
+        }
+        return opts;
     }
 
     pub fn waitForTableVisibility(self: *ApiHttpServer, table_name: []const u8, expected: TableVisibility) !void {
@@ -5776,16 +5795,20 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
         const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
 
         if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
             return try textResponse(self.alloc, 404, "not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifest(self.alloc, table_name, doc_key, artifact_name, opts, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
@@ -5793,14 +5816,18 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
+        const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
+            error.Forbidden => return try textResponse(self.alloc, 403, "forbidden"),
+        };
 
         if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
             return try textResponse(self.alloc, 404, "not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, self.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifests(self.alloc, table_name, doc_key, opts, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),

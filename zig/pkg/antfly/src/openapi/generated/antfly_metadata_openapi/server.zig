@@ -279,6 +279,11 @@ pub const ListDocumentArtifactManifestsPathParams = struct {
     key: []const u8,
 };
 
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
 /// Reprocess a derived document artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
@@ -300,6 +305,11 @@ pub const GetDocumentArtifactManifestPathParams = struct {
     key: []const u8,
     /// Name of the derived document artifact.
     artifact_name: []const u8,
+};
+
+pub const GetDocumentArtifactManifestParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
 };
 
 /// Reprocess a derived document artifact
@@ -831,7 +841,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
-            return impl.listDocumentArtifactManifests(ctx, table_name, key);
+            const query_params = ListDocumentArtifactManifestsParams{
+                .detail = ctx.query("detail"),
+            };
+            return impl.listDocumentArtifactManifests(ctx, table_name, key, query_params);
         }
 
         /// Reprocess a derived document artifact across a table range
@@ -850,7 +863,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
-            return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name);
+            const query_params = GetDocumentArtifactManifestParams{
+                .detail = ctx.query("detail"),
+            };
+            return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
         }
 
         /// Reprocess a derived document artifact
@@ -940,9 +956,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
-//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
-//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

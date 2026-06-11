@@ -3813,6 +3813,21 @@ paths:
         a source document. This lets clients discover artifact names before
 
         inspecting a single manifest or triggering reprocessing.
+      parameters:
+        - name: detail
+          in: query
+          required: false
+          description: >
+            Response detail level. `summary` returns typed manifest fields only.
+
+            `raw` also includes opaque manifest/state JSON and requires table
+
+            admin permission when authentication is enabled.
+          schema:
+            type: string
+            enum:
+              - summary
+              - raw
       tags:
         - data_operations
       operationId: listDocumentArtifactManifests
@@ -3917,6 +3932,21 @@ paths:
         text field. The route is shard-aware; hosted deployments route the
 
         request to the data group that owns the source document key.
+      parameters:
+        - name: detail
+          in: query
+          required: false
+          description: >
+            Response detail level. `summary` returns typed manifest fields only.
+
+            `raw` also includes opaque manifest/state JSON and requires table
+
+            admin permission when authentication is enabled.
+          schema:
+            type: string
+            enum:
+              - summary
+              - raw
       tags:
         - data_operations
       operationId: getDocumentArtifactManifest
@@ -6020,6 +6050,24 @@ components:
         placement:
           type: string
           description: Current placement summary for the range.
+        owner_group_id:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Owner group for this child artifact range, when assigned.
+        placement_generation:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Placement generation for range ownership metadata.
+        route_status:
+          type: string
+          nullable: true
+          description: Current routing status for child writes in this range.
+        split_eligible:
+          type: boolean
+          nullable: true
+          description: Whether this range may split at its configured split boundary.
         start_key:
           type: string
           description: Inclusive first internal child key covered by this range.
@@ -6041,11 +6089,13 @@ components:
       description: >
         Inspection view for a derived document artifact produced from a source
 
-        table row. The embedded manifest/state JSON fields are intentionally
+        table row. The typed fields form the stable summary contract. The
 
-        opaque so producers can evolve their internal unit schema without
+        embedded manifest/state JSON fields are optional raw detail intended
 
-        changing this route contract.
+        for admin/debug inspection so producers can evolve their internal unit
+
+        schema without changing this route contract.
       required:
         - document_id
         - artifact_name
@@ -6065,7 +6115,6 @@ components:
         - merge_to_generation
         - merge_operation_granularity
         - merge_operation_count
-        - manifest_json
       properties:
         document_id:
           type: string
@@ -6144,11 +6193,13 @@ components:
           description: Human-readable last extraction or materialization error summary, when available.
         manifest_json:
           type: string
-          description: Opaque JSON manifest for the artifact units and provenance.
+          description: Opaque JSON manifest for the artifact units and provenance. Present only for raw
+            detail responses.
         state_json:
           type: string
           nullable: true
-          description: Optional opaque JSON state for incremental processing.
+          description: Optional opaque JSON state for incremental processing. Present only for raw detail
+            responses.
     DocumentArtifactManifestList:
       type: object
       description: Available derived document artifact manifests for a source document.
@@ -15190,6 +15241,11 @@ components:
             type: string
           description: Algebraic provenance labels folded into this result, when requested by an algebraic
             graph executor
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Parsed evidence envelope for provenance labels and edge metadata
         edges:
           x-go-type-skip-optional-pointer: true
           type: array

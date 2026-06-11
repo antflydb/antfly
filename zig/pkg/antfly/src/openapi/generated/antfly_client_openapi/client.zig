@@ -52,6 +52,16 @@ pub const LookupKeyParams = struct {
     fields: ?[]const u8 = null,
 };
 
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+pub const GetDocumentArtifactManifestParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
 pub const RemovePermissionFromUserParams = struct {
     /// The name of the resource for the permission to be removed.
     resource: []const u8,
@@ -545,9 +555,23 @@ pub const Client = struct {
 
     /// List derived document artifact manifests
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts
-    pub fn listDocumentArtifactManifests(self: *@This(), table_name: []const u8, key: []const u8) !ApiResponse(types.DocumentArtifactManifestList) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, table_name, key });
+    pub fn listDocumentArtifactManifests(self: *@This(), table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !ApiResponse(types.DocumentArtifactManifestList) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, table_name, key });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.detail) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "detail=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
     }
@@ -565,9 +589,23 @@ pub const Client = struct {
 
     /// Inspect a derived document artifact manifest
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
-    pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactManifest) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, table_name, key, artifact_name });
+    pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !ApiResponse(types.DocumentArtifactManifest) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, table_name, key, artifact_name });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.detail) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "detail=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
     }

@@ -1429,7 +1429,7 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
-/// Inspection view for a derived document artifact produced from a source table row. The embedded manifest/state JSON fields are intentionally opaque so producers can evolve their internal unit schema without changing this route contract.
+/// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
 pub const DocumentArtifactManifest = struct {
     /// Stable identity of the source document.
     document_id: []const u8,
@@ -1473,9 +1473,9 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: ?[]const u8 = null,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: ?[]const u8 = null,
-    /// Opaque JSON manifest for the artifact units and provenance.
-    manifest_json: []const u8,
-    /// Optional opaque JSON state for incremental processing.
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    manifest_json: ?[]const u8 = null,
+    /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: ?[]const u8 = null,
 };
 

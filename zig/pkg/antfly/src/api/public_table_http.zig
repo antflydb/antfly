@@ -20,6 +20,33 @@ const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
 
+pub const DocumentArtifactManifestDetail = enum {
+    summary,
+    raw,
+};
+
+pub const DocumentArtifactManifestOptions = struct {
+    detail: DocumentArtifactManifestDetail = .raw,
+};
+
+pub fn parseDocumentArtifactManifestOptions(query: []const u8) !DocumentArtifactManifestOptions {
+    var opts = DocumentArtifactManifestOptions{};
+    if (query.len == 0) return opts;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |part| {
+        if (!std.mem.startsWith(u8, part, "detail=")) continue;
+        const value = part["detail=".len..];
+        if (std.mem.eql(u8, value, "summary")) {
+            opts.detail = .summary;
+        } else if (std.mem.eql(u8, value, "raw")) {
+            opts.detail = .raw;
+        } else {
+            return error.InvalidDetail;
+        }
+    }
+    return opts;
+}
+
 pub const TableApi = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -599,6 +626,7 @@ pub fn handleDocumentArtifactManifest(
     table_name: []const u8,
     doc_key: []const u8,
     artifact_name: []const u8,
+    opts: DocumentArtifactManifestOptions,
     api: TableApi,
 ) !OwnedResponse {
     var manifest = api.executeDocumentArtifactManifest(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
@@ -647,7 +675,7 @@ pub fn handleDocumentArtifactManifest(
         merge_operation_count: usize,
         last_error_code: ?[]const u8,
         last_error_message: ?[]const u8,
-        manifest_json: []const u8,
+        manifest_json: ?[]const u8 = null,
         state_json: ?[]const u8,
     };
     const child_ranges = try alloc.alloc(ChildRangeResponse, manifest.child_ranges.len);
@@ -694,9 +722,9 @@ pub fn handleDocumentArtifactManifest(
             .merge_operation_count = manifest.merge_operation_count,
             .last_error_code = manifest.last_error_code,
             .last_error_message = manifest.last_error_message,
-            .manifest_json = manifest.manifest_json,
-            .state_json = manifest.state_json,
-        }, .{}),
+            .manifest_json = if (opts.detail == .raw) manifest.manifest_json else null,
+            .state_json = if (opts.detail == .raw) manifest.state_json else null,
+        }, .{ .emit_null_optional_fields = false }),
     };
 }
 
@@ -704,6 +732,7 @@ pub fn handleDocumentArtifactManifests(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     doc_key: []const u8,
+    opts: DocumentArtifactManifestOptions,
     api: TableApi,
 ) !OwnedResponse {
     var list = api.executeDocumentArtifactManifests(alloc, table_name, doc_key) catch |err| switch (err) {
@@ -752,7 +781,7 @@ pub fn handleDocumentArtifactManifests(
         merge_operation_count: usize,
         last_error_code: ?[]const u8,
         last_error_message: ?[]const u8,
-        manifest_json: []const u8,
+        manifest_json: ?[]const u8 = null,
         state_json: ?[]const u8,
     };
     const Response = struct {
@@ -811,8 +840,8 @@ pub fn handleDocumentArtifactManifests(
             .merge_operation_count = manifest.merge_operation_count,
             .last_error_code = manifest.last_error_code,
             .last_error_message = manifest.last_error_message,
-            .manifest_json = manifest.manifest_json,
-            .state_json = manifest.state_json,
+            .manifest_json = if (opts.detail == .raw) manifest.manifest_json else null,
+            .state_json = if (opts.detail == .raw) manifest.state_json else null,
         };
     }
 
@@ -821,7 +850,7 @@ pub fn handleDocumentArtifactManifests(
         .body = try std.json.Stringify.valueAlloc(alloc, Response{
             .document_id = list.document_id,
             .artifacts = artifacts,
-        }, .{}),
+        }, .{ .emit_null_optional_fields = false }),
     };
 }
 
@@ -1600,6 +1629,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         "docs",
         "doc:a",
         "document_units_v1",
+        .{ .detail = .raw },
         Backend.iface(),
     );
     defer resp.deinit(std.testing.allocator);
@@ -1629,6 +1659,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         std.testing.allocator,
         "docs",
         "doc:a",
+        .{ .detail = .raw },
         Backend.iface(),
     );
     defer list_resp.deinit(std.testing.allocator);
@@ -1646,6 +1677,20 @@ test "public document artifact manifest handler returns summary and raw state" {
     try std.testing.expectEqual(@as(usize, 1), parsed_list.value.artifacts.len);
     try std.testing.expectEqualStrings("doc:a", parsed_list.value.artifacts[0].document_id);
     try std.testing.expectEqual(@as(u64, 7), parsed_list.value.artifacts[0].generation);
+
+    var summary_resp = try handleDocumentArtifactManifest(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .{ .detail = .summary },
+        Backend.iface(),
+    );
+    defer summary_resp.deinit(std.testing.allocator);
+    var parsed_summary = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary_resp.body, .{});
+    defer parsed_summary.deinit();
+    try std.testing.expect(parsed_summary.value.object.get("manifest_json") == null);
+    try std.testing.expect(parsed_summary.value.object.get("state_json") == null);
 }
 
 test "public document artifact reprocess handler returns accepted" {

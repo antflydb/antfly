@@ -1958,7 +1958,8 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
-    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
+    pub fn getDocumentArtifactManifest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: metadata_openapi.server.GetDocumentArtifactManifestParams) !httpx.Response {
+        _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
@@ -1967,26 +1968,47 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_key);
         const decoded_artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, artifact_name);
         defer alloc.free(decoded_artifact_name);
+        const opts = self.api_server.documentArtifactManifestOptionsForRequest(table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => {
+                _ = ctx.status(400);
+                return ctx.text("invalid artifact detail");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            },
+        };
         if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, table_name, decoded_key, decoded_artifact_name, self.api_server.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifest(alloc, table_name, decoded_key, decoded_artifact_name, opts, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
-    pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+    pub fn listDocumentArtifactManifests(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_openapi.server.ListDocumentArtifactManifestsParams) !httpx.Response {
+        _ = params;
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, key);
         defer alloc.free(decoded_key);
+        const opts = self.api_server.documentArtifactManifestOptionsForRequest(table_name, ctx.request.uri.query orelse "", authenticated_identity) catch |err| switch (err) {
+            error.InvalidDetail => {
+                _ = ctx.status(400);
+                return ctx.text("invalid artifact detail");
+            },
+            error.Forbidden => {
+                _ = ctx.status(403);
+                return ctx.text("forbidden");
+            },
+        };
         if (!(try self.api_server.sourceDocumentVisibleToIdentity(table_name, decoded_key, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        var resp = try public_table_http.handleDocumentArtifactManifests(alloc, table_name, decoded_key, self.api_server.tableApi());
+        var resp = try public_table_http.handleDocumentArtifactManifests(alloc, table_name, decoded_key, opts, self.api_server.tableApi());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
