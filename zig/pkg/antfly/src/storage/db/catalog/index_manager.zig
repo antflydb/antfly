@@ -5401,13 +5401,42 @@ pub const IndexManager = struct {
     fn saveBackfilledAppliedSequence(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         if (try self.configRequiresEnrichmentReplay(cfg)) return;
         if (try self.configHasPendingSparseEmbeddingArtifactReplay(store, cfg)) return;
+        // Backfill rebuilds the index from the full store contents, so it is
+        // current through the store's durable per-kind latest replay marker
+        // even when the replay records themselves have already been pruned.
+        // On a fresh instance with pruned records lastReplaySequence(0) is 0;
+        // saving that alone regresses the checkpoint below the marker and
+        // traps startup catch-up in a permanent-debt loop that re-backfills
+        // and re-regresses forever.
+        var backfilled_sequence = store.lastReplaySequence(0);
+        if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
+            backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
+        }
         try apply_state.saveAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
             self.applied_sequence_checkpoint_path,
             cfg.name,
-            store.lastReplaySequence(0),
+            backfilled_sequence,
         );
+    }
+
+    fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .pointer => |ptr| @hasDecl(ptr.child, "latestReplaySequenceForHint"),
+            .@"struct" => @hasDecl(T, "latestReplaySequenceForHint"),
+            else => false,
+        };
+    }
+
+    fn replayHintForIndexKind(kind: types.IndexKind) change_journal_mod.TargetHint {
+        return switch (kind) {
+            .full_text => .full_text,
+            .dense_vector => .dense_vector,
+            .sparse_vector => .sparse_vector,
+            .graph => .graph,
+            .algebraic => .algebraic,
+        };
     }
 
     fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {

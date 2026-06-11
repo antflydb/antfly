@@ -4588,6 +4588,7 @@ pub const DataServer = struct {
                     stats.groups_cleared += 1;
                 } else {
                     stats.debt_remaining = true;
+                    std.log.warn("provisioned startup catch-up debt persists group={} table={s}", .{ group_id, table.name });
                 }
             }
         }
