@@ -3605,10 +3605,24 @@ pub const DB = struct {
             dense_backend.manifest_dirty = false;
         }
 
-        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+        try expectObsoletePathsReclaimable(dense_backend, 1);
         try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
         try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
         try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+    }
+
+    /// A queued obsolete path only counts as reclaimable once no reader pins
+    /// the backend; transient background readers (index loads, status probes)
+    /// mask it as pinned_by_readers for a moment. Poll instead of asserting a
+    /// single snapshot so loaded CI machines don't flake.
+    fn expectObsoletePathsReclaimable(backend: *lsm_backend_mod.Backend, expected: u64) !void {
+        var attempts: usize = 0;
+        while (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable != expected) : (attempts += 1) {
+            if (attempts >= 2000) {
+                return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+            }
+            std.Thread.yield() catch {};
+        }
     }
 
     test "db primary lsm maintenance step does not reclaim index obsolete paths" {
@@ -3675,8 +3689,8 @@ pub const DB = struct {
             dense_backend.manifest_dirty = false;
         }
 
-        try std.testing.expectEqual(@as(u64, 1), primary_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
-        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+        try expectObsoletePathsReclaimable(primary_backend, 1);
+        try expectObsoletePathsReclaimable(dense_backend, 1);
 
         _ = try db.runPrimaryLsmMaintenanceStep();
 

@@ -2,7 +2,7 @@
 .zig-global-cache/
 .zig-cache-local/
 .zig-local-cache/
-zig-out/
+zig-out*/
 __pycache__/
 .tla-tools/
 specs/tla/states/

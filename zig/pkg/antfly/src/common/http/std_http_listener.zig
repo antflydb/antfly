@@ -211,8 +211,11 @@ pub const StdHttpListener = struct {
             }
             if (self.cfg.serve_in_connection_threads) {
                 if (!self.tryAcquireConnectionThreadSlot()) {
-                    var rejected_stream = stream;
-                    rejected_stream.close(io);
+                    // All connection-thread slots are busy. Serve inline:
+                    // blocking the accept loop is natural backpressure,
+                    // whereas closing an accepted connection sends RST to a
+                    // client that has already written its request.
+                    self.serveStream(stream);
                     continue;
                 }
                 connection_group.concurrent(io, serveStreamFiber, .{ self, stream }) catch |err| {
@@ -255,7 +258,15 @@ pub const StdHttpListener = struct {
         var stream_writer = owned_stream.writer(io, send_buffer);
         var server: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
 
-        var request = server.receiveHead() catch return;
+        var request = server.receiveHead() catch |err| {
+            // Closing here with unread request bytes sends RST to a client
+            // that is awaiting a response; keep the common idle-close quiet
+            // but record anything else so resets are diagnosable from logs.
+            if (err != error.HttpConnectionClosing and err != error.EndOfStream) {
+                std.log.warn("http receive head failed err={}", .{err});
+            }
+            return;
+        };
         self.handleRequest(&request) catch |err| {
             std.log.err("http request handler error: {}", .{err});
             _ = request.respond("internal server error", .{
@@ -905,6 +916,127 @@ test "std http listener caps active connection handoff threads" {
     try std.testing.expect(listener.tryAcquireConnectionThreadSlot());
     _ = listener.active_connection_threads.fetchSub(1, .acq_rel);
     try std.testing.expectEqual(@as(u32, 0), listener.active_connection_threads.load(.acquire));
+}
+
+test "std http listener saturated connection slots serve inline instead of resetting" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        entered_slow: std.atomic.Value(bool) = .init(false),
+        release_slow: std.atomic.Value(bool) = .init(false),
+
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, req.uri, "/slow")) {
+                self.entered_slow.store(true, .release);
+                while (!self.release_slow.load(.acquire)) sleepMs(1);
+            }
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "text/plain; charset=utf-8"),
+                .body = try alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const RequestThread = struct {
+        uri: []const u8,
+        executor: common.RequestExecutor,
+        status: std.atomic.Value(u16) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = self.uri,
+            }) catch {
+                self.failed.store(true, .release);
+                self.done.store(true, .release);
+                return;
+            };
+            defer response.deinit(std.heap.page_allocator);
+
+            self.status.store(response.status, .release);
+            self.done.store(true, .release);
+        }
+    };
+
+    var app = App{};
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    defer executor.deinit();
+    const request_executor = executor.executor();
+
+    // One connection-thread slot: the slow request occupies it, so the
+    // second request exercises the saturated path, which must serve inline
+    // rather than close (RST) the accepted connection.
+    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        .max_connection_threads = 1,
+    }, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const slow_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/slow", .{base_uri});
+    defer std.testing.allocator.free(slow_uri);
+    const fast_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/fast", .{base_uri});
+    defer std.testing.allocator.free(fast_uri);
+
+    var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
+    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
+    defer slow_thread.join();
+    defer app.release_slow.store(true, .release);
+
+    var saw_slow = false;
+    for (0..1000) |_| {
+        if (app.entered_slow.load(.acquire)) {
+            saw_slow = true;
+            break;
+        }
+        sleepMs(1);
+    }
+    try std.testing.expect(saw_slow);
+
+    var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
+    const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
+    defer fast_thread.join();
+
+    var fast_completed = false;
+    for (0..2000) |_| {
+        if (fast_req.done.load(.acquire)) {
+            fast_completed = true;
+            break;
+        }
+        sleepMs(1);
+    }
+    try std.testing.expect(fast_completed);
+    try std.testing.expect(!fast_req.failed.load(.acquire));
+    try std.testing.expectEqual(@as(u16, 200), fast_req.status.load(.acquire));
+
+    app.release_slow.store(true, .release);
+    var slow_completed = false;
+    for (0..1000) |_| {
+        if (slow_req.done.load(.acquire)) {
+            slow_completed = true;
+            break;
+        }
+        sleepMs(1);
+    }
+    try std.testing.expect(slow_completed);
+    try std.testing.expect(!slow_req.failed.load(.acquire));
+    try std.testing.expectEqual(@as(u16, 200), slow_req.status.load(.acquire));
 }
 
 test "std http listener connection handoff serves fast request while slow request is blocked" {
