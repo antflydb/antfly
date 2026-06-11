@@ -54,6 +54,7 @@ pub const SearchScratch = struct {
     key_views: [][]const u8,
     values: []?[]const u8,
     vector_views: [][]const f32,
+    distance_storage: []f32,
     distances: []f32,
     error_bounds: []f32,
     posting_member_cache: std.ArrayListUnmanaged(PostingMemberCacheEntry) = .empty,
@@ -108,9 +109,8 @@ pub const SearchScratch = struct {
         errdefer alloc.free(values);
         const vector_views = try alloc.alloc([]const f32, max_candidates);
         errdefer alloc.free(vector_views);
-        const distances = try alloc.alloc(f32, max_candidates);
-        errdefer alloc.free(distances);
-        const error_bounds = try alloc.alloc(f32, max_candidates);
+        const distance_storage = try alloc.alloc(f32, 2 * max_candidates);
+        errdefer alloc.free(distance_storage);
         return .{
             .dims = dims,
             .estimate = estimate,
@@ -127,8 +127,9 @@ pub const SearchScratch = struct {
             .key_views = key_views,
             .values = values,
             .vector_views = vector_views,
-            .distances = distances,
-            .error_bounds = error_bounds,
+            .distance_storage = distance_storage,
+            .distances = distance_storage[0..max_candidates],
+            .error_bounds = distance_storage[max_candidates .. 2 * max_candidates],
             .max_posting_member_cache_bytes = max_posting_member_cache_bytes,
             .max_posting_member_cache_entry_bytes = effectivePostingMemberCacheEntryBytes(
                 max_posting_member_cache_bytes,
@@ -145,15 +146,26 @@ pub const SearchScratch = struct {
         if (self.key_views.len < needed) self.key_views = try alloc.realloc(self.key_views, needed);
         if (self.values.len < needed) self.values = try alloc.realloc(self.values, needed);
         if (self.vector_views.len < needed) self.vector_views = try alloc.realloc(self.vector_views, needed);
-        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
-        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+        try self.ensureDistanceStorageCapacity(alloc, needed);
         if (self.vector_batch.len < self.dims * needed) self.vector_batch = try alloc.realloc(self.vector_batch, self.dims * needed);
     }
 
     pub fn ensureDistanceCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.positions.len < needed) self.positions = try alloc.realloc(self.positions, needed);
-        if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
-        if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+        try self.ensureDistanceStorageCapacity(alloc, needed);
+    }
+
+    fn ensureDistanceStorageCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.distances.len >= needed and self.error_bounds.len >= needed) return;
+        const old_distance_len = self.distances.len;
+        const old_error_bound_len = self.error_bounds.len;
+        const new_storage_len = try std.math.mul(usize, needed, 2);
+        self.distance_storage = try alloc.realloc(self.distance_storage, new_storage_len);
+        self.distances = self.distance_storage[0..needed];
+        self.error_bounds = self.distance_storage[needed .. 2 * needed];
+        if (old_error_bound_len != 0) {
+            std.mem.copyBackwards(f32, self.error_bounds[0..old_error_bound_len], self.distance_storage[old_distance_len .. old_distance_len + old_error_bound_len]);
+        }
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -275,8 +287,7 @@ pub const SearchScratch = struct {
             byteLen(self.key_views) +
             byteLen(self.values) +
             byteLen(self.vector_views) +
-            byteLen(self.distances) +
-            byteLen(self.error_bounds) +
+            byteLen(self.distance_storage) +
             posting_member_cache_bytes +
             posting_overlay_bytes;
     }
@@ -300,8 +311,7 @@ pub const SearchScratch = struct {
         alloc.free(self.key_views);
         alloc.free(self.values);
         alloc.free(self.vector_views);
-        alloc.free(self.distances);
-        alloc.free(self.error_bounds);
+        alloc.free(self.distance_storage);
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
         self.posting_member_cache_slots.deinit(alloc);

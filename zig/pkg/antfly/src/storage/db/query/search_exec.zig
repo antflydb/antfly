@@ -364,6 +364,8 @@ pub const DenseSearchProfile = struct {
     hbc_posting_overlay_ns: u64 = 0,
     hbc_posting_overlay_calls: u64 = 0,
     hbc_posting_overlay_base_members: u64 = 0,
+    hbc_posting_base_decode_ns: u64 = 0,
+    hbc_posting_base_decode_members: u64 = 0,
     hbc_posting_overlay_delta_records: u64 = 0,
     hbc_posting_overlay_delta_scan_skips: u64 = 0,
     hbc_posting_overlay_materialized_members: u64 = 0,
@@ -4504,6 +4506,8 @@ fn searchDenseInternal(
         profile.hbc_posting_overlay_ns = profiled.profile.posting_overlay_ns;
         profile.hbc_posting_overlay_calls = profiled.profile.posting_overlay_calls;
         profile.hbc_posting_overlay_base_members = profiled.profile.posting_overlay_base_members;
+        profile.hbc_posting_base_decode_ns = profiled.profile.posting_base_decode_ns;
+        profile.hbc_posting_base_decode_members = profiled.profile.posting_base_decode_members;
         profile.hbc_posting_overlay_delta_records = profiled.profile.posting_overlay_delta_records;
         profile.hbc_posting_overlay_delta_scan_skips = profiled.profile.posting_overlay_delta_scan_skips;
         profile.hbc_posting_overlay_materialized_members = profiled.profile.posting_overlay_materialized_members;

@@ -84,6 +84,9 @@ WRITE_COLUMNS = [
     "posting_base_fixed_width_value_bytes",
     "posting_base_value_bytes_vs_fixed_width",
     "posting_base_value_bytes_per_member",
+    "posting_base_decode_ns",
+    "posting_base_decode_members",
+    "posting_base_decode_ns_per_member",
     "fg_route_leaf_groups",
     "fg_route_items",
     "fg_route_items_per_leaf_group",
@@ -570,6 +573,16 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "posting_base_value_bytes": mean(group, "posting_base_value_bytes"),
                 "posting_base_fixed_width_value_bytes": mean(group, "posting_base_fixed_width_value_bytes"),
                 "posting_base_members": mean(group, "posting_base_members"),
+                "posting_base_decode_ns": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_base_decode_ns",
+                    "post_write_profile_posting_base_decode_ns",
+                ),
+                "posting_base_decode_members": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_base_decode_members",
+                    "post_write_profile_posting_base_decode_members",
+                ),
                 "assignment_map_put_calls": mean(group, "assignment_map_put_calls"),
                 "fg_route_leaf_groups": preferred_mean(
                     group,
@@ -923,6 +936,10 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["posting_base_value_bytes_per_member"] = safe_ratio(
             summary.get("posting_base_value_bytes"),
             summary.get("posting_base_members"),
+        )
+        summary["posting_base_decode_ns_per_member"] = safe_ratio(
+            summary.get("posting_base_decode_ns"),
+            summary.get("posting_base_decode_members"),
         )
         summary["fg_route_items_per_leaf_group"] = safe_ratio(
             summary.get("fg_route_items"),
