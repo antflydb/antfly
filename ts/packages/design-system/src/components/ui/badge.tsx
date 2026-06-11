@@ -17,16 +17,18 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
-        // solid amber fill — the loud variant (shadcn convention for default)
+        // quiet outline — the workhorse default: hairline border, muted ink
         default:
-          "bg-primary text-primary-foreground border-amber-500 [a&]:hover:bg-amber-300",
+          "bg-transparent border-border text-muted-foreground [a&]:hover:border-border-strong [a&]:hover:text-foreground",
+        // solid amber fill — deliberate brand moments only
+        primary: "bg-primary text-primary-foreground border-transparent [a&]:hover:bg-amber-300",
         // subtle muted fill — soft pill, no visible border
         secondary:
           "bg-secondary text-secondary-foreground border-transparent [a&]:hover:bg-secondary/80",
         // semantic destructive — outline only
         destructive:
           "bg-transparent border-destructive text-destructive [a&]:hover:bg-destructive/10",
-        // prototype `.badge` — the workhorse: strong-line border, muted ink
+        // prototype `.badge` — strong-line border, muted ink
         outline:
           "bg-transparent border-border-strong text-muted-foreground [a&]:hover:border-foreground [a&]:hover:text-foreground",
         // amber outline — accent without filling
