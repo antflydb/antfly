@@ -2453,6 +2453,8 @@ pub const SearchHit = struct {
     score_details: ?GraphMetricRerankScoreDetails = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
     chunk_hits: []ChunkHit = &.{},
 
@@ -2464,6 +2466,8 @@ pub const SearchHit = struct {
             .score_details = if (self.score_details) |details| try details.clone(alloc) else null,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             .chunk_hits = &.{},
         };
@@ -2472,6 +2476,8 @@ pub const SearchHit = struct {
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.ancestor_source_data) |data| alloc.free(data);
+            if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
 
@@ -2495,6 +2501,8 @@ pub const SearchHit = struct {
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
         if (self.chunk_hits.len > 0) alloc.free(self.chunk_hits);
@@ -2529,6 +2537,8 @@ pub const ChunkHit = struct {
     id: []u8,
     score: ?f32 = null,
     stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
@@ -2536,6 +2546,8 @@ pub const ChunkHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .score = self.score,
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
+            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
             .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
         };
     }
@@ -2543,6 +2555,8 @@ pub const ChunkHit = struct {
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         self.* = undefined;
     }
@@ -2788,6 +2802,22 @@ pub const ReplayStageStats = struct {
     blocked: bool = false,
     blocked_reason: []const u8 = "",
     error_count: u64 = 0,
+};
+
+pub const ResolverReplayDiagnostic = struct {
+    name: []const u8 = "",
+    table: []const u8 = "",
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+};
+
+pub const ResolverReplayDiagnostics = struct {
+    resolver_count: u64 = 0,
+    resolution_runtime_present: bool = false,
+    resolution_worker_started: bool = false,
+    promotion_runtime_present: bool = false,
+    promotion_worker_started: bool = false,
+    resolvers: []const ResolverReplayDiagnostic = &.{},
 };
 
 pub const TransactionRecoveryStats = struct {
@@ -3057,6 +3087,7 @@ pub const DBStats = struct {
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},
+    resolver_replay: ResolverReplayDiagnostics = .{},
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
@@ -3110,6 +3141,9 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Error name recorded when the index's persisted artifacts failed to
+    // load (e.g. "UnsupportedVersion"); null for healthy indexes.
+    load_error: ?[]const u8 = null,
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
@@ -3117,6 +3151,7 @@ pub const DBIndexStats = struct {
     root_node: u64 = 0,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    enrichment_failed: bool = false,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
@@ -3590,9 +3625,21 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
 }
 
+pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
+    for (stats.resolvers) |resolver| {
+        alloc.free(resolver.name);
+        alloc.free(resolver.table);
+        alloc.free(resolver.source_artifact);
+        alloc.free(resolver.resolution_artifact);
+    }
+    if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
+}
+
 pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
+    freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        if (item.load_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);

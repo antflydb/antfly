@@ -120,6 +120,7 @@ pub const TableApi = struct {
         InvalidGraphMetricAction,
         NotFound,
         MethodNotAllowed,
+        InternalFailure,
     };
 
     pub const ExecuteDocumentArtifactManifestError = error{

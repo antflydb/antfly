@@ -590,8 +590,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.graph_metric_runtime, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.graph_metric_runtime, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -624,8 +623,7 @@ fn appendIndexRuntimeStatus(
         try out.appendSlice(alloc, "{}");
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.graph_metric_runtime, null, item.runtime_present);
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.graph_metric_runtime, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 const AggregatedIndexStatus = struct {

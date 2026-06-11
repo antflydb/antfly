@@ -110,10 +110,7 @@ pub const BackgroundTextStatsResponse = struct {
     }
 };
 
-pub const LsmStorageStats = struct {
-    maintenance: lsm_backend.Backend.MaintenanceStats,
-    write: lsm_backend.Backend.WriteStats,
-};
+pub const LsmStorageStats = runtime_status.LsmStorageStats;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -1146,6 +1143,13 @@ const ParsedTextStatsRequest = union(TextStatsRequestMode) {
     }
 };
 
+pub const RelationalRowsSourceGroupRequest = struct {
+    schema_json: []const u8,
+    topology_epoch: u64,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+};
+
 pub const TableReadSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -1249,6 +1253,17 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsLateralPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsJoinResult = null,
+        relational_rows_source_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            schema_json: []const u8,
+            topology_epoch: u64,
+            req: db_mod.types.RelationalRowsQueryRequest,
+            doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         scan_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1357,6 +1372,38 @@ pub const TableReadSource = struct {
             ptr: *anyopaque,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
+        document_artifact_manifest: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
+        document_artifact_manifests: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            doc_key: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifestList = null,
+        document_artifact_manifest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifest = null,
+        document_artifact_manifests_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.DocumentArtifactManifestList = null,
     };
 
     pub fn lookup(
@@ -1380,6 +1427,42 @@ pub const TableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    pub fn documentArtifactManifest(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const fn_ptr = self.vtable.document_artifact_manifest orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, consistency);
+    }
+
+    pub fn documentArtifactManifestGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const fn_ptr = self.vtable.document_artifact_manifest_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    pub fn documentArtifactManifests(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const fn_ptr = self.vtable.document_artifact_manifests orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, doc_key, consistency);
     }
 
     pub fn query(
@@ -1464,6 +1547,21 @@ pub const TableReadSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
+    pub fn relationalRowsSourceGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        schema_json: []const u8,
+        topology_epoch: u64,
+        req: db_mod.types.RelationalRowsQueryRequest,
+        doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.relational_rows_source_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, schema_json, topology_epoch, req, doc_key_range, consistency);
+    }
+
     pub fn preflightQueryGroupLocal(
         self: TableReadSource,
         alloc: std.mem.Allocator,
@@ -1488,6 +1586,18 @@ pub const TableReadSource = struct {
     ) !?LookupResponse {
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    pub fn documentArtifactManifestsGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const fn_ptr = self.vtable.document_artifact_manifests_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, consistency);
     }
 
     pub fn relationalUniqueOwnerLookup(

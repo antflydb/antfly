@@ -64,6 +64,7 @@ pub const Routes = struct {
     pub const rows_join_suffix = "/rows:join";
     pub const rows_lateral_suffix = "/rows:lateral";
     pub const rows_mutation_source_suffix = "/rows:mutation-source";
+    pub const rows_source_suffix = "/rows:source";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -102,6 +103,9 @@ pub const Routes = struct {
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const artifacts_suffix = "/artifacts";
+    pub const reprocess_suffix = ":reprocess";
+    pub const placement_update_suffix = ":placement";
+    pub const child_range_batch_suffix = ":child-range-batch";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
@@ -279,10 +283,28 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const GroupRowsSource = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupDocumentArtifacts = struct {
         group_id: u64,
         table_name: []const u8,
         key: []const u8,
+    };
+
+    pub const GroupDocumentArtifact = struct {
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const GroupTableArtifact = struct {
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
     };
 
     pub const GroupBatch = struct {
@@ -803,6 +825,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupRowsSource(path: []const u8) ?GroupRowsSource {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, rows_source_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - rows_source_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupBatch(path: []const u8) ?GroupBatch {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -843,6 +875,42 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupDocumentArtifact(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithReprocess(path, false);
+    }
+
+    pub fn matchGroupDocumentArtifactReprocess(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithReprocess(path, true);
+    }
+
+    pub fn matchGroupDocumentArtifactPlacementUpdate(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithControlSuffix(path, placement_update_suffix);
+    }
+
+    pub fn matchGroupDocumentArtifactChildRangeBatch(path: []const u8) ?GroupDocumentArtifact {
+        return matchGroupDocumentArtifactWithControlSuffix(path, child_range_batch_suffix);
+    }
+
+    pub fn matchGroupTableArtifactReprocess(path: []const u8) ?GroupTableArtifact {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, reprocess_suffix)) return null;
+        const effective_rest = rest[0 .. rest.len - reprocess_suffix.len];
+        const table_rest = effective_rest[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, table_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = table_rest[0..artifacts_index];
+        const artifact_name = table_rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, table_rest, documents_marker) != null) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
     pub fn matchGroupDocumentArtifacts(path: []const u8) ?GroupDocumentArtifacts {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -858,6 +926,59 @@ pub const Routes = struct {
             .group_id = group.group_id,
             .table_name = table_name,
             .key = key,
+        };
+    }
+
+    fn matchGroupDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?GroupDocumentArtifact {
+        if (reprocess) return matchGroupDocumentArtifactWithControlSuffix(path, reprocess_suffix);
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        const table_rest = rest[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const document_rest = table_rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (std.mem.endsWith(u8, artifact_name, reprocess_suffix) or
+            std.mem.endsWith(u8, artifact_name, placement_update_suffix) or
+            std.mem.endsWith(u8, artifact_name, child_range_batch_suffix))
+        {
+            return null;
+        }
+        if (key.len == 0 or artifact_name.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    fn matchGroupDocumentArtifactWithControlSuffix(path: []const u8, suffix: []const u8) ?GroupDocumentArtifact {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        const table_rest = rest[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = table_rest[0..documents_index];
+        const document_rest = table_rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        var artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (!std.mem.endsWith(u8, artifact_name, suffix)) return null;
+        artifact_name = artifact_name[0 .. artifact_name.len - suffix.len];
+        if (key.len == 0 or artifact_name.len == 0) return null;
+        return .{
+            .group_id = group.group_id,
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
         };
     }
 
