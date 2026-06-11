@@ -13626,6 +13626,26 @@ fn computeDocumentExtractionAssetRequestDerived(
     const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
     const to_generation = from_generation + 1;
 
+    const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
+    defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
+    if (!force_reprocess) {
+        if (metadata_fingerprint) |fingerprint| {
+            if (existing_state) |state| {
+                if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint)) {
+                    if (existing_manifest) |value| {
+                        if (!(try documentExtractionManifestHasLastError(alloc, value))) {
+                            try artifact_writes.append(alloc, .{
+                                .key = try alloc.dupe(u8, manifest_key),
+                                .value = try alloc.dupe(u8, value),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
         alloc,
         db.remote_content,
@@ -13661,8 +13681,12 @@ fn computeDocumentExtractionAssetRequestDerived(
     defer extraction.deinit(alloc);
     try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, extraction.content_type, &extraction);
 
-    const source_fingerprint = try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
-    defer alloc.free(source_fingerprint);
+    const byte_source_fingerprint = if (metadata_fingerprint == null)
+        try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+    else
+        null;
+    defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
+    const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -14581,6 +14605,14 @@ fn documentExtractionStateValueAlloc(
         .unit_descriptors = unit_descriptors,
         .chunk_keys = chunk_keys,
     }, .{});
+}
+
+fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("fingerprint") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, fingerprint);
 }
 
 fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {

@@ -6165,18 +6165,26 @@ pub const ApiHttpServer = struct {
             return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
         }
 
-        const running = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .running, null);
-        defer self.alloc.free(running);
+        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid job state");
+        };
+        defer parsed_running.deinit();
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
 
         const source = self.table_writes orelse {
-            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, "method not allowed");
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
             return try textResponse(self.alloc, 405, "method not allowed");
         };
 
-        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, state.shard_cursors.len);
+        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
         defer self.alloc.free(shard_resumes);
-        for (state.shard_cursors, shard_resumes) |cursor, *out_resume| {
+        for (running_state.shard_cursors, shard_resumes) |cursor, *out_resume| {
             out_resume.* = .{
                 .group_id = cursor.group_id,
                 .next_key = cursor.next_key,
@@ -6184,42 +6192,42 @@ pub const ApiHttpServer = struct {
             };
         }
         const req = db_mod.types.DocumentArtifactTableReprocessRequest{
-            .from_key = if (shard_resumes.len > 0) "" else (state.next_key orelse state.from_key),
-            .to_key = state.to_key,
-            .limit = state.limit,
+            .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
+            .to_key = running_state.to_key,
+            .limit = running_state.limit,
             .shard_cursors = shard_resumes,
         };
         const result = source.reprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, req) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => {
-                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 return try textResponse(self.alloc, 503, "doc identity unavailable");
             },
             error.InvalidArgument => {
-                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 return try textResponse(self.alloc, 400, "invalid request");
             },
             error.NotFound => {
-                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 return try textResponse(self.alloc, 404, "not found");
             },
             else => {
-                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, @errorName(err));
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
-                std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, state.job_id, err });
+                std.log.err("public document artifact reprocess job failed table={s} artifact={s} job_id={d} err={}", .{ table_name, artifact_name, running_state.job_id, err });
                 return try textResponse(self.alloc, 500, "artifact reprocess job failed");
             },
         };
         if (result == null) {
-            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, state, .failed, "method not allowed");
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
             defer self.alloc.free(failed);
             return try textResponse(self.alloc, 405, "method not allowed");
         }
         var pass = result.?;
         defer pass.deinit(self.alloc);
-        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, state, pass);
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, pass);
         defer self.alloc.free(updated);
         return try jsonBodyResponseWithStatus(self.alloc, 202, updated);
     }

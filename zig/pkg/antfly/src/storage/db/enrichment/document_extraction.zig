@@ -135,9 +135,17 @@ pub const Result = struct {
 pub const Config = struct {
     filename: []const u8 = "",
     content_type: []const u8 = "",
+    etag: []const u8 = "",
+    checksum: []const u8 = "",
+    version: []const u8 = "",
+    last_modified: []const u8 = "",
     credentials: []const u8 = "",
     filename_field: []const u8 = "",
     content_type_field: []const u8 = "",
+    etag_field: []const u8 = "",
+    checksum_field: []const u8 = "",
+    version_field: []const u8 = "",
+    last_modified_field: []const u8 = "",
     html_strip_tags: bool = true,
     ocr_enabled: bool = false,
     ocr_config_json: []const u8 = "",
@@ -149,9 +157,17 @@ pub const Config = struct {
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.filename.len > 0) alloc.free(@constCast(self.filename));
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
+        if (self.etag.len > 0) alloc.free(@constCast(self.etag));
+        if (self.checksum.len > 0) alloc.free(@constCast(self.checksum));
+        if (self.version.len > 0) alloc.free(@constCast(self.version));
+        if (self.last_modified.len > 0) alloc.free(@constCast(self.last_modified));
         if (self.credentials.len > 0) alloc.free(@constCast(self.credentials));
         if (self.filename_field.len > 0) alloc.free(@constCast(self.filename_field));
         if (self.content_type_field.len > 0) alloc.free(@constCast(self.content_type_field));
+        if (self.etag_field.len > 0) alloc.free(@constCast(self.etag_field));
+        if (self.checksum_field.len > 0) alloc.free(@constCast(self.checksum_field));
+        if (self.version_field.len > 0) alloc.free(@constCast(self.version_field));
+        if (self.last_modified_field.len > 0) alloc.free(@constCast(self.last_modified_field));
         if (self.ocr_config_json.len > 0) alloc.free(@constCast(self.ocr_config_json));
         if (self.transcription_config_json.len > 0) alloc.free(@constCast(self.transcription_config_json));
         for (self.routes) |*route| route.deinit(alloc);
@@ -238,9 +254,17 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     errdefer config.deinit(alloc);
     config.filename = try dupeStringField(alloc, object, "filename");
     config.content_type = try dupeStringField(alloc, object, "content_type");
+    config.etag = try dupeStringField(alloc, object, "etag");
+    config.checksum = try dupeStringField(alloc, object, "checksum");
+    config.version = try dupeStringField(alloc, object, "version");
+    config.last_modified = try dupeStringField(alloc, object, "last_modified");
     config.credentials = try dupeStringField(alloc, object, "credentials");
     config.filename_field = try dupeSourceStringField(alloc, object, "filename_field");
     config.content_type_field = try dupeSourceStringField(alloc, object, "content_type_field");
+    config.etag_field = try dupeSourceStringField(alloc, object, "etag_field");
+    config.checksum_field = try dupeSourceStringField(alloc, object, "checksum_field");
+    config.version_field = try dupeSourceStringField(alloc, object, "version_field");
+    config.last_modified_field = try dupeSourceStringField(alloc, object, "last_modified_field");
     config.html_strip_tags = boolField(object, "html_strip_tags") orelse true;
     config.ocr_enabled = boolField(object, "ocr_fallback") orelse false;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
@@ -380,7 +404,12 @@ fn dupeStringArrayOrStringField(alloc: Allocator, object: std.json.ObjectMap, fi
 }
 
 pub fn applySourceMetadataFromJson(alloc: Allocator, config: *Config, doc_value: []const u8) !void {
-    if (config.filename_field.len == 0 and config.content_type_field.len == 0) return;
+    if (config.filename_field.len == 0 and
+        config.content_type_field.len == 0 and
+        config.etag_field.len == 0 and
+        config.checksum_field.len == 0 and
+        config.version_field.len == 0 and
+        config.last_modified_field.len == 0) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
     defer parsed.deinit();
@@ -398,12 +427,81 @@ pub fn applySourceMetadataFromJson(alloc: Allocator, config: *Config, doc_value:
             config.content_type = value;
         }
     }
+    if (config.etag_field.len > 0) {
+        if (try dupeOptionalStringField(alloc, parsed.value.object, config.etag_field)) |value| {
+            if (config.etag.len > 0) alloc.free(@constCast(config.etag));
+            config.etag = value;
+        }
+    }
+    if (config.checksum_field.len > 0) {
+        if (try dupeOptionalStringField(alloc, parsed.value.object, config.checksum_field)) |value| {
+            if (config.checksum.len > 0) alloc.free(@constCast(config.checksum));
+            config.checksum = value;
+        }
+    }
+    if (config.version_field.len > 0) {
+        if (try dupeOptionalStringField(alloc, parsed.value.object, config.version_field)) |value| {
+            if (config.version.len > 0) alloc.free(@constCast(config.version));
+            config.version = value;
+        }
+    }
+    if (config.last_modified_field.len > 0) {
+        if (try dupeOptionalStringField(alloc, parsed.value.object, config.last_modified_field)) |value| {
+            if (config.last_modified.len > 0) alloc.free(@constCast(config.last_modified));
+            config.last_modified = value;
+        }
+    }
 }
 
 fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: []const u8) !?[]const u8 {
     const value = object.get(field) orelse return null;
     if (value != .string) return null;
     return try alloc.dupe(u8, value.string);
+}
+
+pub fn metadataFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    config: Config,
+) !?[]u8 {
+    if (config.etag.len == 0 and
+        config.checksum.len == 0 and
+        config.version.len == 0 and
+        config.last_modified.len == 0) return null;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v1");
+    hashField(&hasher, "source_url", source_url);
+    hashField(&hasher, "config_json", config_json);
+    hashField(&hasher, "filename", config.filename);
+    hashField(&hasher, "content_type", config.content_type);
+    hashField(&hasher, "etag", config.etag);
+    hashField(&hasher, "checksum", config.checksum);
+    hashField(&hasher, "version", config.version);
+    hashField(&hasher, "last_modified", config.last_modified);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hashField(hasher: *std.crypto.hash.sha2.Sha256, name: []const u8, value: []const u8) void {
+    var len_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, @intCast(name.len), .big);
+    hasher.update(&len_buf);
+    hasher.update(name);
+    std.mem.writeInt(u64, &len_buf, @intCast(value.len), .big);
+    hasher.update(&len_buf);
+    hasher.update(value);
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
 }
 
 pub fn extractDownloadedAlloc(
@@ -2385,15 +2483,41 @@ test "document extraction parses generated OCR and transcription config" {
 test "document extraction applies source metadata fields from row json" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"source":{"filename_field":"filename","content_type_field":"mime_type"}}
+        \\{"source":{"filename_field":"filename","content_type_field":"mime_type","etag_field":"etag","checksum_field":"sha256","version_field":"rev","last_modified_field":"updated_at"}}
     );
     defer config.deinit(alloc);
 
     try applySourceMetadataFromJson(alloc, &config,
-        \\{"filename":"contract.pdf","mime_type":"application/pdf"}
+        \\{"filename":"contract.pdf","mime_type":"application/pdf","etag":"abc123","sha256":"def456","rev":"7","updated_at":"2026-06-11T12:00:00Z"}
     );
     try std.testing.expectEqualStrings("contract.pdf", config.filename);
     try std.testing.expectEqualStrings("application/pdf", config.content_type);
+    try std.testing.expectEqualStrings("abc123", config.etag);
+    try std.testing.expectEqualStrings("def456", config.checksum);
+    try std.testing.expectEqualStrings("7", config.version);
+    try std.testing.expectEqualStrings("2026-06-11T12:00:00Z", config.last_modified);
+}
+
+test "document extraction metadata fingerprint requires version metadata" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"filename":"contract.pdf","content_type":"application/pdf"}
+    );
+    defer config.deinit(alloc);
+
+    try std.testing.expect((try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)) == null);
+
+    if (config.version.len > 0) alloc.free(@constCast(config.version));
+    config.version = try alloc.dupe(u8, "1");
+    const first = (try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)).?;
+    defer alloc.free(first);
+
+    if (config.version.len > 0) alloc.free(@constCast(config.version));
+    config.version = try alloc.dupe(u8, "2");
+    const second = (try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)).?;
+    defer alloc.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 test "document extraction route matching normalizes content type parameters" {

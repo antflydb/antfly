@@ -1717,6 +1717,41 @@ fn processDocumentExtractionAsset(
     defer config.deinit(runtime.alloc);
     try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
 
+    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_state) |value| runtime.alloc.free(value);
+    const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_manifest) |value| runtime.alloc.free(value);
+    var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
+    defer freeDocumentArtifactChildRanges(runtime.alloc, previous_child_ranges);
+    if (existing_manifest) |value| {
+        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(runtime.alloc, value);
+    }
+    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
+    const to_generation = from_generation + 1;
+
+    const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
+    defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    if (metadata_fingerprint) |fingerprint| {
+        if (existing_state) |state| {
+            if (documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint)) {
+                if (existing_manifest) |value| {
+                    if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                        runtime.skip_by_hash_count += 1;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
         runtime.alloc,
         runtime.config.remote_content,
@@ -1735,8 +1770,12 @@ fn processDocumentExtractionAsset(
     defer extraction.deinit(runtime.alloc);
     try completeRuntimeDocumentExtractionGeneratedText(runtime, config, source_url, extraction.content_type, &extraction);
 
-    const source_fingerprint = try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data);
-    defer runtime.alloc.free(source_fingerprint);
+    const byte_source_fingerprint = if (metadata_fingerprint == null)
+        try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+    else
+        null;
+    defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1761,31 +1800,13 @@ fn processDocumentExtractionAsset(
     const new_state = try documentExtractionStateValueAlloc(runtime.alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
     defer runtime.alloc.free(new_state);
 
-    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
-    defer runtime.alloc.free(state_key);
-    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
-    defer if (existing_state) |value| runtime.alloc.free(value);
-    const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => null,
-    };
-    defer if (existing_manifest) |value| runtime.alloc.free(value);
-    var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
-    defer freeDocumentArtifactChildRanges(runtime.alloc, previous_child_ranges);
-    if (existing_manifest) |value| {
-        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(runtime.alloc, value);
-    }
-    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
-    const to_generation = from_generation + 1;
-
     if (existing_state) |state| {
         if (std.mem.eql(u8, state, new_state)) {
-            if (existing_manifest != null) {
-                runtime.skip_by_hash_count += 1;
-                return;
+            if (existing_manifest) |value| {
+                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                    runtime.skip_by_hash_count += 1;
+                    return;
+                }
             }
         }
     }
@@ -4243,6 +4264,14 @@ fn documentExtractionStateValueAlloc(
     }, .{});
 }
 
+fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("fingerprint") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, fingerprint);
+}
+
 fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
     return try documentExtractionStateKeysAlloc(alloc, state, "unit_keys");
 }
@@ -4468,6 +4497,13 @@ fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) 
     const generation = parsed.value.object.get("generation") orelse return 0;
     if (generation != .integer or generation.integer < 0) return error.InvalidDocumentExtractionManifest;
     return std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("last_error") != null;
 }
 
 fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {

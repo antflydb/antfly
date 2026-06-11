@@ -142,16 +142,37 @@ pub fn downloadRemoteContentOutcomeAllocWithConfig(
     url: []const u8,
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
-    _ = remote_content;
     _ = secret_store;
-    _ = credential_name;
+    if (credential_name != null) return error.UnsupportedRemoteContentCredential;
+    const security = try effectiveRemoteContentSecurity(remote_content);
     return try scraping.downloadContentOutcomeAllocWithHeaders(
         alloc,
         url,
-        &remote_fetch_security,
+        &security,
         null,
         null,
     );
+}
+
+fn effectiveRemoteContentSecurity(remote_content: ?*const scraping.RemoteContentConfig) !scraping.ContentSecurityConfig {
+    const cfg = remote_content orelse return remote_fetch_security;
+    if (cfg.default_s3 != null or cfg.s3.count() > 0 or cfg.http.count() > 0) return error.UnsupportedRemoteContentCredential;
+    var effective = remote_fetch_security;
+    if (cfg.security) |security| applyContentSecurityOverride(&effective, security);
+    return effective;
+}
+
+fn applyContentSecurityOverride(
+    effective: *scraping.ContentSecurityConfig,
+    override: scraping.ContentSecurityConfig,
+) void {
+    if (override.allowed_hosts) |value| effective.allowed_hosts = value;
+    if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
+    if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
+    if (override.max_image_dimension) |value| effective.max_image_dimension = value;
+    if (override.allowed_paths) |value| effective.allowed_paths = value;
+    if (override.user_agent) |value| effective.user_agent = value;
 }
 
 test "template remote stub renders local template parts" {
