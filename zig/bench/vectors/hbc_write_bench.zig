@@ -44,6 +44,7 @@ const Config = struct {
     use_random_ortho_trans: bool = false,
     centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
     posting_storage_mode: hbc.HBCConfig.PostingStorageMode = .packed_hbc,
+    posting_base_member_block_size: usize = 32,
     flat_centroid_block_size: usize = 128,
     flat_centroid_probe_count: usize = 0,
     flat_centroid_block_probe_count: usize = 0,
@@ -2180,8 +2181,9 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"flat_centroid_block_size\":{d},\"flat_centroid_probe_count\":{d},\"flat_centroid_block_probe_count\":{d}",
+        ",\"posting_base_member_block_size\":{d},\"flat_centroid_block_size\":{d},\"flat_centroid_probe_count\":{d},\"flat_centroid_block_probe_count\":{d}",
         .{
+            scenario.cfg.posting_base_member_block_size,
             scenario.cfg.flat_centroid_block_size,
             scenario.cfg.flat_centroid_probe_count,
             scenario.cfg.flat_centroid_block_probe_count,
@@ -3111,6 +3113,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .kmeans_update_strategy = cfg.kmeans_update_strategy,
         .centroid_directory_mode = cfg.centroid_directory_mode,
         .posting_storage_mode = cfg.posting_storage_mode,
+        .posting_base_member_block_size = cfg.posting_base_member_block_size,
         .flat_centroid_block_size = cfg.flat_centroid_block_size,
         .flat_centroid_probe_count = cfg.flat_centroid_probe_count,
         .flat_centroid_block_probe_count = cfg.flat_centroid_block_probe_count,
@@ -4129,6 +4132,8 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--posting-storage")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.posting_storage_mode = std.meta.stringToEnum(hbc.HBCConfig.PostingStorageMode, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--posting-base-member-block-size")) {
+            cfg.posting_base_member_block_size = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--flat-centroid-block-size")) {
             cfg.flat_centroid_block_size = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--flat-centroid-probe-count")) {

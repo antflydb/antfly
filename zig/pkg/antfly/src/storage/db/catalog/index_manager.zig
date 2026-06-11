@@ -1488,6 +1488,7 @@ pub const IndexManager = struct {
             .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
             .max_retained_posting_fold_scratch_bytes = dense_cfg.max_retained_posting_fold_scratch_bytes,
             .max_posting_delta_tail_value_bytes = dense_cfg.max_posting_delta_tail_value_bytes,
+            .posting_base_member_block_size = dense_cfg.posting_base_member_block_size,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
@@ -5919,6 +5920,7 @@ pub const IndexManager = struct {
                     .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
                     .max_retained_posting_fold_scratch_bytes = dense_cfg.max_retained_posting_fold_scratch_bytes,
                     .max_posting_delta_tail_value_bytes = dense_cfg.max_posting_delta_tail_value_bytes,
+                    .posting_base_member_block_size = dense_cfg.posting_base_member_block_size,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
@@ -11556,6 +11558,7 @@ const DenseConfig = struct {
     max_retained_search_scratch_bytes: usize = 64 * 1024 * 1024,
     max_retained_posting_fold_scratch_bytes: usize = 16 * 1024 * 1024,
     max_posting_delta_tail_value_bytes: usize = 4096,
+    posting_base_member_block_size: usize = 32,
 
     fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
@@ -11985,6 +11988,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             4096,
+        .posting_base_member_block_size = if (root.object.get("posting_base_member_block_size")) |value|
+            try parsePostingBaseMemberBlockSize(value.integer)
+        else
+            32,
     };
     errdefer cfg.deinit(alloc);
     if (cfg.auto_posting_maintenance_allow_overfull_reassignment and
@@ -12940,6 +12947,14 @@ fn parsePostingStorageMode(raw: []const u8) !hbc_mod.HBCConfig.PostingStorageMod
     if (std.mem.eql(u8, raw, "shadow_base_delta")) return .shadow_base_delta;
     if (std.mem.eql(u8, raw, "base_delta")) return .base_delta;
     return error.InvalidIndexConfig;
+}
+
+fn parsePostingBaseMemberBlockSize(raw: i64) !usize {
+    const value = std.math.cast(usize, raw) orelse return error.InvalidIndexConfig;
+    return switch (value) {
+        16, 32, 64 => value,
+        else => error.InvalidIndexConfig,
+    };
 }
 
 fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !void {
@@ -14678,7 +14693,8 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "max_posting_overlay_cache_entry_bytes": 4096,
         \\  "max_retained_search_scratch_bytes": 131072,
         \\  "max_retained_posting_fold_scratch_bytes": 32768,
-        \\  "max_posting_delta_tail_value_bytes": 2048
+        \\  "max_posting_delta_tail_value_bytes": 2048,
+        \\  "posting_base_member_block_size": 64
         \\}
     ;
 
@@ -14738,6 +14754,14 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(@as(usize, 131072), cfg.max_retained_search_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 32768), cfg.max_retained_posting_fold_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 2048), cfg.max_posting_delta_tail_value_bytes);
+    try std.testing.expectEqual(@as(usize, 64), cfg.posting_base_member_block_size);
+}
+
+test "parseDenseConfig rejects unsupported posting base member block size" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{"field":"embedding","dims":8,"posting_base_member_block_size":48}
+    ));
 }
 
 test "parseDenseConfig rejects unbounded overfull reassignment policy" {

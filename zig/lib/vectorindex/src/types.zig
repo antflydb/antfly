@@ -109,6 +109,7 @@ pub const HBCConfig = struct {
     max_retained_search_scratch_bytes: usize = 64 * 1024 * 1024,
     max_retained_posting_fold_scratch_bytes: usize = 16 * 1024 * 1024,
     max_posting_delta_tail_value_bytes: usize = 4096,
+    posting_base_member_block_size: usize = 32,
 };
 
 pub const StorageBackend = enum {

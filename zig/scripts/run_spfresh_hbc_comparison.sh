@@ -14,6 +14,7 @@ LEAF_SIZE="${LEAF_SIZE:-16}"
 BRANCHING_FACTOR="${BRANCHING_FACTOR:-8}"
 SEARCH_WIDTH="${SEARCH_WIDTH:-0}"
 STORAGE="${STORAGE:-host}"
+POSTING_BASE_MEMBER_BLOCK_SIZE="${POSTING_BASE_MEMBER_BLOCK_SIZE:-32}"
 OVERWRITE_HOT_KEYS="${OVERWRITE_HOT_KEYS:-32}"
 OVERWRITE_ROUNDS="${OVERWRITE_ROUNDS:-2}"
 POST_WRITE_QUERIES="${POST_WRITE_QUERIES:-8}"
@@ -563,6 +564,7 @@ COMMON_WRITE_ARGS=(
   --post-write-k "${POST_WRITE_K}"
   --max-posting-overlay-cache-bytes "${MAX_POSTING_OVERLAY_CACHE_BYTES}"
   --max-posting-overlay-cache-entry-bytes "${MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES}"
+  --posting-base-member-block-size "${POSTING_BASE_MEMBER_BLOCK_SIZE}"
 )
 
 COMMON_READ_ARGS=(
@@ -581,6 +583,7 @@ COMMON_READ_ARGS=(
   --exact-truth-cache-path "${READ_EXACT_TRUTH_CACHE_PATH}"
   --max-posting-overlay-cache-bytes "${MAX_POSTING_OVERLAY_CACHE_BYTES}"
   --max-posting-overlay-cache-entry-bytes "${MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES}"
+  --posting-base-member-block-size "${POSTING_BASE_MEMBER_BLOCK_SIZE}"
 )
 
 COMMON_VDBB_WRITE_ARGS=(
@@ -600,6 +603,7 @@ COMMON_VDBB_WRITE_ARGS=(
   --post-write-truth-cache-path "${POST_WRITE_TRUTH_CACHE_DIR}/write-vdbb-procedural-online-${VDBB_VECTORS}v-${VDBB_DIMS}d-${VDBB_POST_WRITE_QUERIES}q-${VDBB_POST_WRITE_K}k.bin"
   --max-posting-overlay-cache-bytes "${MAX_POSTING_OVERLAY_CACHE_BYTES}"
   --max-posting-overlay-cache-entry-bytes "${MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES}"
+  --posting-base-member-block-size "${POSTING_BASE_MEMBER_BLOCK_SIZE}"
 )
 
 COMMON_VDBB_PROCEDURAL_WRITE_ARGS=(
@@ -620,6 +624,7 @@ COMMON_VDBB_PROCEDURAL_WRITE_ARGS=(
   --post-write-recall-mode "${VDBB_POST_WRITE_RECALL_MODE}"
   --max-posting-overlay-cache-bytes "${MAX_POSTING_OVERLAY_CACHE_BYTES}"
   --max-posting-overlay-cache-entry-bytes "${MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES}"
+  --posting-base-member-block-size "${POSTING_BASE_MEMBER_BLOCK_SIZE}"
 )
 
 COMMON_VDBB_1M_PROCEDURAL_WRITE_ARGS=(
@@ -641,6 +646,7 @@ COMMON_VDBB_1M_PROCEDURAL_WRITE_ARGS=(
   --post-write-truth-cache-path "${POST_WRITE_TRUTH_CACHE_DIR}/write-vdbb-1m-procedural-online-${VDBB_1M_VECTORS}v-${VDBB_DIMS}d-${VDBB_1M_POST_WRITE_QUERIES}q-${VDBB_1M_POST_WRITE_K}k.bin"
   --max-posting-overlay-cache-bytes "${MAX_POSTING_OVERLAY_CACHE_BYTES}"
   --max-posting-overlay-cache-entry-bytes "${MAX_POSTING_OVERLAY_CACHE_ENTRY_BYTES}"
+  --posting-base-member-block-size "${POSTING_BASE_MEMBER_BLOCK_SIZE}"
 )
 
 if [[ "${SKIP_VECTOR_STORE}" == "1" ]]; then
