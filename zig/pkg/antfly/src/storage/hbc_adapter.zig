@@ -3523,7 +3523,17 @@ pub const HBCIndex = struct {
             return;
         };
         const resource_stats = manager.sliceStats(.dense_search_working_set);
-        scratch.setPostingMemberCacheAdmissionEnabled(resource_stats.pressure == .normal);
+        switch (resource_stats.pressure) {
+            .normal => scratch.setPostingMemberCacheAdmissionEnabled(true),
+            .soft => {
+                scratch.setPostingMemberCacheAdmissionEnabled(false);
+                _ = scratch.trimPostingMemberCache(self.alloc, scratch.max_posting_member_cache_bytes / 4);
+            },
+            .hard => {
+                scratch.setPostingMemberCacheAdmissionEnabled(false);
+                _ = scratch.clearPostingMemberCache(self.alloc);
+            },
+        }
     }
 
     pub fn acquirePostingFoldScratch(self: *HBCIndex) !vectorindex_posting.PostingStore.FoldScratch {
@@ -3539,7 +3549,9 @@ pub const HBCIndex = struct {
     pub fn releasePostingFoldScratch(self: *HBCIndex, scratch: *vectorindex_posting.PostingStore.FoldScratch) void {
         lockAtomic(&self.posting_fold_scratch_mu);
         defer self.posting_fold_scratch_mu.unlock();
-        if (self.cached_posting_fold_scratch == null) {
+        const max_retained_bytes = self.config.max_retained_posting_fold_scratch_bytes;
+        const should_retain = max_retained_bytes == 0 or scratch.bytes() <= max_retained_bytes;
+        if (self.cached_posting_fold_scratch == null and should_retain) {
             self.cached_posting_fold_scratch = scratch.*;
             scratch.* = .{};
         } else {

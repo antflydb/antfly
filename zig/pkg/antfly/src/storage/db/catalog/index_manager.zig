@@ -1486,6 +1486,7 @@ pub const IndexManager = struct {
             .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
             .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
             .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
+            .max_retained_posting_fold_scratch_bytes = dense_cfg.max_retained_posting_fold_scratch_bytes,
             .max_posting_delta_tail_value_bytes = dense_cfg.max_posting_delta_tail_value_bytes,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
@@ -5916,6 +5917,7 @@ pub const IndexManager = struct {
                     .max_posting_overlay_cache_bytes = dense_cfg.max_posting_overlay_cache_bytes,
                     .max_posting_overlay_cache_entry_bytes = dense_cfg.max_posting_overlay_cache_entry_bytes,
                     .max_retained_search_scratch_bytes = dense_cfg.max_retained_search_scratch_bytes,
+                    .max_retained_posting_fold_scratch_bytes = dense_cfg.max_retained_posting_fold_scratch_bytes,
                     .max_posting_delta_tail_value_bytes = dense_cfg.max_posting_delta_tail_value_bytes,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
@@ -11552,6 +11554,7 @@ const DenseConfig = struct {
     max_posting_overlay_cache_bytes: usize = 8 * 1024 * 1024,
     max_posting_overlay_cache_entry_bytes: usize = 0,
     max_retained_search_scratch_bytes: usize = 64 * 1024 * 1024,
+    max_retained_posting_fold_scratch_bytes: usize = 16 * 1024 * 1024,
     max_posting_delta_tail_value_bytes: usize = 4096,
 
     fn deinit(self: *const DenseConfig, alloc: Allocator) void {
@@ -11974,6 +11977,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
             64 * 1024 * 1024,
+        .max_retained_posting_fold_scratch_bytes = if (root.object.get("max_retained_posting_fold_scratch_bytes")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            16 * 1024 * 1024,
         .max_posting_delta_tail_value_bytes = if (root.object.get("max_posting_delta_tail_value_bytes")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
@@ -14670,6 +14677,7 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "max_posting_overlay_cache_bytes": 65536,
         \\  "max_posting_overlay_cache_entry_bytes": 4096,
         \\  "max_retained_search_scratch_bytes": 131072,
+        \\  "max_retained_posting_fold_scratch_bytes": 32768,
         \\  "max_posting_delta_tail_value_bytes": 2048
         \\}
     ;
@@ -14728,6 +14736,7 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(@as(usize, 65536), cfg.max_posting_overlay_cache_bytes);
     try std.testing.expectEqual(@as(usize, 4096), cfg.max_posting_overlay_cache_entry_bytes);
     try std.testing.expectEqual(@as(usize, 131072), cfg.max_retained_search_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 32768), cfg.max_retained_posting_fold_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 2048), cfg.max_posting_delta_tail_value_bytes);
 }
 

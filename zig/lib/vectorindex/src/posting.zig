@@ -269,15 +269,20 @@ pub const PostingFormat = struct {
     pub const version: u8 = 1;
 
     const base_header_size: usize = 4 + 1 + 8 + 8 + 4;
-    const delta_header_size: usize = 4 + 1 + 4 + 8;
+    pub const delta_header_size: usize = 4 + 1 + 4 + 8;
 
     pub fn encodedBaseSizeForMemberCount(member_count: usize) !usize {
         if (member_count > std.math.maxInt(u32)) return error.TooLarge;
-        return base_header_size + member_count * @sizeOf(u64);
+        return try std.math.add(usize, base_header_size, try std.math.mul(usize, member_count, 10));
     }
 
     pub fn encodedBaseSize(base: PostingBase) !usize {
-        return try encodedBaseSizeForMemberCount(base.members.len);
+        if (base.members.len > std.math.maxInt(u32)) return error.TooLarge;
+        var total: usize = base_header_size;
+        for (base.members) |member_id| {
+            total = try std.math.add(usize, total, varintSize(member_id));
+        }
+        return total;
     }
 
     pub fn encodeBase(alloc: std.mem.Allocator, base: PostingBase) ![]u8 {
@@ -288,8 +293,7 @@ pub const PostingFormat = struct {
         encodeBaseHeader(out, base.posting_id, base.generation, base.members.len);
         var pos: usize = base_header_size;
         for (base.members) |member_id| {
-            writeEncodedBaseMember(out, pos, member_id);
-            pos += @sizeOf(u64);
+            writeVarint(out, &pos, member_id);
         }
         return out;
     }
@@ -302,14 +306,6 @@ pub const PostingFormat = struct {
         std.mem.writeInt(u32, out[21..25], @intCast(member_count), .little);
     }
 
-    fn writeEncodedBaseMember(out: []u8, pos: usize, member_id: VectorId) void {
-        std.mem.writeInt(u64, out[pos..][0..@sizeOf(u64)], member_id, .little);
-    }
-
-    fn readEncodedBaseMember(data: []const u8, pos: usize) VectorId {
-        return std.mem.readInt(u64, data[pos..][0..@sizeOf(u64)], .little);
-    }
-
     pub fn initializeEncodedBaseFromBaseData(
         out: []u8,
         base_data: []const u8,
@@ -320,16 +316,51 @@ pub const PostingFormat = struct {
         const needed = try encodedBaseSizeForMemberCount(header.member_count);
         if (out.len < needed) return error.BufferTooSmall;
         encodeBaseHeader(out, posting_id, generation, header.member_count);
-        @memcpy(out[base_header_size..needed], base_data[base_header_size..needed]);
+        @memcpy(out[base_header_size..base_data.len], base_data[base_header_size..]);
         return header;
     }
 
-    pub fn finishEncodedBase(out: []u8, member_count: usize) ![]const u8 {
+    pub fn finishEncodedBase(out: []u8, encoded_len: usize, member_count: usize) ![]const u8 {
         if (member_count > std.math.maxInt(u32)) return error.TooLarge;
-        const encoded_len = try encodedBaseSizeForMemberCount(member_count);
         if (out.len < encoded_len) return error.BufferTooSmall;
         std.mem.writeInt(u32, out[21..25], @intCast(member_count), .little);
         return out[0..encoded_len];
+    }
+
+    pub fn encodeBaseWithOverlayPlan(
+        scratch: anytype,
+        base_data: []const u8,
+        posting_id: PostingId,
+        generation: u64,
+    ) !struct { encoded: []const u8, member_count: usize } {
+        const header = try decodeBaseHeader(base_data);
+        encodeBaseHeader(scratch.encoded_base, posting_id, generation, 0);
+        var input_pos: usize = base_header_size;
+        var output_pos: usize = base_header_size;
+        var member_count: usize = 0;
+        var read_count: usize = 0;
+        while (read_count < header.member_count) : (read_count += 1) {
+            const member = try readVarint(base_data, &input_pos);
+            if (overlayRemovedMembers(scratch).contains(member)) continue;
+            writeVarint(scratch.encoded_base, &output_pos, member);
+            member_count += 1;
+        }
+        if (input_pos != base_data.len) return error.Corrupted;
+
+        const appended_ids = overlayAppendedIds(scratch);
+        const appended_live = overlayAppendedLive(scratch);
+        const appended_count = overlayAppendedCount(scratch).*;
+        var append_index: usize = 0;
+        while (append_index < appended_count) : (append_index += 1) {
+            if (!appended_live[append_index]) continue;
+            writeVarint(scratch.encoded_base, &output_pos, appended_ids[append_index]);
+            member_count += 1;
+        }
+
+        return .{
+            .encoded = try finishEncodedBase(scratch.encoded_base, output_pos, member_count),
+            .member_count = member_count,
+        };
     }
 
     pub fn decodeBase(alloc: std.mem.Allocator, data: []const u8) !OwnedPostingBase {
@@ -349,8 +380,6 @@ pub const PostingFormat = struct {
         if (!std.mem.eql(u8, data[0..4], &base_magic)) return error.BadPostingBaseMagic;
         if (data[4] != version) return error.UnsupportedPostingBaseVersion;
         const member_count = std.mem.readInt(u32, data[21..25], .little);
-        const expected_len = base_header_size + @as(usize, member_count) * @sizeOf(u64);
-        if (data.len != expected_len) return error.Corrupted;
         return .{
             .posting_id = std.mem.readInt(u64, data[5..13], .little),
             .generation = std.mem.readInt(u64, data[13..21], .little),
@@ -363,9 +392,9 @@ pub const PostingFormat = struct {
         if (members.len < header.member_count) return error.BufferTooSmall;
         var pos: usize = base_header_size;
         for (members[0..header.member_count]) |*member_id| {
-            member_id.* = std.mem.readInt(u64, data[pos..][0..8], .little);
-            pos += 8;
+            member_id.* = try readVarint(data, &pos);
         }
+        if (pos != data.len) return error.Corrupted;
         return header;
     }
 
@@ -495,6 +524,81 @@ pub const PostingFormat = struct {
         return stats;
     }
 
+    pub fn scanDeltaTailAfterGenerationIntoOverlayPlan(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        data: []const u8,
+        base_generation: u64,
+    ) !PostingDeltaTailStats {
+        const header = try decodeDeltaTailHeader(data);
+        var pos = header.records_offset;
+        var stats = PostingDeltaTailStats{ .records = header.record_count };
+        var i: usize = 0;
+        while (i < header.record_count) : (i += 1) {
+            const record = try readDeltaRecord(data, header, &pos);
+            if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            stats.records_after_generation += 1;
+            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            try applyPostingOverlayRecord(alloc, scratch, record);
+        }
+        if (pos != data.len) return error.Corrupted;
+        return stats;
+    }
+
+    fn applyPostingOverlayRecord(alloc: std.mem.Allocator, scratch: anytype, record: PostingDeltaRecord) !void {
+        removeOverlayAppendedMemberIfPresent(scratch, record.vector_id);
+        try overlayRemovedMembers(scratch).put(alloc, record.vector_id, {});
+        switch (record.op) {
+            .insert, .replace => try appendOverlayLiveMember(alloc, scratch, record.vector_id),
+            .tombstone => {},
+        }
+    }
+
+    fn removeOverlayAppendedMemberIfPresent(scratch: anytype, vector_id: VectorId) void {
+        if (overlayAppendedPositions(scratch).fetchRemove(vector_id)) |removed| {
+            overlayAppendedLive(scratch)[removed.value] = false;
+        }
+    }
+
+    fn appendOverlayLiveMember(alloc: std.mem.Allocator, scratch: anytype, vector_id: VectorId) !void {
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, overlayAppendedCount(scratch).* + 1);
+        const pos = overlayAppendedCount(scratch).*;
+        overlayAppendedCount(scratch).* += 1;
+        overlayAppendedIds(scratch)[pos] = vector_id;
+        overlayAppendedLive(scratch)[pos] = true;
+        try overlayAppendedPositions(scratch).put(alloc, vector_id, pos);
+    }
+
+    pub fn overlayRemovedMembers(scratch: anytype) *std.AutoHashMapUnmanaged(VectorId, void) {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "removed_members")) return &scratch.removed_members;
+        return &scratch.posting_overlay_removed_members;
+    }
+
+    pub fn overlayAppendedPositions(scratch: anytype) *std.AutoHashMapUnmanaged(VectorId, usize) {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "appended_positions")) return &scratch.appended_positions;
+        return &scratch.posting_overlay_appended_positions;
+    }
+
+    pub fn overlayAppendedIds(scratch: anytype) []VectorId {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "appended_ids")) return scratch.appended_ids;
+        return scratch.posting_overlay_appended_ids;
+    }
+
+    pub fn overlayAppendedLive(scratch: anytype) []bool {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "appended_live")) return scratch.appended_live;
+        return scratch.posting_overlay_appended_live;
+    }
+
+    pub fn overlayAppendedCount(scratch: anytype) *usize {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "appended_count")) return &scratch.appended_count;
+        return &scratch.posting_overlay_appended_count;
+    }
+
     pub fn applyDeltaTailAfterGenerationIntoScratch(
         alloc: std.mem.Allocator,
         scratch: anytype,
@@ -537,7 +641,7 @@ pub const PostingFormat = struct {
         return total;
     }
 
-    fn varintSize(value: u64) usize {
+    pub fn varintSize(value: u64) usize {
         var remaining = value;
         var bytes: usize = 1;
         while (remaining >= 0x80) : (bytes += 1) {
@@ -661,38 +765,6 @@ pub const PostingFormat = struct {
                         scratch.member_ids[i .. member_count.* - 1],
                         scratch.member_ids[i + 1 .. member_count.*],
                     );
-                }
-                member_count.* -= 1;
-                return;
-            }
-        }
-    }
-
-    pub fn applyDeltaRecordToEncodedBase(out: []u8, member_count: *usize, record: PostingDeltaRecord) void {
-        switch (record.op) {
-            .insert, .replace => {
-                removeMemberFromEncodedBase(out, member_count, record.vector_id);
-                appendEncodedBaseMemberAssumeCapacity(out, member_count, record.vector_id);
-            },
-            .tombstone => removeMemberFromEncodedBase(out, member_count, record.vector_id),
-        }
-    }
-
-    pub fn appendEncodedBaseMemberAssumeCapacity(out: []u8, member_count: *usize, vector_id: VectorId) void {
-        writeEncodedBaseMember(out, base_header_size + member_count.* * @sizeOf(u64), vector_id);
-        member_count.* += 1;
-    }
-
-    fn removeMemberFromEncodedBase(out: []u8, member_count: *usize, vector_id: VectorId) void {
-        var i: usize = 0;
-        while (i < member_count.*) : (i += 1) {
-            const pos = base_header_size + i * @sizeOf(u64);
-            if (readEncodedBaseMember(out, pos) == vector_id) {
-                if (i + 1 < member_count.*) {
-                    const dst_start = base_header_size + i * @sizeOf(u64);
-                    const src_start = base_header_size + (i + 1) * @sizeOf(u64);
-                    const src_end = base_header_size + member_count.* * @sizeOf(u64);
-                    std.mem.copyForwards(u8, out[dst_start .. src_end - @sizeOf(u64)], out[src_start..src_end]);
                 }
                 member_count.* -= 1;
                 return;
@@ -854,10 +926,27 @@ pub const PostingStore = struct {
             if (self.appended_live.len < needed) self.appended_live = try alloc.realloc(self.appended_live, needed);
         }
 
+        pub fn ensurePostingOverlayAppendCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
+            try self.ensureAppendCapacity(alloc, needed);
+        }
+
         pub fn resetFoldApply(self: *FoldScratch) void {
             self.removed_members.clearRetainingCapacity();
             self.appended_positions.clearRetainingCapacity();
             self.appended_count = 0;
+        }
+
+        pub fn resetPostingOverlayApply(self: *FoldScratch) void {
+            self.resetFoldApply();
+        }
+
+        pub fn bytes(self: *const FoldScratch) u64 {
+            return byteLen(self.delta_records) +
+                byteLen(self.encoded_base) +
+                approximateHashMapBytes(self.removed_members.capacity(), @sizeOf(VectorId), 0) +
+                approximateHashMapBytes(self.appended_positions.capacity(), @sizeOf(VectorId), @sizeOf(usize)) +
+                byteLen(self.appended_ids) +
+                byteLen(self.appended_live);
         }
 
         pub fn deinit(self: *FoldScratch, alloc: std.mem.Allocator) void {
@@ -903,7 +992,7 @@ pub const PostingStore = struct {
         profile: anytype,
         now_fn: fn () u64,
         elapsed_fn: fn (u64) u64,
-    ) ![]VectorId {
+    ) ![]const VectorId {
         if (!shouldMaterializeBaseDeltaForQuery(index, @TypeOf(txn))) {
             return try copyMemberIds(alloc, scratch, posting_view);
         }
@@ -911,7 +1000,7 @@ pub const PostingStore = struct {
         const start = now_fn();
         const canonical_base_delta = baseDeltaIsCanonical(index);
         if (canonical_base_delta) {
-            if (try copyCachedPostingMembersIfAvailable(alloc, scratch, posting_view, profile)) |cached_member_ids| {
+            if (copyCachedPostingMembersIfAvailable(scratch, posting_view, profile)) |cached_member_ids| {
                 notePostingOverlay(profile, elapsed_fn(start), cached_member_ids.len, 0, cached_member_ids.len);
                 return cached_member_ids;
             }
@@ -942,7 +1031,10 @@ pub const PostingStore = struct {
 
         _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
         var materialized_len = base_header.member_count;
-        const delta_records_after_base = try applyDeltaTailIntoScratch(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation);
+        const delta_records_after_base = if (canUsePostingOverlayPlan(@TypeOf(scratch)))
+            try applyDeltaTailIntoScratchWithOverlayPlan(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation)
+        else
+            try applyDeltaTailIntoScratch(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation);
         const materialized = scratch.member_ids[0..materialized_len];
         if (!canonical_base_delta and !std.mem.eql(VectorId, materialized, posting_view.members)) {
             notePostingOverlayFallback(profile);
@@ -1178,12 +1270,7 @@ pub const PostingStore = struct {
         if (max_value_bytes != 0 and records.len > 1) {
             var start: usize = 0;
             while (start < records.len) {
-                var end = start + 1;
-                while (end < records.len) : (end += 1) {
-                    const candidate = records[start .. end + 1];
-                    const candidate_bytes = PostingFormat.encodedDeltaTailSize(candidate) catch break;
-                    if (candidate_bytes > max_value_bytes) break;
-                }
+                const end = deltaRecordChunkEnd(records, start, max_value_bytes);
                 try appendDeltaRecordChunk(index, txn, posting_id, records[start..end]);
                 start = end;
             }
@@ -1197,6 +1284,22 @@ pub const PostingStore = struct {
             return index.config.max_posting_delta_tail_value_bytes;
         }
         return 0;
+    }
+
+    fn deltaRecordChunkEnd(records: []const PostingDeltaRecord, start: usize, max_value_bytes: usize) usize {
+        const base_sequence = records[start].sequence;
+        var encoded_bytes = PostingFormat.delta_header_size;
+        var end = start;
+        while (end < records.len) {
+            const record = records[end];
+            if (record.sequence < base_sequence and end != start) break;
+            const sequence_offset = record.sequence - base_sequence;
+            const record_bytes = PostingFormat.varintSize(sequence_offset) + 1 + PostingFormat.varintSize(record.vector_id);
+            if (end != start and encoded_bytes + record_bytes > max_value_bytes) break;
+            encoded_bytes += record_bytes;
+            end += 1;
+        }
+        return end;
     }
 
     fn appendDeltaRecordChunk(index: anytype, txn: anytype, posting_id: PostingId, records: []const PostingDeltaRecord) !void {
@@ -1248,7 +1351,7 @@ pub const PostingStore = struct {
         return out;
     }
 
-    fn scanDeltaTailForFold(
+    fn scanDeltaTailPlanForFold(
         index: anytype,
         txn: anytype,
         posting_id: PostingId,
@@ -1256,7 +1359,7 @@ pub const PostingStore = struct {
         scratch: *FoldScratch,
         base_generation: u64,
     ) !PostingDeltaTailStats {
-        scratch.resetDeltaRecords();
+        scratch.resetPostingOverlayApply();
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -1267,7 +1370,7 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
-            const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoScratch(
+            const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoOverlayPlan(
                 alloc,
                 scratch,
                 entry.value,
@@ -1279,6 +1382,43 @@ pub const PostingStore = struct {
             maybe_entry = try cursor.next();
         }
         return out;
+    }
+
+    fn canUsePostingOverlayPlan(comptime ScratchType: type) bool {
+        const Scratch = switch (@typeInfo(ScratchType)) {
+            .pointer => |ptr| ptr.child,
+            else => ScratchType,
+        };
+        return @hasDecl(Scratch, "resetPostingOverlayApply") and
+            @hasDecl(Scratch, "ensurePostingOverlayAppendCapacity") and
+            @hasField(Scratch, "member_ids");
+    }
+
+    fn resetPostingOverlayApply(scratch: anytype) void {
+        scratch.resetPostingOverlayApply();
+    }
+
+    fn compactMembersWithOverlayPlan(alloc: std.mem.Allocator, scratch: anytype, base_member_count: usize) !usize {
+        const appended_count = PostingFormat.overlayAppendedCount(scratch).*;
+        try scratch.ensureMemberIdCapacity(alloc, base_member_count + appended_count);
+        const base_members = scratch.member_ids[0..base_member_count];
+        const out = scratch.member_ids;
+        var member_count: usize = 0;
+        for (base_members) |member| {
+            if (PostingFormat.overlayRemovedMembers(scratch).contains(member)) continue;
+            out[member_count] = member;
+            member_count += 1;
+        }
+
+        const appended_ids = PostingFormat.overlayAppendedIds(scratch);
+        const appended_live = PostingFormat.overlayAppendedLive(scratch);
+        var append_index: usize = 0;
+        while (append_index < appended_count) : (append_index += 1) {
+            if (!appended_live[append_index]) continue;
+            out[member_count] = appended_ids[append_index];
+            member_count += 1;
+        }
+        return member_count;
     }
 
     pub fn applyDeltaTailIntoScratch(
@@ -1309,6 +1449,39 @@ pub const PostingStore = struct {
             );
             maybe_entry = try cursor.next();
         }
+        return applied;
+    }
+
+    pub fn applyDeltaTailIntoScratchWithOverlayPlan(
+        index: anytype,
+        txn: anytype,
+        posting_id: PostingId,
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+    ) !usize {
+        resetPostingOverlayApply(scratch);
+        var cursor = try openNamespacedCursor(index, txn, .nodes);
+        defer cursor.close();
+
+        var prefix_buf: [10]u8 = undefined;
+        const prefix = hbc.encodePostingDeltaPrefix(&prefix_buf, posting_id);
+        var applied: usize = 0;
+
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoOverlayPlan(
+                alloc,
+                scratch,
+                entry.value,
+                base_generation,
+            );
+            applied += stats.records_after_generation;
+            maybe_entry = try cursor.next();
+        }
+        member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
         return applied;
     }
 
@@ -1354,72 +1527,6 @@ pub const PostingStore = struct {
         notePostingBasePut(index, key.len, encoded.len);
     }
 
-    fn foldShouldUseIndexedApply(base_member_count: usize, delta_record_count: usize) bool {
-        return base_member_count >= 128 or delta_record_count >= 32;
-    }
-
-    fn removeAppendedMemberIfPresent(scratch: *FoldScratch, vector_id: VectorId) void {
-        if (scratch.appended_positions.fetchRemove(vector_id)) |removed| {
-            scratch.appended_live[removed.value] = false;
-        }
-    }
-
-    fn appendLiveMember(alloc: std.mem.Allocator, scratch: *FoldScratch, vector_id: VectorId) !void {
-        try scratch.ensureAppendCapacity(alloc, scratch.appended_count + 1);
-        const pos = scratch.appended_count;
-        scratch.appended_count += 1;
-        scratch.appended_ids[pos] = vector_id;
-        scratch.appended_live[pos] = true;
-        try scratch.appended_positions.put(alloc, vector_id, pos);
-    }
-
-    fn applyIndexedFoldPlan(
-        alloc: std.mem.Allocator,
-        scratch: *FoldScratch,
-        base_header: PostingBaseHeader,
-        records: []const PostingDeltaRecord,
-    ) !usize {
-        scratch.resetFoldApply();
-        try scratch.removed_members.ensureTotalCapacity(alloc, @intCast(records.len));
-        try scratch.appended_positions.ensureTotalCapacity(alloc, @intCast(records.len));
-        try scratch.ensureAppendCapacity(alloc, records.len);
-
-        for (records) |record| {
-            removeAppendedMemberIfPresent(scratch, record.vector_id);
-            try scratch.removed_members.put(alloc, record.vector_id, {});
-            switch (record.op) {
-                .insert, .replace => try appendLiveMember(alloc, scratch, record.vector_id),
-                .tombstone => {},
-            }
-        }
-
-        var member_count: usize = 0;
-        var read_index: usize = 0;
-        while (read_index < base_header.member_count) : (read_index += 1) {
-            const member = PostingFormat.readEncodedBaseMember(
-                scratch.encoded_base,
-                PostingFormat.base_header_size + read_index * @sizeOf(VectorId),
-            );
-            if (scratch.removed_members.contains(member)) continue;
-            PostingFormat.appendEncodedBaseMemberAssumeCapacity(scratch.encoded_base, &member_count, member);
-        }
-
-        var append_index: usize = 0;
-        while (append_index < scratch.appended_count) : (append_index += 1) {
-            if (!scratch.appended_live[append_index]) continue;
-            PostingFormat.appendEncodedBaseMemberAssumeCapacity(scratch.encoded_base, &member_count, scratch.appended_ids[append_index]);
-        }
-        return member_count;
-    }
-
-    fn applyDirectFoldPlan(scratch: *FoldScratch, base_member_count: usize, records: []const PostingDeltaRecord) usize {
-        var materialized_len = base_member_count;
-        for (records) |record| {
-            PostingFormat.applyDeltaRecordToEncodedBase(scratch.encoded_base, &materialized_len, record);
-        }
-        return materialized_len;
-    }
-
     pub fn foldDeltaTailIntoBaseWithOptions(
         index: anytype,
         txn: anytype,
@@ -1440,7 +1547,7 @@ pub const PostingStore = struct {
                 scratch.deinit(index.alloc);
             }
         }
-        const stats = try scanDeltaTailForFold(index, txn, posting_id, index.alloc, &scratch, base_header.generation);
+        const stats = try scanDeltaTailPlanForFold(index, txn, posting_id, index.alloc, &scratch, base_header.generation);
         if (stats.records == 0) {
             return .{
                 .base_member_count = base_header.member_count,
@@ -1470,12 +1577,9 @@ pub const PostingStore = struct {
         const encoded_capacity = try PostingFormat.encodedBaseSizeForMemberCount(materializedMemberCapacityEstimate(base_header.member_count, stats));
         try scratch.ensureEncodedBaseCapacity(index.alloc, encoded_capacity);
         const next_generation = base_header.generation +| 1;
-        _ = try PostingFormat.initializeEncodedBaseFromBaseData(scratch.encoded_base, base_data, posting_id, next_generation);
-        const materialized_len = if (foldShouldUseIndexedApply(base_header.member_count, scratch.deltaRecordCount()))
-            try applyIndexedFoldPlan(index.alloc, &scratch, base_header, scratch.deltaRecords())
-        else
-            applyDirectFoldPlan(&scratch, base_header.member_count, scratch.deltaRecords());
-        const encoded = try PostingFormat.finishEncodedBase(scratch.encoded_base, materialized_len);
+        const folded_base = try PostingFormat.encodeBaseWithOverlayPlan(&scratch, base_data, posting_id, next_generation);
+        const materialized_len = folded_base.member_count;
+        const encoded = folded_base.encoded;
         var base_key_buf: [10]u8 = undefined;
         const written_base_key_bytes = hbc.encodePostingBaseKey(&base_key_buf, posting_id).len;
         const written_base_value_bytes = encoded.len;
@@ -1984,22 +2088,18 @@ fn notePostingOverlay(profile: anytype, elapsed_ns: u64, base_member_count: usiz
 }
 
 fn copyCachedPostingMembersIfAvailable(
-    alloc: std.mem.Allocator,
     scratch: anytype,
     posting_view: PostingView,
     profile: anytype,
-) !?[]VectorId {
+) ?[]const VectorId {
     const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
         .pointer => |ptr| ptr.child,
         else => @TypeOf(scratch),
     };
     if (comptime !@hasDecl(Scratch, "cachedPostingMembers")) return null;
     const cached = scratch.cachedPostingMembers(posting_view.id, posting_view.state.mutation_version) orelse return null;
-    try scratch.ensureMemberIdCapacity(alloc, cached.len);
-    const member_ids = scratch.member_ids[0..cached.len];
-    @memcpy(member_ids, cached);
     notePostingOverlayCacheHit(profile);
-    return member_ids;
+    return cached;
 }
 
 fn cachePostingMembersIfAvailable(
@@ -2072,6 +2172,15 @@ fn notePostingOverlayFallback(profile: anytype) void {
 
 fn isNotFound(err: anyerror) bool {
     return err == error.NotFound;
+}
+
+fn byteLen(values: anytype) u64 {
+    return @as(u64, @intCast(values.len * @sizeOf(std.meta.Child(@TypeOf(values)))));
+}
+
+fn approximateHashMapBytes(capacity: usize, comptime key_size: usize, comptime value_size: usize) u64 {
+    if (capacity == 0) return 0;
+    return @intCast(capacity * (key_size + value_size + 2));
 }
 
 pub const AssignmentMap = struct {

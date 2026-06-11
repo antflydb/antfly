@@ -665,9 +665,18 @@ pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
     defer self.scratch_mu.unlock();
     if (self.cached_scratch) |scratch| {
         self.cached_scratch = null;
+        const previous_bytes = scratch.bytes();
         var configured = scratch;
         if (comptime @hasDecl(@TypeOf(self.*), "configureSearchScratch")) {
             self.configureSearchScratch(&configured);
+        }
+        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+            const configured_bytes = configured.bytes();
+            if (configured_bytes < previous_bytes) {
+                self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| (previous_bytes - configured_bytes));
+            } else if (configured_bytes > previous_bytes) {
+                self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + (configured_bytes - previous_bytes));
+            }
         }
         return .{ .scratch = configured, .from_cache = true, .accounted_bytes = configured.bytes() };
     }

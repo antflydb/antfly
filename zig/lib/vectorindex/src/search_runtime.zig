@@ -61,6 +61,11 @@ pub const SearchScratch = struct {
     max_posting_member_cache_bytes: u64 = 0,
     max_posting_member_cache_entry_bytes: u64 = 0,
     posting_member_cache_admission_enabled: bool = true,
+    posting_overlay_removed_members: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    posting_overlay_appended_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    posting_overlay_appended_ids: []u64 = &.{},
+    posting_overlay_appended_live: []bool = &.{},
+    posting_overlay_appended_count: usize = 0,
 
     pub fn init(
         alloc: Allocator,
@@ -159,8 +164,32 @@ pub const SearchScratch = struct {
         if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
     }
 
+    pub fn ensurePostingOverlayAppendCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.posting_overlay_appended_ids.len < needed) self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, needed);
+        if (self.posting_overlay_appended_live.len < needed) self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, needed);
+    }
+
+    pub fn resetPostingOverlayApply(self: *SearchScratch) void {
+        self.posting_overlay_removed_members.clearRetainingCapacity();
+        self.posting_overlay_appended_positions.clearRetainingCapacity();
+        self.posting_overlay_appended_count = 0;
+    }
+
     pub fn setPostingMemberCacheAdmissionEnabled(self: *SearchScratch, enabled: bool) void {
         self.posting_member_cache_admission_enabled = enabled;
+    }
+
+    pub fn trimPostingMemberCache(self: *SearchScratch, alloc: Allocator, target_bytes: u64) u64 {
+        var evictions: u64 = 0;
+        while (self.posting_member_cache_bytes > target_bytes and self.posting_member_cache.items.len != 0) {
+            self.evictPostingMemberCacheEntry(alloc, 0);
+            evictions += 1;
+        }
+        return evictions;
+    }
+
+    pub fn clearPostingMemberCache(self: *SearchScratch, alloc: Allocator) u64 {
+        return self.trimPostingMemberCache(alloc, 0);
     }
 
     pub fn cachedPostingMembers(self: *SearchScratch, posting_id: u64, mutation_version: u64) ?[]const u64 {
@@ -226,6 +255,11 @@ pub const SearchScratch = struct {
 
     pub fn bytes(self: *const SearchScratch) u64 {
         const posting_member_cache_bytes = byteLen(self.posting_member_cache.items) + self.posting_member_cache_bytes;
+        const posting_overlay_bytes =
+            approximateHashMapBytes(self.posting_overlay_removed_members.capacity(), @sizeOf(u64), 0) +
+            approximateHashMapBytes(self.posting_overlay_appended_positions.capacity(), @sizeOf(u64), @sizeOf(usize)) +
+            byteLen(self.posting_overlay_appended_ids) +
+            byteLen(self.posting_overlay_appended_live);
         return estimateScratchBytes(&self.estimate) +
             byteLen(self.transformed_query) +
             byteLen(self.centroid) +
@@ -242,7 +276,8 @@ pub const SearchScratch = struct {
             byteLen(self.vector_views) +
             byteLen(self.distances) +
             byteLen(self.error_bounds) +
-            posting_member_cache_bytes;
+            posting_member_cache_bytes +
+            posting_overlay_bytes;
     }
 
     pub fn shouldRetain(self: *const SearchScratch, max_retained_bytes: u64) bool {
@@ -268,6 +303,10 @@ pub const SearchScratch = struct {
         alloc.free(self.error_bounds);
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
+        self.posting_overlay_removed_members.deinit(alloc);
+        self.posting_overlay_appended_positions.deinit(alloc);
+        alloc.free(self.posting_overlay_appended_ids);
+        alloc.free(self.posting_overlay_appended_live);
         self.* = undefined;
     }
 };
@@ -280,6 +319,11 @@ fn effectivePostingMemberCacheEntryBytes(max_cache_bytes: u64, configured_entry_
 
 fn byteLen(values: anytype) u64 {
     return @as(u64, @intCast(values.len * @sizeOf(std.meta.Child(@TypeOf(values)))));
+}
+
+fn approximateHashMapBytes(capacity: usize, comptime key_size: usize, comptime value_size: usize) u64 {
+    if (capacity == 0) return 0;
+    return @intCast(capacity * (key_size + value_size + 2));
 }
 
 test "SearchScratch grows error bounds with vector fetch capacity" {
