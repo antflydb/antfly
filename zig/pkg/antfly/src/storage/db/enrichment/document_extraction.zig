@@ -39,6 +39,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
                 pub fn extractPageBox(_: *Reader, _: usize) !struct { min_x: f64, min_y: f64, max_x: f64, max_y: f64 } {
                     return error.PdfExtractionUnavailable;
                 }
+
+                pub fn extractPageRotation(_: *const Reader, _: usize) !?i32 {
+                    return error.PdfExtractionUnavailable;
+                }
             };
 
             pub const TextRun = struct {
@@ -539,6 +543,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         const text_regions = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
         const page_box = parsed.extractPageBox(page_num) catch null;
+        const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + text.len);
         var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
@@ -562,6 +567,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
             .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
+            .page_rotation = page_rotation,
             .text_regions = text_regions,
             .char_start = char_start,
             .char_end = char_end,

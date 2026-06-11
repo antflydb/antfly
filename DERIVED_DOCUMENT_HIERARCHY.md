@@ -412,13 +412,12 @@ Current implementation status:
 - Artifact inspection responses now expose typed source URL, source fingerprint, content type, manifest version, child range descriptors, and merge-plan generation/granularity summaries in addition to preserving raw manifest/state JSON.
 - Public/internal routing now includes a bounded operational table-range repair endpoint, `POST /db/v1/tables/{table}/artifacts/{artifact}:reprocess`, with `from_key`, `to_key`, and `limit` controls plus scanned/reprocessed/skipped/failed counts and per-key failure codes. Hosted/provisioned implementations fan this out to shard-local group handlers and aggregate the bounded pass response.
 - Public authorization now classifies artifact list and manifest inspection as table-read operations, and per-document/table-range artifact reprocess as table-admin operations, before row-filter checks hide source documents the caller cannot see.
-- PDF mechanical extraction now emits page-level provenance on units and unit-derived chunks, including `page_number`, a stable `page_label`, `page_bbox`, source-document character spans, and unit-level best-effort text-region spans/bounding boxes under `format_provenance.text_regions`. Mechanically empty pages are preserved as stable `page` units with `method: "pdf_ocr_pending"` and `extraction_status: "pending_ocr"` so scanned PDFs have deterministic OCR fallback targets. `page_rotation` remains nullable until the PDF reader exposes rotation.
+- PDF mechanical extraction now emits page-level provenance on units and unit-derived chunks, including `page_number`, a stable `page_label`, `page_bbox`, `page_rotation`, source-document character spans, and unit-level best-effort text-region spans/bounding boxes under `format_provenance.text_regions`. Mechanically empty pages are preserved as stable `page` units with `method: "pdf_ocr_pending"` and `extraction_status: "pending_ocr"` so scanned PDFs have deterministic OCR fallback targets.
 - Unit payloads are emitted as derived documents for full-text indexes whose source artifact matches the document-unit artifact name.
 - The synchronous precompute path and async enrichment runtime path both use the same artifact key/state contract, including unit fingerprints in state.
 
 Still remaining in Phase 1:
 
-- Add PDF page rotation once the PDF reader exposes page `/Rotate`; unit-level best-effort text-region bounding boxes now flow from extracted text runs.
 - Define admin-only detail expansion for artifact inspection and long-running/background table-wide reprocess operations beyond the bounded synchronous repair endpoint.
 
 ### Phase 2: Unit-aware chunking and indexing
