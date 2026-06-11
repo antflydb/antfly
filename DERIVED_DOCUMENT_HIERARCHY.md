@@ -580,13 +580,14 @@ Example:
 }
 ```
 
-Recommended direction:
+Implemented direction:
 
-- `return_level`: initially `source` or `chunk`; reserve `unit` and `mention` until their result schemas are explicit.
-- `include`: optional ancestors or descendants to hydrate with each hit. The first implementation accepts `source`, `unit`, and `chunk`; `chunk` requests grouped child hits when the return level is source-like.
-- `rollup`: initially `source` or `none`; reserve `unit` until unit-level result rows are supported.
-- `max_children_per_parent`: limit child hits when rolling up.
-- Results should expose both the matched child and its requested context.
+- `return_level`: accepts `source`, `unit`, `chunk`, and `mention`.
+- `include`: accepts `source`, `unit`, and `chunk` ancestor/descendant hydration controls. Direct chunk searches can hydrate DB-backed source and unit ancestors when requested.
+- `rollup`: accepts `source` or `none`; source rollups can group matched child chunks under the source result.
+- `max_children_per_parent`: limits grouped child hits when rolling up.
+- Results expose a stable `hierarchy` envelope with `level`, `parent_doc_key`, optional `parent_unit_id`, artifact identity, and nested child chunks where relevant.
+- Results expose an `ancestors` envelope for requested context. Source payloads carry `ancestors.source.document`; unit hits carry `ancestors.unit.document`; chunk hits carry unit ancestry and recovered provenance; mention hits carry a stable evidence envelope for resolver/source artifact references.
 
 This keeps retrieval precise while allowing user-facing search to show file-level results.
 
@@ -637,6 +638,8 @@ Recommended direction:
 - Store canonical entities as normal records in an entity table or dedicated graph namespace.
 - Store evidence links from canonical entities/edges back to mention artifacts.
 - Re-run resolution incrementally when mention artifacts change.
+- Scope resolver names to a table by default. A resolver that wants cross-table or cross-team identity must name an explicit shared canonical entity table or graph namespace.
+- Treat tenant/project/team isolation as a namespace boundary. No resolver should write canonical entities across that boundary unless the configuration explicitly names a shared namespace and the caller has admin permission on both the source table and target namespace.
 
 This keeps source-document lifecycle separate from global entity identity.
 
@@ -690,12 +693,11 @@ This gives downstream systems a stable contract without blocking richer extracto
 
 The high-level model is settled enough to start implementation. The pieces that still need concrete product/API decisions are:
 
-- Query response shape: exact request and response schema for hierarchy rollups, grouped hits, and hydrated ancestors.
 - Inspection API shape: filter-aware/user-facing repair policy, per-shard cursors, and long-running table-wide reprocessing jobs. Collection listing, single-artifact manifest inspection, typed source/fingerprint/range/merge/error summaries, summary/raw admin detail modes, source-row row-filter enforcement for per-document operations, route-level read/admin permission classification, bounded table-range repair, and hosted/provisioned routing now exist.
 - Split thresholds: the first unit-level defaults are implemented and manifest-recorded as 256 units or 1 MiB of unit text per range. Oversized single units remain one unit range, while their derived chunks split on chunk boundaries with 256 chunks per range.
 - File route config: the first public shape is `route_preset` plus limited ordered overrides, with `mixed_files` as the default built-in route preset and `explicit_only` as the fail-closed mode. Future design work can decide whether to expose named preset variants beyond those two.
 - Reprocessing semantics: background job scheduling, priority, concurrency, per-shard cursors, and durable progress reporting beyond the bounded synchronous table-range repair endpoint.
-- Entity resolver namespace policy: the durable subscription contract now exists; the remaining product/API decision is how resolver names, canonical entity tables, and graph namespaces are governed across tenants and teams.
+- Entity resolver namespace policy: the durable subscription contract now exists and the recommended governance model is table-scoped resolvers with explicit shared canonical namespaces for cross-table identity. Remaining implementation work is validating permissions and namespace references at resolver configuration time.
 
 These should be resolved as separate implementation RFCs once Phase 1 proves the artifact layout and extraction lifecycle.
 
