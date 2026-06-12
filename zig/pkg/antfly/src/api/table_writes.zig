@@ -450,6 +450,18 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    pub const Diagnostics = struct {
+        cached_entries: u64 = 0,
+        retired_entries: u64 = 0,
+        table_metadata_entries: u64 = 0,
+        active_bulk_sessions: u64 = 0,
+        active_leases: u64 = 0,
+        retired_active_leases: u64 = 0,
+        bulk_ingest_open_entries: u64 = 0,
+        auto_bulk_ingest_open_entries: u64 = 0,
+        auto_bulk_ingest_finish_requested_entries: u64 = 0,
+    };
+
     pub const CachedDb = struct {
         cache: ?*ProvisionedTableWriteCache = null,
         entry: ?*Entry = null,
@@ -776,6 +788,28 @@ pub const ProvisionedTableWriteCache = struct {
                 stats.oldest_idle_ns = @max(stats.oldest_idle_ns, idle_ns);
                 if (idle_ns >= auto_bulk_ingest_max_idle_ns) stats.idle_expired_entries += 1;
             }
+        }
+        return stats;
+    }
+
+    pub fn diagnosticsLocked(self: *const ProvisionedTableWriteCache) Diagnostics {
+        var stats = Diagnostics{
+            .cached_entries = @intCast(self.entries.items.len),
+            .retired_entries = @intCast(self.retired_entries.items.len),
+            .table_metadata_entries = @intCast(self.table_metadata.items.len),
+            .active_bulk_sessions = @intCast(self.active_bulk_ingest_sessions.items.len),
+        };
+        for (self.entries.items) |entry| {
+            stats.active_leases += entry.active_leases;
+            if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
+        }
+        for (self.retired_entries.items) |entry| {
+            stats.retired_active_leases += entry.active_leases;
+            if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
+            if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
         }
         return stats;
     }
@@ -1912,6 +1946,20 @@ const HostedManagedDbCache = struct {
     }
 };
 
+pub const HostedManagedDbCacheDiagnostics = struct {
+    present: bool = false,
+    cached_roots: u64 = 0,
+    cached_entries: u64 = 0,
+    retired_entries: u64 = 0,
+    table_metadata_entries: u64 = 0,
+    active_bulk_sessions: u64 = 0,
+    active_leases: u64 = 0,
+    retired_active_leases: u64 = 0,
+    bulk_ingest_open_entries: u64 = 0,
+    auto_bulk_ingest_open_entries: u64 = 0,
+    auto_bulk_ingest_finish_requested_entries: u64 = 0,
+};
+
 var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
 var hosted_managed_db_cache_registry: std.ArrayListUnmanaged(*HostedManagedDbCache) = .empty;
 
@@ -1962,6 +2010,32 @@ fn hostedManagedDbCacheForRootIfPresent(replica_root_dir: []const u8) ?*HostedMa
         if (std.mem.eql(u8, cache.replica_root_dir, replica_root_dir)) return cache;
     }
     return null;
+}
+
+pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) HostedManagedDbCacheDiagnostics {
+    lockAtomic(&hosted_managed_db_cache_registry_mutex);
+    defer hosted_managed_db_cache_registry_mutex.unlock();
+    const cached_roots: u64 = @intCast(hosted_managed_db_cache_registry.items.len);
+    for (hosted_managed_db_cache_registry.items) |selected| {
+        if (!std.mem.eql(u8, selected.replica_root_dir, replica_root_dir)) continue;
+        lockAtomic(&selected.mutex);
+        defer selected.mutex.unlock();
+        const write_cache = selected.write_cache.diagnosticsLocked();
+        return .{
+            .present = true,
+            .cached_roots = cached_roots,
+            .cached_entries = write_cache.cached_entries,
+            .retired_entries = write_cache.retired_entries,
+            .table_metadata_entries = write_cache.table_metadata_entries,
+            .active_bulk_sessions = write_cache.active_bulk_sessions,
+            .active_leases = write_cache.active_leases,
+            .retired_active_leases = write_cache.retired_active_leases,
+            .bulk_ingest_open_entries = write_cache.bulk_ingest_open_entries,
+            .auto_bulk_ingest_open_entries = write_cache.auto_bulk_ingest_open_entries,
+            .auto_bulk_ingest_finish_requested_entries = write_cache.auto_bulk_ingest_finish_requested_entries,
+        };
+    }
+    return .{ .cached_roots = cached_roots };
 }
 
 fn parseJsonBodyIgnoreUnknown(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {

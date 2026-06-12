@@ -1015,6 +1015,8 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
     try health_metrics.appendPromMetric(writer, "antfly_process_memory_available", "gauge", "Whether process memory metrics are available on this platform", if (stats.available) 1 else 0);
     if (!stats.available) return;
     try health_metrics.appendPromMetric(writer, "antfly_process_resident_bytes", "gauge", "Process resident bytes reported by the operating system", stats.resident_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", stats.anonymous_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", stats.private_dirty_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", stats.footprint_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", stats.wired_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", stats.pageins);
@@ -12705,6 +12707,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try writeProcessMemoryMetrics(&writer, .{
         .available = true,
         .resident_bytes = 11,
+        .anonymous_bytes = 12,
+        .private_dirty_bytes = 17,
         .footprint_bytes = 13,
         .wired_bytes = 19,
         .pageins = 23,
@@ -12714,6 +12718,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     });
     const process_memory_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_memory_available 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_anonymous_bytes 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_private_dirty_bytes 17") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_footprint_bytes 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_pageins_total 23") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_memory_output, "antfly_process_malloc_allocated_bytes 29") != null);
