@@ -1511,6 +1511,193 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ClusterDataGroupStatus"
+    ConnectionKind:
+      type: string
+      enum:
+        - inference_provider
+        - object_store
+        - remote_content_http
+      description: Kind of external connection configured on this node.
+    ConnectionStatus:
+      type: string
+      enum:
+        - connected
+        - error
+        - configured
+        - unsupported
+      description: |
+        Connection status. "connected" means a live probe or listing succeeded,
+        "error" means the probe failed (see the error field), "configured" means
+        the connection is present but was not probed, and "unsupported" means
+        no probe is available for this connection kind or provider.
+    ConnectionProviderType:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - cohere
+        - anthropic
+        - antfly
+        - mock
+      description: Inference provider type for a connection.
+    ConnectedModelType:
+      type: string
+      enum:
+        - embedder
+        - generator
+        - reranker
+        - chunker
+        - recognizer
+        - classifier
+        - rewriter
+        - reader
+        - transcriber
+        - extractor
+        - other
+      description: |
+        Model task type. Mirrors the inference registry taxonomy; "other" is
+        used for models whose task type the provider's listing API does not
+        classify.
+    ConnectedModel:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Model identifier as reported by the provider.
+        display_name:
+          type: string
+          description: Human-readable model name when the provider reports one.
+        dimensions:
+          type: integer
+          description: Embedding output dimension when known.
+        configured:
+          type: boolean
+          description: True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+    InferenceProviderConnection:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/ConnectionProviderType"
+        url:
+          type: string
+          description: Resolved endpoint URL when applicable.
+        region:
+          type: string
+          description: Cloud region (Bedrock).
+        project_id:
+          type: string
+          description: Google Cloud project (Vertex).
+        location:
+          type: string
+          description: Google Cloud location (Vertex).
+        names:
+          type: array
+          items:
+            type: string
+          description: Named registry entries from node config that resolve to this provider instance.
+        configured_model_types:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectedModelType"
+          description: Model types this instance is configured for.
+        models:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/ConnectedModel"
+          description: |
+            Models reported by the provider, grouped by model type. Keys are
+            pluralized ConnectedModelType values ("embedders", "generators",
+            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "readers", "transcribers", "extractors") plus "other" for models
+            the provider's listing API does not classify by task. Populated
+            only when the request includes the "models" expansion.
+    ObjectStoreConnection:
+      type: object
+      required:
+        - backend
+      properties:
+        backend:
+          type: string
+          enum:
+            - s3
+            - gcs
+            - filesystem
+          description: Object store backend type.
+        endpoint:
+          type: string
+          description: Custom endpoint URL when configured.
+        buckets:
+          type: array
+          items:
+            type: string
+          description: Buckets this connection is configured for.
+        prefix:
+          type: string
+          description: Key prefix when configured.
+        purpose:
+          type: string
+          enum:
+            - storage
+            - inference_models
+            - remote_content
+          description: What this object store is used for.
+    RemoteContentHttpConnection:
+      type: object
+      properties:
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Hosts or base URLs this credential applies to.
+    Connection:
+      type: object
+      required:
+        - name
+        - kind
+        - status
+      properties:
+        name:
+          type: string
+          description: Stable identifier for this connection instance.
+        kind:
+          $ref: "#/components/schemas/ConnectionKind"
+        status:
+          $ref: "#/components/schemas/ConnectionStatus"
+        error:
+          type: string
+          description: Failure detail when status is "error".
+        sources:
+          type: array
+          items:
+            type: string
+          description: |
+            Where this connection was configured, e.g.
+            "config:embedders/openai-small" or "table:docs/index:body_vec".
+        inference_provider:
+          $ref: "#/components/schemas/InferenceProviderConnection"
+        object_store:
+          $ref: "#/components/schemas/ObjectStoreConnection"
+        remote_content_http:
+          $ref: "#/components/schemas/RemoteContentHttpConnection"
+    ConnectionsResponse:
+      type: object
+      required:
+        - connections
+      properties:
+        connections:
+          type: array
+          items:
+            $ref: "#/components/schemas/Connection"
     DocumentArtifactChildRange:
       type: object
       description: Parsed child-range descriptor from a derived document artifact manifest.
@@ -6242,6 +6429,58 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClusterTopology"
+        "401":
+          description: Unauthorized - authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /connections:
+    get:
+      summary: List configured external connections
+      tags:
+        - cluster_management
+      description: |
+        Enumerates external connections configured on this node: inference
+        providers (from named embedder/generator/reranker/chunker configs and
+        table embedding indexes), object stores, and remote content sources.
+        With include=models, each inference provider is queried live for its
+        available models where the provider exposes a listing API. Connections
+        that fail to respond are reported with status "error" instead of
+        failing the whole response.
+      operationId: listConnections
+      parameters:
+        - name: types
+          in: query
+          required: false
+          description: |
+            Comma-separated list of connection kinds to include
+            (e.g. "inference_provider,object_store"). Defaults to all kinds.
+          schema:
+            type: string
+        - name: include
+          in: query
+          required: false
+          description: |
+            Comma-separated list of expansions. Supported value: "models" —
+            live-query each inference provider's model listing API.
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          description: Set to "true" to bypass the server-side cache.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Configured connections retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionsResponse"
         "401":
           description: Unauthorized - authentication required
           content:

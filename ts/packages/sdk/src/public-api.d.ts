@@ -44,6 +44,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List configured external connections
+         * @description Enumerates external connections configured on this node: inference
+         *     providers (from named embedder/generator/reranker/chunker configs and
+         *     table embedding indexes), object stores, and remote content sources.
+         *     With include=models, each inference provider is queried live for its
+         *     available models where the provider exposes a listing API. Connections
+         *     that fail to respond are reported with status "error" instead of
+         *     failing the whole response.
+         */
+        get: operations["listConnections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/secrets": {
         parameters: {
             query?: never;
@@ -2088,6 +2114,108 @@ export interface components {
             ranges?: components["schemas"]["ClusterDataRangeStatus"][];
             replicas?: components["schemas"]["ClusterDataReplicaStatus"][];
             groups?: components["schemas"]["ClusterDataGroupStatus"][];
+        };
+        /**
+         * @description Kind of external connection configured on this node.
+         * @enum {string}
+         */
+        ConnectionKind: "inference_provider" | "object_store" | "remote_content_http";
+        /**
+         * @description Connection status. "connected" means a live probe or listing succeeded,
+         *     "error" means the probe failed (see the error field), "configured" means
+         *     the connection is present but was not probed, and "unsupported" means
+         *     no probe is available for this connection kind or provider.
+         * @enum {string}
+         */
+        ConnectionStatus: "connected" | "error" | "configured" | "unsupported";
+        /**
+         * @description Inference provider type for a connection.
+         * @enum {string}
+         */
+        ConnectionProviderType: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "anthropic" | "antfly" | "mock";
+        /**
+         * @description Model task type. Mirrors the inference registry taxonomy; "other" is
+         *     used for models whose task type the provider's listing API does not
+         *     classify.
+         * @enum {string}
+         */
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "recognizer" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModel: {
+            /** @description Model identifier as reported by the provider. */
+            name: string;
+            /** @description Human-readable model name when the provider reports one. */
+            display_name?: string;
+            /** @description Embedding output dimension when known. */
+            dimensions?: number;
+            /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
+            configured?: boolean;
+        };
+        InferenceProviderConnection: {
+            provider: components["schemas"]["ConnectionProviderType"];
+            /** @description Resolved endpoint URL when applicable. */
+            url?: string;
+            /** @description Cloud region (Bedrock). */
+            region?: string;
+            /** @description Google Cloud project (Vertex). */
+            project_id?: string;
+            /** @description Google Cloud location (Vertex). */
+            location?: string;
+            /** @description Named registry entries from node config that resolve to this provider instance. */
+            names?: string[];
+            /** @description Model types this instance is configured for. */
+            configured_model_types?: components["schemas"]["ConnectedModelType"][];
+            /**
+             * @description Models reported by the provider, grouped by model type. Keys are
+             *     pluralized ConnectedModelType values ("embedders", "generators",
+             *     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+             *     "readers", "transcribers", "extractors") plus "other" for models
+             *     the provider's listing API does not classify by task. Populated
+             *     only when the request includes the "models" expansion.
+             */
+            models?: {
+                [key: string]: components["schemas"]["ConnectedModel"][];
+            };
+        };
+        ObjectStoreConnection: {
+            /**
+             * @description Object store backend type.
+             * @enum {string}
+             */
+            backend: "s3" | "gcs" | "filesystem";
+            /** @description Custom endpoint URL when configured. */
+            endpoint?: string;
+            /** @description Buckets this connection is configured for. */
+            buckets?: string[];
+            /** @description Key prefix when configured. */
+            prefix?: string;
+            /**
+             * @description What this object store is used for.
+             * @enum {string}
+             */
+            purpose?: "storage" | "inference_models" | "remote_content";
+        };
+        RemoteContentHttpConnection: {
+            /** @description Hosts or base URLs this credential applies to. */
+            hosts?: string[];
+        };
+        Connection: {
+            /** @description Stable identifier for this connection instance. */
+            name: string;
+            kind: components["schemas"]["ConnectionKind"];
+            status: components["schemas"]["ConnectionStatus"];
+            /** @description Failure detail when status is "error". */
+            error?: string;
+            /**
+             * @description Where this connection was configured, e.g.
+             *     "config:embedders/openai-small" or "table:docs/index:body_vec".
+             */
+            sources?: string[];
+            inference_provider?: components["schemas"]["InferenceProviderConnection"];
+            object_store?: components["schemas"]["ObjectStoreConnection"];
+            remote_content_http?: components["schemas"]["RemoteContentHttpConnection"];
+        };
+        ConnectionsResponse: {
+            connections: components["schemas"]["Connection"][];
         };
         /** @description Parsed child-range descriptor from a derived document artifact manifest. */
         DocumentArtifactChildRange: {
@@ -10098,6 +10226,49 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterTopology"];
+                };
+            };
+            /** @description Unauthorized - authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listConnections: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Comma-separated list of connection kinds to include
+                 *     (e.g. "inference_provider,object_store"). Defaults to all kinds.
+                 */
+                types?: string;
+                /**
+                 * @description Comma-separated list of expansions. Supported value: "models" —
+                 *     live-query each inference provider's model listing API.
+                 */
+                include?: string;
+                /** @description Set to "true" to bypass the server-side cache. */
+                refresh?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Configured connections retrieved successfully */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionsResponse"];
                 };
             };
             /** @description Unauthorized - authentication required */

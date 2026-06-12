@@ -271,6 +271,15 @@ func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ListConnections reports configured external connections. The Go server does
+// not enumerate connections; the Zig implementation provides the full view.
+func (ca *ClusterApi) ListConnections(w http.ResponseWriter, r *http.Request, params ListConnectionsParams) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(ConnectionsResponse{Connections: []Connection{}}); err != nil {
+		ca.ln.logger.Warn("Failed to marshal connections", zap.Error(err))
+	}
+}
+
 type wrapper struct {
 	*TableApi
 	*ClusterApi

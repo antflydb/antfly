@@ -31,6 +31,15 @@ pub fn ApiResponse(comptime T: type) type {
     };
 }
 
+pub const ListConnectionsParams = struct {
+    /// Comma-separated list of connection kinds to include (e.g. "inference_provider,object_store"). Defaults to all kinds.
+    types: ?[]const u8 = null,
+    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    include: ?[]const u8 = null,
+    /// Set to "true" to bypass the server-side cache.
+    refresh: ?[]const u8 = null,
+};
+
 pub const CleanupTransactionSessionsParams = struct {
     cutoff_ns: ?[]const u8 = null,
 };
@@ -121,6 +130,41 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.ClusterTopology).fromResponse(self.allocator, &resp);
+    }
+
+    /// List configured external connections
+    /// GET /db/v1/connections
+    pub fn listConnections(self: *@This(), params: ListConnectionsParams) !ApiResponse(types.ConnectionsResponse) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections", .{self.base_url});
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.types) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "types=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.include) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "include=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.refresh) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "refresh=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ConnectionsResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List secrets status
