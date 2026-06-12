@@ -64,6 +64,8 @@ pub const SegmentMeta = struct {
     max_delta_sequence: u64 = 0,
     byte_len: usize = 0,
     entry_count: usize = 0,
+    index_offset: usize = 0,
+    index_checksum: u32 = 0,
 
     pub fn mayContainPosting(self: SegmentMeta, posting_id: PostingId) bool {
         return self.entry_count != 0 and posting_id >= self.min_posting_id and posting_id <= self.max_posting_id;
@@ -442,10 +444,8 @@ pub const LazyDirectorySnapshot = struct {
             const entry = self.manifest.segments[i];
             if (!entry.meta.mayContainPosting(posting_id)) continue;
 
-            const segment_data = try self.readSegmentAlloc(alloc, entry);
-            defer alloc.free(segment_data);
-            const reader = try Reader.init(segment_data);
-            const base_data = (try reader.getBase(posting_id)) orelse continue;
+            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
+            defer alloc.free(base_data);
             return try posting.PostingFormat.decodeBaseHeader(base_data);
         }
         return null;
@@ -458,10 +458,8 @@ pub const LazyDirectorySnapshot = struct {
             const entry = self.manifest.segments[i];
             if (!entry.meta.mayContainPosting(posting_id)) continue;
 
-            const segment_data = try self.readSegmentAlloc(alloc, entry);
-            defer alloc.free(segment_data);
-            const reader = try Reader.init(segment_data);
-            const base_data = (try reader.getBase(posting_id)) orelse continue;
+            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
+            defer alloc.free(base_data);
             return try posting.PostingFormat.decodeBase(alloc, base_data);
         }
         return null;
@@ -474,10 +472,8 @@ pub const LazyDirectorySnapshot = struct {
             const entry = self.manifest.segments[i];
             if (!entry.meta.mayContainPosting(posting_id)) continue;
 
-            const segment_data = try self.readSegmentAlloc(alloc, entry);
-            defer alloc.free(segment_data);
-            const reader = try Reader.init(segment_data);
-            const centroid_data = (try reader.getCentroidDirectory(posting_id)) orelse continue;
+            const centroid_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .centroid_directory)) orelse continue;
+            defer alloc.free(centroid_data);
             return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
         }
         return null;
@@ -535,6 +531,14 @@ pub const LazyDirectorySnapshot = struct {
         errdefer alloc.free(segment_data);
         try validateSegmentDataMatchesMeta(segment_data, entry.meta);
         return segment_data;
+    }
+
+    fn readPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, kind: EntryKind) !?[]u8 {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        return try readSegmentPointValueAlloc(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id, kind);
     }
 };
 
@@ -1208,6 +1212,30 @@ pub fn readSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
     return data;
 }
 
+pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?[]u8 {
+    if (kind == .delta) return error.InvalidPostingSegmentEntryKind;
+    try validateManifestEntry(entry);
+    const index_bytes = std.math.mul(usize, entry.meta.entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
+    const index_end = std.math.add(usize, entry.meta.index_offset, index_bytes) catch return error.CorruptedPostingSegment;
+    if (entry.meta.index_offset > entry.meta.byte_len or index_end > entry.meta.byte_len - footer_size) return error.CorruptedPostingSegment;
+
+    const index_data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(entry.meta.index_offset), index_bytes);
+    defer alloc.free(index_data);
+    if (indexChecksum(index_data) != entry.meta.index_checksum) return error.BadPostingSegmentChecksum;
+
+    const match_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, kind, 0);
+    if (match_index >= entry.meta.entry_count) return null;
+    const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
+    if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
+    const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+    if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+
+    const value = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(found.offset), found.len);
+    errdefer alloc.free(value);
+    try found.location().verifyValue(value);
+    return value;
+}
+
 fn commitBuiltSegmentToDirectoryWithManifestAlloc(
     alloc: Allocator,
     io: std.Io,
@@ -1675,6 +1703,8 @@ pub const Reader = struct {
             .segment_id = segment_id,
             .byte_len = self.data.len,
             .entry_count = self.entry_count,
+            .index_offset = self.index_offset,
+            .index_checksum = indexChecksum(self.data[self.index_offset .. self.index_offset + self.entry_count * index_entry_size]),
         };
         if (self.entry_count == 0) return meta;
 
@@ -1737,23 +1767,7 @@ pub const Reader = struct {
     fn indexEntry(self: Reader, index: usize) !IndexEntry {
         if (index >= self.entry_count) return error.CorruptedPostingSegment;
         const pos = self.index_offset + index * index_entry_size;
-        const raw = self.data[pos .. pos + index_entry_size];
-        const kind: EntryKind = switch (raw[8]) {
-            @intFromEnum(EntryKind.base) => .base,
-            @intFromEnum(EntryKind.delta) => .delta,
-            @intFromEnum(EntryKind.centroid_directory) => .centroid_directory,
-            else => return error.CorruptedPostingSegment,
-        };
-        const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
-        const len = std.math.cast(usize, readU64(raw[25..33])) orelse return error.CorruptedPostingSegment;
-        return .{
-            .posting_id = readU64(raw[0..8]),
-            .kind = kind,
-            .sequence = readU64(raw[9..17]),
-            .offset = offset,
-            .len = len,
-            .value_checksum = readU32(raw[33..37]),
-        };
+        return try indexEntryFromBytes(self.data[pos .. pos + index_entry_size]);
     }
 };
 
@@ -1790,6 +1804,44 @@ pub const EntryIterator = struct {
         };
     }
 };
+
+fn lowerBoundIndexData(index_data: []const u8, entry_count: usize, posting_id: PostingId, kind: EntryKind, sequence: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = entry_count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const entry = indexEntryFromBytes(index_data[mid * index_entry_size ..][0..index_entry_size]) catch {
+            hi = mid;
+            continue;
+        };
+        if (compareEntryKey(entry.posting_id, entry.kind, entry.sequence, posting_id, kind, sequence) == .lt) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn indexEntryFromBytes(raw: []const u8) !IndexEntry {
+    if (raw.len != index_entry_size) return error.CorruptedPostingSegment;
+    const kind: EntryKind = switch (raw[8]) {
+        @intFromEnum(EntryKind.base) => .base,
+        @intFromEnum(EntryKind.delta) => .delta,
+        @intFromEnum(EntryKind.centroid_directory) => .centroid_directory,
+        else => return error.CorruptedPostingSegment,
+    };
+    const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
+    const len = std.math.cast(usize, readU64(raw[25..33])) orelse return error.CorruptedPostingSegment;
+    return .{
+        .posting_id = readU64(raw[0..8]),
+        .kind = kind,
+        .sequence = readU64(raw[9..17]),
+        .offset = offset,
+        .len = len,
+        .value_checksum = readU32(raw[33..37]),
+    };
+}
 
 fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: IndexEntry) !void {
     try appendU64(alloc, out, entry.posting_id);
@@ -1834,7 +1886,9 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
         lhs.min_delta_sequence == rhs.min_delta_sequence and
         lhs.max_delta_sequence == rhs.max_delta_sequence and
         lhs.byte_len == rhs.byte_len and
-        lhs.entry_count == rhs.entry_count;
+        lhs.entry_count == rhs.entry_count and
+        lhs.index_offset == rhs.index_offset and
+        lhs.index_checksum == rhs.index_checksum;
 }
 
 fn putNewestPoint(
@@ -1867,6 +1921,21 @@ fn writeFileAtomicallyAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
     };
 }
 
+fn readFileRangeAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, offset: u64, len: usize) ![]u8 {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    try reader.seekTo(offset);
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    reader.interface.readSliceAll(out) catch |err| switch (err) {
+        error.EndOfStream => return error.CorruptedPostingSegment,
+        else => return err,
+    };
+    return out;
+}
+
 fn segmentChecksum(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
 }
@@ -1891,12 +1960,14 @@ fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry
     try appendU64(alloc, out, entry.meta.max_delta_sequence);
     try appendU64(alloc, out, @intCast(entry.meta.byte_len));
     try appendU64(alloc, out, @intCast(entry.meta.entry_count));
+    try appendU64(alloc, out, @intCast(entry.meta.index_offset));
+    try appendU32(alloc, out, entry.meta.index_checksum);
     try appendU32(alloc, out, @intCast(entry.path.len));
     try out.appendSlice(alloc, entry.path);
 }
 
 fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedManifestEntry {
-    const fixed_size = 7 * @sizeOf(u64) + @sizeOf(u32);
+    const fixed_size = 8 * @sizeOf(u64) + 2 * @sizeOf(u32);
     if (pos.* > data.len or data.len - pos.* < fixed_size) return error.CorruptedPostingSegmentManifest;
     const segment_id = readU64(data[pos.*..][0..8]);
     pos.* += 8;
@@ -1912,6 +1983,10 @@ fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedMani
     pos.* += 8;
     const entry_count_u64 = readU64(data[pos.*..][0..8]);
     pos.* += 8;
+    const index_offset_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const index_checksum = readU32(data[pos.*..][0..4]);
+    pos.* += 4;
     const path_len_u32 = readU32(data[pos.*..][0..4]);
     pos.* += 4;
     const path_len = std.math.cast(usize, path_len_u32) orelse return error.CorruptedPostingSegmentManifest;
@@ -1927,6 +2002,8 @@ fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedMani
         .max_delta_sequence = max_delta_sequence,
         .byte_len = std.math.cast(usize, byte_len_u64) orelse return error.CorruptedPostingSegmentManifest,
         .entry_count = std.math.cast(usize, entry_count_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .index_offset = std.math.cast(usize, index_offset_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .index_checksum = index_checksum,
     };
     try validateManifestEntry(.{ .meta = meta, .path = path });
     return .{
@@ -2145,6 +2222,61 @@ pub fn testReaderReportsPointValueLocations() !void {
     std.mem.writeInt(u32, bad_value_checksum[segment_checksum_pos..][0..4], segmentChecksum(bad_value_checksum[0..segment_checksum_pos]), .big);
     const bad_reader = try Reader.init(bad_value_checksum);
     try std.testing.expectError(error.BadPostingSegmentChecksum, bad_reader.getBaseLocation(7));
+}
+
+pub fn testSegmentPointValueRangeReadsVerifyIndexAndValue() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(base);
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, base);
+
+    var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
+    defer committed.deinit(alloc);
+    const entry = ManifestEntry{
+        .meta = committed.entry.meta,
+        .path = committed.entry.path,
+    };
+
+    const loaded = (try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base)).?;
+    defer alloc.free(loaded);
+    try std.testing.expectEqualSlices(u8, base, loaded);
+    try std.testing.expect(try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 8, .base) == null);
+    try std.testing.expectError(error.InvalidPostingSegmentEntryKind, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .delta));
+
+    const original = try tmp.dir.readFileAlloc(std.testing.io, committed.entry.path, alloc, .limited(committed.entry.meta.byte_len + 1));
+    defer alloc.free(original);
+    const reader = try Reader.init(original);
+    const base_location = (try reader.getBaseLocation(7)).?;
+
+    var corrupt_footer = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_footer);
+    corrupt_footer[corrupt_footer.len - footer_size + 20] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_footer });
+    try std.testing.expectError(error.BadPostingSegmentChecksum, readSegmentFileAlloc(alloc, std.testing.io, tmp.dir, committed.entry.path, committed.entry.meta.byte_len));
+    const footer_corrupt_value = (try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base)).?;
+    defer alloc.free(footer_corrupt_value);
+    try std.testing.expectEqualSlices(u8, base, footer_corrupt_value);
+
+    var corrupt_index = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_index);
+    corrupt_index[committed.entry.meta.index_offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_index });
+    try std.testing.expectError(error.BadPostingSegmentChecksum, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base));
+
+    var corrupt_value = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_value);
+    corrupt_value[base_location.offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_value });
+    try std.testing.expectError(error.BadPostingSegmentChecksum, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base));
 }
 
 pub fn testRejectsDuplicateLogicalEntries() !void {
@@ -2393,6 +2525,8 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
                 .max_delta_sequence = 20,
                 .byte_len = 4096,
                 .entry_count = 12,
+                .index_offset = 3200,
+                .index_checksum = 0x1234abcd,
             },
             .path = "postings/000001.afps",
         },
@@ -2403,6 +2537,8 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
                 .max_posting_id = 12,
                 .byte_len = 2048,
                 .entry_count = 3,
+                .index_offset = 1800,
+                .index_checksum = 0x4567cdef,
             },
             .path = "postings/000002.afps",
         },
@@ -2425,6 +2561,8 @@ pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
         try std.testing.expectEqual(expected.meta.max_delta_sequence, actual.meta.max_delta_sequence);
         try std.testing.expectEqual(expected.meta.byte_len, actual.meta.byte_len);
         try std.testing.expectEqual(expected.meta.entry_count, actual.meta.entry_count);
+        try std.testing.expectEqual(expected.meta.index_offset, actual.meta.index_offset);
+        try std.testing.expectEqual(expected.meta.index_checksum, actual.meta.index_checksum);
         try std.testing.expectEqualStrings(expected.path, actual.path);
     }
 }
@@ -3754,6 +3892,10 @@ test "posting segment stores base centroid and ordered delta values" {
 
 test "posting segment reader reports point value locations" {
     try testReaderReportsPointValueLocations();
+}
+
+test "posting segment point value range reads verify index and value" {
+    try testSegmentPointValueRangeReadsVerifyIndexAndValue();
 }
 
 test "posting segment rejects duplicate logical entries" {

@@ -173,7 +173,11 @@ Current status:
   into a destination directory before publishing the manifest last, so restored
   stores do not become visible until all referenced segment bytes are present
   and valid. Segment writers can also produce a manifest-ready built segment
-  with validated metadata and a stable segment path. Runtime
+  with validated metadata and a stable segment path. Segment manifests now
+  persist trusted index offsets and checksums, and lazy segment snapshots use
+  verified range reads for base and centroid point records instead of loading
+  the full segment file. Delta-tail iteration still reads matching segment
+  files until the segment index grows a delta-range iterator. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment
@@ -801,10 +805,11 @@ implementations cleanly:
     runs into vector-index-specific files with posting-local indexes, block
     offsets, compact append batches, and a partial-read integrity scheme.
     Segment v1 blobs now carry whole-segment, index, and per-value checksums,
-    so a future lazy point lookup can verify the index bytes and the fetched
-    value bytes without reading the whole segment. Runtime still needs the
-    range-read plumbing and policy before lazy point lookups stop reading full
-    segment files. That may reduce LSM key overhead and improve sequential IO.
+    and manifests persist the index offset/checksum so lazy point lookups can
+    verify the index bytes and fetched value bytes without reading the whole
+    segment. Runtime still needs the write/read backend plumbing and policy
+    before the public `backend = segments` mode is enabled. That may reduce
+    LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

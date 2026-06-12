@@ -127,6 +127,7 @@ pub const copyPostingSegmentDirectoryStoreAlloc = posting_segment.copyDirectoryS
 pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
+pub const readPostingSegmentPointValueAlloc = posting_segment.readSegmentPointValueAlloc;
 pub const openPostingSegmentStoreFromDirectoryAlloc = posting_segment.openStoreFromDirectoryAlloc;
 pub const openLazyPostingSegmentStoreFromDirectoryAlloc = posting_segment.openLazyStoreFromDirectoryAlloc;
 pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
@@ -183,6 +184,10 @@ pub const encodeCentroidDirectoryKey = hbc.encodeCentroidDirectoryKey;
 
 test "posting segment stores base centroid and ordered delta values" {
     try posting_segment.testStoresBaseCentroidAndOrderedDeltaValues();
+}
+
+test "posting segment point value range reads verify index and value" {
+    try posting_segment.testSegmentPointValueRangeReadsVerifyIndexAndValue();
 }
 
 test "posting segment rejects duplicate logical entries" {
