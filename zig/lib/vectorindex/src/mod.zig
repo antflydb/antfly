@@ -101,6 +101,9 @@ pub const PostingSegmentCommitStats = posting_segment.SegmentCommitStats;
 pub const PostingSegmentCommitResult = posting_segment.SegmentCommitResult;
 pub const PostingSegmentDirectoryCompactionStats = posting_segment.DirectoryCompactionStats;
 pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCompactionResult;
+pub const PostingSegmentDirectoryCompactionPlanOptions = posting_segment.DirectoryCompactionPlanOptions;
+pub const PostingSegmentDirectoryCompactionPlanStats = posting_segment.DirectoryCompactionPlanStats;
+pub const PostingSegmentDirectoryCompactionPlan = posting_segment.DirectoryCompactionPlan;
 pub const PostingSegmentDirectoryGarbageCollectionStats = posting_segment.DirectoryGarbageCollectionStats;
 pub const PostingSegmentDirectoryVerificationStats = posting_segment.DirectoryVerificationStats;
 pub const PostingSegmentDirectoryCopyStats = posting_segment.DirectoryCopyStats;
@@ -110,6 +113,8 @@ pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWri
 pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuiltSegmentToDirectoryAlloc;
 pub const compactPostingSegmentDirectoryStoreAlloc = posting_segment.compactDirectoryStoreAlloc;
 pub const compactPostingSegmentDirectoryStoreSegmentIdsAlloc = posting_segment.compactDirectoryStoreSegmentIdsAlloc;
+pub const planPostingSegmentDirectoryCompactionAlloc = posting_segment.planDirectoryCompactionAlloc;
+pub const planPostingSegmentDirectoryCompactionFromDirectoryAlloc = posting_segment.planDirectoryCompactionFromDirectoryAlloc;
 pub const collectPostingSegmentDirectoryGarbageAlloc = posting_segment.collectDirectoryGarbageAlloc;
 pub const verifyPostingSegmentDirectoryStoreAlloc = posting_segment.verifyDirectoryStoreAlloc;
 pub const copyPostingSegmentDirectoryStoreAlloc = posting_segment.copyDirectoryStoreAlloc;
@@ -202,6 +207,10 @@ test "posting segment manifest replacement encodes compaction commit" {
     try posting_segment.testManifestReplacementEncodesCompactionCommit();
 }
 
+test "posting segment directory compaction planner selects within budgets" {
+    try posting_segment.testDirectoryCompactionPlannerSelectsWithinBudgets();
+}
+
 test "posting segment store validates manifest backed segments" {
     try posting_segment.testOpenStoreValidatesManifestBackedSegments();
 }
@@ -224,6 +233,10 @@ test "posting segment directory compaction replaces manifest segments" {
 
 test "posting segment directory compaction can replace selected segments" {
     try posting_segment.testDirectoryCompactionCanReplaceSelectedSegments();
+}
+
+test "posting segment directory compaction plan from directory feeds selected compaction" {
+    try posting_segment.testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction();
 }
 
 test "posting segment directory selected compaction does not read unselected segments" {

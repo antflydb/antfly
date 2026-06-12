@@ -224,6 +224,35 @@ pub const DirectoryCopyStats = struct {
     entries: usize = 0,
 };
 
+pub const DirectoryCompactionPlanOptions = struct {
+    min_input_segments: usize = 2,
+    max_input_segments: usize = 0,
+    max_input_bytes: usize = 0,
+};
+
+pub const DirectoryCompactionPlanStats = struct {
+    manifest_segments: usize = 0,
+    selected_segments: usize = 0,
+    selected_bytes: usize = 0,
+    selected_entries: usize = 0,
+    stopped_on_segment_limit: bool = false,
+    stopped_on_byte_limit: bool = false,
+    insufficient_segments: bool = false,
+};
+
+pub const DirectoryCompactionPlan = struct {
+    segment_ids: []u64,
+    stats: DirectoryCompactionPlanStats,
+
+    pub fn deinit(self: *DirectoryCompactionPlan, alloc: Allocator) void {
+        alloc.free(self.segment_ids);
+        self.* = .{
+            .segment_ids = &.{},
+            .stats = .{},
+        };
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -658,6 +687,66 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
         .encoded = encoded,
         .stats = stats,
     };
+}
+
+pub fn planDirectoryCompactionAlloc(alloc: Allocator, manifest: Manifest, options: DirectoryCompactionPlanOptions) !DirectoryCompactionPlan {
+    try validateManifest(manifest);
+    const min_input_segments = @max(options.min_input_segments, 1);
+
+    var stats = DirectoryCompactionPlanStats{
+        .manifest_segments = manifest.segments.len,
+    };
+    var selected_ids = std.ArrayListUnmanaged(u64).empty;
+    errdefer selected_ids.deinit(alloc);
+
+    var selected_bytes: usize = 0;
+    var selected_entries: usize = 0;
+    for (manifest.segments) |entry| {
+        if (options.max_input_segments != 0 and selected_ids.items.len >= options.max_input_segments) {
+            stats.stopped_on_segment_limit = true;
+            break;
+        }
+        const next_bytes = std.math.add(usize, selected_bytes, entry.meta.byte_len) catch return error.PostingSegmentTooLarge;
+        if (options.max_input_bytes != 0 and next_bytes > options.max_input_bytes) {
+            stats.stopped_on_byte_limit = true;
+            break;
+        }
+        try selected_ids.append(alloc, entry.meta.segment_id);
+        selected_bytes = next_bytes;
+        selected_entries += entry.meta.entry_count;
+    }
+
+    if (selected_ids.items.len < min_input_segments) {
+        stats.insufficient_segments = true;
+        selected_ids.clearRetainingCapacity();
+        selected_bytes = 0;
+        selected_entries = 0;
+    }
+
+    stats.selected_segments = selected_ids.items.len;
+    stats.selected_bytes = selected_bytes;
+    stats.selected_entries = selected_entries;
+    return .{
+        .segment_ids = try selected_ids.toOwnedSlice(alloc),
+        .stats = stats,
+    };
+}
+
+pub fn planDirectoryCompactionFromDirectoryAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    store_options: OpenStoreOptions,
+    plan_options: DirectoryCompactionPlanOptions,
+) !DirectoryCompactionPlan {
+    var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, store_options);
+    defer manifest.deinit(alloc);
+    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
+    defer alloc.free(entries);
+    return try planDirectoryCompactionAlloc(alloc, .{
+        .next_segment_id = manifest.next_segment_id,
+        .segments = entries,
+    }, plan_options);
 }
 
 pub fn openStoreAlloc(alloc: Allocator, manifest_data: []const u8, context: anytype, comptime readSegmentAlloc: anytype) !OwnedSegmentStore {
@@ -2276,6 +2365,75 @@ pub fn testManifestReplacementEncodesCompactionCommit() !void {
     }, &.{1}, colliding[0..]));
 }
 
+pub fn testDirectoryCompactionPlannerSelectsWithinBudgets() !void {
+    const alloc = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 1,
+                .max_posting_id = 2,
+                .byte_len = 100,
+                .entry_count = 2,
+            },
+            .path = "postings/0000000000000001.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 2,
+                .min_posting_id = 3,
+                .max_posting_id = 4,
+                .byte_len = 150,
+                .entry_count = 3,
+            },
+            .path = "postings/0000000000000002.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 3,
+                .min_posting_id = 5,
+                .max_posting_id = 6,
+                .byte_len = 250,
+                .entry_count = 4,
+            },
+            .path = "postings/0000000000000003.afps",
+        },
+    };
+    const manifest = Manifest{
+        .next_segment_id = 4,
+        .segments = entries[0..],
+    };
+
+    var by_count = try planDirectoryCompactionAlloc(alloc, manifest, .{
+        .max_input_segments = 2,
+    });
+    defer by_count.deinit(alloc);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, by_count.segment_ids);
+    try std.testing.expectEqual(@as(usize, 3), by_count.stats.manifest_segments);
+    try std.testing.expectEqual(@as(usize, 2), by_count.stats.selected_segments);
+    try std.testing.expectEqual(@as(usize, 250), by_count.stats.selected_bytes);
+    try std.testing.expectEqual(@as(usize, 5), by_count.stats.selected_entries);
+    try std.testing.expect(by_count.stats.stopped_on_segment_limit);
+    try std.testing.expect(!by_count.stats.insufficient_segments);
+
+    var by_bytes = try planDirectoryCompactionAlloc(alloc, manifest, .{
+        .max_input_bytes = 260,
+    });
+    defer by_bytes.deinit(alloc);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, by_bytes.segment_ids);
+    try std.testing.expectEqual(@as(usize, 250), by_bytes.stats.selected_bytes);
+    try std.testing.expect(by_bytes.stats.stopped_on_byte_limit);
+    try std.testing.expect(!by_bytes.stats.insufficient_segments);
+
+    var too_small = try planDirectoryCompactionAlloc(alloc, manifest, .{
+        .max_input_bytes = 200,
+    });
+    defer too_small.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), too_small.segment_ids.len);
+    try std.testing.expect(too_small.stats.stopped_on_byte_limit);
+    try std.testing.expect(too_small.stats.insufficient_segments);
+}
+
 const TestSegmentFile = struct {
     path: []const u8,
     data: []const u8,
@@ -2649,6 +2807,59 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     const posting_9 = (try snapshot.materializeMembers(alloc, 9)).?;
     defer alloc.free(posting_9);
     try std.testing.expectEqualSlices(posting.VectorId, &.{90}, posting_9);
+}
+
+pub fn testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var writer_3 = Writer.init(alloc);
+    defer writer_3.deinit();
+    try writer_3.appendPostingBase(.{
+        .posting_id = 9,
+        .generation = 1,
+        .members = &.{90},
+    });
+    var committed_3 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_3, .{});
+    defer committed_3.deinit(alloc);
+
+    var plan = try planDirectoryCompactionFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{}, .{
+        .max_input_segments = 2,
+    });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqualSlices(u64, &.{ committed_1.entry.meta.segment_id, committed_2.entry.meta.segment_id }, plan.segment_ids);
+    try std.testing.expectEqual(@as(usize, 3), plan.stats.manifest_segments);
+    try std.testing.expectEqual(@as(usize, 2), plan.stats.selected_segments);
+    try std.testing.expect(plan.stats.stopped_on_segment_limit);
+
+    var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, plan.segment_ids, .{});
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.manifest.output_segments);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(committed_3.entry.meta.segment_id, store.segments[0].meta.segment_id);
+    try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[1].meta.segment_id);
 }
 
 pub fn testDirectorySelectedCompactionDoesNotReadUnselectedSegments() !void {
@@ -3187,6 +3398,10 @@ test "posting segment manifest replacement encodes compaction commit" {
     try testManifestReplacementEncodesCompactionCommit();
 }
 
+test "posting segment directory compaction planner selects within budgets" {
+    try testDirectoryCompactionPlannerSelectsWithinBudgets();
+}
+
 test "posting segment store validates manifest backed segments" {
     try testOpenStoreValidatesManifestBackedSegments();
 }
@@ -3209,6 +3424,10 @@ test "posting segment directory compaction replaces manifest segments" {
 
 test "posting segment directory compaction can replace selected segments" {
     try testDirectoryCompactionCanReplaceSelectedSegments();
+}
+
+test "posting segment directory compaction plan from directory feeds selected compaction" {
+    try testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction();
 }
 
 test "posting segment directory selected compaction does not read unselected segments" {
