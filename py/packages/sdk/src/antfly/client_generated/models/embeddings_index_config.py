@@ -32,6 +32,10 @@ class EmbeddingsIndexConfig:
             dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
                 for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
             field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
+            embedding_name (str | Unset): Generated embedding artifact name consumed by this vector index. Use with a
+                matching embedding enrichment for artifact-backed managed embeddings.
+            source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
+                index. This is descriptive public configuration; the matching enrichment defines the materialized source.
             template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
                 external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
                 "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
@@ -226,6 +230,8 @@ class EmbeddingsIndexConfig:
     sparse: bool | Unset = False
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
+    embedding_name: str | Unset = UNSET
+    source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
@@ -245,6 +251,10 @@ class EmbeddingsIndexConfig:
         dimension = self.dimension
 
         field = self.field
+
+        embedding_name = self.embedding_name
+
+        source_artifact_name = self.source_artifact_name
 
         template = self.template
 
@@ -283,6 +293,10 @@ class EmbeddingsIndexConfig:
             field_dict["dimension"] = dimension
         if field is not UNSET:
             field_dict["field"] = field
+        if embedding_name is not UNSET:
+            field_dict["embedding_name"] = embedding_name
+        if source_artifact_name is not UNSET:
+            field_dict["source_artifact_name"] = source_artifact_name
         if template is not UNSET:
             field_dict["template"] = template
         if distance_metric is not UNSET:
@@ -318,6 +332,10 @@ class EmbeddingsIndexConfig:
         dimension = d.pop("dimension", UNSET)
 
         field = d.pop("field", UNSET)
+
+        embedding_name = d.pop("embedding_name", UNSET)
+
+        source_artifact_name = d.pop("source_artifact_name", UNSET)
 
         template = d.pop("template", UNSET)
 
@@ -362,6 +380,8 @@ class EmbeddingsIndexConfig:
             sparse=sparse,
             dimension=dimension,
             field=field,
+            embedding_name=embedding_name,
+            source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
             mem_only=mem_only,

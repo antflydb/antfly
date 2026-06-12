@@ -986,7 +986,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess": {
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
             header?: never;
@@ -1069,7 +1069,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance": {
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance": {
         parameters: {
             query?: never;
             header?: never;
@@ -1096,7 +1096,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel": {
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel": {
         parameters: {
             query?: never;
             header?: never;
@@ -1150,7 +1150,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess": {
+    "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
             header?: never;
@@ -6830,6 +6830,10 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
+            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            embedding_name?: string;
+            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
              * @example Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.
@@ -6926,6 +6930,35 @@ export interface components {
          * @enum {string}
          */
         IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /**
+         * @description Managed generated artifact kind.
+         * @enum {string}
+         */
+        EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        EnrichmentConfig: {
+            /** @description Stable generated artifact name. */
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            /** @description Source field to read from the source document or source artifact payload. */
+            field?: string;
+            /** @description Optional template for generated text input. */
+            template?: string;
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
+            source_artifact_name?: string;
+            /** @description Expected embedding dimension for embedding enrichments. */
+            expected_dims?: number;
+            /** @description Chunk size for chunk enrichments. */
+            chunk_size?: number;
+            /** @description Chunk overlap for chunk enrichments. */
+            chunk_overlap?: number;
+            /** @description Serialized chunker configuration for chunk enrichments. */
+            chunker_json?: string;
+            /** @description Produced asset content type for asset enrichments. */
+            content_type?: string;
+            /** @description Serialized asset producer configuration. */
+            producer_json?: string;
+        };
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -6939,13 +6972,25 @@ export interface components {
              */
             version?: number;
             /**
-             * @description List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
              * @example [
-             *       "semantic_chunks",
-             *       "summary"
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
              *     ]
              */
-            enrichments?: string[];
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /** @description Defines the structure of a document type */
         DocumentSchema: {
