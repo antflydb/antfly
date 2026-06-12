@@ -647,6 +647,7 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
     new_entries: []const ManifestEntry,
 ) !ManifestReplacementResult {
     try validateManifest(manifest);
+    try rejectDuplicateSegmentIds(remove_segment_ids);
     for (new_entries) |entry| try validateManifestEntry(entry);
 
     var stats = ManifestReplacementStats{
@@ -971,6 +972,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
     options: CommitOptions,
 ) !DirectoryCompactionResult {
     if (segment_ids.len == 0) return error.NoPostingSegmentsToCompact;
+    try rejectDuplicateSegmentIds(segment_ids);
 
     var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, .{
         .manifest_path = options.manifest_path,
@@ -1817,6 +1819,17 @@ fn segmentIdIn(segment_id: u64, segment_ids: []const u64) bool {
     return false;
 }
 
+fn rejectDuplicateSegmentIds(segment_ids: []const u64) !void {
+    if (segment_ids.len < 2) return;
+    var i: usize = 1;
+    while (i < segment_ids.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (segment_ids[i] == segment_ids[j]) return error.DuplicatePostingSegmentId;
+        }
+    }
+}
+
 fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !void {
     var buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &buf, value, .big);
@@ -2348,6 +2361,10 @@ pub fn testManifestReplacementEncodesCompactionCommit() !void {
         .next_segment_id = 4,
         .segments = entries[0..],
     }, &.{99}, replacement[0..]));
+    try std.testing.expectError(error.DuplicatePostingSegmentId, replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = 4,
+        .segments = entries[0..],
+    }, &.{ 1, 1 }, replacement[0..]));
 
     const colliding = [_]ManifestEntry{.{
         .meta = .{
@@ -2784,6 +2801,7 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     defer committed_3.deinit(alloc);
 
     try std.testing.expectError(error.NoPostingSegmentsToCompact, compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{}, .{}));
+    try std.testing.expectError(error.DuplicatePostingSegmentId, compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_1.entry.meta.segment_id, committed_1.entry.meta.segment_id }, .{}));
     try std.testing.expectError(error.PostingSegmentManifestReplacementMissingSegment, compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{99}, .{}));
 
     var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_1.entry.meta.segment_id, committed_2.entry.meta.segment_id }, .{});

@@ -146,8 +146,9 @@ Current status:
   can choose oldest segment ids under segment-count and input-byte caps before
   any segment file is opened, then selected compaction can preserve unselected
   manifest segments while replacing only the scheduled compaction inputs. The
-  selected path reads and validates only the selected segment files, not every
-  segment referenced by the manifest. Old segment files are left as
+  selected path rejects duplicate selected segment ids before segment IO and
+  reads and validates only the selected segment files, not every segment
+  referenced by the manifest. Old segment files are left as
   unreferenced orphans. A manifest-aware
   directory GC pass can then scan the `postings/` directory and delete only
   canonical `.afps` segment files that are absent from the current manifest,
