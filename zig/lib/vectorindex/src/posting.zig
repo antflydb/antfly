@@ -1598,6 +1598,7 @@ pub const PostingStore = struct {
         _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
         notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
         var materialized_len = base_header.member_count;
+        const delta_replay_start = now_fn();
         const delta_records_after_base = if (canUsePostingOverlayPlan(@TypeOf(scratch)))
             if (canonical_base_delta)
                 try applyDeltaTailIntoScratchAdaptiveSorted(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation)
@@ -1605,6 +1606,7 @@ pub const PostingStore = struct {
                 try applyDeltaTailIntoScratchAdaptive(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation)
         else
             try applyDeltaTailIntoScratch(index, txn, posting_view.id, alloc, scratch, &materialized_len, base_header.generation);
+        notePostingDeltaReplay(profile, elapsed_fn(delta_replay_start), delta_records_after_base);
         const materialized = scratch.member_ids[0..materialized_len];
         if (!canonical_base_delta and !std.mem.eql(VectorId, materialized, posting_view.members)) {
             notePostingOverlayFallback(profile);
@@ -3271,6 +3273,16 @@ fn notePostingBaseDecode(profile: anytype, elapsed_ns: u64, member_count: usize)
     profile.posting_base_decode_members += @intCast(member_count);
 }
 
+fn notePostingDeltaReplay(profile: anytype, elapsed_ns: u64, record_count: usize) void {
+    const Profile = switch (@typeInfo(@TypeOf(profile))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(profile),
+    };
+    if (comptime !@hasField(Profile, "posting_delta_replay_ns")) return;
+    profile.posting_delta_replay_ns += elapsed_ns;
+    profile.posting_delta_replay_records += @intCast(record_count);
+}
+
 fn copyCachedPostingMembersIfAvailable(
     scratch: anytype,
     posting_view: PostingView,
@@ -4143,6 +4155,10 @@ const PostingQueryMaterializeTestProfile = struct {
     posting_overlay_ns: u64 = 0,
     posting_overlay_calls: u64 = 0,
     posting_overlay_base_members: u64 = 0,
+    posting_base_decode_ns: u64 = 0,
+    posting_base_decode_members: u64 = 0,
+    posting_delta_replay_ns: u64 = 0,
+    posting_delta_replay_records: u64 = 0,
     posting_overlay_delta_records: u64 = 0,
     posting_overlay_delta_scan_skips: u64 = 0,
     posting_overlay_materialized_members: u64 = 0,
@@ -4716,6 +4732,10 @@ test "posting store query member copy overlays base and delta tail in shadow mod
     try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 20, 30 }, materialized);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_calls);
     try std.testing.expectEqual(@as(u64, 2), profile.posting_overlay_base_members);
+    try std.testing.expectEqual(@as(u64, 15), profile.posting_base_decode_ns);
+    try std.testing.expectEqual(@as(u64, 2), profile.posting_base_decode_members);
+    try std.testing.expectEqual(@as(u64, 15), profile.posting_delta_replay_ns);
+    try std.testing.expectEqual(@as(u64, 2), profile.posting_delta_replay_records);
     try std.testing.expectEqual(@as(u64, 2), profile.posting_overlay_delta_records);
     try std.testing.expectEqual(@as(u64, 2), profile.posting_overlay_materialized_members);
     try std.testing.expectEqual(@as(u64, 0), profile.posting_overlay_fallbacks);
@@ -4770,6 +4790,8 @@ test "posting store query member copy skips delta scan when canonical base is cu
     try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_calls);
     try std.testing.expectEqual(@as(u64, 3), profile.posting_overlay_base_members);
+    try std.testing.expectEqual(@as(u64, 3), profile.posting_base_decode_members);
+    try std.testing.expectEqual(@as(u64, 0), profile.posting_delta_replay_records);
     try std.testing.expectEqual(@as(u64, 0), profile.posting_overlay_delta_records);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_delta_scan_skips);
     try std.testing.expectEqual(@as(u64, 3), profile.posting_overlay_materialized_members);

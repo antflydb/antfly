@@ -91,6 +91,9 @@ WRITE_COLUMNS = [
     "posting_base_decode_ns",
     "posting_base_decode_members",
     "posting_base_decode_ns_per_member",
+    "posting_delta_replay_ns",
+    "posting_delta_replay_records",
+    "posting_delta_replay_ns_per_record",
     "fg_route_leaf_groups",
     "fg_route_items",
     "fg_route_items_per_leaf_group",
@@ -225,6 +228,12 @@ READ_COLUMNS = [
     "overlay_cache_admission_skips",
     "overlay_cache_member_bytes",
     "overlay_delta_records",
+    "posting_base_decode_ns",
+    "posting_base_decode_members",
+    "posting_base_decode_ns_per_member",
+    "posting_delta_replay_ns",
+    "posting_delta_replay_records",
+    "posting_delta_replay_ns_per_record",
     "centroid_blocks_scanned",
     "centroid_blocks_selected",
     "block_probe_limit",
@@ -588,6 +597,16 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     group,
                     "post_write_warm_profile_posting_base_decode_members",
                     "post_write_profile_posting_base_decode_members",
+                ),
+                "posting_delta_replay_ns": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_delta_replay_ns",
+                    "post_write_profile_posting_delta_replay_ns",
+                ),
+                "posting_delta_replay_records": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_delta_replay_records",
+                    "post_write_profile_posting_delta_replay_records",
                 ),
                 "assignment_map_put_calls": mean(group, "assignment_map_put_calls"),
                 "fg_route_leaf_groups": preferred_mean(
@@ -955,6 +974,10 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("posting_base_decode_ns"),
             summary.get("posting_base_decode_members"),
         )
+        summary["posting_delta_replay_ns_per_record"] = safe_ratio(
+            summary.get("posting_delta_replay_ns"),
+            summary.get("posting_delta_replay_records"),
+        )
         summary["fg_route_items_per_leaf_group"] = safe_ratio(
             summary.get("fg_route_items"),
             summary.get("fg_route_leaf_groups"),
@@ -1014,6 +1037,10 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "overlay_cache_admission_skips": mean(group, "profile_posting_overlay_cache_admission_skips"),
                 "overlay_cache_member_bytes": mean(group, "profile_posting_overlay_cache_member_bytes"),
                 "overlay_delta_records": mean(group, "profile_posting_overlay_delta_records"),
+                "posting_base_decode_ns": mean(group, "profile_posting_base_decode_ns"),
+                "posting_base_decode_members": mean(group, "profile_posting_base_decode_members"),
+                "posting_delta_replay_ns": mean(group, "profile_posting_delta_replay_ns"),
+                "posting_delta_replay_records": mean(group, "profile_posting_delta_replay_records"),
                 "centroid_blocks_scanned": mean(group, "centroid_directory_blocks_scanned"),
                 "centroid_blocks_selected": mean(group, "centroid_directory_blocks_selected"),
                 "block_probe_limit": mean(group, "centroid_directory_block_probe_limit"),
@@ -1051,6 +1078,14 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["overlay_cache_hit_rate"] = cache_hit_rate(
             summary.get("overlay_cache_hits"),
             summary.get("overlay_cache_misses"),
+        )
+        summary["posting_base_decode_ns_per_member"] = safe_ratio(
+            summary.get("posting_base_decode_ns"),
+            summary.get("posting_base_decode_members"),
+        )
+        summary["posting_delta_replay_ns_per_record"] = safe_ratio(
+            summary.get("posting_delta_replay_ns"),
+            summary.get("posting_delta_replay_records"),
         )
     return summaries
 

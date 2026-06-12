@@ -5075,6 +5075,8 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_posting_overlay_base_members = profile.hbc_posting_overlay_base_members,
         .hbc_posting_base_decode_ns = profile.hbc_posting_base_decode_ns,
         .hbc_posting_base_decode_members = profile.hbc_posting_base_decode_members,
+        .hbc_posting_delta_replay_ns = profile.hbc_posting_delta_replay_ns,
+        .hbc_posting_delta_replay_records = profile.hbc_posting_delta_replay_records,
         .hbc_posting_overlay_delta_records = profile.hbc_posting_overlay_delta_records,
         .hbc_posting_overlay_delta_scan_skips = profile.hbc_posting_overlay_delta_scan_skips,
         .hbc_posting_overlay_materialized_members = profile.hbc_posting_overlay_materialized_members,

@@ -366,6 +366,8 @@ pub const DenseSearchProfile = struct {
     hbc_posting_overlay_base_members: u64 = 0,
     hbc_posting_base_decode_ns: u64 = 0,
     hbc_posting_base_decode_members: u64 = 0,
+    hbc_posting_delta_replay_ns: u64 = 0,
+    hbc_posting_delta_replay_records: u64 = 0,
     hbc_posting_overlay_delta_records: u64 = 0,
     hbc_posting_overlay_delta_scan_skips: u64 = 0,
     hbc_posting_overlay_materialized_members: u64 = 0,
@@ -4508,6 +4510,8 @@ fn searchDenseInternal(
         profile.hbc_posting_overlay_base_members = profiled.profile.posting_overlay_base_members;
         profile.hbc_posting_base_decode_ns = profiled.profile.posting_base_decode_ns;
         profile.hbc_posting_base_decode_members = profiled.profile.posting_base_decode_members;
+        profile.hbc_posting_delta_replay_ns = profiled.profile.posting_delta_replay_ns;
+        profile.hbc_posting_delta_replay_records = profiled.profile.posting_delta_replay_records;
         profile.hbc_posting_overlay_delta_records = profiled.profile.posting_overlay_delta_records;
         profile.hbc_posting_overlay_delta_scan_skips = profiled.profile.posting_overlay_delta_scan_skips;
         profile.hbc_posting_overlay_materialized_members = profiled.profile.posting_overlay_materialized_members;
@@ -4862,12 +4866,16 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc_overlay index={s} overlay_us={d} calls={d} base_members={d} delta_records={d} delta_scan_skips={d} materialized_members={d} fallbacks={d} cache_hits={d} cache_misses={d} cache_evictions={d} cache_admission_skips={d} cache_member_bytes={d}",
+        "antfly_bench_dense_query_hbc_overlay index={s} overlay_us={d} calls={d} base_members={d} base_decode_us={d} base_decode_members={d} delta_replay_us={d} delta_replay_records={d} delta_records={d} delta_scan_skips={d} materialized_members={d} fallbacks={d} cache_hits={d} cache_misses={d} cache_evictions={d} cache_admission_skips={d} cache_member_bytes={d}",
         .{
             req.index_name orelse "",
             nsToUs(profile.hbc_posting_overlay_ns),
             profile.hbc_posting_overlay_calls,
             profile.hbc_posting_overlay_base_members,
+            nsToUs(profile.hbc_posting_base_decode_ns),
+            profile.hbc_posting_base_decode_members,
+            nsToUs(profile.hbc_posting_delta_replay_ns),
+            profile.hbc_posting_delta_replay_records,
             profile.hbc_posting_overlay_delta_records,
             profile.hbc_posting_overlay_delta_scan_skips,
             profile.hbc_posting_overlay_materialized_members,

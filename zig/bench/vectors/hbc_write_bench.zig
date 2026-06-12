@@ -651,6 +651,10 @@ const QueryProfileTotals = struct {
     posting_overlay_ns: u64 = 0,
     posting_overlay_calls: u64 = 0,
     posting_overlay_base_members: u64 = 0,
+    posting_base_decode_ns: u64 = 0,
+    posting_base_decode_members: u64 = 0,
+    posting_delta_replay_ns: u64 = 0,
+    posting_delta_replay_records: u64 = 0,
     posting_overlay_delta_records: u64 = 0,
     posting_overlay_delta_scan_skips: u64 = 0,
     posting_overlay_materialized_members: u64 = 0,
@@ -701,6 +705,10 @@ const QueryProfileTotals = struct {
         self.posting_overlay_ns += p.posting_overlay_ns;
         self.posting_overlay_calls += p.posting_overlay_calls;
         self.posting_overlay_base_members += p.posting_overlay_base_members;
+        self.posting_base_decode_ns += p.posting_base_decode_ns;
+        self.posting_base_decode_members += p.posting_base_decode_members;
+        self.posting_delta_replay_ns += p.posting_delta_replay_ns;
+        self.posting_delta_replay_records += p.posting_delta_replay_records;
         self.posting_overlay_delta_records += p.posting_overlay_delta_records;
         self.posting_overlay_delta_scan_skips += p.posting_overlay_delta_scan_skips;
         self.posting_overlay_materialized_members += p.posting_overlay_materialized_members;
@@ -2373,13 +2381,17 @@ fn printResult(
             },
         );
         try writer.print(
-            ",\"post_write_profile_child_expand_ns\":{d},\"post_write_profile_leaf_score_ns\":{d},\"post_write_profile_posting_overlay_ns\":{d},\"post_write_profile_posting_overlay_calls\":{d},\"post_write_profile_posting_overlay_base_members\":{d},\"post_write_profile_posting_overlay_delta_records\":{d},\"post_write_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_profile_posting_overlay_materialized_members\":{d},\"post_write_profile_posting_overlay_fallbacks\":{d},\"post_write_profile_posting_overlay_cache_hits\":{d},\"post_write_profile_posting_overlay_cache_misses\":{d},\"post_write_profile_posting_overlay_cache_evictions\":{d},\"post_write_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_profile_rerank_ns\":{d},\"post_write_profile_rerank_vector_load_ns\":{d},\"post_write_profile_rerank_metadata_ns\":{d}",
+            ",\"post_write_profile_child_expand_ns\":{d},\"post_write_profile_leaf_score_ns\":{d},\"post_write_profile_posting_overlay_ns\":{d},\"post_write_profile_posting_overlay_calls\":{d},\"post_write_profile_posting_overlay_base_members\":{d},\"post_write_profile_posting_base_decode_ns\":{d},\"post_write_profile_posting_base_decode_members\":{d},\"post_write_profile_posting_delta_replay_ns\":{d},\"post_write_profile_posting_delta_replay_records\":{d},\"post_write_profile_posting_overlay_delta_records\":{d},\"post_write_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_profile_posting_overlay_materialized_members\":{d},\"post_write_profile_posting_overlay_fallbacks\":{d},\"post_write_profile_posting_overlay_cache_hits\":{d},\"post_write_profile_posting_overlay_cache_misses\":{d},\"post_write_profile_posting_overlay_cache_evictions\":{d},\"post_write_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_profile_rerank_ns\":{d},\"post_write_profile_rerank_vector_load_ns\":{d},\"post_write_profile_rerank_metadata_ns\":{d}",
             .{
                 query.totals.child_expand_ns,
                 query.totals.leaf_score_ns,
                 query.totals.posting_overlay_ns,
                 query.totals.posting_overlay_calls,
                 query.totals.posting_overlay_base_members,
+                query.totals.posting_base_decode_ns,
+                query.totals.posting_base_decode_members,
+                query.totals.posting_delta_replay_ns,
+                query.totals.posting_delta_replay_records,
                 query.totals.posting_overlay_delta_records,
                 query.totals.posting_overlay_delta_scan_skips,
                 query.totals.posting_overlay_materialized_members,
@@ -2441,7 +2453,7 @@ fn printResult(
                 },
             );
             try writer.print(
-                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d},\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
+                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d},\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_base_decode_ns\":{d},\"post_write_warm_profile_posting_base_decode_members\":{d},\"post_write_warm_profile_posting_delta_replay_ns\":{d},\"post_write_warm_profile_posting_delta_replay_records\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
                 .{
                     query.warm_totals.total_ns,
                     query.warm_totals.setup_ns,
@@ -2462,6 +2474,10 @@ fn printResult(
                     query.warm_totals.posting_overlay_ns,
                     query.warm_totals.posting_overlay_calls,
                     query.warm_totals.posting_overlay_base_members,
+                    query.warm_totals.posting_base_decode_ns,
+                    query.warm_totals.posting_base_decode_members,
+                    query.warm_totals.posting_delta_replay_ns,
+                    query.warm_totals.posting_delta_replay_records,
                     query.warm_totals.posting_overlay_delta_records,
                     query.warm_totals.posting_overlay_delta_scan_skips,
                     query.warm_totals.posting_overlay_materialized_members,
@@ -2810,7 +2826,7 @@ fn printCompactQueryResult(writer: anytype, prefix: []const u8, query: PostWrite
     const queries_per_second = if (query.ns == 0) 0 else (@as(f64, @floatFromInt(query.queries)) * 1_000_000_000.0) / @as(f64, @floatFromInt(query.ns));
     const recall_at_k = if (query.recall_total == 0) 0 else @as(f64, @floatFromInt(query.recall_hits)) / @as(f64, @floatFromInt(query.recall_total));
     try writer.print(
-        ",\"{s}_queries\":{d},\"{s}_exact_truth_build_ns\":{d},\"{s}_exact_truth_cache_hit\":{},\"{s}_query_ns_per_query\":{d:.2},\"{s}_query_p95_ns\":{d},\"{s}_queries_per_second\":{d:.2},\"{s}_recall_hits\":{d},\"{s}_recall_total\":{d},\"{s}_recall_at_k\":{d:.4},\"{s}_storage_read_bytes\":{d},\"{s}_profile_posting_overlay_delta_records\":{d},\"{s}_profile_posting_overlay_cache_hits\":{d},\"{s}_profile_posting_overlay_cache_misses\":{d}",
+        ",\"{s}_queries\":{d},\"{s}_exact_truth_build_ns\":{d},\"{s}_exact_truth_cache_hit\":{},\"{s}_query_ns_per_query\":{d:.2},\"{s}_query_p95_ns\":{d},\"{s}_queries_per_second\":{d:.2},\"{s}_recall_hits\":{d},\"{s}_recall_total\":{d},\"{s}_recall_at_k\":{d:.4},\"{s}_storage_read_bytes\":{d},\"{s}_profile_posting_delta_replay_ns\":{d},\"{s}_profile_posting_delta_replay_records\":{d},\"{s}_profile_posting_overlay_delta_records\":{d},\"{s}_profile_posting_overlay_cache_hits\":{d},\"{s}_profile_posting_overlay_cache_misses\":{d}",
         .{
             prefix,
             query.queries,
@@ -2833,6 +2849,10 @@ fn printCompactQueryResult(writer: anytype, prefix: []const u8, query: PostWrite
             prefix,
             query.storage.read_bytes,
             prefix,
+            query.totals.posting_delta_replay_ns,
+            prefix,
+            query.totals.posting_delta_replay_records,
+            prefix,
             query.totals.posting_overlay_delta_records,
             prefix,
             query.totals.posting_overlay_cache_hits,
@@ -2845,7 +2865,7 @@ fn printCompactQueryResult(writer: anytype, prefix: []const u8, query: PostWrite
         const warm_queries_per_second = if (query.warm_ns == 0) 0 else (@as(f64, @floatFromInt(query.warm_queries)) * 1_000_000_000.0) / @as(f64, @floatFromInt(query.warm_ns));
         const warm_recall_at_k = if (query.warm_recall_total == 0) 0 else @as(f64, @floatFromInt(query.warm_recall_hits)) / @as(f64, @floatFromInt(query.warm_recall_total));
         try writer.print(
-            ",\"{s}_warm_queries\":{d},\"{s}_warm_query_ns_per_query\":{d:.2},\"{s}_warm_query_p95_ns\":{d},\"{s}_warm_queries_per_second\":{d:.2},\"{s}_warm_recall_hits\":{d},\"{s}_warm_recall_total\":{d},\"{s}_warm_recall_at_k\":{d:.4},\"{s}_warm_storage_read_bytes\":{d},\"{s}_warm_profile_posting_overlay_delta_records\":{d},\"{s}_warm_profile_posting_overlay_cache_hits\":{d},\"{s}_warm_profile_posting_overlay_cache_misses\":{d}",
+            ",\"{s}_warm_queries\":{d},\"{s}_warm_query_ns_per_query\":{d:.2},\"{s}_warm_query_p95_ns\":{d},\"{s}_warm_queries_per_second\":{d:.2},\"{s}_warm_recall_hits\":{d},\"{s}_warm_recall_total\":{d},\"{s}_warm_recall_at_k\":{d:.4},\"{s}_warm_storage_read_bytes\":{d},\"{s}_warm_profile_posting_delta_replay_ns\":{d},\"{s}_warm_profile_posting_delta_replay_records\":{d},\"{s}_warm_profile_posting_overlay_delta_records\":{d},\"{s}_warm_profile_posting_overlay_cache_hits\":{d},\"{s}_warm_profile_posting_overlay_cache_misses\":{d}",
             .{
                 prefix,
                 query.warm_queries,
@@ -2863,6 +2883,10 @@ fn printCompactQueryResult(writer: anytype, prefix: []const u8, query: PostWrite
                 warm_recall_at_k,
                 prefix,
                 query.warm_storage.read_bytes,
+                prefix,
+                query.warm_totals.posting_delta_replay_ns,
+                prefix,
+                query.warm_totals.posting_delta_replay_records,
                 prefix,
                 query.warm_totals.posting_overlay_delta_records,
                 prefix,

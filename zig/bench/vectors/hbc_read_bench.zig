@@ -472,6 +472,10 @@ const ProfileTotals = struct {
     posting_overlay_ns: u64 = 0,
     posting_overlay_calls: u64 = 0,
     posting_overlay_base_members: u64 = 0,
+    posting_base_decode_ns: u64 = 0,
+    posting_base_decode_members: u64 = 0,
+    posting_delta_replay_ns: u64 = 0,
+    posting_delta_replay_records: u64 = 0,
     posting_overlay_delta_records: u64 = 0,
     posting_overlay_delta_scan_skips: u64 = 0,
     posting_overlay_materialized_members: u64 = 0,
@@ -522,6 +526,10 @@ const ProfileTotals = struct {
         self.posting_overlay_ns += p.posting_overlay_ns;
         self.posting_overlay_calls += p.posting_overlay_calls;
         self.posting_overlay_base_members += p.posting_overlay_base_members;
+        self.posting_base_decode_ns += p.posting_base_decode_ns;
+        self.posting_base_decode_members += p.posting_base_decode_members;
+        self.posting_delta_replay_ns += p.posting_delta_replay_ns;
+        self.posting_delta_replay_records += p.posting_delta_replay_records;
         self.posting_overlay_delta_records += p.posting_overlay_delta_records;
         self.posting_overlay_delta_scan_skips += p.posting_overlay_delta_scan_skips;
         self.posting_overlay_materialized_members += p.posting_overlay_materialized_members;
@@ -1221,13 +1229,17 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"profile_child_expand_ns\":{d},\"profile_leaf_score_ns\":{d},\"profile_posting_overlay_ns\":{d},\"profile_posting_overlay_calls\":{d},\"profile_posting_overlay_base_members\":{d},\"profile_posting_overlay_delta_records\":{d},\"profile_posting_overlay_delta_scan_skips\":{d},\"profile_posting_overlay_materialized_members\":{d},\"profile_posting_overlay_fallbacks\":{d},\"profile_posting_overlay_cache_hits\":{d},\"profile_posting_overlay_cache_misses\":{d},\"profile_posting_overlay_cache_evictions\":{d},\"profile_posting_overlay_cache_admission_skips\":{d},\"profile_posting_overlay_cache_member_bytes\":{d},\"profile_rerank_ns\":{d},\"profile_rerank_vector_load_ns\":{d},\"profile_rerank_metadata_ns\":{d}",
+        ",\"profile_child_expand_ns\":{d},\"profile_leaf_score_ns\":{d},\"profile_posting_overlay_ns\":{d},\"profile_posting_overlay_calls\":{d},\"profile_posting_overlay_base_members\":{d},\"profile_posting_base_decode_ns\":{d},\"profile_posting_base_decode_members\":{d},\"profile_posting_delta_replay_ns\":{d},\"profile_posting_delta_replay_records\":{d},\"profile_posting_overlay_delta_records\":{d},\"profile_posting_overlay_delta_scan_skips\":{d},\"profile_posting_overlay_materialized_members\":{d},\"profile_posting_overlay_fallbacks\":{d},\"profile_posting_overlay_cache_hits\":{d},\"profile_posting_overlay_cache_misses\":{d},\"profile_posting_overlay_cache_evictions\":{d},\"profile_posting_overlay_cache_admission_skips\":{d},\"profile_posting_overlay_cache_member_bytes\":{d},\"profile_rerank_ns\":{d},\"profile_rerank_vector_load_ns\":{d},\"profile_rerank_metadata_ns\":{d}",
         .{
             totals.child_expand_ns,
             totals.leaf_score_ns,
             totals.posting_overlay_ns,
             totals.posting_overlay_calls,
             totals.posting_overlay_base_members,
+            totals.posting_base_decode_ns,
+            totals.posting_base_decode_members,
+            totals.posting_delta_replay_ns,
+            totals.posting_delta_replay_records,
             totals.posting_overlay_delta_records,
             totals.posting_overlay_delta_scan_skips,
             totals.posting_overlay_materialized_members,
