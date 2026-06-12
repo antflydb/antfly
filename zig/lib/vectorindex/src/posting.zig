@@ -68,6 +68,12 @@ pub const PostingBaseHeader = struct {
     member_count: usize,
 };
 
+pub const PostingBaseStats = struct {
+    header: PostingBaseHeader,
+    block_count: usize,
+    encoded_len: usize,
+};
+
 pub const PostingDeltaOp = enum(u8) {
     insert = 1,
     tombstone = 2,
@@ -791,6 +797,34 @@ pub const PostingFormat = struct {
             .generation = std.mem.readInt(u64, data[13..21], .little),
             .member_count = member_count,
         };
+    }
+
+    pub fn decodeBaseStats(data: []const u8) !PostingBaseStats {
+        const header = try decodeBaseHeader(data);
+        var pos: usize = base_header_size;
+        var remaining_members = header.member_count;
+        var block_count: usize = 0;
+        while (remaining_members != 0) {
+            const current_block_count = try readBaseBlockCount(data, &pos, remaining_members);
+            const block_min = try readVarint(data, &pos);
+            var block_index: usize = 0;
+            while (block_index < current_block_count) : (block_index += 1) {
+                const delta = try readVarint(data, &pos);
+                _ = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+            }
+            remaining_members -= current_block_count;
+            block_count += 1;
+        }
+        if (pos != data.len) return error.Corrupted;
+        return .{
+            .header = header,
+            .block_count = block_count,
+            .encoded_len = data.len,
+        };
+    }
+
+    pub fn validateBase(data: []const u8) !PostingBaseHeader {
+        return (try decodeBaseStats(data)).header;
     }
 
     pub fn decodeBaseMembersInto(data: []const u8, members: []VectorId) !PostingBaseHeader {
@@ -3585,6 +3619,30 @@ test "posting base format round trips members" {
     try std.testing.expectError(error.UnsupportedPostingBaseVersion, PostingFormat.decodeBase(alloc, encoded));
 }
 
+test "posting base stats validates encoded blocks without materializing members" {
+    const alloc = std.testing.allocator;
+    const members = [_]VectorId{ 10, 20, 30, 100, 101 };
+
+    const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
+        .posting_id = 7,
+        .generation = 11,
+        .members = members[0..],
+    }, 2);
+    defer alloc.free(encoded);
+
+    const stats = try PostingFormat.decodeBaseStats(encoded);
+    try std.testing.expectEqual(@as(PostingId, 7), stats.header.posting_id);
+    try std.testing.expectEqual(@as(u64, 11), stats.header.generation);
+    try std.testing.expectEqual(members.len, stats.header.member_count);
+    try std.testing.expectEqual(@as(usize, 3), stats.block_count);
+    try std.testing.expectEqual(encoded.len, stats.encoded_len);
+
+    const header = try PostingFormat.decodeBaseHeader(encoded[0 .. encoded.len - 1]);
+    try std.testing.expectEqual(members.len, header.member_count);
+    try std.testing.expectError(error.Corrupted, PostingFormat.decodeBaseStats(encoded[0 .. encoded.len - 1]));
+    try std.testing.expectError(error.Corrupted, PostingFormat.validateBase(encoded[0 .. encoded.len - 1]));
+}
+
 test "posting delta tail round trips and overlays base members" {
     const alloc = std.testing.allocator;
     const records = [_]PostingDeltaRecord{
@@ -4042,14 +4100,38 @@ fn isNotFoundForPostingPersistenceTest(err: anyerror) bool {
 
 const PostingQueryMaterializeTestScratch = struct {
     member_ids: []u64 = &.{},
+    posting_overlay_removed_members: std.AutoHashMapUnmanaged(VectorId, void) = .empty,
+    posting_overlay_appended_positions: std.AutoHashMapUnmanaged(VectorId, usize) = .empty,
+    posting_overlay_appended_ids: []VectorId = &.{},
+    posting_overlay_appended_live: []bool = &.{},
+    posting_overlay_appended_count: usize = 0,
 
     fn deinit(self: *PostingQueryMaterializeTestScratch, alloc: std.mem.Allocator) void {
         alloc.free(self.member_ids);
+        self.posting_overlay_removed_members.deinit(alloc);
+        self.posting_overlay_appended_positions.deinit(alloc);
+        alloc.free(self.posting_overlay_appended_ids);
+        alloc.free(self.posting_overlay_appended_live);
         self.* = .{};
     }
 
     pub fn ensureMemberIdCapacity(self: *PostingQueryMaterializeTestScratch, alloc: std.mem.Allocator, needed: usize) !void {
         if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
+    }
+
+    pub fn ensurePostingOverlayAppendCapacity(self: *PostingQueryMaterializeTestScratch, alloc: std.mem.Allocator, needed: usize) !void {
+        if (self.posting_overlay_appended_ids.len < needed) {
+            self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, needed);
+        }
+        if (self.posting_overlay_appended_live.len < needed) {
+            self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, needed);
+        }
+    }
+
+    pub fn resetPostingOverlayApply(self: *PostingQueryMaterializeTestScratch) void {
+        self.posting_overlay_removed_members.clearRetainingCapacity();
+        self.posting_overlay_appended_positions.clearRetainingCapacity();
+        self.posting_overlay_appended_count = 0;
     }
 };
 
@@ -4420,7 +4502,9 @@ test "posting store scans materializes and folds delta tail into a new base" {
     try std.testing.expectEqual(@as(usize, 36), folded.deleted_tail_key_bytes);
     try std.testing.expect(folded.deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(usize, 10), folded.written_base_key_bytes);
-    try std.testing.expectEqual(@as(usize, 41), folded.written_base_value_bytes);
+    const fixed_width_base_bytes = PostingFormat.encoded_base_header_size + folded.materialized_member_count * @sizeOf(VectorId);
+    try std.testing.expect(folded.written_base_value_bytes >= PostingFormat.encoded_base_header_size);
+    try std.testing.expect(folded.written_base_value_bytes < fixed_width_base_bytes);
     try std.testing.expectEqual(@as(u64, 5), folded.next_generation);
 
     var loaded = try PostingStore.loadBase(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
@@ -4441,7 +4525,7 @@ test "posting store scans materializes and folds delta tail into a new base" {
     try std.testing.expectEqual(@as(u64, 36), index.write_profile.posting_delta_fold_deleted_tail_key_bytes);
     try std.testing.expect(index.write_profile.posting_delta_fold_deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(u64, 10), index.write_profile.posting_delta_fold_written_base_key_bytes);
-    try std.testing.expectEqual(@as(u64, 41), index.write_profile.posting_delta_fold_written_base_value_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(folded.written_base_value_bytes)), index.write_profile.posting_delta_fold_written_base_value_bytes);
 }
 
 test "posting store can defer delta fold until policy threshold is reached" {

@@ -464,6 +464,237 @@ search performance alone.
    storage. The migration should preserve the existing packed-node HBC as the
    benchmark baseline.
 
+## Long-Term Roadmap
+
+### Storage axes
+
+The current base/delta work is a new posting record and value format, not a
+new physical file backend. Posting membership is represented by explicit
+posting base records, append-only posting delta records, and centroid-directory
+records, but those records are still persisted through the LSM-backed index
+namespace:
+
+```text
+PB<posting_id>              -> posting base value
+PD<posting_id><sequence>    -> posting delta tail value
+CD<posting_id>              -> centroid-directory value
+```
+
+That distinction should stay explicit in configuration and docs. The durable
+storage substrate and the logical posting format are separate axes:
+
+```text
+backend = lsm | segments
+format  = packed_hbc | base_delta
+version = 1
+```
+
+Today this PR is:
+
+```text
+backend = lsm
+format  = base_delta
+version = 1
+```
+
+The old default remains effectively:
+
+```text
+backend = lsm
+format  = packed_hbc
+version = 1
+```
+
+A future dedicated vector posting file or segment store should be introduced as
+`backend = segments`, not by overloading the base/delta format name. If the
+physical backend changes while the logical base/delta encoding stays the same,
+that is a backend change. If the posting bytes, overlay rules, sequence rules,
+or centroid-directory value contract change incompatibly, that is a format
+version change.
+
+This avoids misleading names such as `segments_base_delta` while the
+implementation still writes LSM records. It also lets us compare high-level
+implementations cleanly:
+
+- `lsm + packed_hbc + v1`: current production baseline
+- `lsm + base_delta + v1`: current experimental canonical posting store
+- `segments + base_delta + v1`: future dedicated posting-file backend, if the
+  LSM substrate becomes the bottleneck
+- `segments + base_delta + v2`: future dedicated backend plus an incompatible
+  posting-value format revision
+
+### Memory and CPU priorities
+
+1. Micro-batch delta writes per posting.
+
+   The current LSM-backed base/delta path can still pay one LSM key per small
+   posting update when updates are not already grouped. Ingest paths should
+   keep accumulating posting-local operations until a durability, size, or
+   visibility boundary requires a flush, then write one ordered delta value.
+
+   Expected win: fewer LSM keys, fewer cursor records, lower write
+   amplification, and cheaper delta scans.
+
+   Constraint: the buffering boundary must be explicit. Operations cannot sit
+   in an invisible process-local buffer unless the WAL/transaction semantics
+   make crash recovery and read visibility obvious.
+
+2. Cache hot materialized overlays by generation.
+
+   Repeated queries often touch the same large posting. A bounded cache keyed
+   by `(posting_id, base_generation, max_delta_sequence)` could store the
+   materialized member view or a prepared overlay summary.
+
+   Expected win: avoid repeated base decode and delta replay for hot postings.
+
+   Constraint: cache entries need strict byte accounting, generation-based
+   invalidation, and pressure integration with existing resource-manager
+   budgets. This should not become an unbounded second posting store.
+
+3. Continue compacting query scratch into slabs.
+
+   `SearchScratch` still owns several arrays that tend to grow together:
+   positions, vector ids, metadata, lookups, key views, values, vector views,
+   distances, and error bounds. Grouping compatible arrays into one slab can
+   reduce allocator traffic and improve locality on hot query paths.
+
+   Expected win: lower allocator CPU, fewer fragmented allocations, and better
+   cache behavior.
+
+   Constraint: only group arrays with compatible lifetime and growth behavior.
+   Avoid making ownership obscure for slices that can be retained separately.
+
+4. Add specialized base decode modes.
+
+   Not every path needs a fully materialized member slice. Keep separate decode
+   paths for base header only, count/stat only, streaming member iteration, and
+   full materialization.
+
+   Expected win: fold decisions, backlog stats, and membership checks can avoid
+   decoding or allocating full member arrays.
+
+   Constraint: every specialized path must share the same validation rules as
+   the full decoder. Corrupt or unsupported values should fail consistently.
+
+5. Add per-block skip metadata for large base records.
+
+   Sorted canonical base members make it possible to store block offsets and
+   last-member ids. Query materialization, fold application, and membership
+   checks could then jump to relevant blocks instead of scanning from the
+   start.
+
+   Expected win: faster large-posting negative checks, partial decode, and
+   sorted merge application.
+
+   Constraint: block metadata costs bytes. Benchmarks should track base
+   bytes/member and base decode ns/member across clustered, sequential, and
+   random vector-id distributions before changing defaults.
+
+6. Prefer merge-style overlay application where sortedness is guaranteed.
+
+   Canonical base members are sorted. If append and tombstone summaries are
+   also sorted and deduplicated, materialization and fold output can be a
+   linear merge instead of hash-map-heavy replay.
+
+   Expected win: lower memory, better cache behavior, and predictable CPU for
+   large postings.
+
+   Constraint: shadow mode may still need compatibility checks against packed
+   member order while packed HBC remains the source of truth. Merge-style paths
+   should be enabled only when the canonical ordering contract is active.
+
+7. Compact overlay plan storage.
+
+   The overlay plan still uses hash maps plus append arrays in some paths. For
+   small and medium tails, a sorted temporary vector of operations may use less
+   memory and run faster than hash maps.
+
+   Expected win: lower peak fold/query scratch and better cache locality.
+
+   Constraint: use measured thresholds. Large churn-heavy tails may still need
+   hash-backed deduplication.
+
+8. Evaluate frame-of-reference base blocks.
+
+   Varint deltas are simple and good enough for v1, but sorted vector IDs may
+   compress better with block-level frame-of-reference plus bit-packed deltas.
+
+   Expected win: fewer bytes/member and potentially faster block decode for
+   clustered ids.
+
+   Constraint: this is a format-version candidate, not a small cleanup. It
+   needs side-by-side bench columns before becoming public.
+
+9. Add membership hints for large postings.
+
+   For delete/update and some validation paths, compact per-base bloom filters
+   or min/max block hints could avoid full decode on negative membership tests.
+
+   Expected win: faster tombstone and reassignment checks on large postings.
+
+   Constraint: hints add bytes and maintenance cost. They should be optional or
+   thresholded by posting size.
+
+10. Make fold policy cost-aware.
+
+    Current fold policy is mostly threshold based. Longer term, folds should
+    consider observed query replay cost, tail bytes, tombstone density, and
+    maintenance resource pressure.
+
+    Expected win: avoid folding cold tiny tails while keeping hot query
+    overlays cheap.
+
+    Constraint: avoid unstable feedback loops. Use slow-moving counters and
+    keep hard caps for tail debt.
+
+11. Move to a segment backend only if LSM costs dominate.
+
+    A dedicated posting segment backend could pack posting bases and delta
+    runs into vector-index-specific files with posting-local indexes, block
+    offsets, and compact append batches. That may reduce LSM key overhead and
+    improve sequential IO.
+
+    Expected win: lower LSM fanout, fewer small keys, better posting-local read
+    locality, and format-specific compaction.
+
+    Constraint: this is a storage-backend project, not a posting-format tweak.
+    It needs its own crash/recovery, compaction, checksumming, resource
+    accounting, backup/restore, and migration story. Do it only after metrics
+    show the LSM substrate is the limiting cost for `lsm + base_delta + v1`.
+
+### Benchmark and observability work
+
+The next optimization decisions need counters that separate logical format
+cost from backend cost:
+
+- base bytes/member
+- base decode ns/member
+- delta bytes/record
+- delta replay ns/record
+- LSM keys per posting mutation
+- LSM bytes per posting mutation
+- fold peak scratch bytes
+- fold output bytes per folded record
+- overlay cache hit/miss/admission/eviction counts
+- query materialization ns/posting and ns/member
+- search scratch allocation count and retained bytes
+
+Benchmarks should report these by workload shape:
+
+- bulk build, read-heavy
+- append-only ingest
+- hot overwrite
+- random overwrite
+- semantic drift overwrite
+- delete/tombstone-heavy churn
+- mixed insert/delete/update
+- clustered vector ids versus random vector ids
+
+The roadmap should remain evidence driven. `lsm + base_delta + v1` is the
+right next comparison point against packed HBC. A dedicated segment backend is
+only justified if those measurements show LSM key/value overhead, cursor work,
+or LSM compaction is the dominant remaining bottleneck.
+
 ## Refactor Plan
 
 ### Phase 1: Name the boundaries
