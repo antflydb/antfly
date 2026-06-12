@@ -204,6 +204,14 @@ pub const DirectoryGarbageCollectionStats = struct {
     deleted_segment_files: usize = 0,
 };
 
+pub const DirectoryTemporaryCleanupStats = struct {
+    scanned_entries: usize = 0,
+    skipped_entries: usize = 0,
+    segment_temp_files: usize = 0,
+    manifest_temp_files: usize = 0,
+    deleted_temp_files: usize = 0,
+};
+
 pub const DirectoryVerificationStats = struct {
     manifest_segments: usize = 0,
     manifest_bytes: usize = 0,
@@ -1139,6 +1147,44 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     return stats;
 }
 
+pub fn collectDirectoryTemporaryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryTemporaryCleanupStats {
+    var stats = DirectoryTemporaryCleanupStats{};
+    const manifest_tmp_name = try manifestTemporaryFileNameAlloc(alloc, options.manifest_path);
+    defer alloc.free(manifest_tmp_name);
+
+    var postings_dir = dir.openDir(io, segment_directory, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return stats,
+        else => return err,
+    };
+    defer postings_dir.close(io);
+
+    var iter = postings_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        stats.scanned_entries += 1;
+        if (entry.kind != .file) {
+            stats.skipped_entries += 1;
+            continue;
+        }
+
+        const is_segment_tmp = isCanonicalSegmentTemporaryFileName(entry.name);
+        const is_manifest_tmp = std.mem.eql(u8, entry.name, manifest_tmp_name);
+        if (!is_segment_tmp and !is_manifest_tmp) {
+            stats.skipped_entries += 1;
+            continue;
+        }
+
+        if (is_segment_tmp) stats.segment_temp_files += 1;
+        if (is_manifest_tmp) stats.manifest_temp_files += 1;
+
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
+        defer alloc.free(path);
+        try dir.deleteFile(io, path);
+        stats.deleted_temp_files += 1;
+    }
+
+    return stats;
+}
+
 pub fn writeSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment) !OwnedManifestEntry {
     const path = try segmentPathAlloc(alloc, segment.meta.segment_id);
     errdefer alloc.free(path);
@@ -1246,6 +1292,16 @@ fn isCanonicalSegmentFileName(name: []const u8) bool {
         if (!isLowerHex(byte)) return false;
     }
     return true;
+}
+
+fn isCanonicalSegmentTemporaryFileName(name: []const u8) bool {
+    return name.len == 25 and
+        std.mem.eql(u8, name[21..], ".tmp") and
+        isCanonicalSegmentFileName(name[0..21]);
+}
+
+fn manifestTemporaryFileNameAlloc(alloc: Allocator, manifest_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}.tmp", .{std.fs.path.basename(manifest_path)});
 }
 
 fn isLowerHex(byte: u8) bool {
@@ -3164,6 +3220,57 @@ pub fn testDirectoryGarbageCollectionDeletesManifestOrphans() !void {
     try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[0].meta.segment_id);
 }
 
+pub fn testDirectoryTemporaryGarbageCollectionDeletesOnlyKnownTemps() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const empty_stats = try collectDirectoryTemporaryGarbageAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectEqual(@as(usize, 0), empty_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 0), empty_stats.deleted_temp_files);
+
+    try tmp.dir.createDirPath(std.testing.io, segment_directory);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000000001.afps.tmp",
+        .data = "partial segment",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/manifest.afpm.tmp",
+        .data = "partial manifest",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000000002.afps",
+        .data = "committed-looking file",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/random.tmp",
+        .data = "not ours",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000000003.afps.tmp2",
+        .data = "not ours either",
+    });
+
+    const stats = try collectDirectoryTemporaryGarbageAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.segment_temp_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.manifest_temp_files);
+    try std.testing.expectEqual(@as(usize, 2), stats.deleted_temp_files);
+    try std.testing.expect(stats.skipped_entries >= 3);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, "postings/0000000000000001.afps.tmp", alloc, .limited(100)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, "postings/manifest.afpm.tmp", alloc, .limited(100)));
+
+    const committed = try tmp.dir.readFileAlloc(std.testing.io, "postings/0000000000000002.afps", alloc, .limited(100));
+    defer alloc.free(committed);
+    try std.testing.expectEqualStrings("committed-looking file", committed);
+    const random = try tmp.dir.readFileAlloc(std.testing.io, "postings/random.tmp", alloc, .limited(100));
+    defer alloc.free(random);
+    try std.testing.expectEqualStrings("not ours", random);
+    const tmp2 = try tmp.dir.readFileAlloc(std.testing.io, "postings/0000000000000003.afps.tmp2", alloc, .limited(100));
+    defer alloc.free(tmp2);
+    try std.testing.expectEqualStrings("not ours either", tmp2);
+}
+
 pub fn testLazyDirectoryStoreReadsOnlyCandidateSegments() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3625,6 +3732,10 @@ test "posting segment directory selected compaction does not read unselected seg
 
 test "posting segment directory garbage collection deletes manifest orphans" {
     try testDirectoryGarbageCollectionDeletesManifestOrphans();
+}
+
+test "posting segment directory temporary garbage collection deletes only known temps" {
+    try testDirectoryTemporaryGarbageCollectionDeletesOnlyKnownTemps();
 }
 
 test "posting segment lazy directory store reads only candidate segments" {

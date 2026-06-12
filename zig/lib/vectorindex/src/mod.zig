@@ -105,6 +105,7 @@ pub const PostingSegmentDirectoryCompactionPlanOptions = posting_segment.Directo
 pub const PostingSegmentDirectoryCompactionPlanStats = posting_segment.DirectoryCompactionPlanStats;
 pub const PostingSegmentDirectoryCompactionPlan = posting_segment.DirectoryCompactionPlan;
 pub const PostingSegmentDirectoryGarbageCollectionStats = posting_segment.DirectoryGarbageCollectionStats;
+pub const PostingSegmentDirectoryTemporaryCleanupStats = posting_segment.DirectoryTemporaryCleanupStats;
 pub const PostingSegmentDirectoryVerificationStats = posting_segment.DirectoryVerificationStats;
 pub const PostingSegmentDirectoryCopyStats = posting_segment.DirectoryCopyStats;
 pub const PostingSegmentDirectoryManifestStats = posting_segment.DirectoryManifestStats;
@@ -119,6 +120,7 @@ pub const planPostingSegmentDirectoryCompactionFromDirectoryAlloc = posting_segm
 pub const summarizePostingSegmentManifest = posting_segment.summarizeManifest;
 pub const summarizePostingSegmentDirectoryManifestAlloc = posting_segment.summarizeDirectoryManifestAlloc;
 pub const collectPostingSegmentDirectoryGarbageAlloc = posting_segment.collectDirectoryGarbageAlloc;
+pub const collectPostingSegmentDirectoryTemporaryGarbageAlloc = posting_segment.collectDirectoryTemporaryGarbageAlloc;
 pub const verifyPostingSegmentDirectoryStoreAlloc = posting_segment.verifyDirectoryStoreAlloc;
 pub const copyPostingSegmentDirectoryStoreAlloc = posting_segment.copyDirectoryStoreAlloc;
 pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
@@ -256,6 +258,10 @@ test "posting segment directory selected compaction does not read unselected seg
 
 test "posting segment directory garbage collection deletes manifest orphans" {
     try posting_segment.testDirectoryGarbageCollectionDeletesManifestOrphans();
+}
+
+test "posting segment directory temporary garbage collection deletes only known temps" {
+    try posting_segment.testDirectoryTemporaryGarbageCollectionDeletesOnlyKnownTemps();
 }
 
 test "posting segment lazy directory store reads only candidate segments" {

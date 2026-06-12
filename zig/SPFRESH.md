@@ -153,11 +153,13 @@ Current status:
   unreferenced orphans. A manifest-aware
   directory GC pass can then scan the `postings/` directory and delete only
   canonical `.afps` segment files that are absent from the current manifest,
-  while ignoring manifest files, temp files, and non-segment entries. The
-  segment layer also has a manifest-only lazy directory store: it can reopen by
-  decoding the manifest without reading every segment file, then read and
-  validate only manifest entries whose posting range can contain the requested
-  posting. Segment
+  while ignoring manifest files, temp files, and non-segment entries. A separate
+  recovery cleanup pass removes only known temp artifacts from interrupted
+  atomic writes (`*.afps.tmp` segment files and `manifest.afpm.tmp`) while
+  leaving unknown temp names alone. The segment layer also has a manifest-only
+  lazy directory store: it can reopen by decoding the manifest without reading
+  every segment file, then read and validate only manifest entries whose posting
+  range can contain the requested posting. Segment
   writers now also have typed helpers for appending posting-base,
   posting-delta batch, and centroid-directory records, and eager/lazy snapshots
   can materialize the authoritative member view directly from segment-backed
