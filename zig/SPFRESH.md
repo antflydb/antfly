@@ -184,7 +184,11 @@ Current status:
   caps and flush them through the existing atomic segment+manifest commit path,
   including coalescing individual posting delta records into one encoded
   delta-tail value per posting, which gives the future runtime backend an
-  explicit micro-batch append primitive. A directory maintenance step now
+  explicit micro-batch append primitive. A runtime-facing directory store
+  adapter now owns the lazy manifest snapshot plus the bounded batch writer,
+  making flushed base/delta/centroid appends visible through refreshed lazy
+  snapshots and refreshing again after bounded directory maintenance. A
+  directory maintenance step now
   composes temp cleanup, manifest-only compaction planning, selected segment
   compaction, and orphan collection into one bounded stats-returning call for
   future background maintenance wiring. Runtime

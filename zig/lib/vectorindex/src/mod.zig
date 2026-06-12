@@ -103,6 +103,8 @@ pub const PostingSegmentCommitResult = posting_segment.SegmentCommitResult;
 pub const PostingSegmentDirectoryBatchWriterOptions = posting_segment.DirectoryBatchWriterOptions;
 pub const PostingSegmentDirectoryBatchWriterStats = posting_segment.DirectoryBatchWriterStats;
 pub const PostingSegmentDirectoryBatchWriter = posting_segment.DirectoryBatchWriter;
+pub const PostingSegmentRuntimeDirectoryStoreOptions = posting_segment.RuntimeDirectoryStoreOptions;
+pub const PostingSegmentRuntimeDirectoryStore = posting_segment.RuntimeDirectoryStore;
 pub const PostingSegmentDirectoryCompactionStats = posting_segment.DirectoryCompactionStats;
 pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCompactionResult;
 pub const PostingSegmentDirectoryCompactionPlanOptions = posting_segment.DirectoryCompactionPlanOptions;
@@ -251,6 +253,10 @@ test "posting segment directory commit appends manifest segments" {
 
 test "posting segment directory batch writer flushes bounded segments" {
     try posting_segment.testDirectoryBatchWriterFlushesBoundedSegments();
+}
+
+test "posting segment runtime directory store refreshes snapshots" {
+    try posting_segment.testRuntimeDirectoryStoreRefreshesSnapshots();
 }
 
 test "posting segment directory compaction replaces manifest segments" {

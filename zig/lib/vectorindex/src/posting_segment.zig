@@ -403,6 +403,153 @@ pub const DirectoryBatchWriterStats = struct {
     next_segment_id: u64 = 0,
 };
 
+pub const RuntimeDirectoryStoreOptions = struct {
+    manifest_path: []const u8 = default_manifest_path,
+    max_manifest_bytes: usize = 64 * 1024 * 1024,
+    max_segment_bytes: usize = 1024 * 1024 * 1024,
+    initial_segment_id: u64 = 1,
+    max_pending_entries: usize = 1024,
+    max_pending_value_bytes: usize = 4 * 1024 * 1024,
+    max_pending_delta_records: usize = 4096,
+    compaction_plan: DirectoryCompactionPlanOptions = .{},
+    compact_on_maintenance: bool = true,
+    collect_orphan_segments_on_maintenance: bool = true,
+    collect_temporary_files_on_maintenance: bool = true,
+
+    pub fn openOptions(self: RuntimeDirectoryStoreOptions) OpenStoreOptions {
+        return .{
+            .manifest_path = self.manifest_path,
+            .max_manifest_bytes = self.max_manifest_bytes,
+            .max_segment_bytes = self.max_segment_bytes,
+        };
+    }
+
+    pub fn commitOptions(self: RuntimeDirectoryStoreOptions) CommitOptions {
+        return .{
+            .manifest_path = self.manifest_path,
+            .max_manifest_bytes = self.max_manifest_bytes,
+            .max_segment_bytes = self.max_segment_bytes,
+            .initial_segment_id = self.initial_segment_id,
+        };
+    }
+
+    pub fn batchOptions(self: RuntimeDirectoryStoreOptions) DirectoryBatchWriterOptions {
+        return .{
+            .commit = self.commitOptions(),
+            .max_pending_entries = self.max_pending_entries,
+            .max_pending_value_bytes = self.max_pending_value_bytes,
+            .max_pending_delta_records = self.max_pending_delta_records,
+        };
+    }
+
+    pub fn maintenanceOptions(self: RuntimeDirectoryStoreOptions) DirectoryMaintenanceOptions {
+        return .{
+            .commit = self.commitOptions(),
+            .plan = self.compaction_plan,
+            .compact = self.compact_on_maintenance,
+            .collect_orphan_segments = self.collect_orphan_segments_on_maintenance,
+            .collect_temporary_files = self.collect_temporary_files_on_maintenance,
+        };
+    }
+};
+
+pub const RuntimeDirectoryStore = struct {
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: RuntimeDirectoryStoreOptions,
+    lazy: LazyDirectoryStore,
+    batch: DirectoryBatchWriter,
+
+    pub fn openAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: RuntimeDirectoryStoreOptions) !RuntimeDirectoryStore {
+        var manifest = try readManifestForCommitAlloc(alloc, io, dir, options.commitOptions());
+        errdefer manifest.deinit(alloc);
+        return .{
+            .alloc = alloc,
+            .io = io,
+            .dir = dir,
+            .options = options,
+            .lazy = .{
+                .manifest = manifest,
+                .io = io,
+                .dir = dir,
+                .options = options.openOptions(),
+            },
+            .batch = DirectoryBatchWriter.init(alloc, io, dir, options.batchOptions()),
+        };
+    }
+
+    pub fn deinit(self: *RuntimeDirectoryStore) void {
+        self.batch.deinit();
+        self.lazy.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn snapshot(self: *const RuntimeDirectoryStore) LazyDirectorySnapshot {
+        return self.lazy.snapshot();
+    }
+
+    pub fn pendingEntries(self: RuntimeDirectoryStore) usize {
+        return self.batch.pendingEntries();
+    }
+
+    pub fn pendingDeltaRecords(self: RuntimeDirectoryStore) usize {
+        return self.batch.pendingDeltaRecords();
+    }
+
+    pub fn batchStats(self: RuntimeDirectoryStore) DirectoryBatchWriterStats {
+        return self.batch.stats;
+    }
+
+    pub fn appendBase(self: *RuntimeDirectoryStore, posting_id: PostingId, value: []const u8) !void {
+        try self.batch.appendBase(posting_id, value);
+    }
+
+    pub fn appendPostingBase(self: *RuntimeDirectoryStore, base: posting.PostingBase) !void {
+        try self.batch.appendPostingBase(base);
+    }
+
+    pub fn appendCentroidDirectory(self: *RuntimeDirectoryStore, posting_id: PostingId, value: []const u8) !void {
+        try self.batch.appendCentroidDirectory(posting_id, value);
+    }
+
+    pub fn appendCentroidDirectoryRecord(self: *RuntimeDirectoryStore, record: posting.CentroidDirectoryRecord) !void {
+        try self.batch.appendCentroidDirectoryRecord(record);
+    }
+
+    pub fn appendDelta(self: *RuntimeDirectoryStore, posting_id: PostingId, sequence: u64, value: []const u8) !void {
+        try self.batch.appendDelta(posting_id, sequence, value);
+    }
+
+    pub fn appendPostingDeltaRecords(self: *RuntimeDirectoryStore, posting_id: PostingId, records: []const posting.PostingDeltaRecord) !void {
+        try self.batch.appendPostingDeltaRecords(posting_id, records);
+    }
+
+    pub fn appendDeltaRecord(self: *RuntimeDirectoryStore, posting_id: PostingId, record: posting.PostingDeltaRecord) !void {
+        try self.batch.appendDeltaRecord(posting_id, record);
+    }
+
+    pub fn flush(self: *RuntimeDirectoryStore) !?SegmentCommitStats {
+        const result = try self.batch.flush();
+        if (result != null) try self.reloadManifest();
+        return result;
+    }
+
+    pub fn maintain(self: *RuntimeDirectoryStore) !DirectoryMaintenanceStats {
+        _ = try self.flush();
+        const stats = try maintainDirectoryStoreAlloc(self.alloc, self.io, self.dir, self.options.maintenanceOptions());
+        try self.reloadManifest();
+        return stats;
+    }
+
+    pub fn reloadManifest(self: *RuntimeDirectoryStore) !void {
+        var manifest = try readManifestForCommitAlloc(self.alloc, self.io, self.dir, self.options.commitOptions());
+        errdefer manifest.deinit(self.alloc);
+        self.lazy.manifest.deinit(self.alloc);
+        self.lazy.manifest = manifest;
+    }
+};
+
 pub const Catalog = struct {
     segments: []const SegmentBlob,
 
@@ -3576,6 +3723,80 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
     try std.testing.expectEqual(@as(u64, 3), loaded_centroid.payload_version);
 }
 
+pub fn testRuntimeDirectoryStoreRefreshesSnapshots() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try RuntimeDirectoryStore.openAlloc(alloc, std.testing.io, tmp.dir, .{
+        .max_pending_entries = 64,
+        .max_pending_value_bytes = 64 * 1024,
+        .max_pending_delta_records = 64,
+        .compaction_plan = .{
+            .min_input_segments = 2,
+            .max_input_segments = 2,
+        },
+    });
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), store.snapshot().manifest.segments.len);
+    try std.testing.expectEqual(@as(?posting.PostingBaseHeader, null), try store.snapshot().loadBaseHeader(alloc, 7));
+
+    try store.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), store.pendingEntries());
+    try std.testing.expectEqual(@as(?posting.PostingBaseHeader, null), try store.snapshot().loadBaseHeader(alloc, 7));
+
+    const first_flush = (try store.flush()).?;
+    try std.testing.expectEqual(@as(u64, 1), first_flush.segment_id);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().manifest.segments.len);
+    const base_header = (try store.snapshot().loadBaseHeader(alloc, 7)).?;
+    try std.testing.expectEqual(@as(u64, 1), base_header.generation);
+    try std.testing.expectEqual(@as(u32, 2), base_header.member_count);
+
+    try store.appendDeltaRecord(7, .{
+        .sequence = (@as(u64, 2) << 32) | 1,
+        .op = .insert,
+        .vector_id = 30,
+    });
+    try store.appendCentroidDirectoryRecord(.{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 3,
+        .payload_version = 4,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 3,
+        .bounds_radius = 5.0,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+
+    const second_flush = (try store.flush()).?;
+    try std.testing.expectEqual(@as(u64, 2), second_flush.segment_id);
+    try std.testing.expectEqual(@as(usize, 2), store.snapshot().manifest.segments.len);
+    const members_before_maintenance = (try store.snapshot().materializeMembers(alloc, 7)).?;
+    defer alloc.free(members_before_maintenance);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, members_before_maintenance);
+    var centroid_before_maintenance = (try store.snapshot().loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer centroid_before_maintenance.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), centroid_before_maintenance.mutation_version);
+
+    const maintenance = try store.maintain();
+    try std.testing.expect(maintenance.compacted);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().manifest.segments.len);
+    try std.testing.expectEqual(@as(usize, 2), maintenance.garbage.deleted_segment_files);
+
+    const members_after_maintenance = (try store.snapshot().materializeMembers(alloc, 7)).?;
+    defer alloc.free(members_after_maintenance);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, members_after_maintenance);
+    try std.testing.expectEqual(@as(usize, 0), store.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 0), store.pendingDeltaRecords());
+}
+
 pub fn testDirectoryCompactionReplacesManifestSegments() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4488,6 +4709,10 @@ test "posting segment directory commit appends manifest segments" {
 
 test "posting segment directory batch writer flushes bounded segments" {
     try testDirectoryBatchWriterFlushesBoundedSegments();
+}
+
+test "posting segment runtime directory store refreshes snapshots" {
+    try testRuntimeDirectoryStoreRefreshesSnapshots();
 }
 
 test "posting segment directory compaction replaces manifest segments" {
