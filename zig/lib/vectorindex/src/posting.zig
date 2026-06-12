@@ -90,6 +90,8 @@ pub const PostingDeltaTailStats = struct {
     records: usize = 0,
     records_after_generation: usize = 0,
     tombstones_after_generation: usize = 0,
+    encoded_key_bytes: usize = 0,
+    encoded_value_bytes: usize = 0,
 };
 
 pub const FoldDeltaTailResult = struct {
@@ -116,6 +118,7 @@ pub const FoldDeltaTailOptions = struct {
     min_delta_records: usize = 1,
     min_tombstone_records: usize = 0,
     min_delta_to_base_ratio_bps: u32 = 0,
+    min_delta_value_bytes: usize = 0,
     max_materialized_members: usize = std.math.maxInt(usize),
     max_materialized_bytes: usize = std.math.maxInt(usize),
 };
@@ -1027,7 +1030,10 @@ pub const PostingFormat = struct {
 
     pub fn deltaTailStatsAfterGeneration(data: []const u8, base_generation: u64) !PostingDeltaTailStats {
         var iterator = try DeltaTailIterator.init(data);
-        var stats = PostingDeltaTailStats{ .records = iterator.recordCount() };
+        var stats = PostingDeltaTailStats{
+            .records = iterator.recordCount(),
+            .encoded_value_bytes = data.len,
+        };
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
@@ -1057,7 +1063,10 @@ pub const PostingFormat = struct {
     ) !PostingDeltaTailStats {
         var iterator = try DeltaTailIterator.init(data);
         try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
-        var stats = PostingDeltaTailStats{ .records = iterator.recordCount() };
+        var stats = PostingDeltaTailStats{
+            .records = iterator.recordCount(),
+            .encoded_value_bytes = data.len,
+        };
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
@@ -1074,7 +1083,10 @@ pub const PostingFormat = struct {
         base_generation: u64,
     ) !PostingDeltaTailStats {
         var iterator = try DeltaTailIterator.init(data);
-        var stats = PostingDeltaTailStats{ .records = iterator.recordCount() };
+        var stats = PostingDeltaTailStats{
+            .records = iterator.recordCount(),
+            .encoded_value_bytes = data.len,
+        };
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
@@ -2004,6 +2016,8 @@ pub const PostingStore = struct {
             out.records += stats.records;
             out.records_after_generation += stats.records_after_generation;
             out.tombstones_after_generation += stats.tombstones_after_generation;
+            out.encoded_key_bytes += entry.key.len;
+            out.encoded_value_bytes += entry.value.len;
             maybe_entry = try cursor.next();
         }
         return out;
@@ -2040,6 +2054,8 @@ pub const PostingStore = struct {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             out.stats.records += iterator.recordCount();
+            out.stats.encoded_key_bytes += entry.key.len;
+            out.stats.encoded_value_bytes += entry.value.len;
             while (try iterator.next()) |record| {
                 if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 out.stats.records_after_generation += 1;
@@ -2570,6 +2586,7 @@ pub const PostingStore = struct {
         if (stats.records_after_generation >= options.min_delta_records) return true;
 
         if (options.min_tombstone_records != 0 and stats.tombstones_after_generation >= options.min_tombstone_records) return true;
+        if (options.min_delta_value_bytes != 0 and stats.encoded_value_bytes >= options.min_delta_value_bytes) return true;
         if (options.min_delta_to_base_ratio_bps != 0) {
             const denominator = @max(base_member_count, @as(usize, 1));
             const ratio_bps = (stats.records_after_generation * 10_000) / denominator;
@@ -4356,6 +4373,11 @@ test "posting store persists base records and appends deltas through namespace h
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
     try std.testing.expectEqual(PostingDeltaOp.tombstone, decoded[0].op);
     try std.testing.expectEqual(@as(VectorId, 100), decoded[0].vector_id);
+    const delta_stats = try PostingStore.deltaTailStats(&index, &txn, 9, std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 1), delta_stats.records);
+    try std.testing.expectEqual(@as(usize, 0), delta_stats.records_after_generation);
+    try std.testing.expectEqual(index.delta_entries.items[0].key.len, delta_stats.encoded_key_bytes);
+    try std.testing.expectEqual(index.delta_entries.items[0].value.len, delta_stats.encoded_value_bytes);
 }
 
 test "posting store delete artifacts removes base centroid and delta tail families" {
@@ -4762,6 +4784,49 @@ test "posting store skips delta fold when materialized member cap would be excee
     const deltas_after_skip = try PostingStore.loadDeltaTail(&index, &txn, 9);
     defer alloc.free(deltas_after_skip);
     try std.testing.expectEqual(@as(usize, 1), deltas_after_skip.len);
+}
+
+test "posting store can fold delta tail based on encoded value bytes" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{ .alloc = alloc };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    const members = [_]VectorId{ 100, 200, 300 };
+    try PostingStore.saveBase(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = members[0..],
+    });
+    try PostingStore.appendDelta(&index, &txn, 9, .{
+        .sequence = (@as(u64, 5) << 32) | 1,
+        .op = .insert,
+        .vector_id = 400,
+    });
+
+    const skipped = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
+        .min_delta_records = 99,
+        .min_tombstone_records = 99,
+        .min_delta_to_base_ratio_bps = 20_000,
+    });
+    try std.testing.expect(skipped.skipped);
+
+    const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
+        .min_delta_records = 99,
+        .min_tombstone_records = 99,
+        .min_delta_to_base_ratio_bps = 20_000,
+        .min_delta_value_bytes = 1,
+    });
+    try std.testing.expect(!folded.skipped);
+    try std.testing.expectEqual(@as(usize, 1), folded.delta_records);
+    try std.testing.expectEqual(@as(u64, 5), folded.next_generation);
+
+    var base_after_fold = try PostingStore.loadBase(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer base_after_fold.deinit(alloc);
+    try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 100, 200, 300, 400 }, base_after_fold.members);
+    const deltas_after_fold = try PostingStore.loadDeltaTail(&index, &txn, 9);
+    defer alloc.free(deltas_after_fold);
+    try std.testing.expectEqual(@as(usize, 0), deltas_after_fold.len);
 }
 
 test "posting store indexed delta fold compacts tombstones and repeated inserts" {
