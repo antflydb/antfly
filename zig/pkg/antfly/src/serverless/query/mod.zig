@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const std = @import("std");
+
 pub const runtime = @import("runtime.zig");
 pub const materializer = @import("materializer.zig");
 pub const request = @import("request.zig");
@@ -121,4 +123,35 @@ test "serverless query module compiles" {
     _ = materializeDocumentsAlloc;
     _ = materializeDocumentsOverBaseAlloc;
     _ = freeMaterializedDocuments;
+
+    const alloc = std.testing.allocator;
+    const sources = @import("../search_sources.zig").defaultPublishedSearchSources();
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"embeddings\":{\"serverless_chunk\":[1.0,0.0,0.0]},\"identity_read_generation\":7}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"embeddings\":{\"serverless_chunk\":[1.0,0.0,0.0]},\"allow_doc_identity_reassignment\":true}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"text\":\"alpha\",\"native_doc_id_constraints\":{\"include_doc_ids\":[\"doc:a\"]}}",
+        sources,
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphNeighborsPlanAlloc(
+        alloc,
+        "{\"doc_id\":\"doc:a\",\"identity_read_generation\":7}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphTraversePlanAlloc(
+        alloc,
+        "{\"start_doc_id\":\"doc:a\",\"allow_doc_identity_reassignment\":true}",
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphShortestPathPlanAlloc(
+        alloc,
+        "{\"start_doc_id\":\"doc:a\",\"end_doc_id\":\"doc:b\",\"native_doc_id_constraints\":{\"include_doc_ids\":[\"doc:a\"]}}",
+    ));
 }

@@ -1,4 +1,4 @@
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/shared/scraping.yaml
 package scraping
 
 import (

@@ -1,43 +1,19 @@
-import { Anty, Button, EmptyState } from "@antfly/design-system";
-import type { ReactNode } from "react";
+import { AntyEmptyState, Button } from "@antfly/design-system";
 
-interface AntyEmptyStateProps {
-  title: string;
-  description?: string;
-  action?: ReactNode;
-  className?: string;
-}
-
-export function AntyEmptyState({ title, description, action, className }: AntyEmptyStateProps) {
-  return (
-    <EmptyState
-      icon={
-        <div className="grid size-16 place-items-center">
-          <Anty
-            size={56}
-            expression="idle"
-            float
-            blink
-            showShadow={false}
-            showGlow
-            eyeStyle="alive"
-          />
-        </div>
-      }
-      title={title}
-      description={description}
-      action={action}
-      className={className}
-    />
-  );
-}
+export { AntyEmptyState };
 
 export function NoTablesState({ onCreate }: { onCreate?: () => void }) {
   return (
     <AntyEmptyState
       title="No tables yet"
       description="Create your first table to start indexing and searching your data."
-      action={onCreate ? <Button onClick={onCreate}>Create Table</Button> : undefined}
+      action={
+        onCreate ? (
+          <Button variant="brand" onClick={onCreate}>
+            Create Table
+          </Button>
+        ) : undefined
+      }
     />
   );
 }
@@ -59,7 +35,7 @@ export function NoModelsState() {
   return (
     <AntyEmptyState
       title="No models loaded"
-      description="Connect a Termite instance or load models to get started with this playground."
+      description="Connect an Antfly inference runtime or load models to get started with this playground."
     />
   );
 }

@@ -10,6 +10,7 @@ import type {
   AntflyConfig,
   BackupRequest,
   BatchRequest,
+  BatchResult,
   ChatAgentConfig,
   ChatAgentTurnResult,
   ChatMessage,
@@ -17,6 +18,10 @@ import type {
   CreateTableRequest,
   CreateUserRequest,
   IndexConfig,
+  LinearMergeRequest,
+  LinearMergeResult,
+  MultiBatchRequest,
+  MultiBatchResult,
   Permission,
   QueryBuilderRequest,
   QueryBuilderResult,
@@ -31,7 +36,12 @@ import type {
   ScanKeysRequest,
   TableSchema,
   User,
+  WriteOptions,
 } from "./types.js";
+
+export const DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20;
+export const DEFAULT_WRITE_MAX_RESPONSE_BYTES = 1 << 20;
+const MAX_ERROR_RESPONSE_BYTES = 1 << 20;
 
 type UserOperations = {
   getCurrentUser: () => Promise<CurrentUser | undefined>;
@@ -62,6 +72,106 @@ type UserSummary = {
 type SuccessMessage = {
   message?: string;
 };
+
+type ClusterTopology =
+  paths["/db/v1/cluster"]["get"]["responses"][200]["content"]["application/json"];
+
+function apiErrorMessage(error: unknown, fallback = "unknown error"): string {
+  if (!error) return fallback;
+  if (typeof error === "string") return error.trim() || fallback;
+  if (error && typeof error === "object") {
+    const fields = error as {
+      error?: unknown;
+      detail?: unknown;
+      message?: unknown;
+      title?: unknown;
+    };
+    for (const value of [fields.error, fields.detail, fields.message, fields.title]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return fallback;
+    }
+  }
+  return String(error);
+}
+
+function errorMessage(error: unknown): string {
+  return apiErrorMessage(error);
+}
+
+function normalizedWriteOptions(
+  options?: WriteOptions
+): Required<Pick<WriteOptions, "maxRequestBytes" | "maxResponseBytes">> &
+  Pick<WriteOptions, "signal"> {
+  return {
+    maxRequestBytes:
+      options?.maxRequestBytes && options.maxRequestBytes > 0
+        ? options.maxRequestBytes
+        : DEFAULT_WRITE_MAX_REQUEST_BYTES,
+    maxResponseBytes:
+      options?.maxResponseBytes && options.maxResponseBytes > 0
+        ? options.maxResponseBytes
+        : DEFAULT_WRITE_MAX_RESPONSE_BYTES,
+    signal: options?.signal,
+  };
+}
+
+function encodeBoundedJSON(value: unknown, maxBytes: number): string {
+  const encoded = JSON.stringify(value);
+  if (new TextEncoder().encode(encoded).byteLength > maxBytes) {
+    throw new Error(`encoded request exceeded ${maxBytes} bytes`);
+  }
+  return encoded;
+}
+
+async function readLimitedResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<{ text: string; truncated: boolean }> {
+  if (!response.body) {
+    return { text: await response.text(), truncated: false };
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const remaining = maxBytes - total;
+    if (remaining <= 0) {
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+    if (value.byteLength > remaining) {
+      chunks.push(value.slice(0, remaining));
+      total += remaining;
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+    chunks.push(value);
+    total += value.byteLength;
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(bytes), truncated };
+}
+
+function parseJSON<T>(text: string): T {
+  return JSON.parse(text) as T;
+}
 
 export class AntflyClient {
   private client: Client<paths>;
@@ -124,6 +234,71 @@ export class AntflyClient {
     });
   }
 
+  private requestHeaders(extra?: Record<string, string>): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.config.headers,
+      ...extra,
+    };
+
+    const authHeader = this.getAuthHeader();
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    }
+
+    return headers;
+  }
+
+  private url(path: string): string {
+    return `${normalizeBaseUrl(this.config.baseUrl)}${path}`;
+  }
+
+  private async postBoundedJSON<T>(
+    path: string,
+    body: unknown,
+    options: WriteOptions | undefined,
+    errorPrefix: string,
+    marshalErrorPrefix: string
+  ): Promise<{ data?: T; text: string }> {
+    const opts = normalizedWriteOptions(options);
+    let encodedBody: string;
+    try {
+      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes);
+    } catch (error) {
+      throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+    }
+
+    const response = await fetch(this.url(path), {
+      method: "POST",
+      headers: this.requestHeaders(),
+      body: encodedBody,
+      signal: opts.signal,
+    });
+
+    if (!response.ok) {
+      const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
+      let message = apiErrorMessage(text);
+      try {
+        message = apiErrorMessage(parseJSON<unknown>(text), message);
+      } catch {
+        // Non-JSON error bodies are reported as-is below.
+      }
+      if (truncated) {
+        message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
+      }
+      throw new Error(`${errorPrefix}: ${response.status} ${message}`);
+    }
+
+    const { text, truncated } = await readLimitedResponseText(response, opts.maxResponseBytes);
+    if (truncated) {
+      throw new Error(`${errorPrefix} response exceeded ${opts.maxResponseBytes} bytes`);
+    }
+    if (!text.trim()) {
+      return { text };
+    }
+    return { data: parseJSON<T>(text), text };
+  }
+
   /**
    * Update authentication credentials.
    * Accepts any auth type: basic (username/password), apiKey, or token.
@@ -144,8 +319,17 @@ export class AntflyClient {
    * Get cluster status
    */
   async getStatus() {
-    const { data, error } = await this.client.GET("/api/v1/status");
-    if (error) throw new Error(`Failed to get status: ${error.error}`);
+    const { data, error } = await this.client.GET("/db/v1/status");
+    if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    return data;
+  }
+
+  /**
+   * Get cluster topology and data placement status.
+   */
+  async getClusterStatus(): Promise<ClusterTopology | undefined> {
+    const { data, error } = await this.client.GET("/db/v1/cluster");
+    if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
 
@@ -153,19 +337,19 @@ export class AntflyClient {
    * Private helper for query requests to avoid code duplication
    */
   private async performQuery(
-    path: "/api/v1/query" | "/api/v1/tables/{tableName}/query",
+    path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     request: QueryRequest,
     tableName?: string
   ): Promise<QueryResponses | undefined> {
-    if (path === "/api/v1/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}/query", {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: request,
       });
       if (error) throw new Error(`Table query failed: ${error.error}`);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/api/v1/query", {
+      const { data, error } = await this.client.POST("/db/v1/query", {
         body: request,
       });
       if (error) throw new Error(`Query failed: ${error.error}`);
@@ -177,14 +361,14 @@ export class AntflyClient {
    * Private helper for multiquery requests to avoid code duplication
    */
   private async performMultiquery(
-    path: "/api/v1/query" | "/api/v1/tables/{tableName}/query",
+    path: "/db/v1/query" | "/db/v1/tables/{tableName}/query",
     requests: QueryRequest[],
     tableName?: string
   ): Promise<QueryResponses | undefined> {
     const ndjson = `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`;
 
-    if (path === "/api/v1/tables/{tableName}/query" && tableName) {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}/query", {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: ndjson,
         headers: {
@@ -194,7 +378,7 @@ export class AntflyClient {
       if (error) throw new Error(`Table multi-query failed: ${error.error}`);
       return data;
     } else {
-      const { data, error } = await this.client.POST("/api/v1/query", {
+      const { data, error } = await this.client.POST("/db/v1/query", {
         body: ndjson,
         headers: {
           "Content-Type": "application/x-ndjson",
@@ -209,7 +393,7 @@ export class AntflyClient {
    * Global query operations
    */
   async query(request: QueryRequest): Promise<QueryResult | undefined> {
-    const data = await this.performQuery("/api/v1/query", request);
+    const data = await this.performQuery("/db/v1/query", request);
     // The global query returns QueryResponses, extract the first result
     return data?.responses?.[0];
   }
@@ -218,7 +402,7 @@ export class AntflyClient {
    * Execute multiple queries in a single request
    */
   async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
-    return this.performMultiquery("/api/v1/query", requests);
+    return this.performMultiquery("/db/v1/query", requests);
   }
 
   /**
@@ -244,7 +428,7 @@ export class AntflyClient {
 
     const abortController = new AbortController();
     const response = await fetch(
-      `${normalizeBaseUrl(this.config.baseUrl)}/api/v1/agents/retrieval`,
+      `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
         headers,
@@ -513,12 +697,62 @@ export class AntflyClient {
    * @returns Promise with QueryBuilderResult containing the generated query, explanation, and confidence
    */
   async queryBuilderAgent(request: QueryBuilderRequest): Promise<QueryBuilderResult> {
-    const { data, error } = await this.client.POST("/api/v1/agents/query-builder", {
+    const { data, error } = await this.client.POST("/db/v1/agents/query-builder", {
       body: request,
     });
     if (error) throw new Error(`Query builder agent failed: ${error.error}`);
     // biome-ignore lint/style/noNonNullAssertion: data is guaranteed defined after error check
     return data! as unknown as QueryBuilderResult;
+  }
+
+  /**
+   * Perform a cross-table batch operation atomically.
+   */
+  async multiBatch(request: MultiBatchRequest): Promise<MultiBatchResult> {
+    return this.multiBatchWithOptions(request);
+  }
+
+  /**
+   * Perform a cross-table batch operation with request and response size bounds.
+   */
+  async multiBatchWithOptions(
+    request: MultiBatchRequest,
+    options?: WriteOptions
+  ): Promise<MultiBatchResult> {
+    const { data } = await this.postBoundedJSON<MultiBatchResult>(
+      "/db/v1/batch",
+      request,
+      options,
+      "Multi-batch operation failed",
+      "marshalling multi-batch request"
+    );
+    return data ?? {};
+  }
+
+  /**
+   * Perform a stateless linear merge against a table.
+   */
+  async linearMerge(tableName: string, request: LinearMergeRequest): Promise<LinearMergeResult> {
+    return this.linearMergeWithOptions(tableName, request);
+  }
+
+  /**
+   * Perform a stateless linear merge with request and response size bounds.
+   */
+  async linearMergeWithOptions(
+    tableName: string,
+    request: LinearMergeRequest,
+    options?: WriteOptions
+  ): Promise<LinearMergeResult> {
+    const { data } = await this.postBoundedJSON<LinearMergeResult>(
+      `/db/v1/tables/${encodeURIComponent(tableName)}/merge`,
+      request,
+      options,
+      "Linear merge operation failed",
+      "marshalling linear merge request"
+    );
+    if (!data) throw new Error("Linear merge operation failed: unexpected empty response");
+    return data;
   }
 
   /**
@@ -529,7 +763,7 @@ export class AntflyClient {
      * List all tables
      */
     list: async (params?: { prefix?: string; pattern?: string }) => {
-      const { data, error } = await this.client.GET("/api/v1/tables", {
+      const { data, error } = await this.client.GET("/db/v1/tables", {
         params: params ? { query: params } : undefined,
       });
       if (error) throw new Error(`Failed to list tables: ${error.error}`);
@@ -540,7 +774,7 @@ export class AntflyClient {
      * Get table details and status
      */
     get: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/api/v1/tables/{tableName}", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to get table: ${error.error}`);
@@ -551,11 +785,13 @@ export class AntflyClient {
      * Create a new table
      */
     create: async (tableName: string, config: CreateTableRequest = {}) => {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
         body: config,
       });
-      if (error) throw new Error(`Failed to create table: ${error.error}`);
+      if (error) {
+        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+      }
       return data;
     },
 
@@ -563,7 +799,7 @@ export class AntflyClient {
      * Drop a table
      */
     drop: async (tableName: string) => {
-      const { error } = await this.client.DELETE("/api/v1/tables/{tableName}", {
+      const { error } = await this.client.DELETE("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to drop table: ${error.error}`);
@@ -574,7 +810,7 @@ export class AntflyClient {
      * Update schema for a table
      */
     updateSchema: async (tableName: string, config: TableSchema) => {
-      const { data, error } = await this.client.PUT("/api/v1/tables/{tableName}/schema", {
+      const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
       });
@@ -586,34 +822,52 @@ export class AntflyClient {
      * Query a specific table
      */
     query: async (tableName: string, request: QueryRequest) => {
-      return this.performQuery("/api/v1/tables/{tableName}/query", request, tableName);
+      return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName);
     },
 
     /**
      * Execute multiple queries on a specific table
      */
     multiquery: async (tableName: string, requests: QueryRequest[]) => {
-      return this.performMultiquery("/api/v1/tables/{tableName}/query", requests, tableName);
+      return this.performMultiquery("/db/v1/tables/{tableName}/query", requests, tableName);
     },
 
     /**
      * Perform batch operations on a table
      */
-    batch: async (tableName: string, request: BatchRequest) => {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}/batch", {
-        params: { path: { tableName } },
-        // @ts-expect-error Our BatchRequest type allows any object shape for inserts
-        body: request,
-      });
-      if (error) throw new Error(`Batch operation failed: ${error.error}`);
-      return data;
+    batch: async (tableName: string, request: BatchRequest): Promise<BatchResult> => {
+      return this.tables.batchWithOptions(tableName, request);
+    },
+
+    /**
+     * Perform batch operations on a table with request and response size bounds.
+     */
+    batchWithOptions: async (
+      tableName: string,
+      request: BatchRequest,
+      options?: WriteOptions
+    ): Promise<BatchResult> => {
+      const { data } = await this.postBoundedJSON<BatchResult>(
+        `/db/v1/tables/${encodeURIComponent(tableName)}/batch`,
+        request,
+        options,
+        "Batch operation failed",
+        "marshalling batch request"
+      );
+      return (
+        data ?? {
+          inserted: Object.keys(request.inserts ?? {}).length,
+          deleted: request.deletes?.length ?? 0,
+          transformed: request.transforms?.length ?? 0,
+        }
+      );
     },
 
     /**
      * Backup a table
      */
     backup: async (tableName: string, request: BackupRequest) => {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}/backup", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/backup", {
         params: { path: { tableName } },
         body: request,
       });
@@ -625,7 +879,7 @@ export class AntflyClient {
      * Restore a table from backup
      */
     restore: async (tableName: string, request: RestoreRequest) => {
-      const { data, error } = await this.client.POST("/api/v1/tables/{tableName}/restore", {
+      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
         params: { path: { tableName } },
         body: request,
       });
@@ -641,7 +895,7 @@ export class AntflyClient {
      * @param options.fields - Comma-separated list of fields to include (e.g., "title,author,metadata.tags")
      */
     lookup: async (tableName: string, key: string, options?: { fields?: string }) => {
-      const { data, error } = await this.client.GET("/api/v1/tables/{tableName}/lookup/{key}", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/documents/{key}", {
         params: {
           path: { tableName, key },
           query: options?.fields ? { fields: options.fields } : undefined,
@@ -680,7 +934,7 @@ export class AntflyClient {
         Object.assign(headers, config.headers);
 
         const response = await fetch(
-          `${normalizeBaseUrl(config.baseUrl)}/api/v1/tables/${tableName}/lookup`,
+          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/lookup`,
           {
             method: "POST",
             headers,
@@ -752,7 +1006,7 @@ export class AntflyClient {
      * List all indexes for a table
      */
     list: async (tableName: string) => {
-      const { data, error } = await this.client.GET("/api/v1/tables/{tableName}/indexes", {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/indexes", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to list indexes: ${error.error}`);
@@ -764,7 +1018,7 @@ export class AntflyClient {
      */
     get: async (tableName: string, indexName: string) => {
       const { data, error } = await this.client.GET(
-        "/api/v1/tables/{tableName}/indexes/{indexName}",
+        "/db/v1/tables/{tableName}/indexes/{indexName}",
         {
           params: { path: { tableName, indexName } },
         }
@@ -777,7 +1031,7 @@ export class AntflyClient {
      * Create a new index
      */
     create: async (tableName: string, config: IndexConfig) => {
-      const { error } = await this.client.POST("/api/v1/tables/{tableName}/indexes/{indexName}", {
+      const { error } = await this.client.POST("/db/v1/tables/{tableName}/indexes/{indexName}", {
         params: { path: { tableName, indexName: config.name } },
         body: config,
       });
@@ -789,7 +1043,7 @@ export class AntflyClient {
      * Drop an index
      */
     drop: async (tableName: string, indexName: string) => {
-      const { error } = await this.client.DELETE("/api/v1/tables/{tableName}/indexes/{indexName}", {
+      const { error } = await this.client.DELETE("/db/v1/tables/{tableName}/indexes/{indexName}", {
         params: { path: { tableName, indexName } },
       });
       if (error) throw new Error(`Failed to drop index: ${error.error}`);
@@ -912,7 +1166,7 @@ export class AntflyClient {
   async evaluate(
     request: import("./types.js").EvalRequest
   ): Promise<import("./types.js").EvalResult> {
-    const { data, error } = await this.client.POST("/api/v1/eval", {
+    const { data, error } = await this.client.POST("/db/v1/eval", {
       body: request,
     });
     if (error) throw new Error(`Evaluation failed: ${error.error}`);
@@ -931,5 +1185,7 @@ export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl
     .trim()
     .replace(/\/$/, "")
-    .replace(/\/api\/v1$/, "");
+    .replace(/\/db\/v1$/, "")
+    .replace(/\/auth\/v1$/, "")
+    .replace(/\/ai\/v1$/, "");
 }

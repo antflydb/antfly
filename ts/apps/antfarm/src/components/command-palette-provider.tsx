@@ -9,7 +9,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@antfly/design-system";
-import { TermiteClient } from "@antfly/sdk";
+import { InferenceClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
   ClipboardCheck,
@@ -67,13 +67,13 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const navigate = useNavigate();
 
   const { theme, setTheme } = useTheme();
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
 
-  // Create TermiteClient for semantic search
-  const termiteClient = React.useMemo(
-    () => new TermiteClient({ baseUrl: termiteApiUrl }),
-    [termiteApiUrl]
+  // Create InferenceClient for semantic search
+  const inferenceClient = React.useMemo(
+    () => new InferenceClient({ baseUrl: inferenceApiUrl }),
+    [inferenceApiUrl]
   );
 
   const isCommandAvailable = React.useCallback(
@@ -111,7 +111,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     const commands = [
       { icon: Table, label: "Tables", href: "/" },
       { icon: Plus, label: "Create Table", href: "/create" },
-      { icon: Library, label: "Models", href: "/models" },
+      { icon: Library, label: "Models & Runtime", href: "/inference/models" },
     ];
     if (showLocalAdminRoutes) {
       commands.push({ icon: Users, label: "Users", href: "/users" });
@@ -121,12 +121,17 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
   const playgroundCommands = React.useMemo(
     () => [
-      { icon: Scissors, label: "Chunking Playground", href: "/playground/chunking" },
-      { icon: Tag, label: "Recognize Playground", href: "/playground/recognize" },
-      { icon: Repeat2, label: "Rewriting Playground", href: "/playground/rewrite" },
-      { icon: ArrowUpDown, label: "Reranking Playground", href: "/playground/rerank" },
-      { icon: Network, label: "Knowledge Graph", href: "/playground/kg" },
-      { icon: ClipboardCheck, label: "Evals", href: "/playground/evals" },
+      { icon: Scissors, label: "Data Chunking Playground", href: "/data/playground/chunk" },
+      { icon: ClipboardCheck, label: "Data Evals", href: "/data/playground/evals" },
+      {
+        icon: Scissors,
+        label: "Antfly Inference Chunking Playground",
+        href: "/inference/playground/chunk",
+      },
+      { icon: Tag, label: "Extraction Playground", href: "/inference/playground/extract" },
+      { icon: Repeat2, label: "Rewriting Playground", href: "/inference/playground/rewrite" },
+      { icon: ArrowUpDown, label: "Reranking Playground", href: "/inference/playground/rerank" },
+      { icon: Network, label: "Knowledge Graph", href: "/inference/playground/kg" },
     ],
     []
   );
@@ -163,7 +168,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     setIsSearching(true);
     const timer = setTimeout(async () => {
       try {
-        const results = await semanticSearch(searchValue, termiteClient);
+        const results = await semanticSearch(searchValue, inferenceClient);
         const filteredResults = results.filter((result) => isCommandAvailable(result.item));
         setSemanticResults(filteredResults);
       } catch (e) {
@@ -174,7 +179,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [searchValue, hasStringMatches, termiteClient, isCommandAvailable]);
+  }, [searchValue, hasStringMatches, inferenceClient, isCommandAvailable]);
 
   // Reset search state when dialog closes
   React.useEffect(() => {

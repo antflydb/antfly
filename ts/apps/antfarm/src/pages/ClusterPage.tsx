@@ -8,7 +8,6 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
-  GraphPaperBg,
   Select,
   SelectContent,
   SelectItem,
@@ -202,7 +201,7 @@ function ShardBlock({ shard, storeId }: { shard: ShardStatus; storeId: string })
         <button
           type="button"
           className={cn(
-            "inline-flex items-center justify-center min-w-[28px] h-6 px-1.5 rounded text-[10px] font-mono font-medium border cursor-default transition-colors",
+            "inline-flex items-center justify-center min-w-[28px] h-6 px-1.5 rounded-none text-[10px] font-mono font-medium border cursor-default transition-colors",
             roleStyles[role]
           )}
         >
@@ -258,9 +257,7 @@ function NodeCard({ store, shardCount }: { store: StoreInfo; shardCount: number 
         <div className="text-[11px] text-muted-foreground font-mono truncate">{apiHost}</div>
         <div className="flex items-center justify-between text-[11px]">
           <span className="text-muted-foreground">{timeAgo(store.last_seen)}</span>
-          <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-            {shardCount} shards
-          </Badge>
+          <Badge className="text-[10px] px-1.5 py-0">{shardCount} shards</Badge>
         </div>
       </CardContent>
     </Card>
@@ -317,7 +314,7 @@ function ShardLegend() {
     <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
       {items.map((item) => (
         <div key={item.label} className="flex items-center gap-1.5">
-          <span className={cn("inline-block w-4 h-3 rounded border", item.className)} />
+          <span className={cn("inline-block w-4 h-3 rounded-none border", item.className)} />
           <span>{item.label}</span>
         </div>
       ))}
@@ -362,7 +359,6 @@ const ClusterPage: React.FC = () => {
     <DashboardPage>
       {/* Section A: Cluster Health Header */}
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
         <DashboardPageHeader>
           <div>
             <div className="flex items-center gap-3">
@@ -370,7 +366,7 @@ const ClusterPage: React.FC = () => {
               <HealthBadge health={cluster.health} />
             </div>
             <DashboardPageDescription>
-              Monitor node health, shard placement, and table distribution.
+              Monitor data node health, range placement, and table distribution.
             </DashboardPageDescription>
           </div>
           <DashboardPageActions>
@@ -403,9 +399,13 @@ const ClusterPage: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label="Nodes" value={storeList.length} icon={<Network className="w-4 h-4" />} />
+        <StatCard
+          label="Data Nodes"
+          value={storeList.length}
+          icon={<Network className="w-4 h-4" />}
+        />
         <StatCard label="Tables" value={uniqueTables} icon={<Database className="w-4 h-4" />} />
-        <StatCard label="Shards" value={totalShards} />
+        <StatCard label="Ranges" value={totalShards} />
         {totalDisk > 0 && <StatCard label="Disk" value={formatBytes(totalDisk)} />}
       </div>
 
@@ -440,11 +440,11 @@ const ClusterPage: React.FC = () => {
       {tableRows.length > 0 ? (
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-medium text-muted-foreground">Shard Distribution</h3>
+            <h3 className="text-sm font-medium text-muted-foreground">Range Distribution</h3>
             <ShardLegend />
           </div>
 
-          <div className="border rounded-lg overflow-x-auto">
+          <div className="border rounded-none overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b bg-muted/30">
@@ -510,7 +510,7 @@ const ClusterPage: React.FC = () => {
       ) : (
         !cluster.isLoading &&
         storeList.length > 0 && (
-          <div className="flex flex-col items-center justify-center py-16 gap-3 border rounded-lg bg-muted/20">
+          <div className="flex flex-col items-center justify-center py-16 gap-3 border rounded-none bg-muted/20">
             <Database className="w-8 h-8 text-muted-foreground" />
             <p className="text-muted-foreground">No tables yet</p>
             <Button variant="outline" size="sm" asChild>

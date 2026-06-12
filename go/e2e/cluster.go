@@ -157,7 +157,7 @@ func NewTestCluster(t *testing.T, ctx context.Context, cfg TestClusterConfig) *T
 	time.Sleep(500 * time.Millisecond)
 
 	// Create client
-	apiURL := cluster.MetadataNode.APIURL + "/api/v1"
+	apiURL := cluster.MetadataNode.APIURL + "/db/v1"
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
 	client, err := antfly.NewAntflyClient(apiURL, httpClient)
 	if err != nil {
@@ -534,7 +534,7 @@ func (c *TestCluster) WaitForStoresRegistered(ctx context.Context, expectedStore
 			}
 
 			// Call the status endpoint to check registered stores
-			resp, err := http.Get(c.MetadataNode.APIURL + "/api/v1/status")
+			resp, err := http.Get(c.MetadataNode.APIURL + "/db/v1/status")
 			if err != nil {
 				c.T.Logf("  [Poll %d] Error getting status: %v", pollCount, err)
 				continue
@@ -602,7 +602,7 @@ func (c *TestCluster) WaitForShardsReady(ctx context.Context, tableName string, 
 			}
 
 			// Shards exist, now check cluster health to ensure Raft leaders are elected
-			resp, err := http.Get(c.MetadataNode.APIURL + "/api/v1/status")
+			resp, err := http.Get(c.MetadataNode.APIURL + "/db/v1/status")
 			if err != nil {
 				c.T.Logf("  [Poll %d] Error getting cluster status: %v", pollCount, err)
 				continue
@@ -669,7 +669,7 @@ func (c *TestCluster) WaitForShardCount(ctx context.Context, tableName string, m
 }
 
 func (c *TestCluster) getClusterStatus(ctx context.Context) (*clusterStatusResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.MetadataNode.APIURL+"/api/v1/status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.MetadataNode.APIURL+"/db/v1/status", nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating cluster status request: %w", err)
 	}

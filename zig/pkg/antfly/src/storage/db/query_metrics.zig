@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 
 const metric_name = "antfly_indexes_query_duration_seconds";
 const metric_help = "Index query latency in seconds.";
@@ -96,7 +97,7 @@ const MetricsMutex = struct {
     state: std.atomic.Mutex = .unlocked,
 
     fn lock(self: *@This()) void {
-        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.state);
     }
 
     fn unlock(self: *@This()) void {

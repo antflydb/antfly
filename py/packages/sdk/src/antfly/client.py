@@ -1,7 +1,7 @@
 """Main client interface for Antfly SDK."""
 
 import base64
-from typing import Any, Optional, cast
+from typing import Any, cast
 from urllib.parse import quote
 
 from httpx import Timeout
@@ -25,11 +25,15 @@ from .exceptions import AntflyException
 
 
 def normalize_base_url(base_url: str) -> str:
-    """Return the Antfly API base URL for local or CloudAF endpoints."""
+    """Return the Antfly server root URL for local or CloudAF endpoints."""
     trimmed = base_url.rstrip("/")
-    if trimmed.endswith("/api/v1"):
-        return trimmed
-    return f"{trimmed}/api/v1"
+    if trimmed.endswith("/db/v1"):
+        return trimmed[: -len("/db/v1")]
+    if trimmed.endswith("/auth/v1"):
+        return trimmed[: -len("/auth/v1")]
+    if trimmed.endswith("/ai/v1"):
+        return trimmed[: -len("/ai/v1")]
+    return trimmed
 
 
 class AntflyClient:
@@ -38,10 +42,10 @@ class AntflyClient:
     def __init__(
         self,
         base_url: str,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        api_key: Optional[tuple[str, str]] = None,
-        token: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
+        api_key: tuple[str, str] | None = None,
+        token: str | None = None,
         timeout: float = 30.0,
     ):
         """
@@ -123,9 +127,9 @@ class AntflyClient:
     def create_table(
         self,
         name: str,
-        num_shards: Optional[int] = None,
-        indexes: Optional[dict[str, Any]] = None,
-        schema: Optional[dict[str, Any]] = None,
+        num_shards: int | None = None,
+        indexes: dict[str, Any] | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Create a new table.
@@ -152,7 +156,7 @@ class AntflyClient:
 
         return self._request(
             "POST",
-            f"/tables/{quote(name, safe='')}",
+            f"/db/v1/tables/{quote(name, safe='')}",
             json=body,
         )
 
@@ -166,7 +170,7 @@ class AntflyClient:
         Raises:
             AntflyException: If listing tables fails
         """
-        return self._request("GET", "/tables")
+        return self._request("GET", "/db/v1/tables")
 
     def get_table(self, name: str) -> dict[str, Any]:
         """
@@ -181,7 +185,7 @@ class AntflyClient:
         Raises:
             AntflyException: If getting table fails
         """
-        return self._request("GET", f"/tables/{quote(name, safe='')}")
+        return self._request("GET", f"/db/v1/tables/{quote(name, safe='')}")
 
     def drop_table(self, name: str) -> None:
         """
@@ -193,7 +197,7 @@ class AntflyClient:
         Raises:
             AntflyException: If dropping table fails
         """
-        self._request("DELETE", f"/tables/{quote(name, safe='')}")
+        self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
     def get(self, table: str, key: str) -> dict[str, Any]:
         """
@@ -225,8 +229,8 @@ class AntflyClient:
     def batch(
         self,
         table: str,
-        inserts: Optional[dict[str, dict[str, Any]]] = None,
-        deletes: Optional[list[str]] = None,
+        inserts: dict[str, dict[str, Any]] | None = None,
+        deletes: list[str] | None = None,
     ) -> None:
         """
         Perform batch operations on a table.

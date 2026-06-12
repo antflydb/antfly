@@ -11,7 +11,7 @@ interface IndexFieldProps {
 
 const IndexField: React.FC<IndexFieldProps> = ({ index, onRemove, schemaFields }) => {
   return (
-    <div className="flex flex-col gap-4 mb-4 p-4 border rounded-md bg-card">
+    <div className="flex flex-col gap-4 mb-4 p-4 border rounded-none bg-card">
       <div className="flex justify-between items-center">
         <h4 className="font-semibold">Index {index + 1}</h4>
         <Button onClick={onRemove} aria-label="delete index" variant="ghost" size="icon">

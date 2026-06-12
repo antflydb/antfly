@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
@@ -27,6 +28,8 @@ const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartLsmCacheBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartLsmCompactionBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
+const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartLsmTableBuilderBytes: u64 = 512 * 1024 * 1024;
 const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
 const MaxSmartLsmInMemoryStateBytes: u64 = 2 * 1024 * 1024 * 1024;
 const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
@@ -37,6 +40,8 @@ const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartReplayWindowBytes: u64 = 256 * 1024 * 1024;
 const MinSmartFullTextPendingBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartFullTextPendingBytes: u64 = 512 * 1024 * 1024;
+const MinSmartFullTextBuildBytes: u64 = 128 * 1024 * 1024;
+const MaxSmartFullTextBuildBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartDerivedBacklogBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDerivedBacklogBytes: u64 = 512 * 1024 * 1024;
 const MinSmartTextMergeBytes: u64 = 32 * 1024 * 1024;
@@ -45,7 +50,7 @@ const MinSmartAlgebraicTensorBytes: u64 = 32 * 1024 * 1024;
 const MaxSmartAlgebraicTensorBytes: u64 = 256 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 fn readMemoryLimitFile(path: []const u8) ?u64 {
@@ -113,6 +118,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
     const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
+    const lsm_table_builder_hard = adaptiveSliceHardLimit(total, 32, MinSmartLsmTableBuilderBytes, MaxSmartLsmTableBuilderBytes);
     const lsm_in_memory_state_hard = adaptiveSliceHardLimit(total, 8, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const lsm_wal_write_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const hbc_hard = adaptiveSliceHardLimit(total, 12, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
@@ -120,12 +126,14 @@ fn smartResourceBudgets() SmartResourceBudgets {
     const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
     const full_text_hard = adaptiveSliceHardLimit(total, 32, MinSmartFullTextPendingBytes, MaxSmartFullTextPendingBytes);
+    const full_text_build_hard = adaptiveSliceHardLimit(total, 24, MinSmartFullTextBuildBytes, MaxSmartFullTextBuildBytes);
     const derived_hard = adaptiveSliceHardLimit(total, 32, MinSmartDerivedBacklogBytes, MaxSmartDerivedBacklogBytes);
     const text_merge_hard = adaptiveSliceHardLimit(total, 64, MinSmartTextMergeBytes, MaxSmartTextMergeBytes);
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = resourceBudget(3, hbc_hard);
@@ -134,6 +142,7 @@ fn smartResourceBudgets() SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
@@ -146,8 +155,8 @@ fn smartResourceBudgets() SmartResourceBudgets {
 
 pub const ProvisionedGroupStorage = struct {
     alloc: std.mem.Allocator,
-    group_lsm_generation_mutex: std.atomic.Mutex = .unlocked,
-    group_lsm_generations: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    group_visible_root_generation_mutex: std.atomic.Mutex = .unlocked,
+    group_visible_root_generations: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
     lsm_cache: lsm_backend.Cache,
     hbc_cache: hbc_mod.Cache,
@@ -170,7 +179,7 @@ pub const ProvisionedGroupStorage = struct {
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
-        self.group_lsm_generations.deinit(self.alloc);
+        self.group_visible_root_generations.deinit(self.alloc);
         self.write_cache.deinit();
         self.read_cache.deinit();
         self.runtime_status_cache.deinit();
@@ -194,23 +203,26 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.hbc_cache = &self.hbc_cache;
         self.read_cache.resource_manager = &self.resource_manager;
         self.read_cache.backend_runtime = self.backend_runtime;
-        self.read_cache.local_termite_provider = read_source.local_termite_provider;
+        self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
-        self.write_cache.lsm_cache = &self.lsm_cache;
+        // Keep the shared LSM block cache query-side. Writer DBs should use
+        // transient read buffers during ingest/build work rather than warming
+        // the read cache with blocks that may never be queried.
+        self.write_cache.lsm_cache = null;
         self.write_cache.hbc_cache = &self.hbc_cache;
         self.write_cache.resource_manager = &self.resource_manager;
         self.write_cache.backend_runtime = self.backend_runtime;
-        self.write_cache.local_termite_provider = write_source.local_termite_provider;
+        self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
-        read_source.group_lsm_generation = self.groupLsmGenerationSource();
+        _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
         read_source.primary_lookup_db = write_source.primaryLookupDbSource();
         write_source.read_cache = &self.read_cache;
         write_source.write_cache = &self.write_cache;
         write_source.runtime_status_cache = &self.runtime_status_cache;
-        write_source.group_lsm_generation = self.groupLsmGenerationSource();
+        _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
     }
 
     pub fn attachBackendRuntime(
@@ -226,17 +238,17 @@ pub const ProvisionedGroupStorage = struct {
         write_source.backend_runtime = runtime;
     }
 
-    pub fn generationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
-        return self.group_lsm_generations.get(group_id) orelse 0;
+    pub fn visibleRootGenerationForGroup(self: *ProvisionedGroupStorage, group_id: u64) u64 {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
+        return self.group_visible_root_generations.get(group_id) orelse table_reads.backend_current_root_generation;
     }
 
-    pub fn bumpGroupGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
+    pub fn bumpGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, group_ids: []const u64) !void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
         for (group_ids) |group_id| {
-            const entry = try self.group_lsm_generations.getOrPut(self.alloc, group_id);
+            const entry = try self.group_visible_root_generations.getOrPut(self.alloc, group_id);
             if (entry.found_existing) {
                 entry.value_ptr.* +%= 1;
             } else {
@@ -245,13 +257,13 @@ pub const ProvisionedGroupStorage = struct {
         }
     }
 
-    pub fn pruneGroupGenerations(self: *ProvisionedGroupStorage, retain_group_ids: []const u64) void {
-        lockAtomic(&self.group_lsm_generation_mutex);
-        defer self.group_lsm_generation_mutex.unlock();
+    pub fn pruneGroupVisibleRootGenerations(self: *ProvisionedGroupStorage, retain_group_ids: []const u64) void {
+        lockAtomic(&self.group_visible_root_generation_mutex);
+        defer self.group_visible_root_generation_mutex.unlock();
 
         var stale = std.ArrayListUnmanaged(u64).empty;
         defer stale.deinit(self.alloc);
-        var i = self.group_lsm_generations.iterator();
+        var i = self.group_visible_root_generations.iterator();
         while (i.next()) |entry| {
             for (retain_group_ids) |group_id| {
                 if (entry.key_ptr.* == group_id) break;
@@ -259,35 +271,35 @@ pub const ProvisionedGroupStorage = struct {
                 stale.append(self.alloc, entry.key_ptr.*) catch return;
             }
         }
-        for (stale.items) |group_id| _ = self.group_lsm_generations.remove(group_id);
+        for (stale.items) |group_id| _ = self.group_visible_root_generations.remove(group_id);
     }
 
-    pub fn groupLsmGenerationSource(self: *ProvisionedGroupStorage) table_reads.GroupLsmGenerationSource {
+    pub fn groupVisibleRootGenerationSource(self: *ProvisionedGroupStorage) table_reads.GroupVisibleRootGenerationSource {
         return .{
             .ptr = self,
-            .generation_for_group = groupLsmGenerationForGroup,
+            .visible_root_generation_for_group = groupVisibleRootGenerationForGroup,
         };
     }
 
-    fn groupLsmGenerationForGroup(ptr: *anyopaque, group_id: u64) u64 {
+    fn groupVisibleRootGenerationForGroup(ptr: *anyopaque, group_id: u64) u64 {
         const self: *ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
-        return self.generationForGroup(group_id);
+        return self.visibleRootGenerationForGroup(group_id);
     }
 };
 
-test "provisioned group storage prunes stale generations" {
+test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);
     defer storage.deinit();
 
-    try storage.bumpGroupGenerations(&.{ 11, 22, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(33));
+    try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
 
-    storage.pruneGroupGenerations(&.{ 11, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 0), storage.generationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.generationForGroup(33));
+    storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(22));
+    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
 }
 
 test "provisioned group storage aligns lsm cache with resource budget" {
@@ -306,6 +318,7 @@ test "provisioned group storage derives all resource budgets" {
     inline for (.{
         resource_manager_mod.Slice.lsm_block_table_cache,
         resource_manager_mod.Slice.lsm_compaction_work,
+        resource_manager_mod.Slice.lsm_table_builder_working_set,
         resource_manager_mod.Slice.lsm_in_memory_state,
         resource_manager_mod.Slice.lsm_wal_write_working_set,
         resource_manager_mod.Slice.hbc_node_metadata_cache,

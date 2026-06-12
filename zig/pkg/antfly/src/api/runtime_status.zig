@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_time = @import("../platform/time.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
 pub const RuntimeStatusSource = enum {
     unknown,
@@ -62,6 +63,7 @@ pub const LocalTableRuntimeStatus = struct {
     disk_bytes: u64 = 0,
     created_at_millis: u64 = 0,
     stats: db_mod.types.DBStats,
+    lsm_storage_stats: ?LsmStorageStats = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         db_mod.types.freeDBStats(alloc, self.stats);
@@ -75,12 +77,20 @@ pub const LocalTableRuntimeStatus = struct {
             .disk_bytes = self.disk_bytes,
             .created_at_millis = self.created_at_millis,
             .stats = try cloneDBStats(alloc, self.stats),
+            .lsm_storage_stats = self.lsm_storage_stats,
         };
     }
 
     pub fn withMetadataDefaults(self: *@This(), source: RuntimeStatusSource, now_ns: u64) void {
         self.metadata = self.metadata.withDefaults(source, now_ns);
     }
+};
+
+pub const LsmStorageStats = struct {
+    maintenance: lsm_backend.Backend.MaintenanceStats = .{},
+    write: lsm_backend.Backend.WriteStats = .{},
+    maintenance_score: u64 = 0,
+    maintenance_debt_hint: u64 = 0,
 };
 
 pub fn statusHasRuntimeFacts(status: LocalTableRuntimeStatus) bool {
@@ -285,6 +295,12 @@ pub const TableRuntimeSnapshotCache = struct {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
     }
 
+    pub fn upsertGroupStatusPreservingMetadata(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
+    }
+
     fn upsertGroupStatusLocked(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
@@ -453,6 +469,8 @@ fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
+    if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
+    if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
@@ -464,6 +482,44 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
         // has ever published concrete index state.
     }
     return false;
+}
+
+fn docIdentityStatsHaveRuntimeFacts(stats: db_mod.types.DocIdentityStats) bool {
+    return stats.namespace_table_id != 0 or
+        stats.namespace_shard_id != 0 or
+        stats.namespace_range_id != 0 or
+        stats.next_ordinal != 1 or
+        stats.allocated_ordinals != 0 or
+        stats.ordinal_capacity_remaining != 0 or
+        stats.ordinal_capacity_exhausted or
+        stats.rebuild_required or
+        stats.state_rows != 0 or
+        stats.live_ordinals != 0 or
+        stats.tombstone_ordinals != 0 or
+        stats.min_created_generation != 0 or
+        stats.max_created_generation != 0 or
+        stats.min_deleted_generation != 0 or
+        stats.max_deleted_generation != 0 or
+        stats.scanned_primary_docs != 0 or
+        stats.primary_docs_missing_ordinals != 0 or
+        stats.primary_docs_missing_identity_state != 0 or
+        stats.primary_docs_with_tombstone_ordinals != 0;
+}
+
+fn docSetPlanningStatsHaveRuntimeFacts(stats: db_mod.types.DocSetPlanningStats) bool {
+    return stats.resolved_set_count != 0 or
+        stats.all_set_count != 0 or
+        stats.none_set_count != 0 or
+        stats.doc_key_list_count != 0 or
+        stats.ordinal_list_count != 0 or
+        stats.ordinal_bitmap_count != 0 or
+        stats.doc_key_list_docs != 0 or
+        stats.ordinal_list_docs != 0 or
+        stats.ordinal_bitmap_docs != 0 or
+        stats.missing_ordinal_coverage_count != 0 or
+        stats.bitmap_promotion_count != 0 or
+        stats.unsupported_filter_shape_count != 0 or
+        stats.stale_identity_generation_rejection_count != 0;
 }
 
 fn indexHasArtifactVisibilityFacts(index: db_mod.types.DBIndexStats) bool {
@@ -711,12 +767,56 @@ fn cloneAlgebraicProgressStatuses(
     return out;
 }
 
+fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.ResolverReplayDiagnostics) !db_mod.types.ResolverReplayDiagnostics {
+    var resolvers = try alloc.alloc(db_mod.types.ResolverReplayDiagnostic, stats.resolvers.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (resolvers[0..initialized]) |resolver| {
+            alloc.free(resolver.name);
+            alloc.free(resolver.table);
+            alloc.free(resolver.source_artifact);
+            alloc.free(resolver.resolution_artifact);
+        }
+        if (resolvers.len > 0) alloc.free(resolvers);
+    }
+
+    for (stats.resolvers, 0..) |resolver, i| {
+        const name = try alloc.dupe(u8, resolver.name);
+        errdefer alloc.free(name);
+        const table = try alloc.dupe(u8, resolver.table);
+        errdefer alloc.free(table);
+        const source_artifact = try alloc.dupe(u8, resolver.source_artifact);
+        errdefer alloc.free(source_artifact);
+        const resolution_artifact = try alloc.dupe(u8, resolver.resolution_artifact);
+        errdefer alloc.free(resolution_artifact);
+        resolvers[i] = .{
+            .name = name,
+            .table = table,
+            .source_artifact = source_artifact,
+            .resolution_artifact = resolution_artifact,
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .resolver_count = stats.resolver_count,
+        .resolution_runtime_present = stats.resolution_runtime_present,
+        .resolution_worker_started = stats.resolution_worker_started,
+        .promotion_runtime_present = stats.promotion_runtime_present,
+        .promotion_worker_started = stats.promotion_worker_started,
+        .resolvers = resolvers,
+    };
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
+    const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
+    errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, stats.indexes.len);
     var initialized: usize = 0;
     errdefer {
         for (indexes[0..initialized]) |item| {
             alloc.free(item.name);
+            if (item.load_error) |value| alloc.free(value);
             if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
             if (item.algebraic_last_error_reason) |value| alloc.free(value);
             if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -755,6 +855,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     for (stats.indexes, 0..) |item, i| {
+        const load_error = if (item.load_error) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (load_error) |value| alloc.free(value);
         const algebraic_last_error_doc_key = if (item.algebraic_last_error_doc_key) |value|
             try alloc.dupe(u8, value)
         else
@@ -844,6 +949,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         indexes[i] = .{
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
+            .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
@@ -928,7 +1034,12 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
+        .doc_identity = stats.doc_identity,
+        .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
+        .resolution = stats.resolution,
+        .promotion = stats.promotion,
+        .resolver_replay = resolver_replay,
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,
         .text_merge = stats.text_merge,
@@ -949,6 +1060,27 @@ test "table runtime snapshot cache clones stored status" {
             .doc_count = 11,
             .index_count = 2,
             .indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 2),
+            .doc_identity = .{
+                .namespace_table_id = 101,
+                .namespace_shard_id = 202,
+                .namespace_range_id = 303,
+                .next_ordinal = 44,
+                .allocated_ordinals = 43,
+                .rebuild_required = true,
+                .state_rows = 41,
+                .live_ordinals = 40,
+                .min_created_generation = 12,
+                .max_created_generation = 18,
+                .min_deleted_generation = 15,
+                .max_deleted_generation = 19,
+            },
+            .doc_set_planning = .{
+                .resolved_set_count = 9,
+                .ordinal_list_count = 8,
+                .ordinal_list_docs = 7,
+                .missing_ordinal_coverage_count = 6,
+                .stale_identity_generation_rejection_count = 5,
+            },
         },
     };
     items[0].stats.indexes[0] = .{
@@ -1055,6 +1187,18 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(usize, 1), cloned.items.len);
     try std.testing.expectEqual(@as(u64, 7), cloned.items[0].group_id);
     try std.testing.expectEqual(@as(u64, 11), cloned.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 101), cloned.items[0].stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(@as(u64, 202), cloned.items[0].stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(@as(u64, 303), cloned.items[0].stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u32, 44), cloned.items[0].stats.doc_identity.next_ordinal);
+    try std.testing.expect(cloned.items[0].stats.doc_identity.rebuild_required);
+    try std.testing.expectEqual(@as(u64, 12), cloned.items[0].stats.doc_identity.min_created_generation);
+    try std.testing.expectEqual(@as(u64, 18), cloned.items[0].stats.doc_identity.max_created_generation);
+    try std.testing.expectEqual(@as(u64, 15), cloned.items[0].stats.doc_identity.min_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 19), cloned.items[0].stats.doc_identity.max_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 9), cloned.items[0].stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
     try std.testing.expectEqualStrings("alg", cloned.items[0].stats.indexes[1].name);
     try std.testing.expectEqual(@as(u64, 1), cloned.items[0].stats.indexes[1].algebraic_parse_error_count);
@@ -1607,6 +1751,37 @@ test "synthetic status with preserved visibility counters is a runtime fact" {
     };
 
     try std.testing.expect(statusHasRuntimeFacts(status));
+}
+
+test "cached identity and doc set telemetry are runtime facts" {
+    const identity_status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .doc_identity = .{
+                .rebuild_required = true,
+            },
+        },
+    };
+
+    const planning_status = LocalTableRuntimeStatus{
+        .group_id = 8,
+        .metadata = .{
+            .source = .synthetic_config,
+            .freshness = .stale,
+        },
+        .stats = .{
+            .doc_set_planning = .{
+                .stale_identity_generation_rejection_count = 1,
+            },
+        },
+    };
+
+    try std.testing.expect(statusHasRuntimeFacts(identity_status));
+    try std.testing.expect(statusHasRuntimeFacts(planning_status));
 }
 
 test "table runtime snapshot cache preserves generic artifact visibility on sequence-only refresh" {

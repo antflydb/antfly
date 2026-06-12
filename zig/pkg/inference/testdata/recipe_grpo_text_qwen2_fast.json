@@ -1,0 +1,31 @@
+{
+  "recipe": "grpo",
+  "model": {
+    "path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct",
+    "reference_path": "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct",
+    "family": "qwen2",
+    "name": "qwen2-local-fast"
+  },
+  "dataset": {
+    "path": "pkg/inference/testdata/grpo_text_prompts.jsonl",
+    "format": "text-grpo",
+    "max_examples": 1,
+    "max_seq_len": 64
+  },
+  "adapter": {
+    "rank": 8,
+    "alpha": 32
+  },
+  "grpo": {
+    "group_size": 2,
+    "clip_epsilon": 0.2,
+    "kl_coef": 0.04,
+    "normalize_advantage": true,
+    "max_completion_tokens": 2,
+    "reward_mode": "prefix-match"
+  },
+  "artifacts": {
+    "root": "/tmp/termite-grpo-text-qwen2-fast"
+  },
+  "backend": "native"
+}

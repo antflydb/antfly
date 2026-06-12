@@ -469,9 +469,6 @@ func TestTTLQueryFiltering(t *testing.T) {
 func createTestDBWithTTL(t *testing.T, ttlDuration string) (*DBImpl, func()) {
 	t.Helper()
 
-	// Create temporary directory for test DB
-	tempDir := t.TempDir()
-
 	// Create schema with TTL
 	tableSchema := &schema.TableSchema{
 		TtlDuration: ttlDuration,
@@ -485,6 +482,14 @@ func createTestDBWithTTL(t *testing.T, ttlDuration string) (*DBImpl, func()) {
 			},
 		},
 	}
+	return createTestDBWithSchema(t, tableSchema)
+}
+
+func createTestDBWithSchema(t *testing.T, tableSchema *schema.TableSchema) (*DBImpl, func()) {
+	t.Helper()
+
+	// Create temporary directory for test DB
+	tempDir := t.TempDir()
 
 	// Create DBImpl with proper initialization
 	dbImpl := &DBImpl{
@@ -505,6 +510,53 @@ func createTestDBWithTTL(t *testing.T, ttlDuration string) (*DBImpl, func()) {
 	}
 
 	return dbImpl, cleanup
+}
+
+func TestBatchWritesTTLTimestampsWithoutContextTimestamp(t *testing.T) {
+	dbImpl, cleanup := createTestDBWithTTL(t, "1h")
+	defer cleanup()
+
+	require.NoError(t, dbImpl.Batch(
+		context.Background(),
+		[][2][]byte{{[]byte("doc:local"), []byte(`{"data":"local write"}`)}},
+		nil,
+		Op_SyncLevelWrite,
+	))
+
+	timestamp, err := dbImpl.GetTimestamp([]byte("doc:local"))
+	require.NoError(t, err)
+	require.NotZero(t, timestamp, "TTL-enabled writes without a context timestamp must still write :t metadata")
+}
+
+func TestBatchDerivesTTLTimestampsFromCustomField(t *testing.T) {
+	tableSchema := &schema.TableSchema{
+		TtlDuration: "1h",
+		TtlField:    "written_at",
+		DefaultType: "default",
+		DocumentSchemas: map[string]schema.DocumentSchema{
+			"default": {
+				Schema: map[string]any{
+					"type": "object",
+				},
+			},
+		},
+	}
+	dbImpl, cleanup := createTestDBWithSchema(t, tableSchema)
+	defer cleanup()
+
+	require.NoError(t, dbImpl.Batch(
+		context.Background(),
+		[][2][]byte{{[]byte("doc:old"), []byte(`{"written_at":"2020-01-01T00:00:00Z","data":"stale"}`)}},
+		nil,
+		Op_SyncLevelWrite,
+	))
+
+	timestamp, err := dbImpl.GetTimestamp([]byte("doc:old"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1577836800000000000), timestamp)
+
+	_, err = dbImpl.Get(context.Background(), []byte("doc:old"))
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func compressJSON(jsonBytes []byte) ([]byte, error) {

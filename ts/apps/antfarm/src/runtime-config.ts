@@ -1,7 +1,7 @@
 export interface AntfarmRuntimeConfig {
   basePath?: string;
   apiUrl?: string;
-  termiteApiUrl?: string;
+  inferenceApiUrl?: string;
   authMode?: "local" | "external";
 }
 

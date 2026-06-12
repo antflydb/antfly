@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
+const doc_set = @import("../doc_set.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const graph_exec = @import("graph_exec.zig");
@@ -51,6 +52,16 @@ pub const ChunkParentResultShaper = struct {
         alloc: Allocator,
         req: types.SearchRequest,
         parent_ids: []const []const u8,
+    ) anyerror![]?[]u8 = null,
+    load_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!?[]u8 = null,
+    load_many_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
 };
 
@@ -89,6 +100,18 @@ pub const StoredPatternFilterExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
 };
 
 pub const SearchResultPostprocessor = struct {
@@ -124,6 +147,18 @@ pub const SearchResultPostprocessor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    resolve_doc_set_doc_ids: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 = null,
+    resolve_doc_ids_to_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet = null,
     load_many_parent_stored: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -144,6 +179,8 @@ pub fn externalizeSearchResultArtifactIds(alloc: Allocator, result: *types.Searc
 }
 
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
+    if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
+
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
 
@@ -155,6 +192,31 @@ pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void
 
     for (result.hits) |hit| {
         const gop = try seen.getOrPut(alloc, hit.id);
+        if (gop.found_existing) continue;
+        try deduped.append(alloc, try hit.clone(alloc));
+    }
+
+    const owned_hits = try alloc.dupe(types.SearchHit, deduped.items);
+    deduped.deinit(alloc);
+
+    for (result.hits) |*hit| hit.deinit(alloc);
+    if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = owned_hits;
+    result.total_hits = @intCast(result.hits.len);
+}
+
+fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !void {
+    var seen = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, void).empty;
+    defer seen.deinit(alloc);
+
+    var deduped = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (deduped.items) |*hit| hit.deinit(alloc);
+        deduped.deinit(alloc);
+    }
+
+    for (result.hits) |hit| {
+        const gop = try seen.getOrPut(alloc, hit.doc_ordinal.?);
         if (gop.found_existing) continue;
         try deduped.append(alloc, try hit.clone(alloc));
     }
@@ -230,7 +292,7 @@ pub fn reshapeChunkBackedResult(
     raw: types.SearchResult,
     shaper: ChunkParentResultShaper,
 ) !types.SearchResult {
-    if (req.return_mode == .chunk) return raw;
+    if (req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
 
     var grouped = std.StringHashMapUnmanaged(usize).empty;
     defer grouped.deinit(alloc);
@@ -248,6 +310,7 @@ pub fn reshapeChunkBackedResult(
         if (!gop.found_existing) {
             try parents.append(alloc, .{
                 .id = try alloc.dupe(u8, parent_id),
+                .doc_ordinal = chunk_hit.doc_ordinal,
                 .score = chunk_hit.score,
                 .stored_data = null,
                 .chunk_hits = &.{},
@@ -257,6 +320,7 @@ pub fn reshapeChunkBackedResult(
         }
 
         const parent_hit = &parents.items[gop.value_ptr.*];
+        if (parent_hit.doc_ordinal == null) parent_hit.doc_ordinal = chunk_hit.doc_ordinal;
         if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
             parent_hit.score = chunk_hit.score;
         }
@@ -273,6 +337,9 @@ pub fn reshapeChunkBackedResult(
                 .id = try alloc.dupe(u8, chunk_hit.id),
                 .score = chunk_hit.score,
                 .stored_data = if (chunk_hit.stored_data) |stored| try alloc.dupe(u8, stored) else null,
+                .ancestor_source_data = if (chunk_hit.ancestor_source_data) |stored| try alloc.dupe(u8, stored) else null,
+                .ancestor_unit_data = if (chunk_hit.ancestor_unit_data) |stored| try alloc.dupe(u8, stored) else null,
+                .artifact_ref = if (chunk_hit.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
             });
             parent_hit.chunk_hits = try chunks.toOwnedSlice(alloc);
         }
@@ -294,6 +361,292 @@ pub fn reshapeChunkBackedResult(
         .total_hits_relation = raw.total_hits_relation,
         .graph_results = &.{},
     };
+}
+
+const ChunkAncestorInfo = struct {
+    parent_doc_key: []u8,
+    unit_key: ?[]u8 = null,
+
+    fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
+        alloc.free(self.parent_doc_key);
+        if (self.unit_key) |key| alloc.free(key);
+        self.* = undefined;
+    }
+};
+
+fn chunkStorageKeyForArtifactRefAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) !?[]u8 {
+    if (artifact_ref.kind == .chunk) return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+    if (artifact_ref.kind != .embedding) return null;
+    const source = artifact_ref.source orelse return null;
+    if (source.kind != .chunk) return null;
+    const chunk_ref = types.ArtifactRef{
+        .document_id = artifact_ref.document_id,
+        .name = source.name,
+        .kind = .chunk,
+        .chunk_id = source.chunk_id,
+        .unit_id = source.unit_id,
+    };
+    return try artifact_ids.internalKeyForArtifactRefAlloc(alloc, chunk_ref);
+}
+
+fn chunkStorageKeyForHitAlloc(alloc: Allocator, hit: types.SearchHit) !?[]u8 {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref)) |chunk_key| return chunk_key;
+    }
+
+    if (internal_keys.isChunkArtifactRecordKey(hit.id)) return try alloc.dupe(u8, hit.id);
+
+    const maybe_embedding_identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
+    if (maybe_embedding_identity) |identity_value| {
+        var identity = identity_value;
+        defer identity.deinit(alloc);
+        if (internal_keys.isChunkArtifactRecordKey(identity.doc_key)) return try alloc.dupe(u8, identity.doc_key);
+    }
+
+    var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    return try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref);
+}
+
+fn hydrateDirectChunkAncestors(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    raw: types.SearchResult,
+    shaper: ChunkParentResultShaper,
+) !types.SearchResult {
+    if ((!req.hierarchy_include_source and !req.hierarchy_include_unit) or raw.hits.len == 0) return raw;
+    if (shaper.load_stored == null and shaper.load_many_stored == null) return raw;
+
+    var owned = raw;
+    errdefer owned.deinit();
+
+    var infos = try alloc.alloc(?ChunkAncestorInfo, owned.hits.len);
+    defer {
+        for (infos) |*maybe_info| {
+            if (maybe_info.*) |*info| info.deinit(alloc);
+        }
+        alloc.free(infos);
+    }
+    @memset(infos, null);
+
+    const chunk_payloads = try loadDirectChunkPayloads(alloc, owned.hits, shaper);
+    defer freeOptionalOwnedBytes(alloc, chunk_payloads);
+
+    var source_count: usize = 0;
+    var unit_count: usize = 0;
+    for (owned.hits, 0..) |hit, i| {
+        const chunk_key = (try chunkStorageKeyForHitAlloc(alloc, hit)) orelse continue;
+        defer alloc.free(chunk_key);
+        const payload = chunk_payloads[i] orelse hit.stored_data orelse continue;
+        const info = parseChunkAncestorInfoAlloc(alloc, chunk_key, payload) catch |err| switch (err) {
+            error.InvalidChunkArtifact, error.InvalidInternalUserKey => continue,
+            else => return err,
+        };
+        if (req.hierarchy_include_source) source_count += 1;
+        if (req.hierarchy_include_unit and info.unit_key != null) unit_count += 1;
+        infos[i] = info;
+    }
+
+    if (req.hierarchy_include_source and source_count > 0) {
+        try hydrateDirectChunkSourceAncestors(alloc, &owned, infos, source_count, shaper);
+    }
+    if (req.hierarchy_include_unit and unit_count > 0) {
+        try hydrateDirectChunkUnitAncestors(alloc, &owned, infos, unit_count, shaper);
+    }
+
+    return owned;
+}
+
+fn loadDirectChunkPayloads(
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+    shaper: ChunkParentResultShaper,
+) ![]?[]u8 {
+    const loaded = try alloc.alloc(?[]u8, hits.len);
+    errdefer {
+        freeOptionalOwnedBytes(alloc, loaded);
+    }
+    @memset(loaded, null);
+
+    const storage_keys = try alloc.alloc(?[]u8, hits.len);
+    defer {
+        for (storage_keys) |maybe_key| if (maybe_key) |key| alloc.free(key);
+        alloc.free(storage_keys);
+    }
+    @memset(storage_keys, null);
+    var missing_count: usize = 0;
+    for (hits, 0..) |hit, i| {
+        if (try chunkStorageKeyForHitAlloc(alloc, hit)) |chunk_key| {
+            storage_keys[i] = chunk_key;
+            missing_count += 1;
+        }
+    }
+    if (missing_count == 0) return loaded;
+
+    if (shaper.load_many_stored) |load_many| {
+        const keys = try alloc.alloc([]const u8, missing_count);
+        defer alloc.free(keys);
+        var key_index: usize = 0;
+        for (storage_keys) |maybe_key| {
+            const key = maybe_key orelse continue;
+            keys[key_index] = key;
+            key_index += 1;
+        }
+        var many = try load_many(shaper.ctx, alloc, keys);
+        defer {
+            for (many) |value| if (value) |bytes| alloc.free(bytes);
+            if (many.len > 0) alloc.free(many);
+        }
+        key_index = 0;
+        for (storage_keys, 0..) |maybe_key, i| {
+            if (maybe_key == null) continue;
+            if (many[key_index]) |bytes| {
+                loaded[i] = bytes;
+                many[key_index] = null;
+            }
+            key_index += 1;
+        }
+        return loaded;
+    }
+
+    const load_one = shaper.load_stored orelse return loaded;
+    for (storage_keys, 0..) |maybe_key, i| {
+        const key = maybe_key orelse continue;
+        loaded[i] = try load_one(shaper.ctx, alloc, key);
+    }
+    return loaded;
+}
+
+fn parseChunkAncestorInfoAlloc(alloc: Allocator, chunk_key: []const u8, payload: []const u8) !ChunkAncestorInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidChunkArtifact;
+    const object = parsed.value.object;
+    const parent_doc_key = if (try jsonObjectStringDupe(alloc, object, "_parent_doc_key")) |key|
+        key
+    else if (try jsonObjectStringDupe(alloc, object, "parent_doc_key")) |key|
+        key
+    else
+        return error.InvalidChunkArtifact;
+    errdefer alloc.free(parent_doc_key);
+
+    const source_artifact_name = try jsonObjectStringDupe(alloc, object, "_source_artifact_name");
+    defer if (source_artifact_name) |name| alloc.free(name);
+    const parent_unit_id = try jsonObjectStringDupe(alloc, object, "_parent_unit_id");
+    defer if (parent_unit_id) |unit_id| alloc.free(unit_id);
+
+    const unit_key = if (source_artifact_name != null and parent_unit_id != null)
+        try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, source_artifact_name.?, parent_unit_id.?)
+    else blk: {
+        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key)) orelse break :blk null;
+        defer artifact_ref.deinit(alloc);
+        const unit_id = artifact_ref.unit_id orelse break :blk null;
+        break :blk try internal_keys.documentUnitArtifactKeyAlloc(alloc, parent_doc_key, "document_units_v1", unit_id);
+    };
+
+    return .{
+        .parent_doc_key = parent_doc_key,
+        .unit_key = unit_key,
+    };
+}
+
+fn jsonObjectStringDupe(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return null;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn hydrateDirectChunkSourceAncestors(
+    alloc: Allocator,
+    result: *types.SearchResult,
+    infos: []const ?ChunkAncestorInfo,
+    source_count: usize,
+    shaper: ChunkParentResultShaper,
+) !void {
+    const load_many = shaper.load_many_stored;
+    const load_one = shaper.load_stored;
+    if (load_many == null and load_one == null) return;
+
+    const parent_ids = try alloc.alloc([]const u8, source_count);
+    defer alloc.free(parent_ids);
+    var index: usize = 0;
+    for (infos) |maybe_info| {
+        const info = maybe_info orelse continue;
+        parent_ids[index] = info.parent_doc_key;
+        index += 1;
+    }
+
+    var loaded = if (load_many) |load_many_fn|
+        try load_many_fn(shaper.ctx, alloc, parent_ids)
+    else blk: {
+        const out = try alloc.alloc(?[]u8, source_count);
+        errdefer freeOptionalOwnedBytes(alloc, out);
+        @memset(out, null);
+        for (parent_ids, 0..) |parent_id, i| {
+            out[i] = try load_one.?(shaper.ctx, alloc, parent_id);
+        }
+        break :blk out;
+    };
+    defer freeOptionalOwnedBytes(alloc, loaded);
+
+    index = 0;
+    for (result.hits, infos) |*hit, maybe_info| {
+        if (maybe_info == null) continue;
+        if (loaded[index]) |bytes| {
+            hit.ancestor_source_data = bytes;
+            loaded[index] = null;
+        }
+        index += 1;
+    }
+}
+
+fn hydrateDirectChunkUnitAncestors(
+    alloc: Allocator,
+    result: *types.SearchResult,
+    infos: []const ?ChunkAncestorInfo,
+    unit_count: usize,
+    shaper: ChunkParentResultShaper,
+) !void {
+    const load_many = shaper.load_many_stored;
+    const load_one = shaper.load_stored;
+    if (load_many == null and load_one == null) return;
+
+    const unit_keys = try alloc.alloc([]const u8, unit_count);
+    defer alloc.free(unit_keys);
+    var index: usize = 0;
+    for (infos) |maybe_info| {
+        const info = maybe_info orelse continue;
+        const unit_key = info.unit_key orelse continue;
+        unit_keys[index] = unit_key;
+        index += 1;
+    }
+
+    var loaded = if (load_many) |load_many_fn|
+        try load_many_fn(shaper.ctx, alloc, unit_keys)
+    else blk: {
+        const out = try alloc.alloc(?[]u8, unit_count);
+        errdefer freeOptionalOwnedBytes(alloc, out);
+        @memset(out, null);
+        for (unit_keys, 0..) |unit_key, i| {
+            out[i] = try load_one.?(shaper.ctx, alloc, unit_key);
+        }
+        break :blk out;
+    };
+    defer freeOptionalOwnedBytes(alloc, loaded);
+
+    index = 0;
+    for (result.hits, infos) |*hit, maybe_info| {
+        const info = maybe_info orelse continue;
+        if (info.unit_key == null) continue;
+        if (loaded[index]) |bytes| {
+            hit.ancestor_unit_data = bytes;
+            loaded[index] = null;
+        }
+        index += 1;
+    }
 }
 
 fn normalizeGroupedParentHitOrder(
@@ -339,6 +692,121 @@ fn searchHitScoresEqual(left: ?f32, right: ?f32) bool {
     return left.? == right.?;
 }
 
+fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
+    for (doc_ids) |doc_id| {
+        if (std.mem.eql(u8, doc_id, expected)) return true;
+    }
+    return false;
+}
+
+const ResolvedPatternDocIds = struct {
+    ids: []const []const u8 = &.{},
+    ordinal_set: ?doc_set.ResolvedDocSet = null,
+    active: bool = false,
+    all: bool = false,
+    owned: bool = false,
+
+    fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
+        if (self.ordinal_set) |*set| set.deinit(alloc);
+        if (self.owned) freeResolvedDocIds(alloc, self.ids);
+        self.* = .{};
+    }
+};
+
+fn freeResolvedDocIds(alloc: Allocator, ids: []const []const u8) void {
+    for (ids) |id| alloc.free(@constCast(id));
+    if (ids.len > 0) alloc.free(@constCast(ids));
+}
+
+fn resolvePatternDocIdsAlloc(
+    alloc: Allocator,
+    set: *const doc_set.ResolvedDocSet,
+    hits: []const types.SearchHit,
+    generation: ?u64,
+    executor: StoredPatternFilterExecutor,
+) !ResolvedPatternDocIds {
+    return switch (set.*) {
+        .all => .{ .all = true },
+        .none => .{ .active = true },
+        .doc_keys => |keys| .{ .ids = keys, .active = true },
+        .ordinals, .ordinal_bitmap => blk: {
+            if (allHitsHaveDocOrdinals(hits)) break :blk .{
+                .ordinal_set = try doc_set.cloneAlloc(alloc, set),
+                .active = true,
+            };
+            const resolve = executor.resolve_doc_set_doc_ids orelse return error.UnsupportedQueryRequest;
+            const ids = (try resolve(executor.ctx, alloc, set, generation)) orelse return error.UnsupportedQueryRequest;
+            break :blk .{ .ids = ids, .active = true, .owned = true };
+        },
+    };
+}
+
+fn resolvePatternDocIdsFromPublicIdsAlloc(
+    alloc: Allocator,
+    ids: []const []const u8,
+    hits: []const types.SearchHit,
+    generation: ?u64,
+    executor: StoredPatternFilterExecutor,
+) !ResolvedPatternDocIds {
+    if (ids.len == 0) return .{ .active = true };
+    const resolve = executor.resolve_doc_ids_to_doc_set orelse return .{ .ids = ids, .active = true };
+    var resolved = try resolve(executor.ctx, alloc, ids, generation);
+    errdefer resolved.deinit(alloc);
+    switch (resolved) {
+        .all => {
+            resolved.deinit(alloc);
+            return .{ .all = true };
+        },
+        .none => {
+            resolved.deinit(alloc);
+            return .{ .active = true };
+        },
+        .doc_keys => |keys| {
+            return .{ .ids = keys, .active = true, .ordinal_set = resolved };
+        },
+        .ordinals, .ordinal_bitmap => {
+            if (allHitsHaveDocOrdinals(hits)) return .{ .ordinal_set = resolved, .active = true };
+            const project = executor.resolve_doc_set_doc_ids orelse {
+                resolved.deinit(alloc);
+                return error.UnsupportedQueryRequest;
+            };
+            const projected = (try project(executor.ctx, alloc, &resolved, generation)) orelse {
+                resolved.deinit(alloc);
+                return error.UnsupportedQueryRequest;
+            };
+            resolved.deinit(alloc);
+            return .{ .ids = projected, .active = true, .owned = true };
+        },
+    }
+}
+
+fn allHitsHaveDocOrdinals(hits: []const types.SearchHit) bool {
+    for (hits) |hit| {
+        if (hit.doc_ordinal == null) return false;
+    }
+    return true;
+}
+
+fn resolvedPatternContainsHit(resolved: ResolvedPatternDocIds, hit: types.SearchHit) bool {
+    if (resolved.ordinal_set) |*set| {
+        return switch (set.*) {
+            .doc_keys => containsDocId(resolved.ids, hit.id),
+            .ordinals, .ordinal_bitmap => blk: {
+                const ordinal = hit.doc_ordinal orelse return false;
+                break :blk set.containsOrdinal(ordinal);
+            },
+            .all => true,
+            .none => false,
+        };
+    }
+    return containsDocId(resolved.ids, hit.id);
+}
+
+fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
+    const ptr = req.resolved_doc_filter orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
 fn loadParentStoredForGroupedHits(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -372,7 +840,34 @@ pub fn applyStoredSearchPatternFilters(
     result: types.SearchResult,
     executor: StoredPatternFilterExecutor,
 ) !types.SearchResult {
-    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return result;
+    const has_positive_doc_ids = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
+    const has_native_doc_ids = has_positive_doc_ids or req.exclude_doc_ids.len > 0;
+    const resolved_filter = resolvedDocFilterFromRequest(req);
+    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and !has_native_doc_ids and resolved_filter == null) return result;
+
+    var resolved_include = if (resolved_filter) |filter|
+        try resolvePatternDocIdsAlloc(alloc, &filter.include, result.hits, req.identity_read_generation, executor)
+    else
+        ResolvedPatternDocIds{};
+    defer resolved_include.deinit(alloc);
+
+    var resolved_exclude = if (resolved_filter) |filter|
+        try resolvePatternDocIdsAlloc(alloc, &filter.exclude, result.hits, req.identity_read_generation, executor)
+    else
+        ResolvedPatternDocIds{};
+    defer resolved_exclude.deinit(alloc);
+
+    var native_include = if (has_positive_doc_ids)
+        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.filter_doc_ids, result.hits, req.identity_read_generation, executor)
+    else
+        ResolvedPatternDocIds{};
+    defer native_include.deinit(alloc);
+
+    var native_exclude = if (req.exclude_doc_ids.len > 0)
+        try resolvePatternDocIdsFromPublicIdsAlloc(alloc, req.exclude_doc_ids, result.hits, req.identity_read_generation, executor)
+    else
+        ResolvedPatternDocIds{};
+    defer native_exclude.deinit(alloc);
 
     var filter_query = if (req.filter_query_json.len > 0)
         try std.json.parseFromSlice(std.json.Value, alloc, req.filter_query_json, .{})
@@ -427,13 +922,17 @@ pub fn applyStoredSearchPatternFilters(
     for (owned.hits, 0..) |*hit, i| {
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
+        const batch_loaded_stored = if (needs_stored and hit.stored_data == null and loaded_many != null) blk: {
+            defer loaded_missing_index += 1;
+            break :blk loaded_many.?[loaded_missing_index];
+        } else null;
         const parsed_stored = if (needs_stored) blk: {
             const maybe_stored = if (hit.stored_data) |stored|
                 stored
-            else if (loaded_many) |values| blk2: {
-                defer loaded_missing_index += 1;
-                break :blk2 values[loaded_missing_index];
-            } else try executor.load_stored(executor.ctx, alloc, hit.id);
+            else if (loaded_many != null)
+                batch_loaded_stored
+            else
+                try executor.load_stored(executor.ctx, alloc, hit.id);
             const stored = maybe_stored orelse {
                 hit.deinit(alloc);
                 continue;
@@ -443,7 +942,23 @@ pub fn applyStoredSearchPatternFilters(
         } else null;
 
         var keep = true;
-        if (compiled_filter) |compiled| {
+        if (has_positive_doc_ids) {
+            keep = resolvedPatternContainsHit(native_include, hit.*);
+        }
+        if (keep and resolved_include.active) {
+            keep = resolvedPatternContainsHit(resolved_include, hit.*);
+        }
+        if (keep and req.exclude_doc_ids.len > 0) {
+            keep = !resolvedPatternContainsHit(native_exclude, hit.*);
+        }
+        if (keep and resolved_exclude.all) {
+            keep = false;
+        }
+        if (keep and resolved_exclude.active) {
+            keep = !resolvedPatternContainsHit(resolved_exclude, hit.*);
+        }
+        if (keep and compiled_filter != null) {
+            const compiled = compiled_filter.?;
             keep = if (filter_needs_stored)
                 try compiled.matches(hit_alloc, hit.id, parsed_stored.?.value)
             else
@@ -507,6 +1022,8 @@ pub fn postprocessTextSearchResult(
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
+        .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
     try dedupeSearchHitsById(alloc, &filtered);
     if (chunk_backed) {
@@ -514,6 +1031,9 @@ pub fn postprocessTextSearchResult(
             .ctx = processor.ctx,
             .resolve_parent_id = processor.resolve_parent_id,
             .load_parent_stored = processor.load_parent_stored,
+            .load_parent_stored_many = processor.load_many_parent_stored,
+            .load_stored = processor.load_stored,
+            .load_many_stored = processor.load_many_stored,
         });
         if (req.count_only) return stripCountOnlySearchHits(alloc, reshaped);
         return reshaped;
@@ -539,12 +1059,17 @@ pub fn postprocessVectorSearchResult(
             .ctx = processor.ctx,
             .resolve_parent_id = processor.resolve_parent_id,
             .load_parent_stored = processor.load_parent_stored,
+            .load_parent_stored_many = processor.load_many_parent_stored,
+            .load_stored = processor.load_stored,
+            .load_many_stored = processor.load_many_stored,
         });
     }
     return try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
         .load_many_stored = processor.load_many_stored,
+        .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
+        .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
 }
 
@@ -634,6 +1159,9 @@ fn loadStoredForVisibleHit(
 const TestStoredLoader = struct {
     single_calls: usize = 0,
     many_calls: usize = 0,
+    resolve_calls: usize = 0,
+    doc_id_resolve_calls: usize = 0,
+    seen_generation: ?u64 = null,
 
     fn loadStored(ctx: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
         const loader: *TestStoredLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
@@ -657,7 +1185,107 @@ const TestStoredLoader = struct {
         }
         return values;
     }
+
+    fn resolveDocSetDocIds(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !?[]const []const u8 {
+        const loader: *TestStoredLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        loader.resolve_calls += 1;
+        loader.seen_generation = generation;
+        var out = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (out.items) |id| alloc.free(@constCast(id));
+            out.deinit(alloc);
+        }
+        switch (set.*) {
+            .ordinals => |ordinals| {
+                for (ordinals) |ordinal| {
+                    const id: []const u8 = switch (ordinal) {
+                        1 => "doc:a",
+                        2 => "doc:b",
+                        3 => "doc:c",
+                        else => return error.InvalidArgument,
+                    };
+                    try out.append(alloc, try alloc.dupe(u8, id));
+                }
+                return try out.toOwnedSlice(alloc);
+            },
+            else => return null,
+        }
+    }
+
+    fn resolveDocSetDocIdsUnsupported(
+        ctx: ?*anyopaque,
+        _: Allocator,
+        _: *const doc_set.ResolvedDocSet,
+        _: ?u64,
+    ) !?[]const []const u8 {
+        const loader: *TestStoredLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        loader.resolve_calls += 1;
+        return null;
+    }
+
+    fn resolveDocIdsToDocSet(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        const loader: *TestStoredLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        loader.doc_id_resolve_calls += 1;
+        loader.seen_generation = generation;
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(alloc);
+        for (doc_ids) |doc_id| {
+            const ordinal: doc_set.DocOrdinal = if (std.mem.eql(u8, doc_id, "doc:a"))
+                1
+            else if (std.mem.eql(u8, doc_id, "doc:b"))
+                2
+            else if (std.mem.eql(u8, doc_id, "doc:c"))
+                3
+            else
+                return try doc_set.cloneDocKeysAlloc(alloc, doc_ids);
+            try ordinals.append(alloc, ordinal);
+        }
+        return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    }
 };
+
+test "dedupeSearchHitsById uses ordinals when hit page is complete" {
+    const alloc = std.testing.allocator;
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 3),
+        .total_hits = 3,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 1,
+    };
+    result.hits[1] = .{
+        .id = try alloc.dupe(u8, "alias:a"),
+        .doc_ordinal = 1,
+    };
+    result.hits[2] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .doc_ordinal = 2,
+    };
+
+    try dedupeSearchHitsById(alloc, &result);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), result.hits[0].doc_ordinal);
+    try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[1].doc_ordinal);
+}
 
 test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters" {
     const alloc = std.testing.allocator;
@@ -684,6 +1312,215 @@ test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters
     try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters applies native doc id constraints without stored loads" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c") };
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .filter_doc_ids = &.{ "doc:a", "doc:b" },
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:a"},
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .doc_ordinal = 1 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .doc_ordinal = 2 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .doc_ordinal = 3 };
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .filter_doc_ids = &.{ "doc:a", "doc:b" },
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &.{"doc:a"},
+        .identity_read_generation = 9,
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+        .resolve_doc_set_doc_ids = TestStoredLoader.resolveDocSetDocIdsUnsupported,
+        .resolve_doc_ids_to_doc_set = TestStoredLoader.resolveDocIdsToDocSet,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 2), loader.doc_id_resolve_calls);
+    try std.testing.expectEqual(@as(?u64, 9), loader.seen_generation);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters applies resolved doc filters without stored loads" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c") };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .resolved_doc_filter = &filter,
+        .identity_read_generation = 7,
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+        .resolve_doc_set_doc_ids = TestStoredLoader.resolveDocSetDocIds,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(usize, 2), loader.resolve_calls);
+    try std.testing.expectEqual(@as(?u64, 7), loader.seen_generation);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .doc_ordinal = 1 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .doc_ordinal = 2 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .doc_ordinal = 3 };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var loader = TestStoredLoader{};
+    var result = try applyStoredSearchPatternFilters(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+        .resolve_doc_set_doc_ids = TestStoredLoader.resolveDocSetDocIdsUnsupported,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.resolve_calls);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "applyStoredSearchPatternFilters fails closed without resolved ordinal projection" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var loader = TestStoredLoader{};
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    };
+    errdefer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, applyStoredSearchPatternFilters(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, result, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    }));
+    result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.resolve_calls);
+}
+
+test "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var loader = TestStoredLoader{};
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    };
+    errdefer result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, applyStoredSearchPatternFilters(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, result, .{
+        .ctx = &loader,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+        .resolve_doc_set_doc_ids = TestStoredLoader.resolveDocSetDocIdsUnsupported,
+    }));
+    result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), loader.many_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.resolve_calls);
 }
 
 test "applyStoredSearchPatternFilters batch-loads only missing stored docs" {
@@ -727,6 +1564,76 @@ const TestChunkParentShaper = struct {
     }
 };
 
+const TestDirectChunkAncestorLoader = struct {
+    chunk_key: []const u8,
+    unit_key: []const u8,
+
+    fn loadParentStored(_: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, parent_id: []const u8) !?[]u8 {
+        if (!std.mem.eql(u8, parent_id, "doc:a")) return null;
+        return try alloc.dupe(u8, "{\"title\":\"source\"}");
+    }
+
+    fn loadStored(ctx: ?*anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+        const self: *const TestDirectChunkAncestorLoader = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (std.mem.eql(u8, key, "doc:a")) {
+            return try alloc.dupe(u8, "{\"title\":\"source\"}");
+        }
+        if (std.mem.eql(u8, key, self.chunk_key)) {
+            return try alloc.dupe(u8,
+                \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1"}
+            );
+        }
+        if (std.mem.eql(u8, key, self.unit_key)) {
+            return try alloc.dupe(u8, "{\"unit_id\":\"page:000001\",\"text\":\"unit text\"}");
+        }
+        return null;
+    }
+};
+
+test "reshapeChunkBackedResult hydrates direct chunk ancestors" {
+    const alloc = std.testing.allocator;
+
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 0);
+    defer alloc.free(chunk_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(unit_key);
+
+    var loader = TestDirectChunkAncestorLoader{
+        .chunk_key = chunk_key,
+        .unit_key = unit_key,
+    };
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 1);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, chunk_key),
+        .score = 0.4,
+    };
+
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .chunk,
+        .limit = 1,
+        .include_stored = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 1,
+    }, .{
+        .ctx = &loader,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestDirectChunkAncestorLoader.loadParentStored,
+        .load_stored = TestDirectChunkAncestorLoader.loadStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings(chunk_key, result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data == null);
+    try std.testing.expectEqualStrings("{\"title\":\"source\"}", result.hits[0].ancestor_source_data.?);
+    try std.testing.expectEqualStrings("{\"unit_id\":\"page:000001\",\"text\":\"unit text\"}", result.hits[0].ancestor_unit_data.?);
+}
+
 test "reshapeChunkBackedResult orders equal-score parent hits by doc id" {
     const alloc = std.testing.allocator;
 
@@ -759,4 +1666,172 @@ test "reshapeChunkBackedResult orders equal-score parent hits by doc id" {
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
+}
+
+test "reshapeChunkBackedResult preserves parent ordinal from chunk hits" {
+    const alloc = std.testing.allocator;
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 2);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a#0"),
+        .doc_ordinal = 7,
+        .score = 0.4,
+    };
+    raw_hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:a#1"),
+        .doc_ordinal = 7,
+        .score = 0.6,
+    };
+
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .parent,
+        .limit = 1,
+        .include_stored = false,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 2,
+    }, .{
+        .ctx = null,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 7), result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(?f32, 0.6), result.hits[0].score);
+}
+
+test "reshapeChunkBackedResult preserves nested chunk artifact refs" {
+    const alloc = std.testing.allocator;
+
+    var raw_hits = try alloc.alloc(types.SearchHit, 1);
+    raw_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a#0"),
+        .score = 0.4,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "document_chunks_v1"),
+            .kind = .chunk,
+            .chunk_id = 0,
+            .unit_id = try alloc.dupe(u8, "page:000001"),
+        },
+    };
+
+    var result = try reshapeChunkBackedResult(alloc, .{
+        .return_mode = .parent_with_chunks,
+        .limit = 1,
+        .include_stored = false,
+    }, .{
+        .alloc = alloc,
+        .hits = raw_hits,
+        .total_hits = 1,
+    }, .{
+        .ctx = null,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    const artifact_ref = result.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", artifact_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
+    try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
+test "externalizeSearchResultArtifactIds preserves hit ordinals" {
+    const alloc = std.testing.allocator;
+
+    const top_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("body_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 0,
+    };
+    const graph_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:b"),
+        .name = @constCast("body_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 1,
+    };
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 1),
+        .total_hits = 1,
+        .graph_results = try alloc.alloc(types.GraphSearchResult, 1),
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, top_ref),
+        .doc_ordinal = 17,
+        .score = 1.0,
+    };
+    result.graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .hits = try alloc.alloc(types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    result.graph_results[0].hits[0] = .{
+        .id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, graph_ref),
+        .doc_ordinal = 23,
+        .score = 0.5,
+    };
+
+    try externalizeSearchResultArtifactIds(alloc, &result);
+
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 17), result.hits[0].doc_ordinal);
+    try std.testing.expectEqualStrings("af1:chunk:ZG9jOmE:Ym9keV9jaHVua3NfdjE:0", result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 23), result.graph_results[0].hits[0].doc_ordinal);
+    try std.testing.expectEqualStrings("af1:chunk:ZG9jOmI:Ym9keV9jaHVua3NfdjE:1", result.graph_results[0].hits[0].id);
+}
+
+test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
+    const alloc = std.testing.allocator;
+
+    const unit_chunk_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("document_chunks_v1"),
+        .kind = .chunk,
+        .chunk_id = 0,
+        .unit_id = @constCast("page:000001"),
+    };
+
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .chunk_hits = try alloc.alloc(types.ChunkHit, 1),
+    };
+    result.hits[0].chunk_hits[0] = .{
+        .id = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, unit_chunk_ref),
+    };
+
+    try externalizeSearchResultArtifactIds(alloc, &result);
+
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    try std.testing.expectEqualStrings(
+        "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:0:unit:cGFnZTowMDAwMDE",
+        result.hits[0].chunk_hits[0].id,
+    );
+    const artifact_ref = result.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", artifact_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
+    try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
 }

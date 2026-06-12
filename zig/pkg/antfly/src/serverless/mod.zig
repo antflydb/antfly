@@ -320,3 +320,7 @@ test "serverless module compiles" {
     _ = ServerlessServerConfig;
     _ = ServerlessServer;
 }
+
+test "serverless public graph seed totals mark saturated pages incomplete" {
+    try api.http_handler.testPublicGraphSeedTotalHits();
+}

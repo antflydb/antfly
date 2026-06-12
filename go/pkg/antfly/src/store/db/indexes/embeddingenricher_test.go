@@ -1151,7 +1151,7 @@ func TestEmbeddingEnricher_EnrichBatch_WithChunking(t *testing.T) {
 	embeddedTextsMu.Unlock()
 
 	assert.NotEmpty(t, receivedTexts, "embedder should have been called")
-	// Note: chunking may not work in test environment if ANTFLY_TERMITE_URL is not set
+	// Note: chunking may not work in test environment if ANTFLY_INFERENCE_URL is not set
 	// At minimum, we should embed the document itself
 	assert.GreaterOrEqual(t, len(receivedTexts), 1, "should embed at least the document")
 

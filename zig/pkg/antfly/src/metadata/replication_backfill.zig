@@ -1250,7 +1250,7 @@ fn normalizeRouteFilterQueryAlloc(alloc: Allocator, value: std.json.Value) !std.
             }
             inner.deinit(alloc);
         }
-        inline for (.{ "must", "should", "must_not" }) |field_name| {
+        inline for (.{ "must", "filter", "should", "must_not" }) |field_name| {
             if (bool_query.object.get(field_name)) |items_value| {
                 if (items_value != .array) return error.InvalidReplicationSourceConfig;
                 var items = std.json.Array.init(alloc);
@@ -1299,6 +1299,29 @@ fn normalizeRouteFilterQueryAlloc(alloc: Allocator, value: std.json.Value) !std.
     }
 
     return try cloneJsonValueAllocLocal(alloc, value);
+}
+
+test "metadata replication route bool filter clauses are required with must clauses" {
+    const alloc = std.testing.allocator;
+
+    var active = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"tenant":"acme","status":"active"}
+    , .{});
+    defer active.deinit();
+    var inactive = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"tenant":"acme","status":"inactive"}
+    , .{});
+    defer inactive.deinit();
+
+    const route = ParsedReplicationRouteConfig{
+        .target_table = @constCast("target"[0..]),
+        .where_json = @constCast(
+            \\{"bool":{"must":[{"term":{"tenant":"acme"}}],"filter":[{"term":{"status":"active"}}]}}
+        [0..]),
+    };
+
+    try std.testing.expect(try routeMatchesRow(alloc, route, "doc:active", active.value));
+    try std.testing.expect(!(try routeMatchesRow(alloc, route, "doc:inactive", inactive.value)));
 }
 
 fn resolveConfiguredTransformOpsAlloc(
@@ -1393,6 +1416,8 @@ fn deriveUnsetTransformOpsFromUpdateAlloc(
 
 fn mapTransformOpType(op_name: []const u8) !db_mod.types.TransformOpType {
     if (std.mem.eql(u8, op_name, "$set")) return .set;
+    if (std.mem.eql(u8, op_name, "$setOnInsert")) return .set_on_insert;
+    if (std.mem.eql(u8, op_name, "$set_on_insert")) return .set_on_insert;
     if (std.mem.eql(u8, op_name, "$unset")) return .unset;
     if (std.mem.eql(u8, op_name, "$inc")) return .inc;
     if (std.mem.eql(u8, op_name, "$push")) return .push;

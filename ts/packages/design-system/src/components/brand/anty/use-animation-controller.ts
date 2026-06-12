@@ -20,6 +20,12 @@ import { createGlowSystem, type GlowSystemControls } from "./animation/glow-syst
 import { initializeCharacter } from "./animation/initialize";
 import { createShadowTracker, type ShadowTrackerControls } from "./animation/shadow";
 import {
+  createPixelateSystem,
+  type PixelateCycleOptions,
+  type PixelateOptions,
+  type PixelateSystemControls,
+} from "./pixelate/pixelate-system";
+import {
   type AnimationCallbacks,
   type AnimationOptions,
   AnimationState,
@@ -46,6 +52,10 @@ export interface AnimationElements {
   outerGlow?: HTMLElement | null;
   leftBody?: HTMLElement | null;
   rightBody?: HTMLElement | null;
+  /** Wrapper around the vector body/eyes, toggled off while pixelated. */
+  vectorLayer?: HTMLElement | null;
+  /** WebGL canvas overlay used by the pixelate subsystem. */
+  pixelCanvas?: HTMLCanvasElement | null;
   [key: string]: HTMLElement | SVGPathElement | SVGSVGElement | null | undefined;
 }
 
@@ -72,6 +82,8 @@ export interface UseAnimationControllerOptions extends ControllerConfig {
   floatDuration?: number;
   /** Override float easing curve (default: 'sine.inOut') */
   floatEase?: string;
+  /** When true, pixelate transitions cut instantly and the cycle is disabled. */
+  reducedMotion?: boolean;
 }
 
 export interface UseAnimationControllerReturn {
@@ -86,6 +98,12 @@ export interface UseAnimationControllerReturn {
   isIdle: () => boolean;
   isIdlePlaying: () => boolean;
   getDebugInfo: () => ReturnType<AnimationController["getDebugInfo"]>;
+  pixelate: (opts?: PixelateOptions) => void;
+  depixelate: (opts?: PixelateOptions) => void;
+  togglePixelate: (opts?: PixelateOptions) => void;
+  startPixelateCycle: (opts?: PixelateCycleOptions) => void;
+  stopPixelateCycle: () => void;
+  isPixelated: () => boolean;
   isReady: boolean;
 }
 
@@ -113,7 +131,11 @@ export function useAnimationController(
     floatAmplitude,
     floatDuration,
     floatEase,
+    reducedMotion = false,
   } = options;
+
+  // The character box is `sizeScale * 160` px (sizeScale = size / 160).
+  const sizePx = Math.round(sizeScale * 160);
 
   const controllerRef = useRef<AnimationController | null>(null);
   const isInitialized = useRef(false);
@@ -140,6 +162,11 @@ export function useAnimationController(
   const isWakingUpRef = useRef(false);
   const shadowTrackerRef = useRef<ShadowTrackerControls | null>(null);
   const glowSystemRef = useRef<GlowSystemControls | null>(null);
+  const pixelateSystemRef = useRef<PixelateSystemControls | null>(null);
+  /** Intent recorded before the pixelate system exists; replayed on creation. */
+  const pendingPixelateRef = useRef<{ form: "pixel"; opts?: PixelateOptions } | null>(null);
+  const reducedMotionRef = useRef(reducedMotion);
+  reducedMotionRef.current = reducedMotion;
 
   useEffect(() => {
     if (isInitialized.current) return;
@@ -201,6 +228,8 @@ export function useAnimationController(
       shadowTrackerRef.current = null;
       glowSystemRef.current?.stop();
       glowSystemRef.current = null;
+      pixelateSystemRef.current?.destroy();
+      pixelateSystemRef.current = null;
       controllerRef.current?.destroy();
       controllerRef.current = null;
       isInitialized.current = false;
@@ -260,15 +289,34 @@ export function useAnimationController(
           glowSystemRef.current.hide();
         }
       }
+
+      if (elements.pixelCanvas && elements.vectorLayer && !pixelateSystemRef.current) {
+        pixelateSystemRef.current = createPixelateSystem(
+          elements.pixelCanvas,
+          elements.vectorLayer,
+          sizePx
+        );
+        pixelateSystemRef.current.setReducedMotion(reducedMotionRef.current);
+        const pending = pendingPixelateRef.current;
+        if (pending) {
+          pendingPixelateRef.current = null;
+          pixelateSystemRef.current.pixelate(pending.opts);
+        }
+      }
     }
-  }, [elements, isOff, logoMode, activeScale, sizeScale, offScale, eyeStyle]);
+  }, [elements, isOff, logoMode, activeScale, sizeScale, offScale, eyeStyle, sizePx]);
 
   useEffect(() => {
     if (glowSystemRef.current) {
       glowSystemRef.current.updateSizeScale(sizeScale);
       glowSystemRef.current.snapToCharacter();
     }
-  }, [sizeScale]);
+    pixelateSystemRef.current?.resize(sizePx);
+  }, [sizeScale, sizePx]);
+
+  useEffect(() => {
+    pixelateSystemRef.current?.setReducedMotion(reducedMotion);
+  }, [reducedMotion]);
 
   useEffect(() => {
     if (!controllerRef.current) return;
@@ -622,6 +670,32 @@ export function useAnimationController(
     return controllerRef.current.getDebugInfo();
   }, []);
 
+  // The pixelate system is created one commit AFTER mount effects run (its
+  // canvas/vector elements register via callback refs into `elements` state),
+  // so a pixelate()/depixelate() called from a mount effect — e.g. the
+  // declarative `pixelated` prop — would land on null and be silently
+  // dropped. Queue the intent and replay it when the system is created.
+  const pixelate = useCallback((opts?: PixelateOptions) => {
+    if (pixelateSystemRef.current) pixelateSystemRef.current.pixelate(opts);
+    else pendingPixelateRef.current = { form: "pixel", opts };
+  }, []);
+  const depixelate = useCallback((opts?: PixelateOptions) => {
+    if (pixelateSystemRef.current) pixelateSystemRef.current.depixelate(opts);
+    else pendingPixelateRef.current = null;
+  }, []);
+  const togglePixelate = useCallback((opts?: PixelateOptions) => {
+    pixelateSystemRef.current?.toggle(opts);
+  }, []);
+  const startPixelateCycle = useCallback((opts?: PixelateCycleOptions) => {
+    pixelateSystemRef.current?.startCycle(opts);
+  }, []);
+  const stopPixelateCycle = useCallback(() => {
+    pixelateSystemRef.current?.stopCycle();
+  }, []);
+  const isPixelated = useCallback(() => {
+    return pixelateSystemRef.current?.isPixelated() ?? false;
+  }, []);
+
   return useMemo(
     () => ({
       playEmotion,
@@ -635,6 +709,12 @@ export function useAnimationController(
       isIdle: isIdleActive,
       isIdlePlaying,
       getDebugInfo,
+      pixelate,
+      depixelate,
+      togglePixelate,
+      startPixelateCycle,
+      stopPixelateCycle,
+      isPixelated,
       isReady: isReady.current,
     }),
     [
@@ -649,6 +729,12 @@ export function useAnimationController(
       isIdleActive,
       isIdlePlaying,
       getDebugInfo,
+      pixelate,
+      depixelate,
+      togglePixelate,
+      startPixelateCycle,
+      stopPixelateCycle,
+      isPixelated,
     ]
   );
 }

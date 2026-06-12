@@ -1,7 +1,12 @@
+/**
+ * Visual language: square corners everywhere. The radius variables stay
+ * defined so existing shadcn components that compute from --radius still
+ * work — they just all resolve to 0.
+ */
 :root {
-  --radius: 0.625rem;
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  --radius: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
 }

@@ -99,6 +99,11 @@ pub const MetadataStatus = struct {
     projected_restore_progress: usize = 0,
     projected_split_transitions: usize = 0,
     projected_merge_transitions: usize = 0,
+    projected_doc_identity_lifecycle_unknown: usize = 0,
+    projected_doc_identity_lifecycle_preserving: usize = 0,
+    projected_doc_identity_lifecycle_reassigning: usize = 0,
+    projected_doc_identity_lifecycle_rebuild_required: usize = 0,
+    projected_doc_identity_lifecycle_ready: usize = 0,
     preferred_stores: usize = 0,
     constrained_stores: usize = 0,
     overloaded_stores: usize = 0,
@@ -625,6 +630,7 @@ test "metadata admin snapshot captures projected metadata state" {
                     .receiver_ready_for_reads = true,
                     .donor_delta_sequence = 4,
                     .receiver_delta_sequence = 4,
+                    .allow_doc_identity_reassignment = true,
                 },
                 .receiver = .{
                     .phase = .cutover_ready,
@@ -638,7 +644,9 @@ test "metadata admin snapshot captures projected metadata state" {
                     .receiver_ready_for_reads = true,
                     .donor_delta_sequence = 4,
                     .receiver_delta_sequence = 4,
+                    .allow_doc_identity_reassignment = true,
                 },
+                .receiver_local_leader = true,
             };
         }
     };
@@ -716,6 +724,7 @@ test "metadata admin snapshot captures projected metadata state" {
     try std.testing.expectEqual(@as(u64, 10), snapshot.merged_group_statuses[0].group_id);
     try std.testing.expect(snapshot.merged_group_statuses[0].leader_known);
     try std.testing.expectEqual(@as(u64, 11), snapshot.merged_group_statuses[0].leader_store_id);
+    try std.testing.expect(snapshot.merged_group_statuses[0].doc_identity_reassignment_active);
 }
 
 test "metadata admin snapshot derives replication source action hints for reseed" {

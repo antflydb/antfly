@@ -3,7 +3,7 @@
 **Status**: Planned
 **Created**: 2025-12-10
 **Updated**: 2026-03-01
-**Applies to**: antfly-operator, termite controllers
+**Applies to**: antfly-operator, inference controllers
 
 ## Summary
 
@@ -18,8 +18,8 @@ Both operators implement validation methods directly on their CRD types using th
 | AntflyCluster | `api/v1/antflycluster_webhook.go` | `validateClusterConfiguration()` calls `cluster.ValidateCreate()` |
 | AntflyBackup | `api/v1/antflybackup_webhook.go` | None |
 | AntflyRestore | `api/v1/antflyrestore_webhook.go` | None |
-| TermitePool | `api/v1alpha1/termitepool_webhook.go` | `validatePool()` reimplements validation inline |
-| TermiteRoute | `api/v1alpha1/termiteroute_webhook.go` | None |
+| InferencePool | `api/v1alpha1/inferencepool_webhook.go` | `validatePool()` reimplements validation inline |
+| InferenceProxy | `api/v1alpha1/inferenceproxy_webhook.go` | None |
 
 **Current behavior:**
 1. User runs `kubectl apply -f cluster.yaml`
@@ -61,20 +61,20 @@ The current validation methods on CRD types are unexported (e.g., `validateAntfl
 - `api/v1/antflycluster_webhook.go` — export `validateAntflyCluster()` → `ValidateAntflyCluster()`, `validateImmutability()` → `ValidateImmutability()`
 - `api/v1/antflybackup_webhook.go` — same pattern
 - `api/v1/antflyrestore_webhook.go` — same pattern
-- `api/v1alpha1/termitepool_webhook.go` — same pattern
-- `api/v1alpha1/termiteroute_webhook.go` — same pattern
+- `api/v1alpha1/inferencepool_webhook.go` — same pattern
+- `api/v1alpha1/inferenceproxy_webhook.go` — same pattern
 
 The existing `ValidateCreate()` / `ValidateUpdate()` / `ValidateDelete()` methods on the CRD types remain for backward compatibility with controller fallback. They delegate to the exported methods.
 
-#### 0.2 Fix TermitePool Controller Validation
+#### 0.2 Fix InferencePool Controller Validation
 
-The TermitePool controller's `validatePool()` reimplements validation logic inline rather than delegating to `pool.ValidateCreate()`. This causes validation drift.
+The InferencePool controller's `validatePool()` reimplements validation logic inline rather than delegating to `pool.ValidateCreate()`. This causes validation drift.
 
-**File**: `go/pkg/operator/controllers/termite/termitepool_controller.go`
+**File**: `go/pkg/operator/controllers/inference/inferencepool_controller.go`
 
 Replace the inline `validatePool()` method with:
 ```go
-func (r *TermitePoolReconciler) validatePool(pool *antflyaiv1alpha1.TermitePool) error {
+func (r *InferencePoolReconciler) validatePool(pool *antflyaiv1alpha1.InferencePool) error {
     return pool.ValidateCreate()
 }
 ```
@@ -84,7 +84,7 @@ func (r *TermitePoolReconciler) validatePool(pool *antflyaiv1alpha1.TermitePool)
 Add controller-level fallback validation for CRDs that lack it:
 - AntflyBackup controller
 - AntflyRestore controller
-- TermiteRoute controller
+- InferenceProxy controller
 
 Follow the AntflyCluster pattern: call `obj.ValidateCreate()` during reconciliation with exponential backoff on error.
 
@@ -362,13 +362,13 @@ make manifests generate
 
 This generates `config/webhook/manifests.yaml` containing the `ValidatingWebhookConfiguration` for all three CRDs.
 
-### Phase 2: termite controllers Webhooks
+### Phase 2: inference controllers Webhooks
 
-Apply the same pattern to termite controllers for TermitePool and TermiteRoute.
+Apply the same pattern to inference controllers for InferencePool and InferenceProxy.
 
 #### 2.1 Create Validator Structs
 
-**File**: `internal/webhook/termite/v1alpha1/termitepool_validator.go`
+**File**: `internal/webhook/inference/v1alpha1/inferencepool_validator.go`
 
 ```go
 package v1alpha1
@@ -376,37 +376,37 @@ package v1alpha1
 import (
     "context"
 
-    antflyaiv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+    antflyaiv1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
     "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-type TermitePoolValidator struct{}
+type InferencePoolValidator struct{}
 
-var _ admission.Validator[*antflyaiv1alpha1.TermitePool] = &TermitePoolValidator{}
+var _ admission.Validator[*antflyaiv1alpha1.InferencePool] = &InferencePoolValidator{}
 
-func (v *TermitePoolValidator) ValidateCreate(ctx context.Context, obj *antflyaiv1alpha1.TermitePool) (admission.Warnings, error) {
-    return nil, obj.ValidateTermitePool()
+func (v *InferencePoolValidator) ValidateCreate(ctx context.Context, obj *antflyaiv1alpha1.InferencePool) (admission.Warnings, error) {
+    return nil, obj.ValidateInferencePool()
 }
 
-func (v *TermitePoolValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *antflyaiv1alpha1.TermitePool) (admission.Warnings, error) {
+func (v *InferencePoolValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *antflyaiv1alpha1.InferencePool) (admission.Warnings, error) {
     if err := newObj.ValidateImmutability(oldObj); err != nil {
         return nil, err
     }
-    return nil, newObj.ValidateTermitePool()
+    return nil, newObj.ValidateInferencePool()
 }
 
-func (v *TermitePoolValidator) ValidateDelete(ctx context.Context, obj *antflyaiv1alpha1.TermitePool) (admission.Warnings, error) {
+func (v *InferencePoolValidator) ValidateDelete(ctx context.Context, obj *antflyaiv1alpha1.InferencePool) (admission.Warnings, error) {
     return nil, nil
 }
 ```
 
-**File**: `internal/webhook/termite/v1alpha1/termiteroute_validator.go` — same pattern for TermiteRoute.
+**File**: `internal/webhook/inference/v1alpha1/inferenceproxy_validator.go` — same pattern for InferenceProxy.
 
-**File**: `internal/webhook/termite/v1alpha1/setup.go` — registers both validators.
+**File**: `internal/webhook/inference/v1alpha1/setup.go` — registers both validators.
 
 #### 2.2 Update main.go, deployment, and kustomize
 
-Same infrastructure pattern as Phase 1, adapted for the termite controllers namespace and service names.
+Same infrastructure pattern as Phase 1, adapted for the inference controllers namespace and service names.
 
 **Files:**
 - `go/pkg/operator/cmd/antfly-operator/main.go` — add webhook server and `ENABLE_WEBHOOKS` toggle
@@ -522,16 +522,16 @@ EOF
 | `config/default/manager_webhook_patch.yaml` | Create | Deployment patch |
 | `cmd/antfly-operator/main.go` | Modify | Add webhook server + ENABLE_WEBHOOKS |
 
-### termite controllers
+### inference controllers
 
 | File | Action | Description |
 |------|--------|-------------|
-| `api/v1alpha1/termitepool_webhook.go` | Modify | Export core validation methods |
-| `api/v1alpha1/termiteroute_webhook.go` | Modify | Export core validation methods |
-| `controllers/termitepool_controller.go` | Modify | Replace inline `validatePool()` with delegation |
-| `internal/webhook/termite/v1alpha1/termitepool_validator.go` | Create | Typed validator struct |
-| `internal/webhook/termite/v1alpha1/termiteroute_validator.go` | Create | Typed validator struct |
-| `internal/webhook/termite/v1alpha1/setup.go` | Create | Webhook registration |
+| `api/v1alpha1/inferencepool_webhook.go` | Modify | Export core validation methods |
+| `api/v1alpha1/inferenceproxy_webhook.go` | Modify | Export core validation methods |
+| `controllers/inferencepool_controller.go` | Modify | Replace inline `validatePool()` with delegation |
+| `internal/webhook/inference/v1alpha1/inferencepool_validator.go` | Create | Typed validator struct |
+| `internal/webhook/inference/v1alpha1/inferenceproxy_validator.go` | Create | Typed validator struct |
+| `internal/webhook/inference/v1alpha1/setup.go` | Create | Webhook registration |
 | `config/webhook/*` | Create | Webhook configuration |
 | `config/certmanager/*` | Create | Certificate configuration |
 | `config/default/kustomization.yaml` | Modify | Include webhook resources |

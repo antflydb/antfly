@@ -8,7 +8,7 @@ storage:
     base_dir: "antflydb"
   keyvalue: "local"
   metadatakv: "local"
-termite:
+inference:
   api_url: "http://127.0.0.1:11433"
 max_shard_size_bytes: 64000000
 replication_factor: 3

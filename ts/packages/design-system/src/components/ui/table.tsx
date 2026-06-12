@@ -18,14 +18,14 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
 
 function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
   return (
-    <>
-      <style>{`
-        thead[data-slot="table-header"] tr:hover {
-          background-color: transparent !important;
-        }
-      `}</style>
-      <thead data-slot="table-header" className={cn("", className)} {...props} />
-    </>
+    <thead
+      data-slot="table-header"
+      className={cn(
+        "[&>tr]:border-b-(length:--border-width) [&>tr]:border-border [&>tr:hover]:bg-transparent",
+        className
+      )}
+      {...props}
+    />
   );
 }
 
@@ -67,7 +67,12 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        "text-foreground h-12 px-4 text-left align-middle font-semibold [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+        // mono uppercase "instrument readout" voice (same family as MonoLabel),
+        // dimmed so the heads recede behind the data
+        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        "h-11 px-4 text-left align-middle whitespace-nowrap",
+        // checkbox handling preserved
+        "[&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className
       )}
       {...props}
@@ -80,7 +85,7 @@ function TableCell({ className, ...props }: React.ComponentProps<"td">) {
     <td
       data-slot="table-cell"
       className={cn(
-        "py-3 px-4 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px] text-foreground",
+        "py-4 px-4 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px] text-foreground",
         className
       )}
       {...props}

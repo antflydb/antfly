@@ -7,13 +7,11 @@ const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 /// The chunking provider to use.
 pub const ChunkerProvider = enum {
     mock,
-    termite,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .mock => "mock",
-            .termite => "termite",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -26,23 +24,19 @@ pub const ChunkerProvider = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "mock", .mock },
-            .{ "termite", .termite },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Configuration for the Termite chunking provider. Termite is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
-pub const TermiteChunkerConfig = struct {
-    /// The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
+/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
+pub const AntflyChunkerConfig = struct {
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
     model: []const u8,
 };
-
-/// Configuration for the local Antfly chunking provider. This provider runs chunking directly within the storage node process, without requiring an external Termite service. It uses simple fixed-size tokenizer-based chunking with no caching overhead. **Use this when:** - Running single-node deployments (swarm mode) - You don't need embedding/chunk caching across nodes - You want minimal setup complexity **Use Termite instead when:** - Running multi-node clusters where caching reduces costs - You need ONNX-accelerated chunking models - You want persistent chunk/embedding caches
-pub const AntflyChunkerConfig = struct {};
 
 pub const Chunk = antfly_chunking_api_openapi.Chunk;
 
@@ -50,7 +44,7 @@ pub const ChunkOptions = antfly_chunking_api_openapi.ChunkOptions;
 
 /// A unified configuration for a chunking provider.
 pub const ChunkerConfig = struct {
-    /// The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_TERMITE_URL environment variable.
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
     model: ?[]const u8 = null,

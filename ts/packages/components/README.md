@@ -77,7 +77,7 @@ function MyComponent() {
 
   // Start streaming
   startStream({
-    url: 'http://localhost:8080/api/v1',
+    url: 'http://localhost:8080/db/v1',
     request: {
       query: 'how does raft work',
       tables: ['docs']

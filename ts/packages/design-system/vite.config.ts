@@ -6,6 +6,7 @@ import dts from "vite-plugin-dts";
 import tsconfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
+  root: __dirname,
   plugins: [
     react(),
     tsconfigPaths(),
@@ -69,6 +70,6 @@ export default defineConfig({
       plugins: [preserveDirectives()],
     },
     sourcemap: true,
-    outDir: "dist",
+    outDir: resolve(__dirname, "dist"),
   },
 });

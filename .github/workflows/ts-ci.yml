@@ -66,11 +66,28 @@ jobs:
   playwright:
     needs: [test]
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-heavy
+    env:
+      PNPM_STORE_PATH: /mnt/cache/pnpm-store
     defaults:
       run:
         working-directory: ts
     steps:
+      - name: Configure cache directories
+        run: |
+          playwright_browsers_path="${RUNNER_TEMP}/playwright-browsers"
+          xdg_cache_home="${RUNNER_TEMP}/xdg"
+          tmpdir="${RUNNER_TEMP}/tmp"
+
+          {
+            echo "PLAYWRIGHT_BROWSERS_PATH=${playwright_browsers_path}"
+            echo "XDG_CACHE_HOME=${xdg_cache_home}"
+            echo "TMPDIR=${tmpdir}"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$PNPM_STORE_PATH" "$playwright_browsers_path" "$xdg_cache_home" "$tmpdir"
+        working-directory: .
+
       - uses: actions/checkout@v6
 
       - name: Install pnpm
@@ -81,8 +98,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: lts/*
-          cache: 'pnpm'
-          cache-dependency-path: ts/pnpm-lock.yaml
+
+      - name: Configure pnpm cache
+        run: pnpm config set store-dir "$PNPM_STORE_PATH"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -90,9 +108,23 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install Playwright Browsers
+      - name: Install Playwright OS Dependencies
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright install --with-deps
+        timeout-minutes: 10
+        run: |
+          set -euxo pipefail
+          time pnpm exec playwright install-deps chromium
+
+      # ARC hangs extracting Playwright-managed browser archives, so use apt-installed Chrome.
+      - name: Install Google Chrome
+        working-directory: .
+        timeout-minutes: 10
+        run: |
+          set -euxo pipefail
+          chrome_deb="${RUNNER_TEMP}/google-chrome-stable_current_amd64.deb"
+          curl -fsSL -o "$chrome_deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y "$chrome_deb"
+          google-chrome --version
 
       - name: Preview server
         working-directory: ts/apps/antfarm
@@ -104,8 +136,9 @@ jobs:
 
       - name: Run Playwright tests
         working-directory: ts/apps/antfarm
-        run: pnpm exec playwright test
+        run: pnpm exec playwright test --project=chromium --reporter=list
         env:
+          ANTFARM_PLAYWRIGHT_USE_SYSTEM_CHROME: "1"
           BASE_URL: http://localhost:4173
 
       - uses: actions/upload-artifact@v6

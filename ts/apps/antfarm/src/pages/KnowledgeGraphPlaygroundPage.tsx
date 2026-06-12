@@ -39,7 +39,7 @@ import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { fetchWithRetry } from "@/lib/utils";
 
-// RecognizeResponse types matching Termite /api/recognize
+// Recognition response types matching the Antfly inference extraction API.
 interface RecognizeEntity {
   text: string;
   label: string;
@@ -105,15 +105,17 @@ interface ResolverConfig {
 const DEFAULT_ENTITY_LABELS = ["person", "organization", "location", "date"];
 const DEFAULT_RELATION_LABELS = ["founded", "works_at", "located_in", "ceo_of", "acquired"];
 
-// Entity type colors
+// Entity type colors — routed through the design-system categorical chart
+// palette so node types stay distinguishable without inventing new hues
+// (color is the only channel available in the SVG graph).
 const ENTITY_TYPE_COLORS: Record<string, string> = {
-  person: "#3b82f6", // blue
-  organization: "#22c55e", // green
-  location: "#a855f7", // purple
-  date: "#f59e0b", // amber
-  product: "#ec4899", // pink
-  event: "#06b6d4", // cyan
-  default: "#6b7280", // gray
+  person: "var(--chart-series-1)",
+  organization: "var(--chart-series-2)",
+  location: "var(--chart-series-3)",
+  date: "var(--chart-series-4)",
+  product: "var(--chart-series-5)",
+  event: "var(--chart-series-6)",
+  default: "var(--muted-foreground)",
 };
 
 const STORAGE_KEY = "antfarm-playground-knowledge-graph";
@@ -196,7 +198,7 @@ function getModelName(model: string): string {
 }
 
 const KnowledgeGraphPlaygroundPage: React.FC = () => {
-  const { termiteApiUrl } = useApiConfig();
+  const { inferenceApiUrl } = useApiConfig();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Restore state from localStorage
@@ -286,7 +288,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${termiteApiUrl}/ml/v1/models`, {
+        const response = await fetch(`${inferenceApiUrl}/ai/v1/models`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -321,7 +323,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       }
     })();
     return () => controller.abort();
-  }, [termiteApiUrl]);
+  }, [inferenceApiUrl]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
@@ -394,7 +396,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         }
       }
 
-      const response = await fetchWithRetry(`${termiteApiUrl}/ml/v1/recognize`, {
+      const response = await fetchWithRetry(`${inferenceApiUrl}/ai/v1/recognize`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -418,12 +420,20 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to connect to Termite. Make sure Termite is running."
+          : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, termiteApiUrl]);
+  }, [
+    inputText,
+    selectedModel,
+    isRebelModel,
+    entityLabels,
+    relationLabels,
+    config,
+    inferenceApiUrl,
+  ]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -521,7 +531,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     });
 
     return (
-      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-lg">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-none">
         <title>Knowledge graph visualization</title>
         <defs>
           <marker
@@ -532,7 +542,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
             refY="3.5"
             orient="auto"
           >
-            <polygon points="0 0, 10 3.5, 0 7" fill="#888" />
+            <polygon points="0 0, 10 3.5, 0 7" fill="var(--muted-foreground)" />
           </marker>
         </defs>
 
@@ -576,7 +586,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 y1={y1}
                 x2={x2}
                 y2={y2}
-                stroke={isSelected ? "#3b82f6" : "#888"}
+                stroke={isSelected ? "var(--primary)" : "var(--muted-foreground)"}
                 strokeWidth={isSelected ? 2 : 1}
                 markerEnd="url(#arrowhead)"
               />
@@ -746,7 +756,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                   {entityLabels.map((label) => (
                     <Badge
                       key={label}
-                      variant="secondary"
                       style={{
                         backgroundColor: `${getNodeColor(label)}20`,
                         borderColor: getNodeColor(label),
@@ -793,7 +802,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 <Label>Relation Labels</Label>
                 <div className="flex flex-wrap gap-2 mb-2">
                   {relationLabels.map((label) => (
-                    <Badge key={label} variant="outline" className="gap-1">
+                    <Badge key={label} className="gap-1">
                       {label}
                       <button
                         type="button"
@@ -888,7 +897,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -896,20 +905,20 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Hash className="h-3 w-3" />
             {result.nodes.length} nodes
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <GitBranch className="h-3 w-3" />
             {result.edges.length} edges
           </Badge>
-          <Badge variant="secondary" className="gap-1.5">
+          <Badge className="gap-1.5">
             <Zap className="h-3 w-3" />
             {result.model}
           </Badge>
           {processingTime && (
-            <Badge variant="outline" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Clock className="h-3 w-3" />
               {processingTime.toFixed(0)}ms
             </Badge>
@@ -959,7 +968,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 <TabsContent value="visual" className="mt-0">
                   {graphVisualization}
                   {(selectedNode || selectedEdge) && (
-                    <div className="mt-4 p-3 bg-muted/50 rounded-lg border text-sm">
+                    <div className="mt-4 p-3 bg-muted/50 rounded-none border text-sm">
                       {selectedNode && (
                         <div>
                           <div className="font-medium">{selectedNode.canonical_name}</div>
@@ -989,7 +998,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="nodes" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-lg border overflow-hidden">
+                  <div className="rounded-none border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>
@@ -1006,7 +1015,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                             </td>
                             <td className="px-3 py-2">
                               <Badge
-                                variant="outline"
                                 style={{
                                   backgroundColor: `${getNodeColor(node.type)}20`,
                                   borderColor: getNodeColor(node.type),
@@ -1026,7 +1034,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="edges" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-lg border overflow-hidden">
+                  <div className="rounded-none border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>
@@ -1043,7 +1051,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                               {nodeMap.get(edge.source_id)?.canonical_name || edge.source_id}
                             </td>
                             <td className="px-3 py-2">
-                              <Badge variant="outline">{edge.type}</Badge>
+                              <Badge>{edge.type}</Badge>
                             </td>
                             <td className="px-3 py-2">
                               {nodeMap.get(edge.target_id)?.canonical_name || edge.target_id}

@@ -2,8 +2,8 @@ openapi: 3.0.3
 info:
   title: Antfly Public API
   version: v1alpha1
-  description: Joined public contract for the Antfly server. Antfly APIs are served under `/api/v1`, auth
-    APIs under `/auth/v1`, and Termite ML APIs under `/ml/v1`.
+  description: Joined public contract for the Antfly server. Antfly APIs are served under `/db/v1`, auth
+    APIs under `/auth/v1`, inference APIs under `/ai/v1`, and ML prediction APIs under `/ml/v1`.
 servers:
   - url: /
 tags:
@@ -2068,12 +2068,12 @@ security:
   - ApiKeyAuth: []
   - BearerAuth: []
 paths:
-  /api/v1/status:
+  /db/v1/status:
     get:
       summary: Get cluster status
       tags:
         - cluster_management
-      description: Returns the current health and status of all stores and shards in the cluster
+      description: Returns minimal cluster health and runtime status.
       operationId: getStatus
       responses:
         '200':
@@ -2094,7 +2094,34 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/secrets:
+  /db/v1/cluster:
+    get:
+      summary: Get cluster topology
+      tags:
+        - cluster_management
+      description: Returns cluster health plus data-node, range, replica, and group topology for dashboard
+        views.
+      operationId: getCluster
+      responses:
+        '200':
+          description: Cluster topology retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterTopology'
+        '401':
+          description: Unauthorized - authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/secrets:
     get:
       summary: List secrets status
       tags:
@@ -2123,7 +2150,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/secrets/{key}:
+  /db/v1/secrets/{key}:
     parameters:
       - name: key
         in: path
@@ -2202,7 +2229,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/batch:
+  /db/v1/batch:
     post:
       summary: Cross-table batch operations
       tags:
@@ -2249,7 +2276,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/commit:
+  /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
       tags:
@@ -2310,7 +2337,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions:
+  /db/v1/transactions:
     get:
       summary: List transaction sessions
       tags:
@@ -2329,7 +2356,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/cleanup:
+  /db/v1/transactions/cleanup:
     post:
       summary: Clean up expired transaction sessions
       tags:
@@ -2356,7 +2383,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/begin:
+  /db/v1/transactions/begin:
     post:
       summary: Begin a transaction session
       tags:
@@ -2383,7 +2410,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}:
+  /db/v1/transactions/{transaction_id}:
     get:
       summary: Get transaction session details
       tags:
@@ -2410,7 +2437,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/stage:
+  /db/v1/transactions/{transaction_id}/stage:
     post:
       summary: Stage a transaction commit request
       tags:
@@ -2443,7 +2470,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/read:
+  /db/v1/transactions/{transaction_id}/read:
     post:
       summary: Stage a transaction read version
       tags:
@@ -2480,7 +2507,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/write:
+  /db/v1/transactions/{transaction_id}/write:
     post:
       summary: Stage a transaction write
       tags:
@@ -2513,7 +2540,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/delete:
+  /db/v1/transactions/{transaction_id}/delete:
     post:
       summary: Stage a transaction delete
       tags:
@@ -2546,7 +2573,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/savepoints:
+  /db/v1/transactions/{transaction_id}/savepoints:
     post:
       summary: Create a transaction savepoint
       tags:
@@ -2573,7 +2600,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback:
+  /db/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback:
     post:
       summary: Roll back a transaction session to a savepoint
       tags:
@@ -2605,7 +2632,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/commit:
+  /db/v1/transactions/{transaction_id}/commit:
     post:
       summary: Commit a transaction session
       tags:
@@ -2642,7 +2669,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/transactions/{transaction_id}/abort:
+  /db/v1/transactions/{transaction_id}/abort:
     post:
       summary: Abort a transaction session
       tags:
@@ -2669,7 +2696,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/backup:
+  /db/v1/backup:
     post:
       summary: Backup all tables or selected tables
       tags:
@@ -2735,7 +2762,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/restore:
+  /db/v1/restore:
     post:
       summary: Restore multiple tables from a backup
       tags:
@@ -2780,7 +2807,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/backups:
+  /db/v1/backups:
     get:
       summary: List available backups
       tags:
@@ -2820,7 +2847,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/query:
+  /db/v1/query:
     post:
       summary: Perform a global query
       tags:
@@ -2937,7 +2964,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/eval:
+  /db/v1/eval:
     post:
       summary: Standalone evaluation endpoint
       tags:
@@ -2986,7 +3013,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/agents/query-builder:
+  /db/v1/agents/query-builder:
     post:
       summary: Build a search query from natural language
       tags:
@@ -3041,7 +3068,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/agents/retrieval:
+  /db/v1/agents/retrieval:
     post:
       summary: Retrieval Agent - Agentic document retrieval with tool calling
       tags:
@@ -3141,7 +3168,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables:
+  /db/v1/tables:
     get:
       summary: List all tables
       tags:
@@ -3181,7 +3208,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}:
+  /db/v1/tables/{tableName}:
     parameters:
       - name: tableName
         in: path
@@ -3369,7 +3396,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/query:
+  /db/v1/tables/{tableName}/query:
     parameters:
       - name: tableName
         in: path
@@ -3408,7 +3435,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/batch:
+  /db/v1/tables/{tableName}/batch:
     parameters:
       - name: tableName
         in: path
@@ -3444,7 +3471,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/merge:
+  /db/v1/tables/{tableName}/merge:
     parameters:
       - name: tableName
         in: path
@@ -3537,7 +3564,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/backup:
+  /db/v1/tables/{tableName}/backup:
     parameters:
       - name: tableName
         in: path
@@ -3577,7 +3604,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/restore:
+  /db/v1/tables/{tableName}/restore:
     parameters:
       - name: tableName
         in: path
@@ -3615,7 +3642,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/schema:
+  /db/v1/tables/{tableName}/schema:
     parameters:
       - name: tableName
         in: path
@@ -3651,7 +3678,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/lookup:
+  /db/v1/tables/{tableName}/lookup:
     parameters:
       - name: tableName
         in: path
@@ -3696,7 +3723,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/lookup/{key}:
+  /db/v1/tables/{tableName}/documents/{key}:
     parameters:
       - name: tableName
         in: path
@@ -3707,11 +3734,11 @@ paths:
       - name: key
         in: path
         required: true
-        description: Key of the record to lookup
+        description: Key of the document to retrieve
         schema:
           type: string
     get:
-      summary: Lookup a key in a table
+      summary: Retrieve a document by key
       tags:
         - data_operations
       operationId: lookupKey
@@ -3764,7 +3791,432 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/indexes:
+  /db/v1/tables/{tableName}/documents/{key}/artifacts:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        description: Percent-encoded source document key.
+        schema:
+          type: string
+    get:
+      summary: List derived document artifact manifests
+      description: >
+        Returns the derived document artifact manifests currently available for
+
+        a source document. This lets clients discover artifact names before
+
+        inspecting a single manifest or triggering reprocessing.
+      parameters:
+        - name: detail
+          in: query
+          required: false
+          description: >
+            Response detail level. `summary` returns typed manifest fields only.
+
+            `raw` also includes opaque manifest/state JSON and requires table
+
+            admin permission when authentication is enabled.
+          schema:
+            type: string
+            enum:
+              - summary
+              - raw
+      tags:
+        - data_operations
+      operationId: listDocumentArtifactManifests
+      responses:
+        '200':
+          description: Artifact manifest list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactManifestList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Reprocess a derived document artifact across a table range
+      description: >
+        Runs a bounded operational repair pass for a derived document artifact
+
+        across source rows in key order. Use `next_key` from the response as
+
+        the next request's `from_key` for simple single-cursor continuation.
+
+        Distributed repair controllers should persist `shard_cursors` from the
+
+        response and pass them back on the next request to resume each shard
+
+        independently when scanning large sharded tables.
+      tags:
+        - data_operations
+      operationId: reprocessDocumentArtifactRange
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentArtifactTableReprocessRequest'
+      responses:
+        '202':
+          description: Bounded reprocessing pass was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactTableReprocessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Create a derived document artifact reprocess job
+      description: >
+        Creates a durable user-facing repair job for a derived document
+
+        artifact. The job advances through the same bounded per-shard repair
+
+        primitive used by `/reprocess`, and stores returned continuation
+
+        cursors so hosted controllers can resume large sharded table repairs
+
+        without collapsing progress into a single global key cursor.
+      tags:
+        - data_operations
+      operationId: startDocumentArtifactReprocessJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentArtifactReprocessJobStartRequest'
+      responses:
+        '202':
+          description: Reprocess job was created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get derived document artifact reprocess job status
+      tags:
+        - data_operations
+      operationId: getDocumentArtifactReprocessJob
+      responses:
+        '200':
+          description: Reprocess job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a derived document artifact reprocess job
+      description: Runs one bounded repair pass and persists the resulting job state.
+      tags:
+        - data_operations
+      operationId: advanceDocumentArtifactReprocessJob
+      responses:
+        '202':
+          description: Reprocess job advanced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '200':
+          description: Reprocess job was already terminal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Reprocess job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a derived document artifact reprocess job
+      tags:
+        - data_operations
+      operationId: cancelDocumentArtifactReprocessJob
+      responses:
+        '200':
+          description: Reprocess job was cancelled or already terminal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        description: Percent-encoded source document key.
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    get:
+      summary: Inspect a derived document artifact manifest
+      description: >
+        Returns manifest and processing state for a derived document artifact,
+
+        such as the document-unit hierarchy extracted from a PDF, HTML page, or
+
+        text field. The route is shard-aware; hosted deployments route the
+
+        request to the data group that owns the source document key.
+      parameters:
+        - name: detail
+          in: query
+          required: false
+          description: >
+            Response detail level. `summary` returns typed manifest fields only.
+
+            `raw` also includes opaque manifest/state JSON and requires table
+
+            admin permission when authentication is enabled.
+          schema:
+            type: string
+            enum:
+              - summary
+              - raw
+      tags:
+        - data_operations
+      operationId: getDocumentArtifactManifest
+      responses:
+        '200':
+          description: Artifact manifest found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactManifest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: key
+        in: path
+        required: true
+        description: Percent-encoded source document key.
+        schema:
+          type: string
+      - name: artifactName
+        in: path
+        required: true
+        description: Name of the derived document artifact.
+        schema:
+          type: string
+    post:
+      summary: Reprocess a derived document artifact
+      description: >
+        Invalidates the current artifact state and requests the producer to
+
+        rebuild the derived document hierarchy for the source document.
+      tags:
+        - data_operations
+      operationId: reprocessDocumentArtifact
+      responses:
+        '202':
+          description: Reprocessing was accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/indexes:
     parameters:
       - name: tableName
         in: path
@@ -3794,7 +4246,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /api/v1/tables/{tableName}/indexes/{indexName}:
+  /db/v1/tables/{tableName}/indexes/{indexName}:
     parameters:
       - name: tableName
         in: path
@@ -4766,11 +5218,11 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /ml/v1/embed:
+  /ai/v1/embed:
     post:
       summary: Create embeddings (alias of `/embeddings`)
       description: >
-        Alias of `/ml/v1/embeddings`.
+        Alias of `/ai/v1/embeddings`.
 
 
         Accepts the OpenAI embeddings request shape and returns the same OpenAI-compatible
@@ -4784,33 +5236,33 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteEmbedRequest'
+              $ref: '#/components/schemas/InferenceEmbedRequest'
       responses:
         '200':
           description: Embeddings generated successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteEmbedResponse'
+                $ref: '#/components/schemas/InferenceEmbedResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/chunk:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/chunk:
     post:
       summary: Chunk text into smaller segments
       description: >
@@ -4848,27 +5300,27 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteChunkRequest'
+              $ref: '#/components/schemas/InferenceChunkRequest'
       responses:
         '200':
           description: Text chunked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteChunkResponse'
+                $ref: '#/components/schemas/InferenceChunkResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/rerank_multimodal:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
       description: >
@@ -4888,33 +5340,33 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRerankMultimodalRequest'
+              $ref: '#/components/schemas/InferenceRerankMultimodalRequest'
       responses:
         '200':
           description: Documents reranked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRerankResponse'
+                $ref: '#/components/schemas/InferenceRerankResponse'
         '400':
           description: Invalid request or unsupported model
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '501':
           description: Multimodal reranking contract recognized but encoder path not implemented yet
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/rerank:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/rerank:
     post:
       summary: Rerank prompts by relevance
       description: >
@@ -4934,7 +5386,7 @@ paths:
         3. Send pre-rendered text strings as `prompts`
 
 
-        This design keeps Termite stateless and allows clients to customize rendering logic.
+        This design keeps inference stateless and allows clients to customize rendering logic.
 
 
         ## Models
@@ -4965,39 +5417,39 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRerankRequest'
+              $ref: '#/components/schemas/InferenceRerankRequest'
       responses:
         '200':
           description: Prompts reranked successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRerankResponse'
+                $ref: '#/components/schemas/InferenceRerankResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Reranking service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/generate:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
       description: >
@@ -5011,7 +5463,7 @@ paths:
 
         Models are auto-discovered from `models_dir/generators/` at startup.
 
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
 
         ## Streaming
@@ -5036,7 +5488,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteGenerateRequest'
+              $ref: '#/components/schemas/InferenceGenerateRequest'
       responses:
         '200':
           description: >
@@ -5046,35 +5498,35 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateResponse'
+                $ref: '#/components/schemas/InferenceGenerateResponse'
             text/event-stream:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateChunk'
+                $ref: '#/components/schemas/InferenceGenerateChunk'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/chat/completions:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
       description: >
@@ -5087,7 +5539,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteGenerateRequest'
+              $ref: '#/components/schemas/InferenceGenerateRequest'
       responses:
         '200':
           description: >
@@ -5097,319 +5549,35 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateResponse'
+                $ref: '#/components/schemas/InferenceGenerateResponse'
             text/event-stream:
               schema:
-                $ref: '#/components/schemas/TermiteGenerateChunk'
+                $ref: '#/components/schemas/InferenceGenerateChunk'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/recognize:
-    post:
-      summary: Recognize named entities
-      description: >
-        Recognizes named entities (persons, organizations, locations, etc.) from text using ONNX recognition
-        models.
-
-
-        ## Entity Types
-
-
-        Standard CoNLL entity types:
-
-        - **PER**: Person names (e.g., "John Smith")
-
-        - **ORG**: Organizations (e.g., "Google", "Apple Inc.")
-
-        - **LOC**: Locations (e.g., "New York", "France")
-
-        - **MISC**: Miscellaneous entities
-
-
-        ## Models
-
-
-        - Models are auto-discovered from `models_dir/recognizers/`
-
-        - Supports quantized variants (model_i8.onnx)
-
-        - Compatible with HuggingFace BERT-based recognition models
-
-        - GLiNER models support custom entity labels via the `labels` parameter
-      operationId: recognizeEntities
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TermiteRecognizeRequest'
-      responses:
-        '200':
-          description: Entities extracted successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteRecognizeResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '503':
-          description: Recognition service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/classify:
-    post:
-      summary: Zero-shot text classification
-      description: >
-        Classifies text into arbitrary categories using NLI-based zero-shot classification models.
-
-
-        ## How It Works
-
-
-        Zero-shot classification uses Natural Language Inference (NLI) to classify text
-
-        without requiring training data for the specific categories. The model determines
-
-        how well a text "entails" each candidate label.
-
-
-        ## Models
-
-
-        - Models are auto-discovered from `models_dir/classifiers/`
-
-        - Supports multilingual models like mDeBERTa-mnli-xnli
-
-        - Compatible with HuggingFace NLI/MNLI models exported to ONNX
-
-
-        ## Use Cases
-
-
-        - **Sentiment Analysis**: Classify as positive/negative/neutral
-
-        - **Topic Classification**: Categorize by topic without training
-
-        - **Intent Detection**: Identify user intents from text
-
-        - **Content Moderation**: Detect inappropriate content types
-
-
-        ## Multilingual Support
-
-
-        The mDeBERTa-mnli-xnli model supports 100+ languages. You can classify text
-
-        in any supported language using labels in that language.
-      operationId: classifyText
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TermiteClassifyRequest'
-      responses:
-        '200':
-          description: Classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteClassifyResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/classify/document:
-    post:
-      summary: Document classification
-      description: >
-        Runs a native document classification head against a document image.
-
-
-        This endpoint serves `layoutdoc_sequence_head.safetensors` artifacts produced by
-
-        the Zig finetuning stack. It currently reconstructs the same compact visual/layout
-
-        feature vector used by the training code and applies the saved sequence head.
-
-
-        ## Current Scope
-
-
-        - Native `layoutdoc_sequence_head` checkpoints only
-
-        - Local image path input only
-
-        - Caller must supply labels in model output order
-
-        - Supports JPEG, PNG, and JPEG2000 image files
-
-
-        ## Not Yet Included
-
-
-        - Served `layoutdoc_token_head`
-
-        - OCR token / bbox request shapes
-
-        - Label vocab discovery from checkpoint artifacts
-      operationId: classifyDocument
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TermiteDocumentClassificationRequest'
-      responses:
-        '200':
-          description: Document classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteDocumentClassificationResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '404':
-          description: Model or image not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/classify/document_tokens:
-    post:
-      summary: Document token classification
-      description: >
-        Runs a native document token classification head against caller-provided OCR tokens and bounding
-        boxes.
-
-
-        This endpoint serves `layoutdoc_token_head.safetensors` artifacts produced by the
-
-        Zig finetuning stack. It reconstructs the same compact 6-dimensional token feature
-
-        vector used by the training code for each OCR token.
-
-
-        ## Current Scope
-
-
-        - Native `layoutdoc_token_head` checkpoints only
-
-        - Caller-provided OCR token text and bboxes
-
-        - Caller must supply labels in model output order
-
-
-        ## Not Yet Included
-
-
-        - OCR extraction inside this endpoint
-
-        - Sequence-head image features
-
-        - Label vocab discovery from checkpoint artifacts
-      operationId: classifyDocumentTokens
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TermiteDocumentTokenClassificationRequest'
-      responses:
-        '200':
-          description: Document token classification completed successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteDocumentTokenClassificationResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '404':
-          description: Model not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-        '503':
-          description: Classification service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/rewrite:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
       description: >
@@ -5442,39 +5610,39 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteRewriteRequest'
+              $ref: '#/components/schemas/InferenceRewriteRequest'
       responses:
         '200':
           description: Text rewritten successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteRewriteResponse'
+                $ref: '#/components/schemas/InferenceRewriteResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/read:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
       description: >
@@ -5486,7 +5654,7 @@ paths:
 
         Models are auto-discovered from `models_dir/readers/` at startup.
 
-        Use the `/ml/v1/models` endpoint to list available models.
+        Use the `/ai/v1/models` endpoint to list available models.
 
 
         - **TrOCR**: Pure OCR for printed/handwritten text
@@ -5524,39 +5692,39 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteReadRequest'
+              $ref: '#/components/schemas/InferenceReadRequest'
       responses:
         '200':
           description: Images read successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteReadResponse'
+                $ref: '#/components/schemas/InferenceReadResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Reader service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/transcribe:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/transcribe:
     post:
       summary: Transcribe audio to text (speech-to-text)
       description: >
@@ -5622,147 +5790,88 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteTranscribeRequest'
+              $ref: '#/components/schemas/InferenceTranscribeRequest'
       responses:
         '200':
           description: Audio transcribed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteTranscribeResponse'
+                $ref: '#/components/schemas/InferenceTranscribeResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Transcription service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/extract:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract:
     post:
-      summary: Extract structured data from text
+      summary: Extract entities, relations, classifications, and structures
       description: >
-        Extracts structured data from text using GLiNER2 models.
+        Schema-driven extraction over shared AI content parts. This is the
 
-        Field names in the schema are treated as NER labels, and the model's
+        canonical public API for named entity recognition, relation extraction,
 
-        span extraction pipeline populates field values.
+        text/document classification, token classification, and structured
 
-
-        ## Schema Format
-
-
-        The schema maps structure names to arrays of field definitions:
-
-        ```json
-
-        {
-          "person": ["name::str", "age::str", "skills::list"]
-        }
-
-        ```
-
-
-        Field types:
-
-        - `::str` - Keep only the top-scoring span (default if no type specified)
-
-        - `::list` - Keep all extracted spans as an array
-
-        - `::[opt1|opt2]::str` - Choice field, classified against options
-
-
-        ## Example
-
-
-        ```json
-
-        {
-          "model": "fastino/gliner2-base-v1",
-          "texts": ["John Smith is 30 years old and works at Google."],
-          "schema": {
-            "person": ["name::str", "age::str", "company::str"]
-          }
-        }
-
-        ```
-
-
-        Response:
-
-        ```json
-
-        {
-          "model": "fastino/gliner2-base-v1",
-          "results": [
-            {
-              "person": [
-                {
-                  "name": {"value": "John Smith"},
-                  "age": {"value": "30"},
-                  "company": {"value": "Google"}
-                }
-              ]
-            }
-          ]
-        }
-
-        ```
-      operationId: extractJSON
+        document extraction.
+      operationId: extract
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteExtractRequest'
+              $ref: '#/components/schemas/ExtractionRequest'
       responses:
         '200':
           description: Extraction completed successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteExtractResponse'
+                $ref: '#/components/schemas/ExtractionResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '503':
           description: Extraction service unavailable (no models configured)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/models:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models:
     get:
       summary: List available models
       description: >
@@ -5845,44 +5954,26 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteModelsResponse'
+                $ref: '#/components/schemas/InferenceModelsResponse'
         '400':
           description: Bad request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/version:
-    get:
-      summary: Get version information
-      description: Returns Termite version, git commit, build time, and Go runtime version.
-      operationId: getVersion
-      responses:
-        '200':
-          description: Version information
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteVersionResponse'
-        '400':
-          description: Bad request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TermiteError'
-  /ml/v1/embeddings:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
       description: >
         OpenAI-compatible embeddings endpoint. Accepts the same request format
 
-        as OpenAI's `/v1/embeddings` API, served here under `/ml/v1/embeddings`.
+        as OpenAI's `/v1/embeddings` API, served here under `/ai/v1/embeddings`.
 
         For sparse-capable models, each `data` item still uses the `embedding`
 
@@ -5895,32 +5986,98 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TermiteEmbedRequest'
+              $ref: '#/components/schemas/InferenceEmbedRequest'
       responses:
         '200':
           description: Embedding response
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteEmbedResponse'
+                $ref: '#/components/schemas/InferenceEmbedResponse'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TermiteError'
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/models:
+    get:
+      summary: List Traditional ML predictors
+      description: >
+        Returns the Traditional ML predictor catalog for `/ml/v1/predict`.
+
+        Predictors are loaded from `<ml_dir>/<name>/` and exposed separately
+
+        from the AI model catalog.
+      operationId: listPredictors
+      responses:
+        '200':
+          description: Predictors retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictorsResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ml/v1/predict:
+    post:
+      summary: Run a traditional ML predictor
+      description: >
+        Run a tabular predictor (tree ensemble, linear, or SVM) on a batch of
+
+        feature vectors. Models are loaded from `<ml_dir>/<name>/` and
+
+        identified by name. Use `/ml/v1/models` for the list of available
+
+        predictors and their feature schemas.
+      operationId: predict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferencePredictRequest'
+      responses:
+        '200':
+          description: Predictions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferencePredictResponse'
+        '400':
+          description: Invalid request (malformed body, feature-count mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Predictor not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Batch too large (> 10000 rows)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
 components:
   securitySchemes:
     BasicAuth:
@@ -6019,6 +6176,674 @@ components:
           x-omitzero: false
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+    ClusterTopology:
+      type: object
+      required:
+        - health
+        - data
+      additionalProperties: true
+      properties:
+        health:
+          $ref: '#/components/schemas/ClusterHealth'
+        message:
+          type: string
+          description: Optional message providing details about the health status
+        auth_enabled:
+          type: boolean
+          description: Indicates whether authentication is enabled for the cluster
+          x-omitzero: false
+        swarm_mode:
+          type: boolean
+          description: Indicates whether the cluster is running in single-node swarm mode
+          x-omitzero: false
+        secret_store:
+          $ref: '#/components/schemas/SecretStoreStatus'
+        data:
+          $ref: '#/components/schemas/ClusterDataStatus'
+    ClusterDataStatus:
+      type: object
+      description: Typed Zig status view for table data topology and range placement.
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataNodeStatus'
+        ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataRangeStatus'
+        replicas:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataReplicaStatus'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDataGroupStatus'
+    DocumentArtifactChildRange:
+      type: object
+      description: Parsed child-range descriptor from a derived document artifact manifest.
+      required:
+        - range_id
+        - range_kind
+        - artifact_name
+        - split_boundary
+        - placement
+        - start_key
+        - end_key_exclusive
+        - last_key
+        - child_count
+      properties:
+        range_id:
+          type: string
+          description: Stable range identifier within the artifact manifest generation.
+        range_kind:
+          type: string
+          description: Kind of children covered by this range, such as unit or chunk.
+        artifact_name:
+          type: string
+          description: Artifact namespace covered by this range.
+        split_boundary:
+          type: string
+          description: Logical boundary used for splitting this range.
+        placement:
+          type: string
+          description: Current placement summary for the range.
+        owner_group_id:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Owner group for this child artifact range, when assigned.
+        placement_generation:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Placement generation for range ownership metadata.
+        route_status:
+          type: string
+          nullable: true
+          description: Current routing status for child writes in this range.
+        split_eligible:
+          type: boolean
+          nullable: true
+          description: Whether this range may split at its configured split boundary.
+        start_key:
+          type: string
+          description: Inclusive first internal child key covered by this range.
+        end_key_exclusive:
+          type: string
+          description: Exclusive end internal child key, or empty for the final range.
+        last_key:
+          type: string
+          description: Inclusive last internal child key covered by this range.
+        child_count:
+          type: integer
+          description: Number of child records covered by this range.
+        text_bytes:
+          type: integer
+          nullable: true
+          description: Approximate extracted text bytes covered by this range when available.
+    DocumentArtifactManifest:
+      type: object
+      description: >
+        Inspection view for a derived document artifact produced from a source
+
+        table row. The typed fields form the stable summary contract. The
+
+        embedded manifest/state JSON fields are optional raw detail intended
+
+        for admin/debug inspection so producers can evolve their internal unit
+
+        schema without changing this route contract.
+      required:
+        - document_id
+        - artifact_name
+        - artifact_id
+        - manifest_version
+        - generation
+        - source_url
+        - source_fingerprint
+        - content_type
+        - route_type
+        - unit_count
+        - chunk_count
+        - child_ranges
+        - child_range_count
+        - merge_status
+        - merge_from_generation
+        - merge_to_generation
+        - merge_operation_granularity
+        - merge_operation_count
+      properties:
+        document_id:
+          type: string
+          description: Stable identity of the source document.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact.
+          example: document_units_v1
+        artifact_id:
+          type: string
+          description: Stable identity of this artifact under the document.
+        manifest_version:
+          type: integer
+          format: uint64
+          description: Version of the opaque manifest payload schema.
+        generation:
+          type: integer
+          format: uint64
+          description: Monotonic generation for the current artifact state.
+        source_url:
+          type: string
+          description: Source URL or source identifier used to derive this artifact.
+        source_fingerprint:
+          type: string
+          description: Fingerprint of the source bytes and extractor configuration.
+        content_type:
+          type: string
+          description: Effective source content type selected during extraction.
+        route_type:
+          type: string
+          description: Producer route selected for the source content.
+          example: pdf
+        unsupported_reason:
+          type: string
+          nullable: true
+          description: Reason extraction was skipped, when the source type is unsupported.
+        unit_count:
+          type: integer
+          description: Number of extracted document units.
+        chunk_count:
+          type: integer
+          description: Number of indexable chunks derived from the units.
+        child_ranges:
+          type: array
+          description: Parsed child range descriptors for this artifact generation.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactChildRange'
+        child_range_count:
+          type: integer
+          description: Number of storage child ranges used by this artifact.
+        merge_status:
+          type: string
+          description: Current materialization or merge status.
+        merge_from_generation:
+          type: integer
+          format: uint64
+          description: Previous artifact generation used by the current merge plan.
+        merge_to_generation:
+          type: integer
+          format: uint64
+          description: Target artifact generation produced by the current merge plan.
+        merge_operation_granularity:
+          type: string
+          description: Granularity used when computing merge-plan operations.
+        merge_operation_count:
+          type: integer
+          description: Number of merge operations recorded for this artifact.
+        last_error_code:
+          type: string
+          nullable: true
+          description: Last extraction or materialization error code, when the current artifact generation
+            failed.
+        last_error_message:
+          type: string
+          nullable: true
+          description: Human-readable last extraction or materialization error summary, when available.
+        manifest_json:
+          type: string
+          description: Opaque JSON manifest for the artifact units and provenance. Present only for raw
+            detail responses.
+        state_json:
+          type: string
+          nullable: true
+          description: Optional opaque JSON state for incremental processing. Present only for raw detail
+            responses.
+    DocumentArtifactManifestList:
+      type: object
+      description: Available derived document artifact manifests for a source document.
+      required:
+        - document_id
+        - artifacts
+      properties:
+        document_id:
+          type: string
+          description: Stable identity of the source document.
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentArtifactManifest'
+    DocumentArtifactReprocessResponse:
+      type: object
+      required:
+        - reprocess
+      properties:
+        reprocess:
+          type: string
+          enum:
+            - triggered
+          description: Indicates that reprocessing was accepted.
+    DocumentArtifactTableReprocessRequest:
+      type: object
+      description: Bounded request for reprocessing a derived artifact across source rows in key order.
+      properties:
+        from_key:
+          type: string
+          description: Exclusive lower bound source document key. Use the prior response next_key to continue.
+          default: ''
+        to_key:
+          type: string
+          description: Inclusive upper bound source document key, or empty for the end of the table/range.
+          default: ''
+        limit:
+          type: integer
+          format: uint32
+          description: Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+          default: 100
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors returned by a prior response. When present, distributed
+            repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessShardCursor'
+    DocumentArtifactReprocessFailure:
+      type: object
+      required:
+        - key
+        - error_code
+      properties:
+        key:
+          type: string
+          description: Source document key that failed during reprocessing.
+        error_code:
+          type: string
+          description: Stable error code for the failed document reprocess attempt.
+    DocumentArtifactReprocessShardCursor:
+      type: object
+      required:
+        - next_key
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - limit
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+          nullable: true
+          description: Physical table group that produced this cursor, when known.
+        next_key:
+          type: string
+          description: Source key cursor for resuming this shard-local repair pass.
+        scanned:
+          type: integer
+          description: Number of source rows scanned by this shard-local pass.
+        reprocessed:
+          type: integer
+          description: Number of source rows whose artifact was reprocessed by this shard-local pass.
+        skipped:
+          type: integer
+          description: Number of scanned source rows that no longer had a reprocessable source document
+            in this shard-local pass.
+        failed:
+          type: integer
+          description: Number of scanned source rows that failed in this shard-local pass.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective scan limit used by this shard-local pass.
+    DocumentArtifactTableReprocessResponse:
+      type: object
+      required:
+        - reprocess
+        - reprocess_status
+        - artifact_name
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - limit
+        - pending_shards
+        - failures
+        - shard_cursors
+      properties:
+        reprocess:
+          type: string
+          enum:
+            - triggered
+          description: Indicates that reprocessing was accepted.
+        reprocess_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+          description: Completion state for this bounded pass. `in_progress` means the caller should persist
+            the returned cursor(s) and schedule another pass; `complete` means no continuation cursor
+            remains.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact that was reprocessed.
+        scanned:
+          type: integer
+          description: Number of source rows scanned by this bounded pass.
+        reprocessed:
+          type: integer
+          description: Number of source rows whose artifact was reprocessed.
+        skipped:
+          type: integer
+          description: Number of scanned source rows that no longer had a reprocessable source document.
+        failed:
+          type: integer
+          description: Number of scanned source rows that failed before recording a normal artifact manifest.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective scan limit used by the bounded pass.
+        next_key:
+          type: string
+          nullable: true
+          description: Source key cursor for the next bounded pass, when more rows may remain.
+        pending_shards:
+          type: integer
+          description: Number of shard-local continuations still pending after this pass. For single-shard
+            callers this is 1 when only `next_key` remains and 0 when complete.
+        failures:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessFailure'
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors for distributed repairs. Durable background repair
+            jobs should persist and resume these independently instead of collapsing progress into a single
+            global cursor.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessShardCursor'
+    DocumentArtifactReprocessJobStartRequest:
+      type: object
+      description: Request to create a durable table artifact reprocess job.
+      properties:
+        from_key:
+          type: string
+          description: Exclusive lower bound source document key.
+          default: ''
+        to_key:
+          type: string
+          description: Inclusive upper bound source document key, or empty for the end of the table/range.
+          default: ''
+        limit:
+          type: integer
+          format: uint32
+          description: Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+          default: 100
+        advance:
+          type: boolean
+          description: When true, immediately runs the first bounded pass before returning the job state.
+          default: true
+    DocumentArtifactReprocessJob:
+      type: object
+      required:
+        - job_id
+        - table_name
+        - artifact_name
+        - phase
+        - reprocess_status
+        - from_key
+        - to_key
+        - limit
+        - scanned
+        - reprocessed
+        - skipped
+        - failed
+        - pending_shards
+        - failures
+        - shard_cursors
+        - created_at_millis
+        - last_updated_at_millis
+        - expires_at_millis
+      properties:
+        job_id:
+          type: integer
+          format: uint64
+          description: Server-assigned durable repair job identifier.
+        table_name:
+          type: string
+          description: Table containing the source documents being repaired.
+        artifact_name:
+          type: string
+          description: Name of the derived artifact being repaired.
+        phase:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - cancelled
+          description: Lifecycle phase of the repair job.
+        reprocess_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+            - stopped
+          description: User-facing completion status derived from the phase and remaining cursors.
+        from_key:
+          type: string
+          description: Original exclusive lower bound for the job.
+        to_key:
+          type: string
+          description: Original inclusive upper bound for the job, or empty for the end of the table/range.
+        limit:
+          type: integer
+          format: uint32
+          description: Current per-shard bounded pass limit.
+        next_key:
+          type: string
+          nullable: true
+          description: Single-shard continuation key when no shard cursors are present.
+        scanned:
+          type: integer
+          description: Cumulative source rows scanned by completed passes.
+        reprocessed:
+          type: integer
+          description: Cumulative source rows whose artifact was reprocessed.
+        skipped:
+          type: integer
+          description: Cumulative source rows skipped by completed passes.
+        failed:
+          type: integer
+          description: Cumulative source rows that failed during completed passes.
+        pending_shards:
+          type: integer
+          description: Number of shard-local continuations still pending.
+        failures:
+          type: array
+          description: Failures from the most recent completed pass.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessFailure'
+        shard_cursors:
+          type: array
+          description: Per-shard continuation cursors to resume on the next advance operation.
+          items:
+            $ref: '#/components/schemas/DocumentArtifactReprocessShardCursor'
+        last_error:
+          type: string
+          nullable: true
+          description: Last terminal or transient job error, when available.
+        created_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp when the job was created.
+        last_updated_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp when the job was last updated.
+        expires_at_millis:
+          type: integer
+          format: uint64
+          description: Monotonic server timestamp after which the retained job status may be removed.
+    ClusterDataNodeStatus:
+      type: object
+      required:
+        - data_id
+        - node_id
+      properties:
+        data_id:
+          type: integer
+          format: uint64
+        node_id:
+          type: integer
+          format: uint64
+        api_url:
+          type: string
+        raft_url:
+          type: string
+        role:
+          type: string
+        state:
+          type: string
+        health_class:
+          type: string
+        failure_domain:
+          type: string
+        live:
+          type: boolean
+        drain_requested:
+          type: boolean
+        capacity_bytes:
+          type: integer
+          format: uint64
+        available_bytes:
+          type: integer
+          format: uint64
+        lease_pressure:
+          type: integer
+          format: uint32
+        read_load:
+          type: integer
+          format: uint32
+        write_load:
+          type: integer
+          format: uint32
+        active_backfills:
+          type: integer
+          format: uint32
+    ClusterDataRangeStatus:
+      type: object
+      required:
+        - group_id
+        - range_id
+        - table_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        range_id:
+          type: integer
+          format: uint64
+        table_id:
+          type: integer
+          format: uint64
+        table_name:
+          type: string
+        start_key:
+          type: string
+        end_key:
+          type: string
+          nullable: true
+        doc_identity_shard_id:
+          type: integer
+          format: uint64
+        doc_identity_range_id:
+          type: integer
+          format: uint64
+        state:
+          type: string
+        leader_data_id:
+          type: integer
+          format: uint64
+          nullable: true
+        voter_count:
+          type: integer
+          format: uint32
+        doc_count:
+          type: integer
+          format: uint64
+        disk_bytes:
+          type: integer
+          format: uint64
+        empty:
+          type: boolean
+    ClusterDataReplicaStatus:
+      type: object
+      required:
+        - group_id
+        - data_id
+        - node_id
+        - replica_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        data_id:
+          type: integer
+          format: uint64
+        node_id:
+          type: integer
+          format: uint64
+        replica_id:
+          type: integer
+          format: uint64
+        peer_node_ids:
+          type: array
+          items:
+            type: integer
+            format: uint64
+    ClusterDataGroupStatus:
+      type: object
+      required:
+        - group_id
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+        leader_known:
+          type: boolean
+        leader_data_id:
+          type: integer
+          format: uint64
+          nullable: true
+        voter_count_known:
+          type: boolean
+        voter_count:
+          type: integer
+          format: uint32
+        healthy_voter_reports:
+          type: integer
+          format: uint32
+        joint_consensus:
+          type: boolean
+        transition_pending:
+          type: boolean
+        replay_required:
+          type: boolean
+        replay_caught_up:
+          type: boolean
+        cutover_ready:
+          type: boolean
+        reads_ready_after_cutover:
+          type: boolean
+        doc_identity_lifecycle:
+          type: string
+        doc_count:
+          type: integer
+          format: uint64
+        disk_bytes:
+          type: integer
+          format: uint64
+        empty:
+          type: boolean
     SecretStoreStatus:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
@@ -6684,6 +7509,267 @@ components:
           $ref: '#/components/schemas/IndexConfig'
         status:
           $ref: '#/components/schemas/IndexStats'
+    LsmStorageStatus:
+      type: object
+      description: Compact LSM backend operational status. Detailed low-level counters are available through
+        metrics.
+      properties:
+        run_count:
+          type: integer
+          format: uint64
+        run_bytes:
+          type: integer
+          format: uint64
+        l0_run_count:
+          type: integer
+          format: uint64
+        l0_bytes:
+          type: integer
+          format: uint64
+        lower_level_run_count:
+          type: integer
+          format: uint64
+        lower_level_bytes:
+          type: integer
+          format: uint64
+        max_level:
+          type: integer
+          format: uint64
+        compactable_l0_run_count:
+          type: integer
+          format: uint64
+        overlapping_l0_run_count:
+          type: integer
+          format: uint64
+        soft_limit_l0_run_count:
+          type: integer
+          format: uint64
+        hard_limit_l0_run_count:
+          type: integer
+          format: uint64
+        write_stall_l0_run_debt:
+          type: integer
+          format: uint64
+        soft_limit_l0_bytes:
+          type: integer
+          format: uint64
+        hard_limit_l0_bytes:
+          type: integer
+          format: uint64
+        write_stall_l0_byte_debt:
+          type: integer
+          format: uint64
+        level_overflow_run_count:
+          type: integer
+          format: uint64
+        level_overflow_bytes:
+          type: integer
+          format: uint64
+        obsolete_path_count:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_readers:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_versions:
+          type: integer
+          format: uint64
+        obsolete_paths_waiting_for_retry:
+          type: integer
+          format: uint64
+        obsolete_paths_reclaimable:
+          type: integer
+          format: uint64
+        obsolete_delete_failures:
+          type: integer
+          format: uint64
+        obsolete_delete_retries:
+          type: integer
+          format: uint64
+        current_manifest_bytes:
+          type: integer
+          format: uint64
+        mutable_entry_count:
+          type: integer
+          format: uint64
+        mutable_bytes:
+          type: integer
+          format: uint64
+        immutable_memtable_count:
+          type: integer
+          format: uint64
+        immutable_entry_count:
+          type: integer
+          format: uint64
+        immutable_bytes:
+          type: integer
+          format: uint64
+        mutable_snapshot_clone_count:
+          type: integer
+          format: uint64
+        mutable_snapshot_clone_bytes:
+          type: integer
+          format: uint64
+        mutable_snapshot_clone_peak_bytes:
+          type: integer
+          format: uint64
+        read_snapshot_mutable_rotation_count:
+          type: integer
+          format: uint64
+        read_snapshot_mutable_rotation_bytes:
+          type: integer
+          format: uint64
+        wal_retained_bytes:
+          type: integer
+          format: uint64
+        compaction_backlog_bytes:
+          type: integer
+          format: uint64
+        active_readers:
+          type: integer
+          format: uint64
+        active_readers_bound_read_txn:
+          type: integer
+          format: uint64
+        active_readers_namespace_read_txn:
+          type: integer
+          format: uint64
+        active_readers_probe_txn:
+          type: integer
+          format: uint64
+        active_readers_current_scan:
+          type: integer
+          format: uint64
+        active_readers_write_txn:
+          type: integer
+          format: uint64
+        active_readers_compaction:
+          type: integer
+          format: uint64
+        active_readers_other:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_bound_read_txn:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_namespace_read_txn:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_probe_txn:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_current_scan:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_write_txn:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_compaction:
+          type: integer
+          format: uint64
+        obsolete_paths_pinned_by_reader_other:
+          type: integer
+          format: uint64
+        active_bulk_ingest_batches:
+          type: integer
+          format: uint64
+        manifest_dirty:
+          type: boolean
+        obsolete_manifest_dirty:
+          type: boolean
+        maintenance_score:
+          type: integer
+          format: uint64
+        maintenance_debt_hint:
+          type: integer
+          format: uint64
+        flush_count:
+          type: integer
+          format: uint64
+        flush_output_run_count:
+          type: integer
+          format: uint64
+        flush_output_bytes:
+          type: integer
+          format: uint64
+        sorted_ingest_run_count:
+          type: integer
+          format: uint64
+        sorted_ingest_bytes:
+          type: integer
+          format: uint64
+        manifest_write_count:
+          type: integer
+          format: uint64
+        manifest_bytes:
+          type: integer
+          format: uint64
+        write_pressure_event_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_count:
+          type: integer
+          format: uint64
+        write_pressure_compaction_step_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_count:
+          type: integer
+          format: uint64
+        write_pressure_overload_l0_run_debt:
+          type: integer
+          format: uint64
+        immutable_rotation_count:
+          type: integer
+          format: uint64
+        immutable_flush_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_attempt_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_success_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_entry_count:
+          type: integer
+          format: uint64
+        bulk_append_attempt_count:
+          type: integer
+          format: uint64
+        bulk_append_entry_count:
+          type: integer
+          format: uint64
+        bulk_append_direct_success_count:
+          type: integer
+          format: uint64
+        bulk_append_direct_entry_count:
+          type: integer
+          format: uint64
+        bulk_append_fallback_backend_pending_count:
+          type: integer
+          format: uint64
+        bulk_append_fallback_below_threshold_count:
+          type: integer
+          format: uint64
+        bulk_append_fallback_duplicate_key_count:
+          type: integer
+          format: uint64
+        bulk_append_fallback_to_mutable_entry_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_direct_entry_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_fallback_unsupported_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_fallback_backend_mutable_count:
+          type: integer
+          format: uint64
+        direct_bulk_ingest_fallback_below_threshold_count:
+          type: integer
+          format: uint64
     StorageStatus:
       type: object
       properties:
@@ -6694,6 +7780,8 @@ components:
         empty:
           type: boolean
           description: Whether the table has received data.
+        lsm:
+          $ref: '#/components/schemas/LsmStorageStatus'
     TableStatus:
       allOf:
         - $ref: '#/components/schemas/Table'
@@ -6707,6 +7795,7 @@ components:
       type: string
       enum:
         - $set
+        - $setOnInsert
         - $unset
         - $inc
         - $push
@@ -6733,7 +7822,7 @@ components:
           example: $.views
         value:
           description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set, etc.)
+            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
     Transform:
       type: object
       required:
@@ -9086,7 +10175,7 @@ components:
             ```json
 
             {
-              "provider": "termite",
+              "provider": "antfly",
               "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
               "field": "content"
             }
@@ -9658,6 +10747,51 @@ components:
           type: object
           additionalProperties: true
           x-go-name: source
+        hierarchy:
+          type: object
+          additionalProperties: true
+          description: >
+            Stable ancestry envelope for derived document hierarchy hits. Present when
+
+            the hit is a derived unit/chunk/embedding artifact or when a source-level
+
+            rollup includes child chunks. Standard fields include `level`,
+
+            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
+
+            `ancestors` with response-local or requested DB-backed source/unit context when available.
+          properties:
+            level:
+              type: string
+              enum:
+                - source
+                - unit
+                - chunk
+                - artifact
+                - embedding
+              description: Hierarchy level represented by this hit.
+            parent_doc_key:
+              type: string
+              description: Source document key that owns this derived hit.
+            parent_unit_id:
+              type: string
+              description: Unit identifier when the hit is attached to a document unit.
+            artifact:
+              type: object
+              additionalProperties: true
+              description: Artifact identity with `name`, `kind`, and optional `unit_id` or `chunk_id`.
+            ancestors:
+              type: object
+              additionalProperties: true
+              description: Ancestor context. Includes `source.id` for derived hits, `source.document`
+                for materialized source rollups or requested source hydration, and `unit.document` for
+                direct unit hits or requested unit hydration when the unit payload is present.
+            chunks:
+              type: array
+              description: Child chunk hits included for source-level rollups.
+              items:
+                type: object
+                additionalProperties: true
         _sort:
           type: array
           items:
@@ -11088,13 +12222,13 @@ components:
         provider: cohere
         model: embed-english-v3.0
         input_type: search_document
-    TermiteEmbedderConfig:
+    AntflyEmbedderConfig:
       type: object
       description: >-
-        Configuration for the Termite embedding provider.
+        Configuration for the Antfly inference embedding provider.
 
 
-        Termite is Antfly's built-in ML service for local embeddings using ONNX models.
+        Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
 
         It provides embedding generation with multi-tier caching (memory + persistent).
 
@@ -11122,38 +12256,15 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Termite API endpoint. Can also be set via ANTFLY_TERMITE_URL environment
-            variable.
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
           example: http://localhost:8082
       required:
         - model
       example:
-        provider: termite
+        provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
-    AntflyEmbedderConfig:
-      type: object
-      description: >-
-        Configuration for the built-in Antfly embedding provider.
-
-
-        Uses an embedded INT8-quantized all-MiniLM-L6-v2 ONNX model bundled directly
-
-        in the binary. No external service, API key, or model download required.
-
-
-        **Model:** all-MiniLM-L6-v2 (384 dimensions, text-only)
-
-
-        **Features:**
-
-        - Zero configuration — works out of the box
-
-        - No network access required
-
-        - Pure Go inference via GoMLX
-      example:
-        provider: antfly
     EmbedderProvider:
       type: string
       enum:
@@ -11165,7 +12276,6 @@ components:
         - bedrock
         - cohere
         - mock
-        - termite
         - antfly
       description: The embedding provider to use.
     EmbedderConfig:
@@ -11413,7 +12523,6 @@ components:
             - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
             - $ref: '#/components/schemas/BedrockEmbedderConfig'
             - $ref: '#/components/schemas/CohereEmbedderConfig'
-            - $ref: '#/components/schemas/TermiteEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
             provider:
@@ -11576,10 +12685,10 @@ components:
           minimum: 1
       required:
         - model
-    TermiteGeneratorConfig:
+    AntflyGeneratorConfig:
       type: object
       description: >
-        Configuration for the Termite generative AI provider.
+        Configuration for the Antfly inference generative AI provider.
       properties:
         model:
           type: string
@@ -11588,7 +12697,8 @@ components:
         api_url:
           type: string
           format: uri
-          description: The URL of the Termite API endpoint.
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
         temperature:
           type: number
           format: float
@@ -11609,7 +12719,7 @@ components:
           description: Top-k sampling parameter.
         timeout:
           type: integer
-          description: HTTP response timeout in seconds for Termite API calls.
+          description: HTTP response timeout in seconds for Inference API calls.
           minimum: 1
       required:
         - model
@@ -11829,7 +12939,6 @@ components:
         - bedrock
         - anthropic
         - cohere
-        - termite
         - antfly
         - mock
       description: The generative AI provider to use.
@@ -11841,7 +12950,7 @@ components:
             - $ref: '#/components/schemas/GoogleGeneratorConfig'
             - $ref: '#/components/schemas/VertexGeneratorConfig'
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
-            - $ref: '#/components/schemas/TermiteGeneratorConfig'
+            - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
             - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
             - $ref: '#/components/schemas/BedrockGeneratorConfig'
@@ -11898,12 +13007,12 @@ components:
           $ref: '#/components/schemas/TextChunkOptions'
         audio:
           $ref: '#/components/schemas/AudioChunkOptions'
-    TermiteChunkerConfig:
+    AntflyChunkerConfig:
       description: >
-        Configuration for the Termite chunking provider.
+        Configuration for the Antfly inference chunking provider.
 
 
-        Termite is a centralized HTTP service that provides chunking with multi-tier caching.
+        Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
 
         The model name maps to ONNX model directory names (similar to how Ollama works).
 
@@ -11929,8 +13038,8 @@ components:
             api_url:
               type: string
               format: uri
-              description: The URL of the Termite API endpoint (e.g., 'http://localhost:8080'). Can also
-                be set via ANTFLY_TERMITE_URL environment variable.
+              description: The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can
+                also be set via ANTFLY_INFERENCE_URL environment variable.
               example: http://localhost:8080
             model:
               type: string
@@ -11941,48 +13050,9 @@ components:
           required:
             - model
       example:
-        provider: termite
+        provider: antfly
         api_url: http://localhost:8080
         model: fixed
-        max_chunks: 50
-        text:
-          target_tokens: 500
-          overlap_tokens: 50
-          separator: >2+
-
-
-    AntflyChunkerConfig:
-      description: >
-        Configuration for the local Antfly chunking provider.
-
-
-        This provider runs chunking directly within the storage node process,
-
-        without requiring an external Termite service. It uses simple fixed-size
-
-        tokenizer-based chunking with no caching overhead.
-
-
-        **Use this when:**
-
-        - Running single-node deployments (swarm mode)
-
-        - You don't need embedding/chunk caching across nodes
-
-        - You want minimal setup complexity
-
-
-        **Use Termite instead when:**
-
-        - Running multi-node clusters where caching reduces costs
-
-        - You need ONNX-accelerated chunking models
-
-        - You want persistent chunk/embedding caches
-      allOf:
-        - $ref: '#/components/schemas/ChunkOptions'
-      example:
-        provider: antfly
         max_chunks: 50
         text:
           target_tokens: 500
@@ -11994,14 +13064,12 @@ components:
       type: string
       enum:
         - mock
-        - termite
         - antfly
       description: The chunking provider to use.
     ChunkerConfig:
       description: A unified configuration for a chunking provider.
       allOf:
         - oneOf:
-            - $ref: '#/components/schemas/TermiteChunkerConfig'
             - $ref: '#/components/schemas/AntflyChunkerConfig'
         - properties:
             provider:
@@ -12027,7 +13095,7 @@ components:
           required:
             - provider
       example:
-        provider: termite
+        provider: antfly
         model: fixed
         text:
           target_tokens: 500
@@ -12062,6 +13130,17 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Field to extract embeddings from (managed indexes only; not allowed when external=true)
+        embedding_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Generated embedding artifact name consumed by this vector index. Use with a matching
+            embedding enrichment for artifact-backed managed embeddings.
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Artifact stream consumed by the embedding enrichment backing this vector index.
+            This is descriptive public configuration; the matching enrichment defines the materialized
+            source.
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -12204,6 +13283,66 @@ components:
         - graph
         - algebraic
       description: The type of the index.
+    EnrichmentKind:
+      type: string
+      enum:
+        - chunk
+        - asset
+        - embedding
+      description: Managed generated artifact kind.
+    EnrichmentConfig:
+      type: object
+      description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
+        indexing and may target source rows or previously generated artifact streams.
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+          description: Stable generated artifact name.
+        kind:
+          $ref: '#/components/schemas/EnrichmentKind'
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Source field to read from the source document or source artifact payload.
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Optional template for generated text input.
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Existing artifact stream this enrichment consumes. Chunk enrichments may consume
+            asset artifacts; embedding enrichments may consume chunk artifacts.
+        expected_dims:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Expected embedding dimension for embedding enrichments.
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Chunk size for chunk enrichments.
+        chunk_overlap:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Chunk overlap for chunk enrichments.
+        chunker_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Serialized chunker configuration for chunk enrichments.
+        content_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Produced asset content type for asset enrichments.
+        producer_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Serialized asset producer configuration.
     IndexConfig:
       type: object
       description: Configuration for an index
@@ -12233,13 +13372,22 @@ components:
         enrichments:
           type: array
           items:
-            type: string
+            $ref: '#/components/schemas/EnrichmentConfig'
           x-go-type-skip-optional-pointer: true
-          description: List of enrichment names to apply to documents before indexing. Enrichments must
-            be defined at the table level.
+          description: Inline managed enrichment definitions required by this index. Enrichments are table-level
+            generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact
+            stream.
           example:
-            - semantic_chunks
-            - summary
+            - name: document_chunks_v1
+              kind: chunk
+              field: text
+              source_artifact_name: document_units_v1
+              chunk_size: 512
+            - name: document_chunk_dense_v1
+              kind: embedding
+              field: text
+              source_artifact_name: document_chunks_v1
+              expected_dims: 768
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -13629,11 +14777,11 @@ components:
           description: >
             Web search provider configuration. Required when websearch tool is enabled.
 
-            See go/pkg/antfly/lib/websearch/openapi.yaml for provider-specific options.
+            See specs/openapi/antfly/websearch.yaml for provider-specific options.
         fetch_config:
           $ref: '#/components/schemas/FetchConfig'
           description: >
-            URL fetching configuration. See go/pkg/antfly/lib/websearch/openapi.yaml
+            URL fetching configuration. See specs/openapi/antfly/websearch.yaml
 
             for available options and security controls.
         max_tool_iterations:
@@ -13969,64 +15117,138 @@ components:
         - assistant
         - system
         - tool
-      description: Role of the message sender in the conversation
-    ChatToolCall:
+      description: Role of the message sender in a generation/chat conversation
+    TextContentPart:
       type: object
-      description: A tool call made by the assistant
+      description: Text content for multimodal input.
       required:
-        - id
+        - type
+        - text
+      properties:
+        type:
+          type: string
+          enum:
+            - text
+        text:
+          type: string
+          description: Text content.
+    ImageURL:
+      type: object
+      description: Image URL or data URI.
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: URL or data URI (data:image/png;base64,...).
+          example: data:image/png;base64,iVBORw0KGgo...
+    ImageURLContentPart:
+      type: object
+      description: Image content in OpenAI-compatible format.
+      required:
+        - type
+        - image_url
+      properties:
+        type:
+          type: string
+          enum:
+            - image_url
+        image_url:
+          $ref: '#/components/schemas/ImageURL'
+    MediaContentPart:
+      type: object
+      description: Inline binary media content (audio, image, etc.).
+      required:
+        - type
+        - data
+        - mime_type
+      properties:
+        type:
+          type: string
+          enum:
+            - media
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded binary data.
+        mime_type:
+          type: string
+          description: MIME type (audio/wav, image/gif, image/png, etc.).
+    ContentPart:
+      description: A content part for multimodal input (text, image URL, or inline media).
+      oneOf:
+        - $ref: '#/components/schemas/TextContentPart'
+        - $ref: '#/components/schemas/ImageURLContentPart'
+        - $ref: '#/components/schemas/MediaContentPart'
+    ChatMessageContent:
+      x-go-type: stdjson.RawMessage
+      x-go-type-import:
+        path: encoding/json
+        name: stdjson
+      description: >
+        Message content. Supports two formats:
+
+        - Simple string: "Hello, how are you?"
+
+        - Array of content parts: [{"type": "text", "text": "Hello"}]
+      oneOf:
+        - type: string
+          description: Simple text content.
+        - type: array
+          description: Array of multimodal content parts.
+          items:
+            $ref: '#/components/schemas/ContentPart'
+    ToolCallFunction:
+      type: object
+      description: The function called by a model tool call.
+      required:
         - name
         - arguments
       properties:
-        id:
-          type: string
-          description: Unique identifier for this tool call
         name:
           type: string
-          description: Name of the tool being called
+          description: Function name.
         arguments:
-          type: object
-          additionalProperties: true
-          description: Arguments passed to the tool as key-value pairs
-    ChatToolResult:
+          type: string
+          description: JSON string of function arguments.
+    ToolCall:
       type: object
-      description: Result from executing a tool call
+      description: OpenAI-compatible assistant tool call.
       required:
-        - tool_call_id
-        - result
+        - id
+        - type
+        - function
       properties:
-        tool_call_id:
+        id:
           type: string
-          description: ID of the tool call this result corresponds to
-        result:
-          type: object
-          additionalProperties: true
-          description: Result data from the tool execution
-        error:
+          description: Tool call identifier.
+        type:
           type: string
-          description: Error message if tool execution failed
+          enum:
+            - function
+        function:
+          $ref: '#/components/schemas/ToolCallFunction'
     ChatMessage:
       type: object
-      description: A message in the conversation history
+      description: OpenAI-compatible message in a generation/chat conversation.
       required:
         - role
-        - content
       properties:
         role:
           $ref: '#/components/schemas/ChatMessageRole'
         content:
-          type: string
-          description: Text content of the message
+          $ref: '#/components/schemas/ChatMessageContent'
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/ChatToolCall'
-          description: Tool calls made by the assistant (only for assistant role)
-        tool_results:
-          type: array
-          items:
-            $ref: '#/components/schemas/ChatToolResult'
-          description: Results from tool executions (only for tool role)
+            $ref: '#/components/schemas/ToolCall'
+          description: Tool calls made by the assistant (only for role=assistant).
+        tool_call_id:
+          type: string
+          description: ID of the tool call this message responds to (only for role=tool).
+        name:
+          type: string
+          description: Optional tool name for tool messages when model templates need it.
     FilterSpec:
       type: object
       description: A filter specification to apply to search queries
@@ -14251,33 +15473,27 @@ components:
       enum:
         - antfly
         - ollama
-        - termite
         - cohere
         - vertex
       description: The reranking provider to use.
     AntflyRerankerConfig:
       type: object
-      description: >-
-        Configuration for the built-in Antfly reranking provider.
-
-
-        Uses an embedded INT8-quantized cross-encoder/ms-marco-MiniLM-L-6-v2 ONNX model
-
-        bundled directly in the binary. No external service, API key, or model download required.
-
-
-        **Model:** cross-encoder/ms-marco-MiniLM-L-6-v2 (6-layer MiniLM cross-encoder)
-
-
-        **Features:**
-
-        - Zero configuration — works out of the box
-
-        - No network access required
-
-        - Pure Go inference via GoMLX
+      description: Configuration for the Antfly inference reranking provider.
+      properties:
+        model:
+          type: string
+          description: The name of the reranking model (e.g., cross-encoder model name).
+        url:
+          type: string
+          format: uri
+          description: The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+            environment variable.
+      required:
+        - model
       example:
         provider: antfly
+        model: mixedbread-ai/mxbai-rerank-base-v1
+        url: http://localhost:8080
     OllamaRerankerConfig:
       type: object
       description: Configuration for the Ollama reranking provider.
@@ -14289,19 +15505,6 @@ components:
           type: string
           format: uri
           description: The URL of the Ollama API endpoint.
-      required:
-        - model
-    TermiteRerankerConfig:
-      type: object
-      description: Configuration for the Termite reranking provider.
-      properties:
-        model:
-          type: string
-          description: The name of the reranking model (e.g., cross-encoder model name).
-        url:
-          type: string
-          format: uri
-          description: The URL of the Termite API endpoint.
       required:
         - model
     CohereRerankerConfig:
@@ -14404,7 +15607,6 @@ components:
         - oneOf:
             - $ref: '#/components/schemas/AntflyRerankerConfig'
             - $ref: '#/components/schemas/OllamaRerankerConfig'
-            - $ref: '#/components/schemas/TermiteRerankerConfig'
             - $ref: '#/components/schemas/CohereRerankerConfig'
             - $ref: '#/components/schemas/VertexRerankerConfig'
       example:
@@ -14740,6 +15942,11 @@ components:
             type: string
           description: Algebraic provenance labels folded into this result, when requested by an algebraic
             graph executor
+        evidence:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Parsed evidence envelope for provenance labels and edge metadata
         edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -14841,7 +16048,7 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
-    TermiteError:
+    InferenceError:
       type: object
       required:
         - error
@@ -14849,71 +16056,112 @@ components:
         error:
           type: string
           description: Error message
-    TermiteTextContentPart:
+    InferencePredictRequest:
       type: object
-      description: Text content for embedding
       required:
-        - type
-        - text
+        - model
+        - input
       properties:
-        type:
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9_-]+$
+          description: Predictor name from the model catalog.
+        input:
+          type: array
+          maxItems: 10000
+          description: Batch of feature vectors. Max 10000 rows.
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictResponse:
+      type: object
+      required:
+        - model
+        - task
+        - predictions
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        predictions:
+          type: array
+          description: >
+            Per-row prediction arrays. Length equals the model's `num_outputs`
+
+            (1 for regression / binary, `num_classes` for multiclass).
+          items:
+            type: array
+            items:
+              type: number
+              format: float
+    InferencePredictorTask:
+      type: string
+      description: Task type for tabular predictors.
+      enum:
+        - regression
+        - binary_classification
+        - multiclass
+        - ranking
+    InferencePredictorInfo:
+      type: object
+      description: Traditional ML predictor metadata.
+      required:
+        - task
+        - num_features
+        - num_outputs
+      properties:
+        task:
+          $ref: '#/components/schemas/InferencePredictorTask'
+        num_features:
+          type: integer
+          minimum: 1
+          description: Number of feature columns expected by the predictor.
+        num_outputs:
+          type: integer
+          minimum: 1
+          description: Number of output values emitted per input row.
+        feature_names:
+          type: array
+          description: Optional feature names in input order.
+          items:
+            type: string
+        source_framework:
+          type: string
+          description: Source framework used to produce the predictor IR.
+    InferencePredictorsResponse:
+      type: object
+      required:
+        - object
+        - predictors
+      properties:
+        object:
           type: string
           enum:
-            - text
-        text:
-          type: string
-          description: Text content to embed
-    TermiteImageURL:
+            - list
+          description: Response object type.
+        predictors:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/InferencePredictorInfo'
+          description: Traditional ML predictors keyed by predictor name.
+    InferenceTextContentPart:
+      $ref: '#/components/schemas/TextContentPart'
+    InferenceImageURL:
+      $ref: '#/components/schemas/ImageURL'
+    InferenceImageURLContentPart:
+      $ref: '#/components/schemas/ImageURLContentPart'
+    InferenceMediaContentPart:
+      $ref: '#/components/schemas/MediaContentPart'
+    InferenceContentPart:
+      $ref: '#/components/schemas/ContentPart'
+    InferenceEmbedRequest:
       type: object
-      description: Image URL or data URI
-      required:
-        - url
-      properties:
-        url:
-          type: string
-          description: URL or data URI (data:image/png;base64,...)
-          example: data:image/png;base64,iVBORw0KGgo...
-    TermiteImageURLContentPart:
-      type: object
-      description: Image content for embedding (OpenAI-compatible format)
-      required:
-        - type
-        - image_url
-      properties:
-        type:
-          type: string
-          enum:
-            - image_url
-        image_url:
-          $ref: '#/components/schemas/TermiteImageURL'
-    TermiteMediaContentPart:
-      type: object
-      description: Inline binary media content (audio, image, etc.)
-      required:
-        - type
-        - data
-        - mime_type
-      properties:
-        type:
-          type: string
-          enum:
-            - media
-        data:
-          type: string
-          format: byte
-          description: Base64-encoded binary data
-        mime_type:
-          type: string
-          description: MIME type (audio/wav, image/gif, image/png, etc.)
-    TermiteContentPart:
-      description: A content part for multimodal input (text, image URL, or inline media)
-      oneOf:
-        - $ref: '#/components/schemas/TermiteTextContentPart'
-        - $ref: '#/components/schemas/TermiteImageURLContentPart'
-        - $ref: '#/components/schemas/TermiteMediaContentPart'
-    TermiteEmbedRequest:
-      type: object
-      description: OpenAI-compatible embedding request with Termite multimodal content-part extension
+      description: OpenAI-compatible embedding request with inference multimodal content-part extension
       required:
         - model
         - input
@@ -14942,7 +16190,7 @@ components:
             - type: array
               description: Array of multimodal content parts
               items:
-                $ref: '#/components/schemas/TermiteContentPart'
+                $ref: '#/components/schemas/ContentPart'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -14980,7 +16228,7 @@ components:
             - document
             - classification
             - clustering
-    TermiteEmbedResponse:
+    InferenceEmbedResponse:
       type: object
       description: OpenAI-compatible embedding response with a polymorphic `embedding` field for dense
         or sparse vectors
@@ -14999,13 +16247,13 @@ components:
           type: array
           description: List of embedding objects
           items:
-            $ref: '#/components/schemas/TermiteEmbeddingObject'
+            $ref: '#/components/schemas/InferenceEmbeddingObject'
         model:
           type: string
           description: Model used for embedding generation
         usage:
-          $ref: '#/components/schemas/TermiteEmbeddingUsage'
-    TermiteSparseVector:
+          $ref: '#/components/schemas/InferenceEmbeddingUsage'
+    InferenceSparseVector:
       type: object
       description: A sparse vector with parallel index/value arrays, sorted by index ascending
       required:
@@ -15024,12 +16272,12 @@ components:
             type: number
             format: float
           description: Corresponding weights for each index (always positive)
-    TermiteChunk:
+    InferenceChunk:
       description: A chunk of content. Text chunks have mime_type text/plain.
       allOf:
         - oneOf:
-            - $ref: '#/components/schemas/TermiteTextContent'
-            - $ref: '#/components/schemas/TermiteBinaryContent'
+            - $ref: '#/components/schemas/InferenceTextContent'
+            - $ref: '#/components/schemas/InferenceBinaryContent'
         - type: object
           required:
             - id
@@ -15042,9 +16290,9 @@ components:
             mime_type:
               type: string
               description: 'MIME type: text/plain, audio/wav, image/png, etc.'
-    TermiteVADOptions:
+    InferenceVADOptions:
       type: object
-      description: Options for Voice Activity Detection (VAD) based audio segmentation. Termite-specific.
+      description: Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
       properties:
         min_silence_duration_ms:
           type: integer
@@ -15061,9 +16309,9 @@ components:
           type: integer
           description: 'Maximum segment duration (ms). Segments longer than this are split. Useful for
             Whisper-compatible chunking. Default: 30000.'
-    TermiteAudioChunkConfig:
+    InferenceAudioChunkConfig:
       type: object
-      description: Audio chunking configuration for Termite, including VAD options.
+      description: Audio chunking configuration for inference, including VAD options.
       properties:
         window_duration_ms:
           type: integer
@@ -15072,13 +16320,13 @@ components:
           type: integer
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
         vad:
-          $ref: '#/components/schemas/TermiteVADOptions'
-    TermiteChunkConfig:
+          $ref: '#/components/schemas/InferenceVADOptions'
+    InferenceChunkConfig:
       type: object
       description: >
-        Configuration for chunking requests to Termite API.
+        Configuration for chunking requests to Inference API.
 
-        Combines shared text options with Termite-specific audio/VAD options.
+        Combines shared text options with inference-specific audio/VAD options.
       properties:
         model:
           type: string
@@ -15095,10 +16343,10 @@ components:
           description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
             and VAD audio models.
         text:
-          $ref: '#/components/schemas/TermiteTextChunkOptions'
+          $ref: '#/components/schemas/InferenceTextChunkOptions'
         audio:
-          $ref: '#/components/schemas/TermiteAudioChunkConfig'
-    TermiteChunkRequest:
+          $ref: '#/components/schemas/InferenceAudioChunkConfig'
+    InferenceChunkRequest:
       type: object
       properties:
         input:
@@ -15113,7 +16361,7 @@ components:
           oneOf:
             - type: string
               description: Text to chunk (backward compatible)
-            - $ref: '#/components/schemas/TermiteContentPart'
+            - $ref: '#/components/schemas/ContentPart'
               description: Content part (text or media)
         text:
           type: string
@@ -15121,8 +16369,8 @@ components:
           description: 'DEPRECATED: Use ''input'' instead. Text to chunk.'
           example: This is a long document that needs to be split into smaller chunks...
         config:
-          $ref: '#/components/schemas/TermiteChunkConfig'
-    TermiteChunkResponse:
+          $ref: '#/components/schemas/InferenceChunkConfig'
+    InferenceChunkResponse:
       type: object
       required:
         - object
@@ -15162,21 +16410,21 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteChunkObject'
+            $ref: '#/components/schemas/InferenceChunkObject'
           description: Array of chunk objects
         model:
           type: string
           description: Chunking model actually used (may differ from requested if fallback occurred)
           example: fixed
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
+          $ref: '#/components/schemas/InferenceGenerateUsage'
         cache_hit:
           type: boolean
           description: Whether result was served from cache
-    TermiteChunkObject:
+    InferenceChunkObject:
       description: A chunk result object. Text chunks have mime_type text/plain.
       allOf:
-        - $ref: '#/components/schemas/TermiteChunk'
+        - $ref: '#/components/schemas/InferenceChunk'
         - type: object
           required:
             - object
@@ -15189,7 +16437,7 @@ components:
             index:
               type: integer
               description: Position of this chunk object in the response data array.
-    TermiteRerankRequest:
+    InferenceRerankRequest:
       type: object
       required:
         - model
@@ -15215,7 +16463,7 @@ components:
           example:
             - Introduction to machine learning...
             - Deep learning fundamentals...
-    TermiteRerankMultimodalDocument:
+    InferenceRerankMultimodalDocument:
       type: object
       required:
         - content
@@ -15224,8 +16472,8 @@ components:
           type: string
           description: Optional caller-provided document identifier
         content:
-          $ref: '#/components/schemas/TermiteChatMessageContent'
-    TermiteRerankMultimodalRequest:
+          $ref: '#/components/schemas/ChatMessageContent'
+    InferenceRerankMultimodalRequest:
       type: object
       required:
         - model
@@ -15243,9 +16491,9 @@ components:
         documents:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRerankMultimodalDocument'
+            $ref: '#/components/schemas/InferenceRerankMultimodalDocument'
           description: Documents expressed as text and image content parts
-    TermiteRerankResponse:
+    InferenceRerankResponse:
       type: object
       required:
         - object
@@ -15261,14 +16509,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRerankObject'
+            $ref: '#/components/schemas/InferenceRerankObject'
           description: Rerank score objects, one per input prompt.
         model:
           type: string
           description: Name of model used for reranking
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRerankObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRerankObject:
       type: object
       required:
         - object
@@ -15286,203 +16534,7 @@ components:
           type: number
           format: float
           description: Relevance score for this prompt.
-    TermiteRecognizeEntity:
-      type: object
-      required:
-        - text
-        - label
-        - start
-        - end
-        - score
-      properties:
-        text:
-          type: string
-          description: The entity text
-          example: John Smith
-        label:
-          type: string
-          description: Entity type (PER, ORG, LOC, MISC)
-          example: PER
-        start:
-          type: integer
-          description: Character offset where entity begins
-          example: 0
-        end:
-          type: integer
-          description: Character offset where entity ends (exclusive)
-          example: 10
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.99
-    TermiteRecognizeRequest:
-      type: object
-      required:
-        - model
-        - texts
-      properties:
-        model:
-          type: string
-          description: Name of recognizer model from models_dir/recognizers/
-          example: dslim/bert-base-NER
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to extract entities from
-          example:
-            - John Smith works at Google.
-            - Apple Inc. is in Cupertino.
-        labels:
-          type: array
-          items:
-            type: string
-          description: >
-            Custom entity labels to extract (GLiNER models only).
-
-            When using a GLiNER model, you can specify any entity types to extract,
-
-            enabling zero-shot NER without model retraining.
-
-            If not provided, the model's default labels are used.
-          example:
-            - person
-            - company
-            - product
-            - date
-        relation_labels:
-          type: array
-          items:
-            type: string
-          description: >
-            Relation types to extract (for models with 'relations' capability).
-
-            Only used when the model supports relation extraction (GLiNER multitask, REBEL).
-
-            Relation extraction runs only when this array is provided and non-empty.
-
-            GLiNER labels may be relation names (works_for), head-qualified
-
-            labels (person::works_for), or head/tail-qualified labels
-
-            (person::works_for::organization).
-          example:
-            - founded
-            - works_at
-            - located_in
-        resolver:
-          $ref: '#/components/schemas/TermiteResolverConfig'
-    TermiteResolverConfig:
-      type: object
-      description: >
-        Configuration for entity resolution. When present in a RecognizeRequest,
-
-        the response entities and relations are deduplicated via entity resolution
-
-        (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-      properties:
-        similarity_threshold:
-          type: number
-          format: float
-          default: 0.85
-          description: Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-        type_must_match:
-          type: boolean
-          default: true
-          description: Whether entity types must match for merging
-        min_entity_confidence:
-          type: number
-          format: float
-          default: 0
-          description: Minimum confidence score for entities to be included
-        min_relation_confidence:
-          type: number
-          format: float
-          default: 0
-          description: Minimum confidence score for relations to be included
-        deduplicate_relations:
-          type: boolean
-          default: true
-          description: Whether to deduplicate relations after entity resolution
-        track_provenance:
-          type: boolean
-          default: true
-          description: Whether to track mention provenance for resolved entities
-    TermiteRelation:
-      type: object
-      required:
-        - head
-        - tail
-        - label
-        - score
-      properties:
-        head:
-          $ref: '#/components/schemas/TermiteRecognizeEntity'
-          description: The subject/head entity in the relationship
-        tail:
-          $ref: '#/components/schemas/TermiteRecognizeEntity'
-          description: The object/tail entity in the relationship
-        label:
-          type: string
-          description: The relationship type
-          example: founded
-        score:
-          type: number
-          format: float
-          description: Confidence score for the relation (0.0 to 1.0)
-          example: 0.95
-    TermiteRecognizeResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteRecognizeObject'
-          description: Recognition result objects, one per input text.
-        model:
-          type: string
-          description: Name of model used for NER
-        usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRecognizeObject:
-      type: object
-      required:
-        - object
-        - index
-        - entities
-      properties:
-        object:
-          type: string
-          enum:
-            - recognition
-        index:
-          type: integer
-          description: Original input text index.
-        entities:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteRecognizeEntity'
-          description: Entities recognized for this input text.
-        relations:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteRelation'
-          description: >
-            Relations recognized for this input text. Only present when using
-
-            a model with 'relations' capability (GLiNER multitask, REBEL).
-    TermiteRewriteRequest:
+    InferenceRewriteRequest:
       type: object
       required:
         - model
@@ -15499,7 +16551,7 @@ components:
           description: Input texts to rewrite/transform
           example:
             - 'Translate to German: Hello, how are you?'
-    TermiteRewriteResponse:
+    InferenceRewriteResponse:
       type: object
       required:
         - object
@@ -15515,14 +16567,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteRewriteObject'
+            $ref: '#/components/schemas/InferenceRewriteObject'
           description: Rewritten text objects, one per input.
         model:
           type: string
           description: Name of model used for rewriting
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteRewriteObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceRewriteObject:
       type: object
       required:
         - object
@@ -15541,586 +16593,7 @@ components:
           items:
             type: string
           description: Rewritten texts for this input, one per beam.
-    TermiteClassifyRequest:
-      type: object
-      required:
-        - model
-        - texts
-        - labels
-      properties:
-        model:
-          type: string
-          description: Name of classifier model from models_dir/classifiers/
-          example: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to classify
-          example:
-            - I love this product!
-            - The service was terrible.
-        labels:
-          type: array
-          items:
-            type: string
-          description: >
-            Candidate labels for zero-shot classification.
-
-            The model will predict which label(s) best describe each text.
-          example:
-            - positive
-            - negative
-            - neutral
-        hypothesis_template:
-          type: string
-          description: >
-            Custom hypothesis template for NLI-based classification.
-
-            Use "{}" as placeholder for the label.
-
-            Default: "This example is {}."
-          example: This text expresses a {} sentiment.
-        multi_label:
-          type: boolean
-          default: false
-          description: >
-            If true, allows multiple labels per text (independent scoring).
-
-            If false (default), scores are normalized across labels.
-    TermiteClassifyResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-          description: The predicted class/category
-          example: positive
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.95
-    TermiteClassifyResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteClassifyObject'
-          description: Classification result objects, one per input text.
-        model:
-          type: string
-          description: Name of model used for classification
-        usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteClassifyObject:
-      type: object
-      required:
-        - object
-        - index
-        - classifications
-      properties:
-        object:
-          type: string
-          enum:
-            - classification
-        index:
-          type: integer
-          description: Original input text index.
-        classifications:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteClassifyResult'
-          description: >
-            Classification results for this input text.
-    TermiteDocumentClassificationRequest:
-      type: object
-      required:
-        - model
-        - image_path
-        - num_tokens
-        - labels
-      properties:
-        model:
-          type: string
-          description: Name or path of the document classification model directory or checkpoint
-          example: acme/layoutdoc-invoice-sequence
-        image_path:
-          type: string
-          description: Absolute or server-local path to the page image
-          example: /tmp/page.png
-        num_tokens:
-          type: integer
-          minimum: 0
-          description: Number of OCR/text tokens associated with the page
-          example: 42
-        labels:
-          type: array
-          items:
-            type: string
-          description: Labels in the same order expected by the checkpoint output head
-          example:
-            - invoice
-            - form
-            - email
-        prefix:
-          type: string
-          description: Optional tensor prefix inside the safetensors checkpoint
-          default: layoutdoc_sequence_head
-          example: layoutdoc_sequence_head
-    TermiteDocumentClassificationFeatures:
-      type: object
-      required:
-        - num_tokens
-        - image_width
-        - image_height
-        - image_components
-        - mean_darkness
-        - std_darkness
-        - top_darkness
-        - bottom_darkness
-        - left_darkness
-        - right_darkness
-        - center_darkness
-      properties:
-        num_tokens:
-          type: integer
-        image_width:
-          type: integer
-        image_height:
-          type: integer
-        image_components:
-          type: integer
-        mean_darkness:
-          type: number
-          format: float
-        std_darkness:
-          type: number
-          format: float
-        top_darkness:
-          type: number
-          format: float
-        bottom_darkness:
-          type: number
-          format: float
-        left_darkness:
-          type: number
-          format: float
-        right_darkness:
-          type: number
-          format: float
-        center_darkness:
-          type: number
-          format: float
-    TermiteDocumentClassificationResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-        score:
-          type: number
-          format: float
-    TermiteDocumentClassificationResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteDocumentClassificationObject'
-        model:
-          type: string
-        usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteDocumentClassificationObject:
-      type: object
-      required:
-        - object
-        - index
-        - checkpoint_path
-        - prefix
-        - input
-        - features
-        - scores
-      properties:
-        object:
-          type: string
-          enum:
-            - document.classification
-        index:
-          type: integer
-        checkpoint_path:
-          type: string
-        prefix:
-          type: string
-        input:
-          type: object
-          required:
-            - image_path
-            - num_tokens
-          properties:
-            image_path:
-              type: string
-            num_tokens:
-              type: integer
-        features:
-          $ref: '#/components/schemas/TermiteDocumentClassificationFeatures'
-        best:
-          nullable: true
-          allOf:
-            - $ref: '#/components/schemas/TermiteDocumentClassificationResult'
-        scores:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteDocumentClassificationResult'
-    TermiteDocumentTokenBox:
-      type: object
-      required:
-        - text
-        - bbox
-      properties:
-        text:
-          type: string
-        bbox:
-          type: array
-          minItems: 4
-          maxItems: 4
-          items:
-            type: integer
-          description: Bounding box normalized to the same 0-1000 layout space used by training
-          example:
-            - 0
-            - 0
-            - 120
-            - 24
-    TermiteDocumentTokenClassificationRequest:
-      type: object
-      required:
-        - model
-        - labels
-        - tokens
-      properties:
-        model:
-          type: string
-          description: Name or path of the document token classification model directory or checkpoint
-          example: acme/layoutdoc-token-tags
-        labels:
-          type: array
-          items:
-            type: string
-          description: Labels in the same order expected by the checkpoint output head
-          example:
-            - O
-            - B-KEY
-            - I-KEY
-        tokens:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteDocumentTokenBox'
-        prefix:
-          type: string
-          description: Optional tensor prefix inside the safetensors checkpoint
-          default: layoutdoc_token_head
-          example: layoutdoc_token_head
-    TermiteDocumentTokenClassificationFeatures:
-      type: object
-      required:
-        - text_length
-        - bbox
-        - width
-        - height
-        - relative_position
-        - bbox_phase_sin
-      properties:
-        text_length:
-          type: integer
-        bbox:
-          type: array
-          minItems: 4
-          maxItems: 4
-          items:
-            type: integer
-        width:
-          type: number
-          format: float
-        height:
-          type: number
-          format: float
-        relative_position:
-          type: number
-          format: float
-        bbox_phase_sin:
-          type: number
-          format: float
-    TermiteDocumentTokenClassificationResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-        score:
-          type: number
-          format: float
-    TermiteDocumentTokenClassificationPrediction:
-      type: object
-      required:
-        - token_index
-        - text
-        - bbox
-        - features
-        - scores
-      properties:
-        token_index:
-          type: integer
-        text:
-          type: string
-        bbox:
-          type: array
-          minItems: 4
-          maxItems: 4
-          items:
-            type: integer
-        features:
-          $ref: '#/components/schemas/TermiteDocumentTokenClassificationFeatures'
-        best:
-          nullable: true
-          allOf:
-            - $ref: '#/components/schemas/TermiteDocumentTokenClassificationResult'
-        scores:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationResult'
-    TermiteDocumentTokenClassificationResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationObject'
-        model:
-          type: string
-        usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteDocumentTokenClassificationObject:
-      type: object
-      required:
-        - object
-        - index
-        - checkpoint_path
-        - prefix
-        - num_tokens
-        - predictions
-      properties:
-        object:
-          type: string
-          enum:
-            - document.token_classification
-        index:
-          type: integer
-        checkpoint_path:
-          type: string
-        prefix:
-          type: string
-        num_tokens:
-          type: integer
-        predictions:
-          type: array
-          description: Each result is an array of ClassifyResult sorted by score descending.
-          items:
-            $ref: '#/components/schemas/TermiteDocumentTokenClassificationPrediction'
-    TermiteExtractRequest:
-      type: object
-      required:
-        - model
-        - schema
-      description: >
-        Exactly one of `texts` or `images` must be provided.
-
-        When using `images`, the server selects a compatible reader internally
-
-        and processes the request as: read document text -> run structured extraction.
-      properties:
-        model:
-          type: string
-          description: Name of extractor model with 'extraction' capability
-          example: fastino/gliner2-base-v1
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to extract structured data from
-          example:
-            - John Smith is 30 years old and works at Google.
-        images:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteImageURL'
-          description: >
-            Optional images to extract structured data from.
-
-            When provided, the server first reads document text with a compatible reader
-
-            and then runs schema extraction on the read text.
-        prompt:
-          type: string
-          description: >
-            Optional read-stage prompt used only when `images` are provided.
-
-            Passed through to the reader before schema extraction.
-          example: <OCR>
-        max_tokens:
-          type: integer
-          description: >
-            Maximum tokens for the read stage when `images` are provided.
-
-            Ignored for text-only extraction requests.
-          default: 256
-        schema:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: string
-          description: >
-            Extraction schema mapping structure names to field definitions.
-
-            Each field is defined as "field_name::type" where type is "str" or "list".
-
-            Optional choice fields: "field_name::[opt1|opt2]::str".
-
-            If no type is specified, defaults to "str".
-          example:
-            person:
-              - name::str
-              - age::str
-              - company::str
-        threshold:
-          type: number
-          format: float
-          description: Score threshold for span extraction (0.0-1.0)
-          default: 0.3
-        flat_ner:
-          type: boolean
-          description: If true, don't allow nested/overlapping entities
-          default: true
-        include_confidence:
-          type: boolean
-          description: If true, include confidence scores in output
-          default: false
-        include_spans:
-          type: boolean
-          description: If true, include character offset spans in output
-          default: false
-    TermiteExtractFieldValue:
-      type: object
-      required:
-        - value
-      properties:
-        value:
-          type: string
-          description: The extracted text value
-          example: John Smith
-        score:
-          type: number
-          format: float
-          description: Confidence score (only present when include_confidence=true)
-          example: 0.95
-        start:
-          type: integer
-          description: Character offset where value begins (only present when include_spans=true)
-          example: 0
-        end:
-          type: integer
-          description: Character offset where value ends (only present when include_spans=true)
-          example: 10
-    TermiteExtractResponse:
-      type: object
-      required:
-        - object
-        - data
-        - model
-        - usage
-      properties:
-        object:
-          type: string
-          enum:
-            - list
-          description: Object type, always "list"
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/TermiteExtractObject'
-          description: Extraction result objects, one per input.
-        model:
-          type: string
-          description: Name of model used for extraction
-        usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteExtractObject:
-      type: object
-      required:
-        - object
-        - index
-        - results
-      properties:
-        object:
-          type: string
-          enum:
-            - extraction
-        index:
-          type: integer
-          description: Original input index.
-        results:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: object
-              additionalProperties: true
-          description: >
-            Extraction result for this input. Maps structure names to arrays of extracted instances.
-
-            Each instance maps field names to ExtractFieldValue (for ::str fields)
-
-            or arrays of ExtractFieldValue (for ::list fields).
-    TermiteReadRequest:
+    InferenceReadRequest:
       type: object
       required:
         - model
@@ -16133,7 +16606,7 @@ components:
         images:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteImageURL'
+            $ref: '#/components/schemas/InferenceImageURL'
           description: >
             Images to read text from. Supports:
 
@@ -16164,7 +16637,7 @@ components:
           description: Maximum tokens to generate
           default: 256
           example: 256
-    TermiteTextRegion:
+    InferenceTextRegion:
       type: object
       required:
         - text
@@ -16186,7 +16659,7 @@ components:
         label:
           type: string
           description: Semantic label from layout analysis (e.g., text, title, table)
-    TermiteReadResult:
+    InferenceReadResult:
       type: object
       required:
         - text
@@ -16212,12 +16685,12 @@ components:
         regions:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTextRegion'
+            $ref: '#/components/schemas/InferenceTextRegion'
           description: >
             Individual text regions with bounding boxes and recognized text.
 
             Populated by multi-stage OCR models (Surya, PaddleOCR).
-    TermiteReadResponse:
+    InferenceReadResponse:
       type: object
       required:
         - object
@@ -16233,16 +16706,16 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteReadObject'
+            $ref: '#/components/schemas/InferenceReadObject'
           description: Read result objects, one per input image.
         model:
           type: string
           description: Name of model used for reading
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteReadObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceReadObject:
       allOf:
-        - $ref: '#/components/schemas/TermiteReadResult'
+        - $ref: '#/components/schemas/InferenceReadResult'
         - type: object
           required:
             - object
@@ -16255,7 +16728,7 @@ components:
             index:
               type: integer
               description: Original input image index.
-    TermiteTranscribeRequest:
+    InferenceTranscribeRequest:
       type: object
       required:
         - audio
@@ -16272,7 +16745,7 @@ components:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
-    TermiteTranscribeResponse:
+    InferenceTranscribeResponse:
       type: object
       required:
         - object
@@ -16288,14 +16761,14 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTranscribeObject'
+            $ref: '#/components/schemas/InferenceTranscribeObject'
           description: Transcription result objects.
         model:
           type: string
           description: Name of model used for transcription
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteTranscribeObject:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceTranscribeObject:
       type: object
       required:
         - object
@@ -16317,7 +16790,7 @@ components:
           type: string
           description: Detected or forced language
           example: en
-    TermiteModelInfo:
+    InferenceModelInfo:
       type: object
       description: Information about a model including its capabilities
       properties:
@@ -16332,9 +16805,13 @@ components:
           items:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
-    TermiteModelsResponse:
+    InferenceModelsResponse:
       type: object
       required:
+        - object
+        - data
+        - allow_downloads
+        - backends
         - chunkers
         - rerankers
         - embedders
@@ -16346,57 +16823,74 @@ components:
         - readers
         - transcribers
       properties:
+        object:
+          type: string
+          enum:
+            - list
+          description: OpenAI-compatible response object type.
+        data:
+          type: array
+          description: OpenAI-compatible flat model list for generation/embedding models.
+          items:
+            type: object
+            additionalProperties: true
+        allow_downloads:
+          type: boolean
+          description: Whether clients should show model download commands.
+          default: true
+        backends:
+          $ref: '#/components/schemas/InferenceBackendRuntimes'
         chunkers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available chunking models (always includes "fixed")
         rerankers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reranking models
         classifiers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available embedding models from models_dir/embedders/
         extractors:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available extractor models (models with 'extraction' capability)
         generators:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available generator/LLM models from models_dir/generators/
         recognizers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available recognizer models from models_dir/recognizers/
         rewriters:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available Seq2Seq rewriter models from models_dir/rewriters/
         readers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reader/OCR models from models_dir/readers/
         transcribers:
           type: object
           additionalProperties:
-            $ref: '#/components/schemas/TermiteModelInfo'
+            $ref: '#/components/schemas/InferenceModelInfo'
           description: Available transcriber/speech-to-text models from models_dir/transcribers/
-    TermiteTool:
+    InferenceTool:
       type: object
       description: A tool (function) that the model can call
       required:
@@ -16409,8 +16903,8 @@ components:
             - function
           description: The type of tool (currently only "function" is supported)
         function:
-          $ref: '#/components/schemas/TermiteFunctionDefinition'
-    TermiteFunctionDefinition:
+          $ref: '#/components/schemas/InferenceFunctionDefinition'
+    InferenceFunctionDefinition:
       type: object
       description: Definition of a function that can be called by the model
       required:
@@ -16440,41 +16934,7 @@ components:
           type: boolean
           description: Whether to enforce strict parameter validation
           default: false
-    TermiteToolCall:
-      type: object
-      description: A tool call made by the model
-      required:
-        - id
-        - type
-        - function
-      properties:
-        id:
-          type: string
-          description: Unique identifier for this tool call
-          example: call_abc123
-        type:
-          type: string
-          enum:
-            - function
-          description: The type of tool call (currently only "function")
-        function:
-          $ref: '#/components/schemas/TermiteToolCallFunction'
-    TermiteToolCallFunction:
-      type: object
-      description: The function called by the model
-      required:
-        - name
-        - arguments
-      properties:
-        name:
-          type: string
-          description: The name of the function called
-          example: get_weather
-        arguments:
-          type: string
-          description: JSON string of the arguments to the function
-          example: '{"location": "San Francisco, CA"}'
-    TermiteToolChoice:
+    InferenceToolChoice:
       description: >
         Controls how the model uses tools. Options:
 
@@ -16509,15 +16969,9 @@ components:
                 name:
                   type: string
                   description: The name of the function to call
-    TermiteRole:
-      type: string
-      enum:
-        - system
-        - user
-        - assistant
-        - tool
-      description: The role of a message sender in a conversation
-    TermiteFinishReason:
+    InferenceRole:
+      $ref: '#/components/schemas/ChatMessageRole'
+    InferenceFinishReason:
       type: string
       enum:
         - stop
@@ -16526,38 +16980,24 @@ components:
         - content_filter
         - function_call
       description: Reason why generation stopped
-    TermiteChatMessageContent:
-      description: >
-        Message content. Supports two formats:
-
-        - Simple string: "Hello, how are you?"
-
-        - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-      oneOf:
-        - type: string
-          description: Simple text content
-        - type: array
-          description: Array of content parts (OpenAI multimodal format)
-          items:
-            $ref: '#/components/schemas/TermiteContentPart'
-    TermiteChatMessage:
+    InferenceChatMessage:
       type: object
       required:
         - role
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
-          $ref: '#/components/schemas/TermiteChatMessageContent'
+          $ref: '#/components/schemas/ChatMessageContent'
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCall'
+            $ref: '#/components/schemas/ToolCall'
           description: Tool calls made by the assistant (only for role=assistant)
         tool_call_id:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
-    TermiteGenerateRequest:
+    InferenceGenerateRequest:
       type: object
       required:
         - model
@@ -16570,7 +17010,7 @@ components:
         messages:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteChatMessage'
+            $ref: '#/components/schemas/InferenceChatMessage'
           description: Conversation messages (OpenAI-compatible format)
         max_tokens:
           type: integer
@@ -16590,7 +17030,7 @@ components:
           default: 1
         top_k:
           type: integer
-          description: Top-k sampling (Termite extension, not in OpenAI API)
+          description: Top-k sampling (inference extension, not in OpenAI API)
           default: 50
         stream:
           type: boolean
@@ -16599,7 +17039,7 @@ components:
         tools:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteTool'
+            $ref: '#/components/schemas/InferenceTool'
           description: >
             List of tools (functions) the model can call.
 
@@ -16629,7 +17069,7 @@ components:
             if count > 0)
           default: 0
         response_format:
-          $ref: '#/components/schemas/TermiteGenerateResponseFormat'
+          $ref: '#/components/schemas/InferenceGenerateResponseFormat'
           description: >
             Structured output control. OpenAI-compatible entry point for requesting JSON output.
 
@@ -16638,18 +17078,18 @@ components:
         grammar:
           type: string
           description: >
-            Termite-native grammar override. When set, this takes precedence over `response_format`.
+            inference-native grammar override. When set, this takes precedence over `response_format`.
 
             Grammar-constrained decoding is currently native-backend only.
         draft_model:
           type: string
           description: >
-            Termite-native speculative decoding extension. Path or model identifier for a smaller draft
+            inference-native speculative decoding extension. Path or model identifier for a smaller draft
             model.
         speculative_k:
           type: integer
           description: >
-            Termite-native speculative decoding extension. Number of draft tokens proposed per verification
+            inference-native speculative decoding extension. Number of draft tokens proposed per verification
             round.
           default: 4
         cache_dtype:
@@ -16661,7 +17101,7 @@ components:
             - fp8
             - int4
           description: >
-            Termite-native KV cache quantization format. Lower precision reduces memory usage but may
+            inference-native KV cache quantization format. Lower precision reduces memory usage but may
 
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
         cache_compaction_ratio:
@@ -16670,7 +17110,7 @@ components:
           minimum: 0.0
           maximum: 1.0
           description: >
-            Termite-native KV cache compaction ratio applied after prefill via Attention Matching.
+            inference-native KV cache compaction ratio applied after prefill via Attention Matching.
 
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
 
@@ -16695,9 +17135,9 @@ components:
 
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
 
-            requires a PJRT plugin path via `TERMITE_XLA_PLUGIN`, `TERMITE_PJRT_PLUGIN`,
+            requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
 
-            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+            `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
 
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
 
@@ -16708,24 +17148,24 @@ components:
             - eager
             - compiled
           description: >
-            Termite-native graph execution mode. `eager` keeps the direct runtime path when possible.
+            inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
 
-            `compiled` runs Termite graph planning, partitioning, and backend executor attachment.
+            `compiled` runs inference graph planning, partitioning, and backend executor attachment.
         compiled_target:
           type: string
           enum:
             - partitioned
             - whole-model
           description: >
-            Termite-native compiled graph target. `partitioned` attaches compiled executors to eligible
+            inference-native compiled graph target. `partitioned` attaches compiled executors to eligible
 
             graph partitions. `whole-model` requests a compiled backend only when it can own the full
 
             traced graph shape.
         tool_choice:
-          $ref: '#/components/schemas/TermiteToolChoice'
+          $ref: '#/components/schemas/InferenceToolChoice'
           description: Controls how the model uses tools
-    TermiteGenerateResponseFormat:
+    InferenceGenerateResponseFormat:
       type: object
       required:
         - type
@@ -16738,10 +17178,10 @@ components:
             - json_object
             - json_schema
         json_schema:
-          $ref: '#/components/schemas/TermiteGenerateJsonSchemaConfig'
+          $ref: '#/components/schemas/InferenceGenerateJsonSchemaConfig'
           description: Optional schema payload for `type=json_schema`. Enforced during native constrained
             decoding and validated after generation.
-    TermiteGenerateJsonSchemaConfig:
+    InferenceGenerateJsonSchemaConfig:
       type: object
       properties:
         name:
@@ -16754,7 +17194,7 @@ components:
           type: object
           additionalProperties: true
           description: JSON Schema object
-    TermiteGenerateResponse:
+    InferenceGenerateResponse:
       type: object
       description: OpenAI-compatible chat completion response
       required:
@@ -16784,11 +17224,11 @@ components:
         choices:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteGenerateChoice'
+            $ref: '#/components/schemas/InferenceGenerateChoice'
           description: List of completion choices (currently always 1)
         usage:
-          $ref: '#/components/schemas/TermiteGenerateUsage'
-    TermiteGenerateChoice:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
+    InferenceGenerateChoice:
       type: object
       required:
         - index
@@ -16799,20 +17239,20 @@ components:
           type: integer
           description: Index of this choice in the list
         message:
-          $ref: '#/components/schemas/TermiteGenerateMessage'
+          $ref: '#/components/schemas/InferenceGenerateMessage'
         finish_reason:
-          $ref: '#/components/schemas/TermiteFinishReason'
+          $ref: '#/components/schemas/InferenceFinishReason'
         logprobs:
           type: object
           nullable: true
           description: Log probability information (not supported, always null)
-    TermiteGenerateMessage:
+    InferenceGenerateMessage:
       type: object
       required:
         - role
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
           type: string
           nullable: true
@@ -16820,9 +17260,9 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCall'
+            $ref: '#/components/schemas/ToolCall'
           description: Tool calls made by the model (only present when finish_reason is tool_calls)
-    TermiteGenerateUsage:
+    InferenceGenerateUsage:
       type: object
       required:
         - prompt_tokens
@@ -16838,7 +17278,7 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
-    TermiteGenerateChunk:
+    InferenceGenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)
       required:
@@ -16861,8 +17301,8 @@ components:
         choices:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteGenerateChunkChoice'
-    TermiteGenerateChunkChoice:
+            $ref: '#/components/schemas/InferenceGenerateChunkChoice'
+    InferenceGenerateChunkChoice:
       type: object
       required:
         - index
@@ -16871,15 +17311,15 @@ components:
         index:
           type: integer
         delta:
-          $ref: '#/components/schemas/TermiteGenerateDelta'
+          $ref: '#/components/schemas/InferenceGenerateDelta'
         finish_reason:
-          $ref: '#/components/schemas/TermiteFinishReason'
-    TermiteGenerateDelta:
+          $ref: '#/components/schemas/InferenceFinishReason'
+    InferenceGenerateDelta:
       type: object
       description: Delta content for streaming
       properties:
         role:
-          $ref: '#/components/schemas/TermiteRole'
+          $ref: '#/components/schemas/InferenceRole'
         content:
           type: string
           nullable: true
@@ -16887,9 +17327,9 @@ components:
         tool_calls:
           type: array
           items:
-            $ref: '#/components/schemas/TermiteToolCallDelta'
+            $ref: '#/components/schemas/InferenceToolCallDelta'
           description: Tool call deltas for streaming tool calls
-    TermiteToolCallDelta:
+    InferenceToolCallDelta:
       type: object
       description: Incremental tool call data for streaming
       properties:
@@ -16905,8 +17345,8 @@ components:
             - function
           description: The type of tool call (only in first delta)
         function:
-          $ref: '#/components/schemas/TermiteToolCallFunctionDelta'
-    TermiteToolCallFunctionDelta:
+          $ref: '#/components/schemas/InferenceToolCallFunctionDelta'
+    InferenceToolCallFunctionDelta:
       type: object
       description: Incremental function call data for streaming
       properties:
@@ -16916,7 +17356,7 @@ components:
         arguments:
           type: string
           description: Incremental arguments JSON string
-    TermiteConfig:
+    InferenceConfig:
       type: object
       required:
         - api_url
@@ -16924,12 +17364,15 @@ components:
         api_url:
           type: string
           format: uri
-          description: URL of the Termite embedding/chunking service
+          description: URL of the inference embedding/chunking service
           example: http://localhost:8080
+        api_key:
+          type: string
+          description: API key used when calling an authenticated shared Antfly inference API.
         models_dir:
           type: string
           description: >
-            Base directory containing model subdirectories. Termite auto-discovers models from:
+            Base directory containing model subdirectories. Antfly inference auto-discovers models from:
 
             - `{models_dir}/embedders/` - Embedding models (ONNX)
 
@@ -16942,15 +17385,15 @@ components:
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
 
-            Defaults to ~/.termite/models (set via viper). If not set, only built-in fixed chunking is
-            available.
-          example: ~/.termite/models
+            Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking
+            is available.
+          example: ~/.antfly/inference/models
         content_security:
-          $ref: '#/components/schemas/TermiteContentSecurityConfig'
+          $ref: '#/components/schemas/InferenceContentSecurityConfig'
           description: Security settings for downloading content from URLs (e.g., images for CLIP models).
             Controls allowed hosts, private IP blocking, download limits, and timeouts.
         s3_credentials:
-          $ref: '#/components/schemas/TermiteCredentials'
+          $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
         keep_alive:
           type: string
@@ -16998,18 +17441,22 @@ components:
             Format: `backend` or `backend:device` where device defaults to `auto`.
 
 
-            Termite tries entries in order and uses the first available backend+device
+            Antfly inference tries entries in order and uses the first available backend+device
 
             combination that supports the model.
 
 
-            **Backends** (depend on build tags):
+            **Backends** (depend on build flags):
 
-            - `go` - Pure Go inference (always available, CPU only, slowest)
+            - `native` - Native CPU backend
 
-            - `onnx` - ONNX Runtime (requires -tags="onnx,ORT", fastest)
+            - `onnx` - ONNX Runtime backend
 
-            - `xla` - GoMLX XLA (requires -tags="xla,XLA", TPU/CUDA/CPU)
+            - `metal` - Apple Metal backend
+
+            - `cuda` - NVIDIA CUDA backend
+
+            - `xla` - PJRT/XLA compiled backend
 
 
             **Devices**:
@@ -17025,23 +17472,18 @@ components:
 
             **Examples**:
 
-            - `["onnx", "xla", "go"]` - Try backends with auto device detection
+            - `["native", "onnx", "xla"]` - Try backends with auto device detection
 
-            - `["onnx:cuda", "xla:tpu", "onnx:cpu", "go"]` - Prefer GPU, fall back to CPU
-
-            - `          default:
-
+            - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+          default:
+            - native
             - onnx
-
             - xla
-
-            - go
           example:
+            - cuda
             - onnx:cuda
             - xla:tpu
-            - onnx:cpu
-            - xla:cpu
-            - go
+            - native
         max_concurrent_requests:
           type: integer
           description: >
@@ -17079,7 +17521,7 @@ components:
           description: >
             List of model names to preload at startup (Ollama-compatible).
 
-            These models are loaded immediately when Termite starts, avoiding first-request latency.
+            These models are loaded immediately when inference starts, avoiding first-request latency.
 
             Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
 
@@ -17140,43 +17582,10 @@ components:
             deployments (e.g., Kubernetes operator) where models are managed externally.
           default: true
         log:
-          $ref: '#/components/schemas/Termiteschemas-Config'
-    TermiteVersionResponse:
+          $ref: '#/components/schemas/Inferenceschemas-Config'
+    InferenceBackendRuntimes:
       type: object
-      required:
-        - version
-        - git_commit
-        - build_time
-        - go_version
-      properties:
-        version:
-          type: string
-          description: Termite version
-          example: v1.0.0
-        git_commit:
-          type: string
-          description: Git commit hash
-          example: abc1234
-        build_time:
-          type: string
-          description: Build timestamp
-          example: '2024-01-15T10:30:00Z'
-        go_version:
-          type: string
-          description: Go runtime version
-          example: go1.25.0
-        runtime:
-          type: string
-          description: Termite runtime implementation
-          example: termite-zig
-        backends:
-          $ref: '#/components/schemas/TermiteBackendCapabilities'
-        allow_downloads:
-          type: boolean
-          description: Whether model downloads are allowed in this deployment
-          example: true
-    TermiteBackendCapabilities:
-      type: object
+      description: Runtime backends compiled into this inference server.
       properties:
         native:
           type: boolean
@@ -17186,11 +17595,23 @@ components:
           type: boolean
           description: Whether the ONNX Runtime backend is built into this runtime
           example: false
+        metal:
+          type: boolean
+          description: Whether the Metal backend is built into this runtime
+          example: true
+        cuda:
+          type: boolean
+          description: Whether the CUDA backend is built into this runtime
+          example: false
+        xla:
+          type: boolean
+          description: Whether the PJRT/XLA backend is built into this runtime
+          example: false
         wasm:
           type: boolean
           description: Whether the WASM backend is built into this runtime
           example: false
-    TermiteTextChunkOptions:
+    InferenceTextChunkOptions:
       type: object
       description: Options specific to text chunking.
       properties:
@@ -17205,7 +17626,7 @@ components:
           type: string
           description: Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
             chunkers.
-    TermiteTextContent:
+    InferenceTextContent:
       type: object
       description: Text content with character offsets.
       required:
@@ -17222,7 +17643,7 @@ components:
         end_char:
           type: integer
           description: Character position in original text where chunk ends (exclusive)
-    TermiteBinaryContent:
+    InferenceBinaryContent:
       type: object
       description: Binary media content with format-specific metadata.
       properties:
@@ -17244,7 +17665,7 @@ components:
         frame_delay_ms:
           type: integer
           description: 'Animation: display delay in milliseconds'
-    TermiteContentSecurityConfig:
+    InferenceContentSecurityConfig:
       type: object
       properties:
         allowed_hosts:
@@ -17296,7 +17717,7 @@ components:
           description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
             servers (e.g., Wikipedia) reject requests without a User-Agent.
           example: AntflyDB/1.0
-    TermiteCredentials:
+    InferenceCredentials:
       type: object
       properties:
         endpoint:
@@ -17323,7 +17744,7 @@ components:
           description: Optional AWS session token for temporary credentials. Supports keystore syntax
             for secret lookup.
           example: your-session-token
-    TermiteLevel:
+    InferenceLevel:
       type: string
       description: Logging verbosity level
       enum:
@@ -17333,7 +17754,7 @@ components:
         - error
       default: info
       example: info
-    TermiteStyle:
+    InferenceStyle:
       type: string
       description: Logging output format style. 'terminal' for colorized console, 'json' for structured
         JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
@@ -17344,15 +17765,15 @@ components:
         - noop
       default: terminal
       example: terminal
-    Termiteschemas-Config:
+    Inferenceschemas-Config:
       type: object
-      description: Logging configuration for Termite services
+      description: Logging configuration for inference services
       properties:
         level:
-          $ref: '#/components/schemas/TermiteLevel'
+          $ref: '#/components/schemas/InferenceLevel'
         style:
-          $ref: '#/components/schemas/TermiteStyle'
-    TermiteEmbeddingObject:
+          $ref: '#/components/schemas/InferenceStyle'
+    InferenceEmbeddingObject:
       type: object
       description: A single embedding result
       required:
@@ -17372,11 +17793,11 @@ components:
               items:
                 type: number
                 format: float
-            - $ref: '#/components/schemas/TermiteSparseVector'
+            - $ref: '#/components/schemas/InferenceSparseVector'
         index:
           type: integer
           description: Index of the input this embedding corresponds to
-    TermiteEmbeddingUsage:
+    InferenceEmbeddingUsage:
       type: object
       description: Token usage information
       required:
@@ -17389,6 +17810,233 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used
+    ExtractionToken:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+        box:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+    ExtractionInput:
+      type: object
+      required:
+        - content
+      properties:
+        id:
+          type: string
+        content:
+          $ref: '#/components/schemas/ChatMessageContent'
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionToken'
+        metadata:
+          type: object
+          additionalProperties: true
+    ExtractionRelationSchema:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+    ExtractionClassificationSchema:
+      type: object
+      required:
+        - name
+        - labels
+      properties:
+        name:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        multi_label:
+          type: boolean
+          default: false
+    ExtractionStructureField:
+      oneOf:
+        - type: string
+        - type: object
+          additionalProperties: true
+    ExtractionStructureSchema:
+      type: object
+      properties:
+        fields:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionStructureField'
+      additionalProperties: true
+    ExtractionSchema:
+      type: object
+      properties:
+        entities:
+          type: array
+          items:
+            type: string
+        relations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionRelationSchema'
+        classifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassificationSchema'
+        structures:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ExtractionStructureSchema'
+      additionalProperties: true
+    ExtractionReaderOptions:
+      type: object
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        url:
+          type: string
+        api_url:
+          type: string
+      additionalProperties: true
+    ExtractionOptions:
+      type: object
+      properties:
+        threshold:
+          type: number
+          format: float
+        flat_ner:
+          type: boolean
+        include_confidence:
+          type: boolean
+        include_spans:
+          type: boolean
+        reader:
+          $ref: '#/components/schemas/ExtractionReaderOptions'
+      additionalProperties: true
+    ExtractionRequest:
+      type: object
+      required:
+        - model
+        - inputs
+        - schema
+      properties:
+        model:
+          type: string
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionInput'
+        schema:
+          $ref: '#/components/schemas/ExtractionSchema'
+        options:
+          $ref: '#/components/schemas/ExtractionOptions'
+    ExtractionEntity:
+      type: object
+      required:
+        - label
+        - text
+      properties:
+        label:
+          type: string
+        text:
+          type: string
+        start:
+          type: integer
+        end:
+          type: integer
+        score:
+          type: number
+          format: float
+    ExtractionRelationEndpoint:
+      type: object
+      properties:
+        entity_index:
+          type: integer
+        id:
+          type: string
+      additionalProperties: true
+    ExtractionRelation:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+        source:
+          $ref: '#/components/schemas/ExtractionRelationEndpoint'
+        target:
+          $ref: '#/components/schemas/ExtractionRelationEndpoint'
+        score:
+          type: number
+          format: float
+      additionalProperties: true
+    ExtractionClassification:
+      type: object
+      required:
+        - name
+        - label
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+        score:
+          type: number
+          format: float
+      additionalProperties: true
+    ExtractionObject:
+      type: object
+      properties:
+        id:
+          type: string
+        entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionEntity'
+        relations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionRelation'
+        classifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionClassification'
+        structures:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    ExtractionResponse:
+      type: object
+      required:
+        - object
+        - model
+        - data
+      properties:
+        object:
+          type: string
+          enum:
+            - extraction
+        model:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionObject'
+        usage:
+          type: object
+          additionalProperties: true
   responses:
     BadRequest:
       description: Bad request
@@ -17410,6 +18058,18 @@ components:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: Request conflicts with the current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: Method not allowed for this resource
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: Service is temporarily unavailable
       content:
         application/json:
           schema:
@@ -17440,5 +18100,5 @@ x-tagGroups:
       - Permission
       - ApiKey
       - RowFilter
-  - name: Termite
+  - name: Inference
     tags: []

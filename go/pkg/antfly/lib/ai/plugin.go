@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../../specs/openapi/antfly/generating.yaml
 package ai
 
 import (
@@ -42,7 +42,7 @@ func init() {
 		func(ctx context.Context, config GeneratorConfig) (DocumentSummarizer, error) {
 			return NewGenKitGenerator(ctx, config)
 		})
-	RegisterDocumentSummarizer(GeneratorProviderTermite,
+	RegisterDocumentSummarizer(GeneratorProviderAntfly,
 		func(ctx context.Context, config GeneratorConfig) (DocumentSummarizer, error) {
 			return NewGenKitGenerator(ctx, config)
 		})

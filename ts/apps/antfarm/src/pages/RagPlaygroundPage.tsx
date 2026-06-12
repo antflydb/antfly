@@ -101,7 +101,7 @@ function ErrorDisplay({ message }: { message: string }) {
     isLong && !expanded ? `${message.slice(0, ERROR_TRUNCATE_LENGTH)}...` : message;
 
   return (
-    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
+    <div className="mb-4 p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
       {displayText}
       {isLong && (
         <button
@@ -375,7 +375,7 @@ const RagPlaygroundPage: React.FC = () => {
         {/* Stats Bar */}
         {pipeline.overallStatus !== "idle" && (
           <div className="flex flex-wrap gap-2">
-            <Badge variant="secondary" className="gap-1.5">
+            <Badge className="gap-1.5">
               <Zap className="h-3 w-3" />
               {formatGeneratorSummary(
                 generationData?.provider && generationData?.model
@@ -387,14 +387,13 @@ const RagPlaygroundPage: React.FC = () => {
               )}
             </Badge>
             {(searchData?.hits?.length ?? 0) > 0 && (
-              <Badge variant="outline" className="gap-1.5">
+              <Badge className="gap-1.5">
                 <BookOpen className="h-3 w-3" />
                 {searchData?.hits.length} docs
               </Badge>
             )}
             {confidenceData && (
               <Badge
-                variant="outline"
                 className={cn(
                   "gap-1.5",
                   confidenceData.generation > 0.7
@@ -439,7 +438,7 @@ const RagPlaygroundPage: React.FC = () => {
             </div>
           )}
           renderClassification={(data) => (
-            <div className="p-3 rounded-lg bg-muted/50 space-y-2">
+            <div className="p-3 rounded-none bg-muted/50 space-y-2">
               <div className="flex items-center gap-2 text-sm font-medium">
                 <Sparkles className="h-4 w-4" />
                 Classification
@@ -461,7 +460,7 @@ const RagPlaygroundPage: React.FC = () => {
                 </div>
               )}
               {data.reasoning && (
-                <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded">
+                <div className="text-xs text-muted-foreground mt-2 p-2 bg-background rounded-none">
                   {data.reasoning}
                 </div>
               )}
@@ -519,12 +518,10 @@ const RagPlaygroundPage: React.FC = () => {
               </CollapsibleTrigger>
               <CollapsibleContent className="space-y-2 mt-2">
                 {hits.map((hit, i) => (
-                  <div key={hit._id || i} className="p-3 rounded-lg border text-xs space-y-1">
+                  <div key={hit._id || i} className="p-3 rounded-none border text-xs space-y-1">
                     <div className="flex items-center justify-between">
                       <span className="font-medium">{hit._id}</span>
-                      <Badge variant="secondary" className="text-xs">
-                        {hit._score?.toFixed(3)}
-                      </Badge>
+                      <Badge className="text-xs">{hit._score?.toFixed(3)}</Badge>
                     </div>
                     {hit._source && (
                       <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap">
@@ -591,8 +588,8 @@ const RagPlaygroundPage: React.FC = () => {
         {/* Active Table/Index Indicator */}
         {selectedTable ? (
           <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-            <Badge variant="secondary">{selectedTable}</Badge>
-            {selectedIndex && <Badge variant="outline">{selectedIndex}</Badge>}
+            <Badge>{selectedTable}</Badge>
+            {selectedIndex && <Badge>{selectedIndex}</Badge>}
           </DashboardToolbar>
         ) : (
           <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
@@ -712,7 +709,7 @@ const RagPlaygroundPage: React.FC = () => {
                       <Label className="text-sm font-medium">Pipeline Steps</Label>
 
                       {/* Classification */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <Sparkles className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -751,7 +748,7 @@ const RagPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Follow-up */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <HelpCircle className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -796,7 +793,7 @@ const RagPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Confidence */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border">
+                      <div className="flex items-center justify-between p-3 rounded-none border">
                         <div className="flex items-center gap-3">
                           <Target className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -862,7 +859,7 @@ const RagPlaygroundPage: React.FC = () => {
               <div className="flex items-center justify-between">
                 <CardTitle className="text-lg">Results</CardTitle>
                 {processingTime && (
-                  <Badge variant="outline" className="gap-1.5">
+                  <Badge className="gap-1.5">
                     <Clock className="h-3 w-3" />
                     {(processingTime / 1000).toFixed(1)}s
                   </Badge>

@@ -438,6 +438,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: metadata.MergeTransitionRe
         .receiver_group_id = record.receiver_group_id,
         .phase = record.phase,
         .rollback_reason = if (record.rollback_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
     };
 }
 
@@ -547,6 +548,7 @@ test "transition service steps split and merge queues through runtime" {
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = observeStatus,
+                    .record_doc_identity_reassignment = recordDocIdentityReassignment,
                     .accept_receiver = acceptReceiver,
                     .catch_up_receiver = catchUpReceiver,
                     .finalize_merge = finalizeMerge,
@@ -558,6 +560,11 @@ test "transition service steps split and merge queues through runtime" {
         fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data.MergeTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
+        }
+
+        fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status.allow_doc_identity_reassignment = true;
         }
 
         fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -608,6 +615,7 @@ test "transition service steps split and merge queues through runtime" {
         .transition_id = 2,
         .donor_group_id = 21,
         .receiver_group_id = 22,
+        .allow_doc_identity_reassignment = true,
     });
 
     _ = try svc.stepPending();
@@ -628,6 +636,7 @@ test "transition service steps split and merge queues through runtime" {
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.bootstrapping_merge_receiver);
     try std.testing.expectEqual(@as(usize, 0), svc.metrics.merge_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), svc.metrics.merge_ready_to_finalize);
+    try std.testing.expect(merge.status.allow_doc_identity_reassignment);
 }
 
 test "transition service upserts and removes queued transitions by id" {

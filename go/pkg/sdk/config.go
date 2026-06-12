@@ -54,11 +54,6 @@ func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
 		if err := modelConfig.FromAntflyEmbedderConfig(v); err != nil {
 			return nil, fmt.Errorf("from antfly embedder config: %w", err)
 		}
-	case TermiteEmbedderConfig:
-		provider = EmbedderProviderTermite
-		if err := modelConfig.FromTermiteEmbedderConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite embedder config: %w", err)
-		}
 	default:
 		return nil, fmt.Errorf("unknown model config type: %T", v)
 	}
@@ -101,10 +96,10 @@ func NewGeneratorConfig(config any) (*GeneratorConfig, error) {
 		if err := modelConfig.FromAnthropicGeneratorConfig(v); err != nil {
 			return nil, fmt.Errorf("from anthropic generator config: %w", err)
 		}
-	case TermiteGeneratorConfig:
-		provider = GeneratorProviderTermite
-		if err := modelConfig.FromTermiteGeneratorConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite generator config: %w", err)
+	case AntflyGeneratorConfig:
+		provider = GeneratorProviderAntfly
+		if err := modelConfig.FromAntflyGeneratorConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly generator config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown model config type: %T", v)
@@ -123,10 +118,10 @@ func NewRerankerConfig(config any) (*RerankerConfig, error) {
 		if err := rerankerConfig.FromOllamaRerankerConfig(v); err != nil {
 			return nil, fmt.Errorf("from ollama reranker config: %w", err)
 		}
-	case TermiteRerankerConfig:
-		provider = RerankerProviderTermite
-		if err := rerankerConfig.FromTermiteRerankerConfig(v); err != nil {
-			return nil, fmt.Errorf("from termite reranker config: %w", err)
+	case AntflyRerankerConfig:
+		provider = RerankerProviderAntfly
+		if err := rerankerConfig.FromAntflyRerankerConfig(v); err != nil {
+			return nil, fmt.Errorf("from antfly reranker config: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown reranker config type: %T", v)
@@ -163,4 +158,73 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 	idxConfig.Type = t
 
 	return idxConfig, nil
+}
+
+// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
+// are generated from an existing generated artifact stream.
+type ArtifactEmbeddingIndexConfig struct {
+	// SourceArtifactName is the artifact stream to embed, for example
+	// "document_chunks_v1".
+	SourceArtifactName string
+	// EmbeddingName is the generated embedding artifact name consumed by the
+	// vector index. It defaults to the index name.
+	EmbeddingName string
+	// SourceField is the text field inside each source artifact payload. It
+	// defaults to "text".
+	SourceField string
+	// VectorField is the vector field exposed to the vector index. It defaults
+	// to "embedding".
+	VectorField string
+	// ExpectedDims is optional when the embedder can be probed by the server.
+	ExpectedDims int
+	Embedder     EmbedderConfig
+	// DistanceMetric defaults on the server when left empty.
+	DistanceMetric DistanceMetric
+}
+
+func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexConfig) (*IndexConfig, error) {
+	if name == "" {
+		return nil, fmt.Errorf("index name is required")
+	}
+	if config.SourceArtifactName == "" {
+		return nil, fmt.Errorf("source artifact name is required")
+	}
+	if config.Embedder.Provider == "" {
+		return nil, fmt.Errorf("embedder provider is required")
+	}
+
+	embeddingName := config.EmbeddingName
+	if embeddingName == "" {
+		embeddingName = name
+	}
+	sourceField := config.SourceField
+	if sourceField == "" {
+		sourceField = "text"
+	}
+	vectorField := config.VectorField
+	if vectorField == "" {
+		vectorField = "embedding"
+	}
+
+	idx, err := NewIndexConfig(name, EmbeddingsIndexConfig{
+		Field:              vectorField,
+		EmbeddingName:      embeddingName,
+		SourceArtifactName: config.SourceArtifactName,
+		Dimension:          config.ExpectedDims,
+		Embedder:           config.Embedder,
+		DistanceMetric:     config.DistanceMetric,
+	})
+	if err != nil {
+		return nil, err
+	}
+	idx.Enrichments = []EnrichmentConfig{
+		{
+			Name:               embeddingName,
+			Kind:               EnrichmentKindEmbedding,
+			Field:              sourceField,
+			SourceArtifactName: config.SourceArtifactName,
+			ExpectedDims:       config.ExpectedDims,
+		},
+	}
+	return idx, nil
 }

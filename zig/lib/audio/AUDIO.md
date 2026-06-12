@@ -1,6 +1,6 @@
 # Audio Support
 
-Termite routes native/server audio through `lib/audio`. The public boundary is
+Antfly inference routes native/server audio through `lib/audio`. The public boundary is
 decoded PCM `f32` samples plus sample rate and channel count; encoded bytes are
 handled as adapters above that boundary.
 

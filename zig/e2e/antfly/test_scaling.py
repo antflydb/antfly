@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -39,6 +40,26 @@ from conftest import (
     wait_for_server,
 )
 from helpers import wait_until
+
+
+class _ClusterStartupDeadline:
+    def __init__(self, expires_at: float):
+        self.expires_at = expires_at
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - time.monotonic())
+
+    def timeout(self, max_timeout_s: float) -> float:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise RuntimeError("multi-node cluster startup deadline expired")
+        return max(0.1, min(max_timeout_s, remaining))
+
+    def sleep(self, duration_s: float) -> None:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            raise RuntimeError("multi-node cluster startup deadline expired")
+        time.sleep(min(duration_s, remaining))
 
 
 def _metadata_admin_url(stateful_api) -> str:
@@ -352,12 +373,16 @@ class MultiNodeScalingCluster:
         *,
         initial_data_node_count: int = 5,
         max_shard_size_bytes: int = 0,
+        startup_deadline_at: float | None = None,
     ):
         self.binary = binary
         self.host = "127.0.0.1"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-scaling-e2e-")
         self.root = Path(self.tempdir.name)
         self.max_shard_size_bytes = max_shard_size_bytes
+        self.startup_deadline = (
+            _ClusterStartupDeadline(startup_deadline_at) if startup_deadline_at is not None else None
+        )
 
         self.metadata_nodes = [
             {
@@ -464,22 +489,33 @@ class MultiNodeScalingCluster:
             )
 
         for url in self.metadata_urls:
-            if not wait_for_server(url, path="/metadata/v1/status"):
+            if not wait_for_server(url, timeout=self.startup_timeout(30.0), path="/metadata/v1/status"):
                 raise RuntimeError(f"Metadata node failed to start at {url}\n{self.debug_logs()}")
-        time.sleep(1.0)
+        self.startup_sleep(1.0)
 
         for node in self.data_nodes:
             self._start_data_node(node)
 
         for url in self.data_api_urls:
-            if not wait_for_server(url):
+            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
                 raise RuntimeError(f"Data node failed to start at {url}\n{self.debug_logs()}")
-        if not self.wait_for_all_data_nodes_registered(timeout_s=60.0):
+        if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+
+    def startup_timeout(self, max_timeout_s: float) -> float:
+        if self.startup_deadline is None:
+            return max_timeout_s
+        return self.startup_deadline.timeout(max_timeout_s)
+
+    def startup_sleep(self, duration_s: float) -> None:
+        if self.startup_deadline is None:
+            time.sleep(duration_s)
+            return
+        self.startup_deadline.sleep(duration_s)
 
     def _start_data_node(self, node: dict[str, int]) -> None:
         log = self._open_log(f"data-{node['id']}.log")
@@ -559,6 +595,12 @@ class MultiNodeScalingCluster:
         if last_error is not None:
             raise last_error
         raise AssertionError("cluster has no metadata URLs")
+
+    def metadata_snapshot_diagnostic(self) -> str:
+        try:
+            return json.dumps(self.metadata_snapshot(), indent=2, sort_keys=True)
+        except Exception as exc:
+            return f"<metadata snapshot unavailable: {exc!r}>"
 
     def post_metadata(self, path: str, *, json_body: dict[str, Any] | None = None) -> requests.Response:
         last_error: Exception | None = None
@@ -746,15 +788,60 @@ class MultiNodeScalingCluster:
             handle.flush()
         return "\n".join(f"[{path.name}]\n{_read_log_tail(path)}" for path in self.log_paths)
 
-    def stop(self) -> None:
-        for proc in [*self.data_procs, *self.metadata_procs]:
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
+    def native_stack_dumps(self, *, per_process_timeout_s: float = 25.0) -> str:
+        """Best-effort `gdb thread apply all bt` for every live node process.
+
+        Server-side hangs (e.g. a 30s batch-write timeout) leave no log
+        evidence when the wedged thread blocks in memory; a stack snapshot
+        taken at failure time is the only way to diagnose them from CI.
+        """
+        if shutil.which("gdb") is None:
+            return "<gdb not available>"
+        parts: list[str] = []
+        for label, procs in (("metadata", self.metadata_procs), ("data", self.data_procs)):
+            for proc in procs:
+                if proc.poll() is not None:
+                    parts.append(f"[{label} pid {proc.pid}] exited rc={proc.returncode}")
+                    continue
                 try:
-                    proc.wait(timeout=10)
+                    result = subprocess.run(
+                        [
+                            "gdb",
+                            "-p",
+                            str(proc.pid),
+                            "-batch",
+                            "-ex",
+                            "set pagination off",
+                            "-ex",
+                            "thread apply all bt 30",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=per_process_timeout_s,
+                    )
+                    body = result.stdout[-250000:]
+                    if result.returncode != 0:
+                        body += f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
+                    parts.append(f"[{label} pid {proc.pid}]\n{body}")
+                except Exception as exc:
+                    parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
+        return "\n".join(parts)
+
+    def stop(self, *, timeout_s: float = 10.0) -> None:
+        procs = [proc for proc in [*self.data_procs, *self.metadata_procs] if proc.poll() is None]
+        for proc in procs:
+            proc.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + timeout_s
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         for handle in self.log_files:
             if not handle.closed:
                 handle.close()
@@ -785,7 +872,7 @@ def split_scaling_cluster() -> MultiNodeScalingCluster:
     cluster = MultiNodeScalingCluster(
         _scaling_antfly_binary(),
         initial_data_node_count=5,
-        max_shard_size_bytes=2048,
+        max_shard_size_bytes=512,
     )
     try:
         yield cluster
@@ -1138,12 +1225,21 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     cluster.create_table(table_name, num_shards=5)
 
     docs = {f"doc-{i:02d}": {"title": f"doc {i}", "rank": i} for i in range(10)}
-    batch = requests.post(
-        f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
-        json={"inserts": docs, "sync_level": "write"},
-        timeout=30,
-    )
-    batch.raise_for_status()
+    try:
+        batch = requests.post(
+            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+            json={"inserts": docs, "sync_level": "write"},
+            timeout=30,
+        )
+        batch.raise_for_status()
+    except requests.RequestException as exc:
+        # Connection resets here have flaked CI with no server-side context;
+        # attach node logs and native stacks so the failure is diagnosable.
+        raise AssertionError(
+            f"seed batch failed table={table_name!r}: {exc!r}"
+            f"\n[native stacks]\n{cluster.native_stack_dumps()}"
+            f"\n[logs]\n{cluster.debug_logs()}"
+        ) from exc
 
     group_ids = wait_until(lambda: _table_group_ids(cluster, table_name), timeout_s=60.0, interval_s=0.5)
     assert group_ids is not None and len(group_ids) >= 5, (
@@ -1310,9 +1406,19 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     }
     _insert_docs(cluster, table_name, docs, min_group_count=1)
 
+    last_reallocate_at = 0.0
+
+    def maybe_trigger_reallocate() -> None:
+        nonlocal last_reallocate_at
+        now = time.monotonic()
+        if now - last_reallocate_at < 5.0:
+            return
+        cluster.trigger_reallocate()
+        last_reallocate_at = now
+
     def split_completed() -> set[int] | None:
         try:
-            cluster.trigger_reallocate()
+            maybe_trigger_reallocate()
             group_ids = _table_group_ids(cluster, table_name)
         except (AssertionError, requests.RequestException):
             return None
@@ -1324,7 +1430,7 @@ def test_autoscaling_finalizes_shard_split_from_size_threshold(
     assert split_groups is not None, (
         "table did not finalize an automatic split after exceeding the configured shard size threshold\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
-        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
     _assert_docs_readable(cluster, table_name, docs, timeout_s=60.0)

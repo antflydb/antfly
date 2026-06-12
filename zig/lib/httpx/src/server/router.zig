@@ -39,6 +39,10 @@ const Route = struct {
 const Segment = union(enum) {
     literal: []const u8,
     param: []const u8,
+    param_suffix: struct {
+        name: []const u8,
+        suffix: []const u8,
+    },
     wildcard: void,
 };
 
@@ -112,7 +116,15 @@ pub const Router = struct {
             if (part.len == 0) continue;
 
             if (part[0] == ':') {
-                try segments.append(self.allocator, .{ .param = part[1..] });
+                if (mem.indexOfScalar(u8, part[1..], ':')) |suffix_idx| {
+                    const suffix_start = 1 + suffix_idx;
+                    try segments.append(self.allocator, .{ .param_suffix = .{
+                        .name = part[1..suffix_start],
+                        .suffix = part[suffix_start..],
+                    } });
+                } else {
+                    try segments.append(self.allocator, .{ .param = part[1..] });
+                }
             } else if (mem.eql(u8, part, "*")) {
                 try segments.append(self.allocator, .wildcard);
             } else {
@@ -183,6 +195,13 @@ pub const Router = struct {
                 .param => |name| {
                     if (param_idx >= params.len) return null;
                     params[param_idx] = .{ .name = name, .value = part };
+                    param_idx += 1;
+                },
+                .param_suffix => |param| {
+                    if (!mem.endsWith(u8, part, param.suffix)) return null;
+                    if (part.len <= param.suffix.len) return null;
+                    if (param_idx >= params.len) return null;
+                    params[param_idx] = .{ .name = param.name, .value = part[0 .. part.len - param.suffix.len] };
                     param_idx += 1;
                 },
                 .wildcard => {
@@ -311,6 +330,34 @@ test "Router multiple parameters" {
     try std.testing.expectEqualStrings("42", result.?.params[0].value);
     try std.testing.expectEqualStrings("postId", result.?.params[1].name);
     try std.testing.expectEqualStrings("99", result.?.params[1].value);
+}
+
+test "Router parameter segment can have a literal suffix" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+    var pbuf: [16]RouteParam = undefined;
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.POST, "/tables/:table/documents/:key/artifacts/:artifact:reprocess", handler);
+
+    const result = router.find(.POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess", &pbuf);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 3), result.?.params.len);
+    try std.testing.expectEqualStrings("table", result.?.params[0].name);
+    try std.testing.expectEqualStrings("docs", result.?.params[0].value);
+    try std.testing.expectEqualStrings("key", result.?.params[1].name);
+    try std.testing.expectEqualStrings("doc%2Fa", result.?.params[1].value);
+    try std.testing.expectEqualStrings("artifact", result.?.params[2].name);
+    try std.testing.expectEqualStrings("document_units_v1", result.?.params[2].value);
+
+    try std.testing.expect(router.find(.POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1", &pbuf) == null);
+    try std.testing.expect(router.find(.POST, "/tables/docs/documents/doc%2Fa/artifacts/:reprocess", &pbuf) == null);
 }
 
 test "Router wildcard route" {

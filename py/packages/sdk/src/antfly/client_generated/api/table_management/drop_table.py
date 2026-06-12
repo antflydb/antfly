@@ -16,7 +16,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "delete",
-        "url": "/api/v1/tables/{table_name}".format(
+        "url": "/db/v1/tables/{table_name}".format(
             table_name=quote(str(table_name), safe=""),
         ),
     }

@@ -21,6 +21,8 @@ const common = antfly.common;
 const db_mod = antfly.db;
 const metadata_api = antfly.metadata_api;
 const metadata_table_manager = antfly.metadata.table_manager;
+const schema_mod = antfly.schema;
+const table_schema_api = antfly.table_schema;
 const platform_time = antfly.platform_time;
 const raft_mod = antfly.raft;
 const http_common = antfly.common.http.http_common;
@@ -29,8 +31,10 @@ const std_http_listener = antfly.common.http.std_http_listener;
 
 const table_name = "docs";
 const index_name = "dense_idx";
+const sparse_index_name = "sparse_idx";
 const text_index_name = "full_text_index_v0";
 const algebraic_index_name = "algebraic_idx";
+const graph_index_name = "graph_idx";
 const native_endian = builtin.target.cpu.arch.endian();
 
 const benchmark_schema_json =
@@ -54,6 +58,12 @@ const ServerKind = enum {
 
 const QueryShape = enum {
     dense,
+    full_text,
+    dense_filter,
+    sparse_filter,
+    graph_expand,
+    algebraic_filter,
+    hybrid_composed,
     hybrid,
     hybrid_filter,
     hybrid_filter_exclude,
@@ -61,6 +71,12 @@ const QueryShape = enum {
 
     fn parse(raw: []const u8) ?QueryShape {
         if (std.mem.eql(u8, raw, "dense")) return .dense;
+        if (std.mem.eql(u8, raw, "full-text")) return .full_text;
+        if (std.mem.eql(u8, raw, "dense-filter")) return .dense_filter;
+        if (std.mem.eql(u8, raw, "sparse-filter")) return .sparse_filter;
+        if (std.mem.eql(u8, raw, "graph-expand")) return .graph_expand;
+        if (std.mem.eql(u8, raw, "algebraic-filter")) return .algebraic_filter;
+        if (std.mem.eql(u8, raw, "hybrid-composed")) return .hybrid_composed;
         if (std.mem.eql(u8, raw, "hybrid")) return .hybrid;
         if (std.mem.eql(u8, raw, "hybrid-filter")) return .hybrid_filter;
         if (std.mem.eql(u8, raw, "hybrid-filter-exclude")) return .hybrid_filter_exclude;
@@ -71,6 +87,12 @@ const QueryShape = enum {
     fn text(self: QueryShape) []const u8 {
         return switch (self) {
             .dense => "dense",
+            .full_text => "full-text",
+            .dense_filter => "dense-filter",
+            .sparse_filter => "sparse-filter",
+            .graph_expand => "graph-expand",
+            .algebraic_filter => "algebraic-filter",
+            .hybrid_composed => "hybrid-composed",
             .hybrid => "hybrid",
             .hybrid_filter => "hybrid-filter",
             .hybrid_filter_exclude => "hybrid-filter-exclude",
@@ -79,21 +101,44 @@ const QueryShape = enum {
     }
 
     fn usesFullText(self: QueryShape) bool {
-        return self != .dense;
+        return switch (self) {
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter => false,
+            .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
+        };
+    }
+
+    fn usesDense(self: QueryShape) bool {
+        return switch (self) {
+            .full_text, .sparse_filter, .graph_expand => false,
+            .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
+        };
+    }
+
+    fn usesSparse(self: QueryShape) bool {
+        return self == .sparse_filter or self == .hybrid_composed;
+    }
+
+    fn usesGraph(self: QueryShape) bool {
+        return self == .graph_expand;
     }
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .hybrid => false,
+            .dense, .full_text, .graph_expand, .hybrid => false,
+            .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .hybrid, .hybrid_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
+    }
+
+    fn needsDefaultFullTextIndex(self: QueryShape) bool {
+        return self.usesFullText() or self.usesFilter() or self.usesExclusion();
     }
 
     fn projectsFields(self: QueryShape) bool {
@@ -107,6 +152,8 @@ const Config = struct {
     query_shape: QueryShape = .dense,
     with_schema: bool = false,
     with_algebraic: bool = false,
+    with_sparse: bool = false,
+    with_graph: bool = false,
     docs: usize = 5000,
     dims: usize = 384,
     queries: usize = 25,
@@ -534,7 +581,7 @@ const FakeStatusSource = struct {
                 .table_id = 1,
                 .name = table_name,
                 .description = "public query guardrail",
-                .schema_json = if (cfg.with_schema) benchmark_schema_json else "",
+                .schema_json = if (cfg.with_schema or cfg.query_shape == .algebraic_filter) benchmark_schema_json else "",
                 .read_schema_json = "",
                 .indexes_json = indexes_json,
                 .replication_sources_json = "[]",
@@ -927,6 +974,7 @@ fn runHandlerBench(
     queries: []const f32,
     query_bodies: []const []const u8,
 ) !void {
+    _ = queries;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
@@ -949,12 +997,13 @@ fn runHandlerBench(
     defer server.deinit();
 
     std.debug.print("public-query guardrail stage=db-search\n", .{});
-    const db_stats = try benchDbSearch(alloc, &db, queries, cfg);
+    const db_stats = try benchDbSearch(alloc, &db, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=handler-pipeline\n", .{});
     const handler_pipeline = try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, handler_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, handler_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
 
@@ -1082,6 +1131,7 @@ fn runLocalBench(
     queries: []const f32,
     query_bodies: []const []const u8,
 ) !void {
+    _ = queries;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
@@ -1137,7 +1187,7 @@ fn runLocalBench(
     defer alloc.free(metrics_uri);
 
     std.debug.print("public-query guardrail stage=db-search\n", .{});
-    const db_stats = try benchDbSearch(alloc, &db, queries, cfg);
+    const db_stats = try benchDbSearch(alloc, &db, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=handler-pipeline\n", .{});
     const handler_pipeline = try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
@@ -1145,6 +1195,7 @@ fn runLocalBench(
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
@@ -1379,6 +1430,10 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
     } else if (std.mem.eql(u8, arg, "--with-algebraic")) {
         cfg.with_algebraic = true;
         cfg.with_schema = true;
+    } else if (std.mem.eql(u8, arg, "--with-sparse")) {
+        cfg.with_sparse = true;
+    } else if (std.mem.eql(u8, arg, "--with-graph")) {
+        cfg.with_graph = true;
     } else if (std.mem.eql(u8, arg, "--require-symbolic-profile")) {
         cfg.require_symbolic_profile = true;
     } else if (std.mem.eql(u8, arg, "--docs")) {
@@ -1440,6 +1495,14 @@ fn openAndSeedDb(
     var db = try db_mod.DB.open(alloc, path, .{});
     errdefer db.close();
 
+    if (cfg.with_schema or cfg.query_shape == .algebraic_filter) {
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, benchmark_schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+    }
+
     const index_cfg = try std.fmt.allocPrint(
         alloc,
         "{{\"field\":\"embedding\",\"dims\":{d},\"metric\":\"l2_squared\",\"external\":true}}",
@@ -1451,14 +1514,28 @@ fn openAndSeedDb(
         .kind = .dense_vector,
         .config_json = index_cfg,
     });
-    if (cfg.query_shape.usesFullText()) {
+    if (cfg.query_shape.needsDefaultFullTextIndex()) {
         try db.addIndex(.{
             .name = text_index_name,
             .kind = .full_text,
             .config_json = "{}",
         });
     }
-    if (cfg.with_algebraic) {
+    if (cfg.with_sparse or cfg.query_shape.usesSparse()) {
+        try db.addIndex(.{
+            .name = sparse_index_name,
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse\",\"external\":true}",
+        });
+    }
+    if (cfg.with_graph or cfg.query_shape.usesGraph()) {
+        try db.addIndex(.{
+            .name = graph_index_name,
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+    if (cfg.with_algebraic or cfg.query_shape == .algebraic_filter) {
         try db.addIndex(.{
             .name = algebraic_index_name,
             .kind = .algebraic,
@@ -1494,7 +1571,7 @@ fn openAndSeedDb(
             const vector = dataset[doc_idx * cfg.dims ..][0..cfg.dims];
             docs[i] = .{
                 .key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{doc_idx}),
-                .value = try encodeVectorDocJson(alloc, vector, doc_idx),
+                .value = try encodeVectorDocJson(alloc, vector, doc_idx, cfg),
             };
             writes[i] = .{
                 .key = docs[i].key,
@@ -1511,45 +1588,52 @@ fn openAndSeedDb(
 }
 
 fn benchmarkIndexesJsonAlloc(alloc: std.mem.Allocator, cfg: Config) ![]u8 {
-    const text_entry = if (cfg.query_shape.usesFullText())
+    const text_entry = if (cfg.query_shape.needsDefaultFullTextIndex())
         try std.fmt.allocPrint(alloc, ",\"{s}\":{{\"type\":\"full_text\"}}", .{text_index_name})
     else
         try alloc.dupe(u8, "");
     defer alloc.free(text_entry);
-    const algebraic_entry = if (cfg.with_algebraic)
+    const sparse_entry = if (cfg.with_sparse or cfg.query_shape.usesSparse())
+        try std.fmt.allocPrint(alloc, ",\"{s}\":{{\"type\":\"embeddings\",\"sparse\":true,\"external\":true}}", .{sparse_index_name})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(sparse_entry);
+    const graph_entry = if (cfg.with_graph or cfg.query_shape.usesGraph())
+        try std.fmt.allocPrint(alloc, ",\"{s}\":{{\"type\":\"graph\"}}", .{graph_index_name})
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(graph_entry);
+    const algebraic_entry = if (cfg.with_algebraic or cfg.query_shape == .algebraic_filter)
         try std.fmt.allocPrint(alloc, ",\"{s}\":{{\"type\":\"algebraic\",\"group_fields\":[{{\"name\":\"category\",\"path\":\"category\",\"type\":\"string\"}},{{\"name\":\"status\",\"path\":\"status\",\"type\":\"string\"}},{{\"name\":\"tenant\",\"path\":\"tenant\",\"type\":\"string\"}}],\"measure_fields\":[{{\"name\":\"score\",\"path\":\"score\",\"type\":\"number\"}}],\"materializations\":[]}}", .{algebraic_index_name})
     else
         try alloc.dupe(u8, "");
     defer alloc.free(algebraic_entry);
-    return try std.fmt.allocPrint(alloc, "{{\"{s}\":{{\"type\":\"embeddings\",\"dimension\":{d},\"distance_metric\":\"l2_squared\"}}{s}{s}}}", .{
+    return try std.fmt.allocPrint(alloc, "{{\"{s}\":{{\"type\":\"embeddings\",\"dimension\":{d},\"distance_metric\":\"l2_squared\"}}{s}{s}{s}{s}}}", .{
         index_name,
         cfg.dims,
+        sparse_entry,
+        graph_entry,
         text_entry,
         algebraic_entry,
     });
 }
 
-fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, queries: []const f32, cfg: Config) !QueryBenchStats {
+fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, query_bodies: []const []const u8, cfg: Config) !QueryBenchStats {
     var stats: QueryBenchStats = .{};
     for (0..cfg.repeats) |_| {
-        for (0..cfg.queries) |i| {
-            const vector = queries[i * cfg.dims ..][0..cfg.dims];
-            const dense = db_mod.types.DenseKnnQuery{
-                .vector = vector,
-                .k = @intCast(cfg.k),
-            };
-            const req = db_mod.types.SearchRequest{
-                .index_name = index_name,
-                .dense = dense,
-                .limit = @intCast(cfg.k),
-                .include_stored = false,
-            };
+        for (query_bodies, 0..) |body, i| {
+            var owned = try api.query.parseQueryRequest(alloc, null, table_name, body);
+            defer owned.deinit(alloc);
+            owned.req.include_stored = false;
+            if (cfg.query_shape.needsDefaultFullTextIndex() and owned.req.primary_text_index_name == null) {
+                owned.req.primary_text_index_name = try alloc.dupe(u8, text_index_name);
+            }
             const started = nowNs();
-            var result = try db.search(alloc, req);
+            var result = try db.search(alloc, owned.req);
             defer result.deinit();
             stats.total_ns += elapsedSince(started);
             stats.queries += 1;
-            if (result.hits.len == 0) {
+            if (result.hits.len == 0 and !searchResultHasGraphPayload(result)) {
                 const db_stats = try db.stats(alloc);
                 defer db_mod.types.freeDBStats(alloc, db_stats);
                 std.debug.print("public-query guardrail empty db result idx={d} query={d}\n", .{
@@ -1565,6 +1649,13 @@ fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, queries: []const f32,
         }
     }
     return stats;
+}
+
+fn searchResultHasGraphPayload(result: db_mod.types.SearchResult) bool {
+    for (result.graph_results) |graph_result| {
+        if (graph_result.nodes.len > 0 or graph_result.paths.len > 0 or graph_result.matches.len > 0 or graph_result.hits.len > 0) return true;
+    }
+    return false;
 }
 
 fn benchDirectHandler(
@@ -1832,6 +1923,7 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     stats.total_ns += elapsed_ns;
     stats.queries += 1;
     if (first.hits.hits) |hits| stats.response_hit_count += @intCast(hits.len);
+    if (graphResultHasNodes(raw_body)) stats.response_hit_count += 1;
     if (first.profile) |profile| {
         stats.profile_response_count += 1;
         if (profile.dense_search) |dense| {
@@ -1953,10 +2045,37 @@ fn enforceSymbolicProfileGuardrail(cfg: Config, stats: QueryBenchStats) !void {
 fn accumulateParsedResponseNoProfile(parsed: QueryResponseWire, raw_body: []const u8) !void {
     if (parsed.responses.len == 0) return error.InvalidQueryResponse;
     const first = parsed.responses[0];
-    if (first.hits.hits == null or first.hits.hits.?.len == 0) {
+    if ((first.hits.hits == null or first.hits.hits.?.len == 0) and !graphResultHasNodes(raw_body)) {
         std.debug.print("public-query guardrail empty response body={s}\n", .{raw_body});
         return error.EmptyQueryResult;
     }
+}
+
+fn graphResultHasNodes(raw_body: []const u8) bool {
+    return std.mem.indexOf(u8, raw_body, "\"graph_results\"") != null and
+        std.mem.indexOf(u8, raw_body, "\"nodes\":[{") != null;
+}
+
+fn enforceSymbolicResultFillGuardrail(cfg: Config, stats: QueryBenchStats) !void {
+    if (!cfg.query_shape.usesFilter()) return;
+    if (cfg.k == 0 or cfg.queries == 0 or cfg.repeats == 0) return;
+    const expected = expectedSymbolicMatchStats(cfg);
+    if (expected.min < cfg.k) return;
+
+    const expected_returned: u64 = @intCast(cfg.queries * cfg.repeats * cfg.k);
+    if (stats.response_hit_count >= expected_returned) return;
+
+    std.debug.print(
+        "public-query guardrail failed: symbolic result underfilled query_shape={s} returned={d} expected_at_least={d} expected_match_min={d} k={d}\n",
+        .{
+            cfg.query_shape.text(),
+            stats.response_hit_count,
+            expected_returned,
+            expected.min,
+            cfg.k,
+        },
+    );
+    return error.SymbolicResultFillGuardrailFailed;
 }
 
 fn enforceGuardrails(cfg: Config, polls: PollStats) !void {
@@ -2074,7 +2193,7 @@ fn runSwarmBench(
     var child = try spawnSwarm(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
 
-    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/api/v1", .{ cfg.bind_host, bind_port });
+    const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, bind_port });
     defer alloc.free(base_uri);
     const health_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/healthz", .{ cfg.bind_host, health_port });
     defer alloc.free(health_uri);
@@ -2098,6 +2217,7 @@ fn runSwarmBench(
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, index_status_uri, cfg, child.id);
@@ -2398,7 +2518,7 @@ fn seedSwarm(
     defer executor.deinit();
     var client = api.ApiHttpClient.init(alloc, executor.executor());
 
-    const create_table_body = if (cfg.with_schema)
+    const create_table_body = if (cfg.with_schema or cfg.query_shape == .algebraic_filter)
         try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\",\"schema\":{s}}}", .{benchmark_schema_json})
     else
         try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\"}}", .{});
@@ -2419,7 +2539,34 @@ fn seedSwarm(
     const created_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_index_path, create_index_body, &.{ 200, 201 });
     defer alloc.free(created_index);
 
-    if (cfg.with_algebraic) {
+    if (cfg.query_shape.usesFullText()) {
+        const create_text_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"full_text\"}}", .{text_index_name});
+        defer alloc.free(create_text_index_body);
+        const create_text_index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, text_index_name });
+        defer alloc.free(create_text_index_path);
+        const created_text_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_text_index_path, create_text_index_body, &.{ 200, 201 });
+        defer alloc.free(created_text_index);
+    }
+
+    if (cfg.with_sparse or cfg.query_shape.usesSparse()) {
+        const create_sparse_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"embeddings\",\"sparse\":true,\"external\":true}}", .{sparse_index_name});
+        defer alloc.free(create_sparse_index_body);
+        const create_sparse_index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, sparse_index_name });
+        defer alloc.free(create_sparse_index_path);
+        const created_sparse_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_sparse_index_path, create_sparse_index_body, &.{ 200, 201 });
+        defer alloc.free(created_sparse_index);
+    }
+
+    if (cfg.with_graph or cfg.query_shape.usesGraph()) {
+        const create_graph_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"graph\"}}", .{graph_index_name});
+        defer alloc.free(create_graph_index_body);
+        const create_graph_index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, graph_index_name });
+        defer alloc.free(create_graph_index_path);
+        const created_graph_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_graph_index_path, create_graph_index_body, &.{ 200, 201 });
+        defer alloc.free(created_graph_index);
+    }
+
+    if (cfg.with_algebraic or cfg.query_shape == .algebraic_filter) {
         const create_algebraic_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"algebraic\",\"derive_from_schema\":true}}", .{algebraic_index_name});
         defer alloc.free(create_algebraic_index_body);
         const create_algebraic_index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, algebraic_index_name });
@@ -2482,7 +2629,7 @@ fn seedSwarm(
     while (start < cfg.docs) : (start += cfg.batch_size) {
         {
             const end = @min(start + cfg.batch_size, cfg.docs);
-            const batch_body = try encodeBatchInsertJson(alloc, dataset, start, end, cfg.dims, cfg.sync_level);
+            const batch_body = try encodeBatchInsertJson(alloc, dataset, start, end, cfg);
             defer alloc.free(batch_body);
             const batch_path = try std.fmt.allocPrint(alloc, "/tables/{s}/batch", .{table_name});
             defer alloc.free(batch_path);
@@ -2623,25 +2770,30 @@ fn encodeBatchInsertJson(
     dataset: []const f32,
     start: usize,
     end: usize,
-    dims: usize,
-    sync_level: db_mod.types.SyncLevel,
+    cfg: Config,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try out.print(alloc, "{{\"sync_level\":\"{s}\",\"inserts\":{{", .{db_mod.types.publicSyncLevelText(sync_level)});
+    try out.print(alloc, "{{\"sync_level\":\"{s}\",\"inserts\":{{", .{db_mod.types.publicSyncLevelText(cfg.sync_level)});
     for (start..end) |doc_idx| {
         if (doc_idx != start) try out.append(alloc, ',');
         try out.print(alloc, "\"doc:{d:0>8}\":", .{doc_idx});
-        try appendVectorDocJson(&out, alloc, dataset[doc_idx * dims ..][0..dims], doc_idx);
+        try appendVectorDocJson(&out, alloc, dataset[doc_idx * cfg.dims ..][0..cfg.dims], doc_idx, cfg);
     }
     try out.appendSlice(alloc, "}}");
     return out.toOwnedSlice(alloc);
 }
 
-fn appendVectorDocJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, vector: []const f32, doc_idx: usize) !void {
+fn appendVectorDocJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, vector: []const f32, doc_idx: usize, cfg: Config) !void {
     try out.appendSlice(alloc, "{\"_embeddings\":{\"" ++ index_name ++ "\":\"");
     try appendPackedF32Base64(out, alloc, vector);
-    try out.appendSlice(alloc, "\"},\"title\":\"Document ");
+    try out.append(alloc, '"');
+    if (cfg.with_sparse or cfg.query_shape.usesSparse()) {
+        try out.appendSlice(alloc, ",\"" ++ sparse_index_name ++ "\":{");
+        try appendSparseEmbeddingObject(out, alloc, doc_idx);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "},\"title\":\"Document ");
     try out.print(alloc, "{d:0>8}", .{doc_idx});
     try out.appendSlice(alloc, "\",\"body\":\"");
     try appendDocBody(out, alloc, doc_idx);
@@ -2653,6 +2805,11 @@ fn appendVectorDocJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocato
     try out.appendSlice(alloc, docTenant(doc_idx));
     try out.appendSlice(alloc, "\",\"score\":");
     try out.print(alloc, "{d}", .{docScore(doc_idx)});
+    if (cfg.with_graph or cfg.query_shape.usesGraph()) {
+        try out.appendSlice(alloc, ",\"_edges\":{\"" ++ graph_index_name ++ "\":{\"cites\":[{\"target\":\"");
+        try out.print(alloc, "doc:{d:0>8}", .{(doc_idx + 1) % cfg.docs});
+        try out.appendSlice(alloc, "\",\"weight\":1.0}]}}");
+    }
     try out.append(alloc, '}');
 }
 
@@ -3059,27 +3216,61 @@ fn waitForQueryIndexesReady(
 fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx: usize, cfg: Config) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"embeddings\":{\"" ++ index_name ++ "\":");
-    try appendF32JsonArray(&out, alloc, vector);
-    try out.appendSlice(alloc, "},");
+    try out.append(alloc, '{');
+    var wrote_field = false;
+    if (cfg.query_shape.usesDense() or cfg.query_shape.usesSparse()) {
+        try out.appendSlice(alloc, "\"embeddings\":{");
+        var wrote_embedding = false;
+        if (cfg.query_shape.usesDense()) {
+            try out.appendSlice(alloc, "\"" ++ index_name ++ "\":");
+            try appendF32JsonArray(&out, alloc, vector);
+            wrote_embedding = true;
+        }
+        if (cfg.query_shape.usesSparse()) {
+            if (wrote_embedding) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "\"" ++ sparse_index_name ++ "\":{\"indices\":[");
+            try appendSparseIndices(&out, alloc, source_doc_idx);
+            try out.appendSlice(alloc, "],\"values\":[");
+            try appendSparseValues(&out, alloc, source_doc_idx);
+            try out.appendSlice(alloc, "]}");
+        }
+        try out.appendSlice(alloc, "}");
+        wrote_field = true;
+    }
     if (cfg.server_kind == .zig) {
-        try out.appendSlice(alloc, "\"indexes\":[\"" ++ index_name ++ "\"],");
+        if (wrote_field) try out.append(alloc, ',');
+        try appendQueryIndexes(&out, alloc, cfg);
+        wrote_field = true;
     }
     if (cfg.query_shape.usesFullText()) {
+        if (wrote_field) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"full_text_search\":{\"match\":\"");
         try out.appendSlice(alloc, docBodyTerm(source_doc_idx));
-        try out.appendSlice(alloc, "\",\"field\":\"body\"},");
+        try out.appendSlice(alloc, "\",\"field\":\"body\"}");
+        wrote_field = true;
+    }
+    if (cfg.query_shape.usesGraph()) {
+        if (wrote_field) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"" ++ graph_index_name ++ "\",\"start_nodes\":{\"keys\":[\"");
+        try out.print(alloc, "doc:{d:0>8}", .{source_doc_idx});
+        try out.appendSlice(alloc, "\"]},\"params\":{\"edge_types\":[\"cites\"]}}}");
+        wrote_field = true;
     }
     if (cfg.query_shape.usesFilter()) {
+        if (wrote_field) try out.append(alloc, ',');
         try appendMetadataFilterQuery(&out, alloc, source_doc_idx);
-        try out.append(alloc, ',');
+        wrote_field = true;
     }
     if (cfg.query_shape.usesExclusion()) {
+        if (wrote_field) try out.append(alloc, ',');
         try appendMetadataExclusionQuery(&out, alloc, source_doc_idx);
-        try out.append(alloc, ',');
+        wrote_field = true;
     }
     if (cfg.query_shape.projectsFields()) {
+        if (wrote_field) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"fields\":[\"title\",\"body\",\"category\",\"status\",\"tenant\",\"score\"],");
+    } else if (wrote_field) {
+        try out.append(alloc, ',');
     }
     try out.appendSlice(alloc, "\"limit\":");
     try out.print(alloc, "{d}", .{cfg.k});
@@ -3095,6 +3286,28 @@ fn appendF32JsonArray(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
     for (vector, 0..) |value, i| {
         if (i != 0) try out.append(alloc, ',');
         try out.print(alloc, "{d:.8}", .{value});
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendQueryIndexes(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cfg: Config) !void {
+    try out.appendSlice(alloc, "\"indexes\":[");
+    var wrote = false;
+    if (cfg.query_shape.usesDense()) {
+        try out.appendSlice(alloc, "\"" ++ index_name ++ "\"");
+        wrote = true;
+    }
+    if (cfg.query_shape.usesSparse()) {
+        if (wrote) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"" ++ sparse_index_name ++ "\"");
+        wrote = true;
+    }
+    if (!wrote and cfg.query_shape.usesFullText()) {
+        try out.appendSlice(alloc, "\"" ++ text_index_name ++ "\"");
+        wrote = true;
+    }
+    if (!wrote and cfg.query_shape.usesGraph()) {
+        try out.appendSlice(alloc, "\"" ++ graph_index_name ++ "\"");
     }
     try out.append(alloc, ']');
 }
@@ -3118,10 +3331,10 @@ fn appendPackedF32Base64(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloca
     _ = std.base64.standard.Encoder.encode(out.items[start..][0..encoded_len], raw);
 }
 
-fn encodeVectorDocJson(alloc: std.mem.Allocator, vector: []const f32, doc_idx: usize) ![]u8 {
+fn encodeVectorDocJson(alloc: std.mem.Allocator, vector: []const f32, doc_idx: usize, cfg: Config) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try appendVectorDocJson(&out, alloc, vector, doc_idx);
+    try appendVectorDocJson(&out, alloc, vector, doc_idx, cfg);
     return out.toOwnedSlice(alloc);
 }
 
@@ -3204,13 +3417,15 @@ fn printPublicQueryGuardrailSummaryJson(
     search_memory: MemoryBreakdown,
 ) void {
     std.debug.print(
-        "{{\"event\":\"public_query_guardrail_summary\",\"mode\":\"{s}\",\"server\":\"{s}\",\"query_shape\":\"{s}\",\"with_schema\":{},\"with_algebraic\":{},\"docs\":{d},\"dims\":{d},\"queries\":{d},\"repeats\":{d},\"k\":{d},\"threads\":{d}",
+        "{{\"event\":\"public_query_guardrail_summary\",\"mode\":\"{s}\",\"server\":\"{s}\",\"query_shape\":\"{s}\",\"with_schema\":{},\"with_algebraic\":{},\"with_sparse\":{},\"with_graph\":{},\"docs\":{d},\"dims\":{d},\"queries\":{d},\"repeats\":{d},\"k\":{d},\"threads\":{d}",
         .{
             mode,
             server,
             cfg.query_shape.text(),
             cfg.with_schema,
             cfg.with_algebraic,
+            cfg.with_sparse,
+            cfg.with_graph,
             cfg.docs,
             cfg.dims,
             cfg.queries,
@@ -3343,6 +3558,39 @@ fn docBodyTerm(doc_idx: usize) []const u8 {
 
 fn docScore(doc_idx: usize) usize {
     return doc_idx % 1000;
+}
+
+fn appendSparseIndices(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
+    try out.print(alloc, "{d},{d},{d}", .{
+        7 + (doc_idx % 32),
+        10_000 + (doc_idx % 64),
+        20_000 + (doc_idx % 128),
+    });
+}
+
+fn appendSparseValues(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
+    try out.print(alloc, "{d:.3},{d:.3},{d:.3}", .{
+        1.0 + @as(f64, @floatFromInt(doc_idx % 5)) * 0.1,
+        0.5 + @as(f64, @floatFromInt(doc_idx % 7)) * 0.05,
+        0.25 + @as(f64, @floatFromInt(doc_idx % 11)) * 0.02,
+    });
+}
+
+fn appendSparseEmbeddingObject(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
+    const indices = [_]usize{
+        7 + (doc_idx % 32),
+        10_000 + (doc_idx % 64),
+        20_000 + (doc_idx % 128),
+    };
+    const values = [_]f64{
+        1.0 + @as(f64, @floatFromInt(doc_idx % 5)) * 0.1,
+        0.5 + @as(f64, @floatFromInt(doc_idx % 7)) * 0.05,
+        0.25 + @as(f64, @floatFromInt(doc_idx % 11)) * 0.02,
+    };
+    for (indices, values, 0..) |idx, value, i| {
+        if (i != 0) try out.append(alloc, ',');
+        try out.print(alloc, "\"{d}\":{d:.3}", .{ idx, value });
+    }
 }
 
 fn appendDocBody(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {

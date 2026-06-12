@@ -92,7 +92,7 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
           <button
             type="button"
             className={cn(
-              "w-full flex items-center gap-3 p-3 rounded-lg border transition-colors text-left",
+              "w-full flex items-center gap-3 p-3 rounded-none border transition-colors text-left",
               statusColor(),
               step.status !== "pending" && "hover:bg-muted/50 cursor-pointer"
             )}
@@ -153,7 +153,7 @@ function renderStepContent(
             </div>
           )}
           {c.reasoning && (
-            <div className="p-2 bg-muted/50 rounded text-muted-foreground">{c.reasoning}</div>
+            <div className="p-2 bg-muted/50 rounded-none text-muted-foreground">{c.reasoning}</div>
           )}
         </div>
       );
@@ -167,23 +167,19 @@ function renderStepContent(
           {data.filterApplied && (
             <div>
               <span className="text-muted-foreground">Filter:</span>{" "}
-              <code className="bg-muted px-1 rounded">{data.filterApplied}</code>
+              <code className="bg-muted px-1 rounded-none">{data.filterApplied}</code>
             </div>
           )}
           <div className="flex items-center gap-2">
-            <Badge variant="secondary" className="text-xs">
-              {data.hits.length} documents retrieved
-            </Badge>
+            <Badge className="text-xs">{data.hits.length} documents retrieved</Badge>
           </div>
           {data.hits.length > 0 && (
             <div className="space-y-1 max-h-48 overflow-y-auto">
               {data.hits.map((hit, i) => (
-                <div key={hit._id || i} className="p-2 rounded border bg-background text-xs">
+                <div key={hit._id || i} className="p-2 rounded-none border bg-background text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-medium truncate">{hit._id}</span>
-                    <Badge variant="secondary" className="text-[10px]">
-                      {hit._score?.toFixed(3)}
-                    </Badge>
+                    <Badge className="text-[10px]">{hit._score?.toFixed(3)}</Badge>
                   </div>
                   {hit._source && (
                     <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap mt-1 line-clamp-3">
@@ -214,7 +210,7 @@ function renderStepContent(
       return (
         <div className="space-y-2">
           {data.provider && data.model && (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge className="text-[10px]">
               {data.provider}/{data.model}
             </Badge>
           )}
@@ -307,7 +303,7 @@ function renderStepContent(
               key={q}
               type="button"
               onClick={() => onFollowupClick?.(q)}
-              className="w-full text-left text-sm p-2 rounded hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
+              className="w-full text-left text-sm p-2 rounded-none hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
             >
               {q}
             </button>

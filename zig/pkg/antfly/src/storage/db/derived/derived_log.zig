@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("../../lsm_backend/mod.zig");
@@ -303,7 +304,7 @@ test "derived log propagates wal group commit settings" {
         fn wait(self: *@This(), total: usize) void {
             var registered = false;
             while (true) {
-                while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+                platform_sync.lockYielding(&self.mutex);
                 if (!registered) {
                     self.waiting += 1;
                     registered = true;

@@ -20,7 +20,7 @@ pub const serverless_maintenance = @import("serverless_maintenance.zig");
 pub const serverless_query = @import("serverless_query.zig");
 pub const serverless_swarm = @import("serverless_swarm.zig");
 pub const swarm = @import("swarm.zig");
-pub const termite = @import("termite.zig");
+pub const inference = @import("inference.zig");
 pub const cli = @import("cli/mod.zig");
 
 test "cmd module compiles" {
@@ -32,6 +32,6 @@ test "cmd module compiles" {
     _ = serverless_query;
     _ = serverless_swarm;
     _ = swarm;
-    _ = termite;
+    _ = inference;
     _ = cli;
 }

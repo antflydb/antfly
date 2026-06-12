@@ -112,7 +112,7 @@ export POSTGRES_URL="postgresql://postgres:secret@localhost:5432/antfly_demo"
 
 ./postgres-sync \
   --postgres "$POSTGRES_URL" \
-  --antfly http://localhost:8080/api/v1 \
+  --antfly http://localhost:8080/db/v1 \
   --pg-table documents \
   --antfly-table postgres_docs \
   --create-table \
@@ -124,7 +124,7 @@ You should see:
 ```
 === Postgres to Antfly Real-time Sync ===
 Postgres: postgresql://postgres:***@localhost:5432/antfly_demo
-Antfly: http://localhost:8080/api/v1
+Antfly: http://localhost:8080/db/v1
 Table: documents.data -> postgres_docs
 Full sync interval: 5m0s
 
@@ -181,7 +181,7 @@ Watch the sync daemon output:
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--postgres` | Postgres connection URL | `$POSTGRES_URL` |
-| `--antfly` | Antfly API URL | `http://localhost:8080/api/v1` |
+| `--antfly` | Antfly API URL | `http://localhost:8080/db/v1` |
 | `--pg-table` | Postgres table name | `documents` |
 | `--id-column` | ID column name | `id` |
 | `--data-column` | JSONB data column name | `data` |
@@ -455,7 +455,7 @@ services:
     environment:
       POSTGRES_URL: postgresql://postgres:${DB_PASSWORD}@postgres/production
     command:
-      - --antfly=http://antfly:8080/api/v1
+      - --antfly=http://antfly:8080/db/v1
       - --create-table
       - --full-sync-interval=10m
     depends_on:
@@ -488,7 +488,7 @@ spec:
               name: postgres-credentials
               key: url
         args:
-        - --antfly=http://antfly-service:8080/api/v1
+        - --antfly=http://antfly-service:8080/db/v1
         - --create-table
         - --full-sync-interval=10m
 ```
@@ -505,7 +505,7 @@ Type=simple
 User=antfly
 Environment=POSTGRES_URL=postgresql://localhost/production
 ExecStart=/usr/local/bin/postgres-sync \
-  --antfly=http://localhost:8080/api/v1 \
+  --antfly=http://localhost:8080/db/v1 \
   --create-table \
   --full-sync-interval=10m
 Restart=always

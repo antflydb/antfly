@@ -6,41 +6,69 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 T = TypeVar("T", bound="AntflyEmbedderConfig")
 
 
 @_attrs_define
 class AntflyEmbedderConfig:
-    """Configuration for the built-in Antfly embedding provider.
+    """Configuration for the Antfly inference embedding provider.
 
-    Uses an embedded INT8-quantized all-MiniLM-L6-v2 ONNX model bundled directly
-    in the binary. No external service, API key, or model download required.
-
-    **Model:** all-MiniLM-L6-v2 (384 dimensions, text-only)
+    Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
+    It provides embedding generation with multi-tier caching (memory + persistent).
 
     **Features:**
-    - Zero configuration — works out of the box
-    - No network access required
-    - Pure Go inference via GoMLX
+    - Local ONNX-based embedding generation
+    - L1 memory cache with configurable TTL
+    - L2 persistent Pebble database cache
+    - Singleflight deduplication for concurrent identical requests
+
+    **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
+
+    Models are loaded from the `models/embedders/{name}/` directory.
 
         Example:
-            {'provider': 'antfly'}
+            {'provider': 'antfly', 'model': 'bge-base-en-v1.5', 'api_url': 'http://localhost:8082'}
 
+        Attributes:
+            model (str): The embedding model name (maps to models/embedders/{name}/ directory). Example: bge-base-en-v1.5.
+            api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
+                environment variable. Example: http://localhost:8082.
     """
 
+    model: str
+    api_url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        model = self.model
+
+        api_url = self.api_url
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "model": model,
+            }
+        )
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        antfly_embedder_config = cls()
+        model = d.pop("model")
+
+        api_url = d.pop("api_url", UNSET)
+
+        antfly_embedder_config = cls(
+            model=model,
+            api_url=api_url,
+        )
 
         antfly_embedder_config.additional_properties = d
         return antfly_embedder_config

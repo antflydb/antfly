@@ -26,7 +26,7 @@ from openapi_spec_validator import validate_spec
 
 ROOT = Path(__file__).resolve().parent.parent
 JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
-TERMITE_SPEC = ROOT / "specs/openapi/termite/api.yaml"
+INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
@@ -81,10 +81,18 @@ def prefixed_path(prefix: str, path: str) -> str:
     return f"{prefix.rstrip('/')}/{path.lstrip('/')}"
 
 
+def inference_public_path(path: str) -> str:
+    if path == "/predict":
+        return prefixed_path("/ml/v1", path)
+    if path == "/predictors":
+        return prefixed_path("/ml/v1", "/models")
+    return prefixed_path("/ai/v1", path)
+
+
 def antfly_public_path(path: str) -> str:
     if path.startswith("/auth/v1/"):
         return path
-    return prefixed_path("/api/v1", path)
+    return prefixed_path("/db/v1", path)
 
 
 def walk_refs(value: object, rename_schema) -> object:
@@ -93,8 +101,14 @@ def walk_refs(value: object, rename_schema) -> object:
         for key, child in value.items():
             if key == "$ref" and isinstance(child, str):
                 prefix = "#/components/schemas/"
+                shared_generating_prefix = "../shared/generating.yaml#/components/schemas/"
+                ai_extraction_prefix = "../ai/extraction.yaml#/components/schemas/"
                 if child.startswith(prefix):
                     out[key] = prefix + rename_schema(child[len(prefix) :])
+                elif child.startswith(shared_generating_prefix):
+                    out[key] = prefix + child[len(shared_generating_prefix) :]
+                elif child.startswith(ai_extraction_prefix):
+                    out[key] = "specs/openapi/ai/extraction.yaml#/components/schemas/" + child[len(ai_extraction_prefix) :]
                 else:
                     out[key] = child
                 continue
@@ -116,20 +130,72 @@ def walk_refs(value: object, rename_schema) -> object:
     return value
 
 
-def termite_schema_name(name: str) -> str:
-    return f"Termite{name}"
+def inference_schema_name(name: str) -> str:
+    return f"Inference{name}"
 
 
-def merge_components(antfly: dict, termite: dict) -> dict:
+PUBLIC_INFERENCE_SCHEMA_ROOTS = {
+    "Config",
+    "ContentPart",
+    "ImageURL",
+    "ImageURLContentPart",
+    "MediaContentPart",
+    "TextContentPart",
+}
+
+
+def collect_local_schema_refs(value: object) -> set[str]:
+    refs: set[str] = set()
+    prefix = "#/components/schemas/"
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "$ref" and isinstance(child, str) and child.startswith(prefix):
+                refs.add(child[len(prefix) :])
+                continue
+            refs.update(collect_local_schema_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(collect_local_schema_refs(child))
+
+    return refs
+
+
+def referenced_inference_schema_names(inference: dict) -> set[str]:
+    schemas = inference.get("components", {}).get("schemas", {})
+    if not isinstance(schemas, dict):
+        return set()
+
+    seen: set[str] = set()
+    pending = list(collect_local_schema_refs(inference.get("paths", {})) | PUBLIC_INFERENCE_SCHEMA_ROOTS)
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+
+        schema = schemas.get(name)
+        if schema is None:
+            continue
+        for child in collect_local_schema_refs(schema):
+            if child not in seen:
+                pending.append(child)
+
+    return seen
+
+
+def merge_components(antfly: dict, inference: dict, inference_schema_names: set[str]) -> dict:
     merged = copy.deepcopy(antfly.get("components", {}))
-    termite_components = copy.deepcopy(termite.get("components", {}))
+    inference_components = copy.deepcopy(inference.get("components", {}))
 
-    termite_schemas = termite_components.pop("schemas", {})
+    inference_schemas = inference_components.pop("schemas", {})
     schemas = merged.setdefault("schemas", {})
-    for name, schema in termite_schemas.items():
-        schemas[termite_schema_name(name)] = walk_refs(schema, termite_schema_name)
+    for name, schema in inference_schemas.items():
+        if name not in inference_schema_names:
+            continue
+        schemas[inference_schema_name(name)] = walk_refs(schema, inference_schema_name)
 
-    for section, section_map in termite_components.items():
+    for section, section_map in inference_components.items():
         if not isinstance(section_map, dict):
             if section not in merged:
                 merged[section] = copy.deepcopy(section_map)
@@ -140,45 +206,47 @@ def merge_components(antfly: dict, termite: dict) -> dict:
         for name, value in section_map.items():
             if name in target and target[name] != value:
                 raise RuntimeError(f"components/{section}/{name} conflict")
-            target[name] = walk_refs(value, termite_schema_name)
+            target[name] = walk_refs(value, inference_schema_name)
 
     return merged
 
 
 def join_specs() -> dict:
     antfly = join_antfly_spec()
-    termite = load_yaml(TERMITE_SPEC)
+    inference = load_yaml(INFERENCE_SPEC)
+    inference_schema_names = referenced_inference_schema_names(inference)
 
     paths = {}
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
-    for path, item in termite.get("paths", {}).items():
-        paths[prefixed_path("/ml/v1", path)] = walk_refs(item, termite_schema_name)
+    for path, item in inference.get("paths", {}).items():
+        paths[inference_public_path(path)] = walk_refs(item, inference_schema_name)
 
     tags = []
     seen_tags = set()
-    for item in antfly.get("tags", []) + termite.get("tags", []):
+    for item in antfly.get("tags", []) + inference.get("tags", []):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
             continue
         seen_tags.add(name)
         tags.append(copy.deepcopy(item))
 
-    return {
+    joined = {
         "openapi": "3.0.3",
         "info": {
             "title": "Antfly Public API",
             "version": antfly.get("info", {}).get("version", "0.1.0"),
             "description": (
                 "Joined public contract for the Antfly server. Antfly APIs are served under "
-                "`/api/v1`, auth APIs under `/auth/v1`, and Termite ML APIs under `/ml/v1`."
+                "`/db/v1`, auth APIs under `/auth/v1`, inference APIs under `/ai/v1`, "
+                "and ML prediction APIs under `/ml/v1`."
             ),
         },
         "servers": [{"url": "/"}],
         "tags": tags,
         "security": copy.deepcopy(antfly.get("security", [])),
         "paths": paths,
-        "components": merge_components(antfly, termite),
+        "components": merge_components(antfly, inference, inference_schema_names),
         "x-tagGroups": [
             {
                 "name": "Antfly",
@@ -195,15 +263,17 @@ def join_specs() -> dict:
                 "tags": ["User", "Permission", "ApiKey", "RowFilter"],
             },
             {
-                "name": "Termite",
+                "name": "Inference",
                 "tags": [
                     tag.get("name")
-                    for tag in termite.get("tags", [])
+                    for tag in inference.get("tags", [])
                     if isinstance(tag, dict) and tag.get("name")
                 ],
             },
         ],
     }
+    joiner = load_join_openapi().load_shared_joiner()
+    return joiner.bundle_joined_spec(joined)
 
 
 def dump_yaml(data: dict, output: Path) -> None:

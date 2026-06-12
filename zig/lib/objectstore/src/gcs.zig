@@ -19,7 +19,7 @@ const client_mod = @import("client.zig");
 const test_support = @import("test_support.zig");
 const types = @import("types.zig");
 const s3 = @import("s3.zig");
-const google_auth = @import("google_auth.zig");
+const google_auth = @import("antfly_google").auth;
 
 const Allocator = std.mem.Allocator;
 

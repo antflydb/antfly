@@ -49,9 +49,7 @@ const BarChart: React.FC<{
     <div className="space-y-1.5">
       <div className="flex items-center gap-2 mb-2">
         <span className="text-sm font-medium">{name}</span>
-        <Badge variant="secondary" className="text-[10px]">
-          {buckets.length} buckets
-        </Badge>
+        <Badge className="text-[10px]">{buckets.length} buckets</Badge>
       </div>
       {buckets.map((bucket) => {
         const count = bucket.doc_count ?? 0;
@@ -62,9 +60,9 @@ const BarChart: React.FC<{
             <span className="w-28 truncate text-right text-muted-foreground shrink-0" title={label}>
               {label}
             </span>
-            <div className="flex-1 h-5 bg-muted rounded-sm overflow-hidden relative">
+            <div className="flex-1 h-5 bg-muted rounded-none overflow-hidden relative">
               <div
-                className="h-full rounded-sm transition-all"
+                className="h-full rounded-none transition-all"
                 style={{ width: `${pct}%`, backgroundColor: chartSeries[0] }}
               />
             </div>

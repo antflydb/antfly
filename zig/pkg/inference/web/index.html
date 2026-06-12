@@ -1,0 +1,1875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Antfly Inference Web Model Chat</title>
+  <style>
+    :root {
+      --bg: #f3ede2;
+      --paper: #fffaf1;
+      --ink: #1f1a17;
+      --muted: #6a5d52;
+      --line: #d7cbbb;
+      --accent: #b6512f;
+      --accent-soft: #f2d9ca;
+      --ok: #226244;
+      --warn: #8b5a1f;
+      --shadow: 0 18px 50px rgba(56, 41, 27, 0.12);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(182, 81, 47, 0.16), transparent 28rem),
+        radial-gradient(circle at bottom right, rgba(86, 116, 87, 0.14), transparent 26rem),
+        var(--bg);
+    }
+
+    .page {
+      width: min(1080px, calc(100vw - 2rem));
+      margin: 1.5rem auto 2rem;
+      display: grid;
+      gap: 1rem;
+    }
+
+    .hero,
+    .panel {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 1.5rem;
+      display: grid;
+      gap: 0.75rem;
+    }
+
+    .kicker {
+      font-size: 0.78rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }
+
+    .subhead {
+      margin: 0;
+      max-width: 54rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(290px, 360px) minmax(0, 1fr);
+      gap: 1rem;
+    }
+
+    .panel {
+      padding: 1rem;
+    }
+
+    .panel h2 {
+      margin: 0 0 0.8rem;
+      font-size: 1rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .field {
+      display: grid;
+      gap: 0.35rem;
+      margin-bottom: 0.8rem;
+    }
+
+    .field label,
+    .hint-title {
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    input[type="file"],
+    input[type="url"],
+    input[type="number"],
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      padding: 0.8rem 0.9rem;
+    }
+
+    textarea {
+      min-height: 10rem;
+      resize: vertical;
+      line-height: 1.45;
+    }
+
+    .system-box {
+      min-height: 5.5rem;
+    }
+
+    .checkline {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0.75rem 0.9rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--ink);
+    }
+
+    .checkline input {
+      width: auto;
+      margin: 0;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      margin-top: 0.3rem;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 0.8rem 1.15rem;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+    }
+
+    button:hover:not(:disabled) { transform: translateY(-1px); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .primary { background: var(--accent); color: #fff8f2; }
+    .secondary { background: var(--accent-soft); color: var(--ink); }
+    .ghost { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+
+    .status {
+      padding: 0.8rem 0.9rem;
+      border-radius: 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    .metrics,
+    .warnings {
+      display: grid;
+      gap: 0.55rem;
+      margin-top: 0.8rem;
+    }
+
+    .metric,
+    .warning {
+      padding: 0.8rem 0.9rem;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.82);
+    }
+
+    .metric strong,
+    .warning strong {
+      display: block;
+      margin-bottom: 0.2rem;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .warning strong { color: var(--warn); }
+
+    .output-shell {
+      display: grid;
+      gap: 0.8rem;
+      min-height: 28rem;
+    }
+
+    .output {
+      min-height: 18rem;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.96), rgba(250,245,236,0.95));
+      white-space: pre-wrap;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .output.placeholder { color: var(--muted); }
+
+    .mini {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+
+    .progress {
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(215, 203, 187, 0.5);
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+
+    .progress > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #cf744d, #a33f22);
+      transition: width 120ms linear;
+    }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="kicker">Embedded Antfly Inference WASM</div>
+      <h1>Model generation in the browser</h1>
+      <p class="subhead">
+        Point the page at a local `~/.antfly/inference/models` directory, discover supported model bundles, and run them directly in the page.
+        Local GGUF generation bundles, Hugging Face SafeTensors GPT bundles, Whisper transcription bundles, GLiNER extraction bundles, local T5-style text-to-text bundles, local BERT-style embedding bundles, and CLIP text-embedding bundles are supported today; remote URL mode still targets GGUF.
+      </p>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <h2>Load</h2>
+        <div class="field">
+          <label for="sourceMode">Source</label>
+          <select id="sourceMode">
+            <option value="file">Local model bundle</option>
+            <option value="url">Remote GGUF URL</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="modelFile">Single GGUF file</label>
+          <input type="file" id="modelFile" accept=".gguf">
+        </div>
+
+        <div class="field">
+          <label for="discoveredModel">Models directory</label>
+          <div class="actions">
+            <button id="pickDirBtn" type="button" class="secondary">Choose models directory</button>
+          </div>
+          <select id="discoveredModel" disabled>
+            <option value="">No supported model bundles discovered yet</option>
+          </select>
+          <p class="mini" id="pickerHint">Use this in Chrome-class browsers to pick `~/.antfly/inference/models` once and list supported local model bundles from that directory. The page currently supports local decoder GGUF bundles, GGUF `mmproj` sidecars, and Hugging Face GPT/T5/Whisper/GLiNER/encoder/CLIP SafeTensors bundles.</p>
+        </div>
+
+        <div class="field">
+          <label for="modelUrl">GGUF URL</label>
+          <input type="url" id="modelUrl" placeholder="https://example.com/model.gguf">
+        </div>
+
+        <div class="field">
+          <label for="streamLoad">Remote loading mode</label>
+          <select id="streamLoad">
+            <option value="stream">Stream weights from URL</option>
+            <option value="buffer">Fetch whole GGUF first</option>
+          </select>
+        </div>
+
+        <div class="actions">
+          <button id="loadBtn" class="primary" disabled>Load Model</button>
+          <button id="unloadBtn" class="ghost" disabled>Unload</button>
+        </div>
+        <p class="mini" id="loadHint" style="margin-top:0.65rem;">Waiting for Antfly Inference Web to initialize.</p>
+        <p class="mini" id="runtimeHint">Runtime: initializing…</p>
+
+        <div id="status" class="status" style="margin-top:0.85rem;">Initializing Antfly Inference Web…</div>
+        <div class="progress" style="margin-top:0.8rem;"><span id="progressBar"></span></div>
+
+        <div class="metrics" id="modelMetrics"></div>
+        <div class="warnings" id="warnings"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Generate</h2>
+        <div class="field">
+          <label for="systemPrompt">System prompt</label>
+          <textarea id="systemPrompt" class="system-box" placeholder="Optional system instruction. Used only when a chat template is available and enabled."></textarea>
+        </div>
+
+        <div class="field">
+          <label for="promptInput">User prompt</label>
+          <textarea id="promptInput" placeholder="Ask the model something. If the loaded bundle exposes a chat template, this page can render a system + user turn before tokenization.">Explain what WebAssembly memory64 changes for large in-browser language models.</textarea>
+        </div>
+
+        <div class="field">
+          <label for="imageInput">Image input</label>
+          <input type="file" id="imageInput" accept="image/*">
+          <p class="mini" id="imageHint">Optional. Enabled when the loaded model supports the integrated browser multimodal path.</p>
+        </div>
+
+        <div class="field">
+          <label for="audioInput">Audio input</label>
+          <input type="file" id="audioInput" accept="audio/*">
+          <p class="mini" id="audioHint">Optional. Enabled when the loaded model supports an audio-capable multimodal path.</p>
+        </div>
+
+        <div class="field">
+          <label for="labelInput">Extraction labels</label>
+          <textarea id="labelInput" class="system-box" placeholder="person, organization, location" disabled></textarea>
+          <p class="mini" id="labelHint">Used by extraction tasks such as GLiNER. Separate labels with commas or new lines.</p>
+        </div>
+
+        <div class="field">
+          <label class="checkline" for="useChatTemplate">
+            <input type="checkbox" id="useChatTemplate" checked>
+            <span>Use chat template when available</span>
+          </label>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="maxTokens">Max tokens</label>
+            <input type="number" id="maxTokens" min="1" max="512" value="96">
+          </div>
+          <div class="field">
+            <label for="temperature">Temperature</label>
+            <input type="number" id="temperature" min="0" max="2" step="0.1" value="0">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="topK">Top-k</label>
+            <input type="number" id="topK" min="0" max="200" value="0">
+          </div>
+          <div class="field">
+            <label for="topP">Top-p</label>
+            <input type="number" id="topP" min="0" max="1" step="0.05" value="0">
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="generateBtn" class="secondary" disabled>Run Model</button>
+        </div>
+
+        <div class="output-shell">
+          <p class="mini" id="promptMeta">Load a model to start generating.</p>
+          <div id="output" class="output placeholder">The generated text will appear here.</div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script type="module">
+    import { InferenceWeb } from './inference-web.js';
+    import {
+      basename,
+      buildDiscoveredModelEntries,
+      isClipModelType,
+      isEmbeddingModelType,
+      isExtractionModelType,
+      isGenerativeModelType,
+      isInterestingModelFile,
+      isProjectorGgufName,
+      isSeq2SeqModelType,
+    } from './runtime/model-discovery.js';
+    import {
+      buildGlinerRunOptions,
+      defaultExtractionLabels,
+      extractGlinerSpecialTokenIds,
+      normalizeExtractionLabels,
+    } from './runtime/extraction-support.js';
+    import {
+      defaultRebelConfig,
+      parseRebelTriplets,
+      tripletsToRelationOutput,
+    } from './runtime/relation-support.js';
+    import {
+      actionLabelForTask,
+      buildExpandedGemma4MultimodalPrompt,
+      buildExpandedMultimodalPrompt,
+      computeMediaUiState,
+      hasIntegratedVisionConfig,
+      imageOffsetsFromExpandedTokenIds,
+      isGemma3ProjectorKind,
+      isGemma4AudioProjectorKind,
+      isGemma4ImageProjectorKind,
+      supportsBrowserMultimodal,
+    } from './runtime/page-behavior.js';
+    import { computeLoadAvailability } from './runtime/page-controller.js';
+    import { computePromptModeState } from './runtime/page-prompt.js';
+    import { computeLoadWarnings, computeMetricEntries } from './runtime/page-summary.js';
+
+    const inferenceRuntime = new InferenceWeb();
+
+    const modelFileInput = document.getElementById('modelFile');
+    const discoveredModelInput = document.getElementById('discoveredModel');
+    const modelUrlInput = document.getElementById('modelUrl');
+    const pickDirBtn = document.getElementById('pickDirBtn');
+    const pickerHintEl = document.getElementById('pickerHint');
+    const sourceModeInput = document.getElementById('sourceMode');
+    const streamLoadInput = document.getElementById('streamLoad');
+    const loadBtn = document.getElementById('loadBtn');
+    const loadHintEl = document.getElementById('loadHint');
+    const runtimeHintEl = document.getElementById('runtimeHint');
+    const unloadBtn = document.getElementById('unloadBtn');
+    const generateBtn = document.getElementById('generateBtn');
+    const systemPromptInput = document.getElementById('systemPrompt');
+    const promptInput = document.getElementById('promptInput');
+    const imageInput = document.getElementById('imageInput');
+    const imageHintEl = document.getElementById('imageHint');
+    const audioInput = document.getElementById('audioInput');
+    const audioHintEl = document.getElementById('audioHint');
+    const labelInput = document.getElementById('labelInput');
+    const labelHintEl = document.getElementById('labelHint');
+    const useChatTemplateInput = document.getElementById('useChatTemplate');
+    const maxTokensInput = document.getElementById('maxTokens');
+    const temperatureInput = document.getElementById('temperature');
+    const topKInput = document.getElementById('topK');
+    const topPInput = document.getElementById('topP');
+    const statusEl = document.getElementById('status');
+    const outputEl = document.getElementById('output');
+    const promptMetaEl = document.getElementById('promptMeta');
+    const progressBar = document.getElementById('progressBar');
+    const modelMetricsEl = document.getElementById('modelMetrics');
+    const warningsEl = document.getElementById('warnings');
+
+    let modelHandle = null;
+    let projectorHandle = null;
+    let projectorKind = null;
+    let tokenizerHandle = null;
+    let modelConfig = null;
+    let extractionConfig = null;
+    let extractionTokenIds = null;
+    let relationConfig = null;
+    let modelFileBytes = null;
+    let chatTemplate = null;
+    let discoveredModels = [];
+    let pickedModelsDirHandle = null;
+    let activeModelObjectUrl = null;
+    let loadedModelTask = null;
+    let loadedDiscoveredModel = null;
+    let currentRuntimeMode = 'direct';
+    let inferenceReady = false;
+    let generationRunning = false;
+    const GGUF_PROBE_BYTES = 64 * 1024 * 1024;
+    const MAX_BROWSER_WASM32_GGUF_BYTES = 3.5 * 1024 ** 3;
+    const MODULE_CACHE_BUST = `${Date.now()}`;
+
+    function formatByteSize(byteLen) {
+      if (byteLen >= 1024 ** 3) return `${(byteLen / (1024 ** 3)).toFixed(2)} GiB`;
+      if (byteLen >= 1024 ** 2) return `${(byteLen / (1024 ** 2)).toFixed(1)} MiB`;
+      if (byteLen >= 1024) return `${(byteLen / 1024).toFixed(1)} KiB`;
+      return `${byteLen} B`;
+    }
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function setProgress(loaded, total) {
+      const pct = total > 0 ? Math.max(0, Math.min(100, (loaded / total) * 100)) : 0;
+      progressBar.style.width = `${pct}%`;
+    }
+
+    function clearWarnings() {
+      warningsEl.innerHTML = '';
+    }
+
+    function pushWarning(title, text) {
+      const el = document.createElement('div');
+      el.className = 'warning';
+      el.innerHTML = `<strong>${title}</strong><div>${text}</div>`;
+      warningsEl.appendChild(el);
+    }
+
+    function renderMetrics(sourceInfo) {
+      modelMetricsEl.innerHTML = '';
+      const entries = computeMetricEntries({
+        task: loadedModelTask,
+        modelConfig,
+        sourceInfo,
+      });
+
+      for (const [label, value] of entries) {
+        const el = document.createElement('div');
+        el.className = 'metric';
+        el.innerHTML = `<strong>${label}</strong><div>${value}</div>`;
+        modelMetricsEl.appendChild(el);
+      }
+    }
+
+    function updateActionButton() {
+      generateBtn.textContent = actionLabelForTask(loadedModelTask);
+    }
+
+    function hasExternalProjector() {
+      return projectorHandle != null && typeof projectorKind === 'string' && projectorKind.length > 0;
+    }
+
+    function isGemma3Projector() {
+      return isGemma3ProjectorKind(projectorKind);
+    }
+
+    function isGemma4ImageProjector() {
+      return isGemma4ImageProjectorKind(projectorKind);
+    }
+
+    function isGemma4AudioProjector() {
+      return isGemma4AudioProjectorKind(projectorKind);
+    }
+
+    async function loadSelectedImages() {
+      const files = Array.from(imageInput.files ?? []);
+      if (files.length === 0) return [];
+      const images = [];
+      for (const file of files) {
+        images.push(await createImageBitmap(file));
+      }
+      return images;
+    }
+
+    async function loadSelectedImageBytes() {
+      const files = Array.from(imageInput.files ?? []);
+      const bytes = [];
+      for (const file of files) {
+        bytes.push(new Uint8Array(await file.arrayBuffer()));
+      }
+      return bytes;
+    }
+
+    async function loadSelectedAudioBytes() {
+      const files = Array.from(audioInput.files ?? []);
+      const bytes = [];
+      for (const file of files) {
+        bytes.push(new Uint8Array(await file.arrayBuffer()));
+      }
+      return bytes;
+    }
+
+    function releaseImageBitmaps(bitmaps) {
+      for (const bitmap of bitmaps) {
+        if (bitmap && typeof bitmap.close === 'function') bitmap.close();
+      }
+    }
+
+    function updateImageAvailability() {
+      const state = computeMediaUiState({ task: loadedModelTask, config: modelConfig, projectorKind });
+      imageInput.disabled = !state.imageEnabled;
+      audioInput.disabled = !state.audioEnabled;
+      imageHintEl.textContent = state.imageHint;
+      audioHintEl.textContent = state.audioHint;
+    }
+
+    function updateExtractionAvailability() {
+      const extractionEnabled = loadedModelTask === 'extract';
+      labelInput.disabled = !extractionEnabled;
+      labelHintEl.textContent = extractionEnabled
+        ? 'Required. Separate entity labels with commas or new lines. If the bundle exposes default labels, they are prefilled here.'
+        : 'Used by extraction tasks such as GLiNER. Separate labels with commas or new lines.';
+    }
+
+    function refreshPromptMode() {
+      const state = computePromptModeState({
+        modelLoaded: modelHandle != null,
+        tokenizerLoaded: tokenizerHandle != null,
+        modelConfig,
+        task: loadedModelTask,
+        chatTemplate,
+        useChatTemplate: useChatTemplateInput.checked,
+      });
+      useChatTemplateInput.disabled = state.useChatTemplateDisabled;
+      systemPromptInput.disabled = state.systemPromptDisabled;
+      promptMetaEl.textContent = state.promptMeta;
+      updateImageAvailability();
+      updateExtractionAvailability();
+    }
+
+    function hasDirectoryPicker() {
+      return typeof window.showDirectoryPicker === 'function';
+    }
+
+    function hasElectronBridge() {
+      return typeof window.antflyInferenceElectron === 'object' && window.antflyInferenceElectron != null;
+    }
+
+    function hasModelsDirectoryBridge() {
+      return hasDirectoryPicker() || hasElectronBridge();
+    }
+
+    function selectedDiscoveredModel() {
+      if (discoveredModels.length === 0) return null;
+      const index = Number(discoveredModelInput.value);
+      if (!Number.isInteger(index) || index < 0 || index >= discoveredModels.length) {
+        return discoveredModels.find((entry) => entry.supported) ?? null;
+      }
+      const entry = discoveredModels[index] ?? null;
+      return entry?.supported ? entry : (discoveredModels.find((candidate) => candidate.supported) ?? null);
+    }
+
+    function renderDiscoveredModels() {
+      discoveredModelInput.innerHTML = '';
+
+      if (discoveredModels.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No supported model bundles discovered yet';
+        discoveredModelInput.appendChild(option);
+        discoveredModelInput.disabled = true;
+        return;
+      }
+
+      for (const [index, entry] of discoveredModels.entries()) {
+        const option = document.createElement('option');
+        option.value = String(index);
+        option.textContent = entry.label;
+        option.disabled = !entry.supported;
+        discoveredModelInput.appendChild(option);
+      }
+      const firstSupportedIndex = discoveredModels.findIndex((entry) => entry.supported);
+      discoveredModelInput.value = firstSupportedIndex >= 0 ? String(firstSupportedIndex) : '';
+      discoveredModelInput.disabled = false;
+    }
+
+    async function collectModelFiles(dirHandle, prefix = '') {
+      const files = [];
+      for await (const entry of dirHandle.values()) {
+        const entryPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.kind === 'file') {
+          if (isInterestingModelFile(entry.name)) {
+            files.push({ path: entryPath, handle: entry });
+          }
+          continue;
+        }
+        if (entry.kind === 'directory') {
+          const nested = await collectModelFiles(entry, entryPath);
+          files.push(...nested);
+        }
+      }
+      return files;
+    }
+
+    async function readTextDescriptor(file) {
+      if (file?.handle) return readTextFile(file.handle);
+      if (typeof file?.url === 'string' && file.url.length > 0) {
+        const resp = await fetch(file.url);
+        if (!resp.ok) throw new Error(`Failed to read ${file.path}: HTTP ${resp.status}`);
+        return await resp.text();
+      }
+      throw new Error(`No readable source for ${file?.path ?? 'unknown file'}`);
+    }
+
+    async function readJsonDescriptor(file) {
+      return JSON.parse(await readTextDescriptor(file));
+    }
+
+    async function readUrlProbeBytes(url, sizeBytes = null) {
+      const probeEnd = Math.min(Number.isFinite(sizeBytes) ? sizeBytes : GGUF_PROBE_BYTES, GGUF_PROBE_BYTES);
+      const resp = await fetch(url, {
+        headers: {
+          Range: `bytes=0-${Math.max(0, probeEnd - 1)}`,
+        },
+      });
+      if (!resp.ok && resp.status !== 206) {
+        throw new Error(`Failed to probe GGUF metadata: HTTP ${resp.status}`);
+      }
+      return new Uint8Array(await resp.arrayBuffer());
+    }
+
+    async function scanElectronModelsDirectory(dirPath = null) {
+      const scan = await window.antflyInferenceElectron.scanModelsDirectory(dirPath);
+      discoveredModels = await buildDiscoveredModelEntries(scan.files, {
+        readJsonFile: readJsonDescriptor,
+      });
+      pickedModelsDirHandle = {
+        name: basename(scan.directoryPath),
+        path: scan.directoryPath,
+        electron: true,
+      };
+      renderDiscoveredModels();
+      updateLoadAvailability();
+      return scan;
+    }
+
+    async function pickModelsDirectory() {
+      if (hasElectronBridge()) {
+        try {
+          setStatus('Scanning ~/.antfly/inference/models in Electron…');
+          const chosenPath = await window.antflyInferenceElectron.chooseModelsDirectory();
+          if (!chosenPath) {
+            setStatus('Models directory picker canceled.');
+            return;
+          }
+          const scan = await scanElectronModelsDirectory(chosenPath);
+          if (discoveredModels.length === 0) {
+            setStatus(`No supported model bundles found under ${scan.directoryPath}.`);
+            return;
+          }
+          const ggufCount = discoveredModels.filter((entry) => entry.kind === 'gguf').length;
+          const hfGenerateCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'generate').length;
+          const hfTranscribeCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'transcribe').length;
+          const hfExtractCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'extract').length;
+          const hfRelationCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'relations').length;
+          const hfSeq2SeqCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'seq2seq').length;
+          const hfEmbedCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'embed').length;
+          const hfClipCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'clip-embed').length;
+          const unsupportedCount = discoveredModels.filter((entry) => !entry.supported).length;
+          const projectorCount = discoveredModels.filter((entry) => entry.projectorFile != null).length;
+          setStatus(
+            `Discovered ${discoveredModels.length} supported model entr${discoveredModels.length === 1 ? 'y' : 'ies'} under ${basename(scan.directoryPath)}` +
+            ` (${ggufCount} GGUF, ${hfGenerateCount} HF generative, ${hfTranscribeCount} HF Whisper, ${hfExtractCount} HF GLiNER, ${hfRelationCount} HF REBEL, ${hfSeq2SeqCount} HF seq2seq, ${hfEmbedCount} HF embedding, ${hfClipCount} HF CLIP` +
+            `${unsupportedCount > 0 ? `, ${unsupportedCount} unsupported` : ''}` +
+            `${projectorCount > 0 ? `, ${projectorCount} with mmproj sidecars` : ''}).`
+          );
+          return;
+        } catch (err) {
+          setStatus(`Directory scan failed: ${err.message}`);
+          return;
+        }
+      }
+
+      if (!hasDirectoryPicker()) {
+        setStatus('This browser does not support the directory picker. Use the file picker or a Chrome-class browser.');
+        return;
+      }
+
+      try {
+        setStatus('Choose ~/.antfly/inference/models in the browser picker…');
+        const dirHandle = await window.showDirectoryPicker({
+          id: 'antfly-inference-models-dir',
+          mode: 'read',
+        });
+        pickedModelsDirHandle = dirHandle;
+        const files = await collectModelFiles(dirHandle);
+        discoveredModels = await buildDiscoveredModelEntries(files, {
+          readJsonFile: (file) => readJsonFile(file.handle),
+        });
+        renderDiscoveredModels();
+        updateLoadAvailability();
+
+        if (discoveredModels.length === 0) {
+          setStatus(`No supported model bundles found under ${dirHandle.name}.`);
+          return;
+        }
+
+        const ggufCount = discoveredModels.filter((entry) => entry.kind === 'gguf').length;
+        const hfGenerateCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'generate').length;
+        const hfTranscribeCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'transcribe').length;
+        const hfExtractCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'extract').length;
+        const hfRelationCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'relations').length;
+        const hfSeq2SeqCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'seq2seq').length;
+        const hfEmbedCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'embed').length;
+        const hfClipCount = discoveredModels.filter((entry) => entry.kind === 'hf-gpt-safetensors' && entry.taskHint === 'clip-embed').length;
+        const unsupportedCount = discoveredModels.filter((entry) => !entry.supported).length;
+        const projectorCount = discoveredModels.filter((entry) => entry.projectorFile != null).length;
+        setStatus(
+          `Discovered ${discoveredModels.length} supported model entr${discoveredModels.length === 1 ? 'y' : 'ies'} under ${dirHandle.name}` +
+          ` (${ggufCount} GGUF, ${hfGenerateCount} HF generative, ${hfTranscribeCount} HF Whisper, ${hfExtractCount} HF GLiNER, ${hfRelationCount} HF REBEL, ${hfSeq2SeqCount} HF seq2seq, ${hfEmbedCount} HF embedding, ${hfClipCount} HF CLIP` +
+          `${unsupportedCount > 0 ? `, ${unsupportedCount} unsupported` : ''}` +
+          `${projectorCount > 0 ? `, ${projectorCount} with mmproj sidecars` : ''}).`
+        );
+      } catch (err) {
+        if (err?.name === 'AbortError') {
+          setStatus('Directory picker canceled.');
+          return;
+        }
+        setStatus(`Directory scan failed: ${err.message}`);
+      }
+    }
+
+    async function ensureReadPermission(handle) {
+      if (!handle || typeof handle.queryPermission !== 'function') return true;
+      const opts = { mode: 'read' };
+      const current = await handle.queryPermission(opts);
+      if (current === 'granted') return true;
+      if (typeof handle.requestPermission !== 'function') return false;
+      return (await handle.requestPermission(opts)) === 'granted';
+    }
+
+    async function readGgufProbeBytes(fileLike) {
+      const probeEnd = Math.min(fileLike.size, GGUF_PROBE_BYTES);
+      return new Uint8Array(await fileLike.slice(0, probeEnd).arrayBuffer());
+    }
+
+    async function readTextFile(fileHandle) {
+      const file = await fileHandle.getFile();
+      return await file.text();
+    }
+
+    async function readJsonFile(fileHandle) {
+      return JSON.parse(await readTextFile(fileHandle));
+    }
+
+    function revokeActiveModelObjectUrl() {
+      if (activeModelObjectUrl != null) {
+        URL.revokeObjectURL(activeModelObjectUrl);
+        activeModelObjectUrl = null;
+      }
+    }
+
+    function currentRuntimeMemoryModel() {
+      return inferenceRuntime.memoryModel ?? inferenceRuntime.abi?.memoryModel ?? null;
+    }
+
+    function workerModeSupported() {
+      return typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated === true;
+    }
+
+    function assertLocalModelFitsCurrentRuntime(fileLike) {
+      const memoryModel = currentRuntimeMemoryModel();
+      if (memoryModel === 'wasm32' && fileLike.size > MAX_BROWSER_WASM32_GGUF_BYTES) {
+        throw new Error(
+          `Selected GGUF is ${formatByteSize(fileLike.size)}, but the current browser runtime initialized as wasm32. ` +
+          `This page cannot load a local GGUF that large in direct browser mode yet; use a smaller quant or the Electron/wasm64 path.`
+        );
+      }
+    }
+
+    function firstTokenId(value) {
+      if (Array.isArray(value)) return value.length > 0 ? value[0] : undefined;
+      return typeof value === 'number' ? value : undefined;
+    }
+
+    function updateLoadAvailability() {
+      const state = computeLoadAvailability({
+        sourceMode: sourceModeInput.value,
+        inferenceReady,
+        hasDirectoryPicker: hasModelsDirectoryBridge(),
+        hasSingleFile: Boolean(modelFileInput.files?.[0]),
+        hasDiscoveredModel: Boolean(selectedDiscoveredModel()),
+        discoveredModelCount: discoveredModels.length,
+        remoteUrl: modelUrlInput.value,
+      });
+
+      modelFileInput.disabled = state.modelFileDisabled;
+      discoveredModelInput.disabled = state.discoveredModelDisabled;
+      pickDirBtn.disabled = state.pickDirDisabled;
+      modelUrlInput.disabled = state.modelUrlDisabled;
+      streamLoadInput.disabled = state.streamLoadDisabled;
+      loadBtn.disabled = state.loadDisabled;
+      loadBtn.title = state.loadTitle;
+      loadHintEl.textContent = state.loadHint;
+    }
+
+    async function loadModel() {
+      const sourceMode = sourceModeInput.value;
+      const discoveredModel = sourceMode === 'file' ? selectedDiscoveredModel() : null;
+      const file = sourceMode === 'file' ? (modelFileInput.files?.[0] ?? null) : null;
+      const modelUrl = sourceMode === 'url' ? modelUrlInput.value.trim() : '';
+      if (sourceMode === 'file' && !file && !discoveredModel) {
+        setStatus('Choose a model bundle or GGUF file first.');
+        return;
+      }
+      if (sourceMode === 'url' && modelUrl.length === 0) {
+        setStatus('Enter a GGUF URL first.');
+        return;
+      }
+      if (!inferenceReady) {
+        setStatus('Antfly Inference Web is still initializing. Wait for the initialized status and try again.');
+        return;
+      }
+
+      await unloadModel({ silent: true });
+      clearWarnings();
+      setProgress(0, 1);
+      chatTemplate = null;
+      loadedModelTask = null;
+      extractionConfig = null;
+      extractionTokenIds = null;
+      relationConfig = null;
+      loadedDiscoveredModel = discoveredModel;
+      updateActionButton();
+      outputEl.textContent = 'The generated text will appear here.';
+      outputEl.classList.add('placeholder');
+      promptMetaEl.textContent = 'Loading config, tokenizer, and model bundle…';
+      loadBtn.disabled = true;
+      generateBtn.disabled = true;
+
+      try {
+        let sourceInfo;
+        if (sourceMode === 'file') {
+          let fileLike = file;
+          if (discoveredModel) {
+            if (discoveredModel.modelFile.handle) {
+              const dirAllowed = await ensureReadPermission(pickedModelsDirHandle);
+              const fileAllowed = await ensureReadPermission(discoveredModel.modelFile.handle);
+              if (!dirAllowed && !fileAllowed) {
+                throw new Error('Browser read permission was denied for the selected models directory');
+              }
+              try {
+                fileLike = await discoveredModel.modelFile.handle.getFile();
+              } catch (err) {
+                throw new Error(`Browser could not read ${discoveredModel.modelFile.path}. Re-pick the models directory and try again. Original error: ${err.message}`);
+              }
+            }
+          }
+          setStatus(`Reading ${discoveredModel?.label ?? fileLike?.name ?? basename(discoveredModel?.modelFile?.path ?? 'model')}…`);
+          modelFileBytes = null;
+
+          if (discoveredModel?.kind === 'hf-gpt-safetensors') {
+            const configAllowed = discoveredModel.configFile?.handle ? await ensureReadPermission(discoveredModel.configFile.handle) : true;
+            const tokenizerAllowed = discoveredModel.tokenizerFile?.handle ? await ensureReadPermission(discoveredModel.tokenizerFile.handle) : true;
+            if (!configAllowed || !tokenizerAllowed) {
+              throw new Error('Browser read permission was denied for the selected Hugging Face model bundle');
+            }
+
+            setStatus('Loading GPT config from local Hugging Face bundle…');
+            modelConfig = await readJsonDescriptor(discoveredModel.configFile);
+            loadedModelTask = discoveredModel.taskHint ?? (
+              isGenerativeModelType(modelConfig?.model_type)
+                ? 'generate'
+                : isSeq2SeqModelType(modelConfig?.model_type)
+                  ? 'seq2seq'
+                : isClipModelType(modelConfig?.model_type)
+                  ? 'clip-embed'
+                : isEmbeddingModelType(modelConfig?.model_type)
+                  ? 'embed'
+                  : isExtractionModelType(modelConfig?.model_type)
+                    ? 'extract'
+                    : null
+            );
+            if (!loadedModelTask) {
+              throw new Error(`The current page does not yet support local Hugging Face model_type=${modelConfig?.model_type ?? 'unknown'} bundles.`);
+            }
+            setProgress(0.2, 1);
+
+            setStatus('Loading tokenizer from local Hugging Face bundle…');
+            const tokenizerJson = await readTextDescriptor(discoveredModel.tokenizerFile);
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(tokenizerJson);
+            if (loadedModelTask === 'extract') {
+              extractionTokenIds = extractGlinerSpecialTokenIds(tokenizerJson);
+            }
+            setProgress(0.4, 1);
+
+            if (loadedModelTask === 'extract' && discoveredModel.glinerConfigFile) {
+              try {
+                extractionConfig = await readJsonDescriptor(discoveredModel.glinerConfigFile);
+              } catch (_) {
+                extractionConfig = null;
+              }
+            }
+            if (loadedModelTask === 'extract') {
+              const defaultLabels = defaultExtractionLabels(extractionConfig);
+              labelInput.value = defaultLabels.join('\n');
+            }
+            if (loadedModelTask === 'relations') {
+              if (discoveredModel.rebelConfigFile) {
+                try {
+                  relationConfig = defaultRebelConfig(await readJsonDescriptor(discoveredModel.rebelConfigFile));
+                } catch (_) {
+                  relationConfig = defaultRebelConfig();
+                }
+              } else {
+                relationConfig = defaultRebelConfig();
+              }
+              labelInput.value = '';
+            }
+
+            if (discoveredModel.tokenizerConfigFile) {
+              try {
+                const tokenizerConfig = await readJsonDescriptor(discoveredModel.tokenizerConfigFile);
+                chatTemplate = typeof tokenizerConfig?.chat_template === 'string'
+                  ? tokenizerConfig.chat_template
+                  : null;
+              } catch (_) {
+                chatTemplate = null;
+              }
+            }
+            setProgress(0.5, 1);
+
+            if (fileLike) {
+              assertLocalModelFitsCurrentRuntime(fileLike);
+            }
+            const localModelSource = discoveredModel.modelFile.url ?? URL.createObjectURL(fileLike);
+            if (!discoveredModel.modelFile.url) activeModelObjectUrl = localModelSource;
+            const start = performance.now();
+            if (loadedModelTask === 'generate') {
+              setStatus('Streaming GPT SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.streamLoadGptModel(localModelSource, modelConfig, {
+                family: modelConfig.model_type,
+                onProgress: ({ loaded, total }) => setProgress(loaded, total || fileLike?.size || discoveredModel.modelFile.sizeBytes || 1),
+              });
+            } else if (loadedModelTask === 'transcribe') {
+              setStatus('Loading Whisper SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadWhisperModel(localModelSource, modelConfig);
+              setProgress(1, 1);
+            } else if (loadedModelTask === 'extract') {
+              setStatus('Loading GLiNER SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadGlinerModel(localModelSource, modelConfig);
+              setProgress(1, 1);
+            } else if (loadedModelTask === 'relations' || (loadedModelTask === 'seq2seq' && String(modelConfig?.model_type ?? '').toLowerCase() === 'bart')) {
+              setStatus('Loading BART/REBEL SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadFlorenceModel(localModelSource, modelConfig);
+              setProgress(1, 1);
+            } else if (loadedModelTask === 'seq2seq') {
+              setStatus('Loading seq2seq SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadT5Model(localModelSource, modelConfig);
+              setProgress(1, 1);
+            } else if (loadedModelTask === 'clip-embed') {
+              setStatus('Loading CLIP SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadClipModel(localModelSource, modelConfig);
+              setProgress(1, 1);
+            } else {
+              setStatus('Loading encoder SafeTensors from local bundle…');
+              modelHandle = await inferenceRuntime.loadModel(localModelSource, modelConfig, { format: 'safetensors' });
+              setProgress(1, 1);
+            }
+            const elapsed = (performance.now() - start).toFixed(0);
+            setProgress(1, 1);
+            setStatus(`Loaded ${discoveredModel.label} in ${elapsed}ms.`);
+            sourceInfo = {
+              label: discoveredModel.label,
+              sizeBytes: fileLike?.size ?? discoveredModel.modelFile.sizeBytes ?? null,
+            };
+          } else {
+            loadedModelTask = 'generate';
+            if (fileLike) {
+              assertLocalModelFitsCurrentRuntime(fileLike);
+            }
+            const ggufSource = discoveredModel?.modelFile?.url ?? fileLike;
+            const modelProbeBytes = discoveredModel?.modelFile?.url
+              ? await readUrlProbeBytes(discoveredModel.modelFile.url, discoveredModel.modelFile.sizeBytes)
+              : await readGgufProbeBytes(fileLike);
+            setProgress(0.15, 1);
+
+            setStatus('Inferring GPT config from GGUF metadata…');
+            modelConfig = await inferenceRuntime.inferGptConfigFromGguf(modelProbeBytes);
+            setProgress(0.3, 1);
+
+            setStatus('Loading tokenizer from GGUF metadata…');
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(modelProbeBytes, { format: 'gguf' });
+            setProgress(0.45, 1);
+
+            setStatus('Inferring chat template from GGUF metadata…');
+            chatTemplate = await inferenceRuntime.inferChatTemplateFromGguf(modelProbeBytes);
+            setProgress(0.55, 1);
+
+            setStatus('Streaming GPT model from GGUF…');
+            const start = performance.now();
+            modelHandle = await inferenceRuntime.streamLoadGgufModel(ggufSource, modelConfig, {
+              onProgress: ({ loaded, total }) => setProgress(loaded, total || fileLike?.size || discoveredModel?.modelFile?.sizeBytes || 1),
+            });
+            if (discoveredModel?.projectorFile) {
+              setStatus(`Loading external projector ${basename(discoveredModel.projectorFile.path)}…`);
+              const projectorSource = discoveredModel.projectorFile.url
+                ? discoveredModel.projectorFile.url
+                : await discoveredModel.projectorFile.handle.getFile();
+              const projector = await inferenceRuntime.loadProjectorGguf(projectorSource);
+              projectorHandle = projector.handle;
+              projectorKind = projector.kind;
+            }
+            const elapsed = (performance.now() - start).toFixed(0);
+            setProgress(1, 1);
+            setStatus(`Loaded ${discoveredModel?.label ?? fileLike?.name ?? basename(discoveredModel?.modelFile?.path ?? 'model')} in ${elapsed}ms.`);
+            sourceInfo = {
+              label: discoveredModel?.label ?? fileLike?.name ?? basename(discoveredModel?.modelFile?.path ?? 'model'),
+              sizeBytes: fileLike?.size ?? discoveredModel?.modelFile?.sizeBytes ?? null,
+            };
+          }
+        } else {
+          loadedModelTask = 'generate';
+          setStatus('Inferring GPT config from GGUF URL…');
+          modelConfig = await inferenceRuntime.inferGptConfigFromGguf(modelUrl);
+          setProgress(0.2, 1);
+
+          const useStreaming = streamLoadInput.value === 'stream';
+          const start = performance.now();
+          if (useStreaming) {
+            setStatus('Streaming GGUF model and auto-loading tokenizer…');
+            modelHandle = await inferenceRuntime.streamLoadGgufModel(modelUrl, modelConfig, {
+              autoLoadTokenizer: true,
+              onProgress: ({ loaded, total }) => setProgress(loaded, total || 1),
+              onTokenizerLoaded: ({ tokenizerHandle: handle, chatTemplate: template }) => {
+                tokenizerHandle = handle;
+                chatTemplate = template ?? null;
+              },
+            });
+          } else {
+            setStatus('Loading tokenizer from GGUF URL…');
+            tokenizerHandle = await inferenceRuntime.loadTokenizer(modelUrl, { format: 'gguf' });
+            setProgress(0.45, 1);
+            setStatus('Inferring chat template from GGUF URL…');
+            chatTemplate = await inferenceRuntime.inferChatTemplateFromGguf(modelUrl);
+            setProgress(0.55, 1);
+            setStatus('Loading GPT model from GGUF URL…');
+            modelHandle = await inferenceRuntime.loadGptModel(modelUrl, modelConfig, { format: 'gguf' });
+            setProgress(1, 1);
+          }
+          const elapsed = (performance.now() - start).toFixed(0);
+          if (tokenizerHandle == null) {
+            throw new Error('Tokenizer was not loaded from the remote GGUF source');
+          }
+          setStatus(`Loaded remote GGUF in ${elapsed}ms.`);
+          sourceInfo = { label: useStreaming ? 'Remote stream' : 'Remote buffered', sizeBytes: null };
+        }
+
+        renderMetrics(sourceInfo);
+        const warnings = computeLoadWarnings({
+          task: loadedModelTask,
+          sourceInfo,
+          projectorKind,
+          projectorFilePath: discoveredModel?.projectorFile ? basename(discoveredModel.projectorFile.path) : null,
+          chatTemplate,
+        });
+        for (const warning of warnings) {
+          pushWarning(warning.title, warning.text);
+        }
+        updateActionButton();
+        refreshPromptMode();
+        unloadBtn.disabled = false;
+        generateBtn.disabled = false;
+      } catch (err) {
+        setStatus(`Load failed: ${err.message}`);
+        await unloadModel({ silent: true });
+        setProgress(0, 1);
+      } finally {
+        updateLoadAvailability();
+      }
+    }
+
+    async function unloadModel({ silent = false } = {}) {
+      if (projectorHandle != null) {
+        inferenceRuntime.unloadProjector(projectorHandle);
+        projectorHandle = null;
+        projectorKind = null;
+      }
+      if (modelHandle != null) {
+        inferenceRuntime.unloadModel(modelHandle);
+        modelHandle = null;
+      }
+      if (tokenizerHandle != null) {
+        inferenceRuntime.unloadTokenizer(tokenizerHandle);
+        tokenizerHandle = null;
+      }
+      revokeActiveModelObjectUrl();
+      modelConfig = null;
+      extractionConfig = null;
+      extractionTokenIds = null;
+      relationConfig = null;
+      modelFileBytes = null;
+      chatTemplate = null;
+      loadedModelTask = null;
+      loadedDiscoveredModel = null;
+      generationRunning = false;
+      generateBtn.disabled = true;
+      unloadBtn.disabled = true;
+      progressBar.style.width = '0%';
+      modelMetricsEl.innerHTML = '';
+      if (!silent) {
+        clearWarnings();
+        setStatus('Model unloaded.');
+        outputEl.textContent = 'The generated text will appear here.';
+        outputEl.classList.add('placeholder');
+      }
+      refreshPromptMode();
+      updateActionButton();
+    }
+
+    async function generate() {
+      if (!modelHandle || !tokenizerHandle || !modelConfig || generationRunning) return;
+      if (!inferenceReady) {
+        setStatus('Antfly Inference Web is not initialized.');
+        return;
+      }
+
+      const prompt = promptInput.value.trim();
+      if (!prompt) {
+        setStatus('Enter a prompt first.');
+        return;
+      }
+
+      generationRunning = true;
+      generateBtn.disabled = true;
+      outputEl.textContent = '';
+      outputEl.classList.remove('placeholder');
+
+      try {
+        if (loadedModelTask === 'embed') {
+          const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 512, 2048));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const tokenIds = Array.from(rawIds);
+          if (tokenIds.length === 0) {
+            throw new Error('Prompt tokenization returned no tokens');
+          }
+          const attentionMask = new Array(tokenIds.length).fill(1);
+          setStatus(`Embedding ${tokenIds.length} prompt tokens…`);
+          promptMetaEl.textContent = `Prompt tokens: ${tokenIds.length}. Running single-text embedding in direct mode.`;
+          const embedding = await Promise.resolve(inferenceRuntime.embed(modelHandle, tokenIds, attentionMask, 1, tokenIds.length));
+          const preview = Array.from(embedding.slice(0, Math.min(16, embedding.length))).map((v) => Number(v).toFixed(5));
+          outputEl.textContent = JSON.stringify({
+            mode: 'embed',
+            dimension: embedding.length,
+            preview,
+          }, null, 2);
+          setStatus(`Computed embedding with dimension ${embedding.length}.`);
+          return;
+        }
+
+        if (loadedModelTask === 'clip-embed') {
+          const maxIds = Math.max(8, Math.min(Number(modelConfig.text_config?.max_position_embeddings) || Number(modelConfig.max_position_embeddings) || 77, 256));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const tokenIds = Array.from(rawIds);
+          if (tokenIds.length === 0) {
+            throw new Error('Prompt tokenization returned no tokens');
+          }
+          setStatus(`Embedding ${tokenIds.length} prompt tokens with CLIP…`);
+          promptMetaEl.textContent = `Prompt tokens: ${tokenIds.length}. Running CLIP text embedding in direct mode.`;
+          const embedding = await Promise.resolve(inferenceRuntime.clipEmbedText(modelHandle, tokenIds, 1, tokenIds.length));
+          const preview = Array.from(embedding.slice(0, Math.min(16, embedding.length))).map((v) => Number(v).toFixed(5));
+          outputEl.textContent = JSON.stringify({
+            mode: 'clip-embed',
+            dimension: embedding.length,
+            preview,
+          }, null, 2);
+          setStatus(`Computed CLIP text embedding with dimension ${embedding.length}.`);
+          return;
+        }
+
+        if (loadedModelTask === 'extract') {
+          const labels = normalizeExtractionLabels(labelInput.value);
+          const effectiveLabels = labels.length > 0 ? labels : defaultExtractionLabels(extractionConfig);
+          if (effectiveLabels.length === 0) {
+            throw new Error('Enter at least one extraction label for GLiNER, such as person, organization, or location.');
+          }
+          const options = buildGlinerRunOptions({
+            glinerConfig: extractionConfig,
+            modelConfig,
+            tokenIds: extractionTokenIds,
+          });
+          setStatus(`Extracting entities across ${effectiveLabels.length} label(s)…`);
+          promptMetaEl.textContent = `Candidate labels: ${effectiveLabels.join(', ')}. Running GLiNER span extraction in ${currentRuntimeMode} mode.`;
+          const start = performance.now();
+          const entities = await Promise.resolve(inferenceRuntime.gliner(
+            modelHandle,
+            tokenizerHandle,
+            prompt,
+            effectiveLabels,
+            {
+              ...options,
+              onProgress: (stage) => setStatus(stage),
+            },
+          ));
+          const elapsed = performance.now() - start;
+          outputEl.textContent = JSON.stringify({
+            mode: 'extract',
+            labels: effectiveLabels,
+            entities,
+          }, null, 2);
+          setStatus(
+            `Extracted ${entities.length} entit${entities.length === 1 ? 'y' : 'ies'} across ${effectiveLabels.length} label(s) in ${elapsed.toFixed(0)}ms.`
+          );
+          return;
+        }
+
+        if (loadedModelTask === 'relations') {
+          const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 1024, 2048));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const inputIds = Array.from(rawIds);
+          if (inputIds.length === 0) {
+            throw new Error('Prompt tokenization returned no tokens');
+          }
+          const encoderMask = new Array(inputIds.length).fill(1);
+          const vocabSize = Number(modelConfig.vocab_size);
+          if (!Number.isFinite(vocabSize) || vocabSize <= 0) {
+            throw new Error('Model config does not expose a valid vocab_size');
+          }
+          const maxTokens = Math.max(1, Number(maxTokensInput.value) || relationConfig?.maxLength || 128);
+          const decoderStartTokenId = firstTokenId(modelConfig.decoder_start_token_id) ?? firstTokenId(modelConfig.bos_token_id) ?? firstTokenId(modelConfig.pad_token_id) ?? 2;
+          const eosTokenId = firstTokenId(modelConfig.eos_token_id) ?? 2;
+          setStatus(`Encoding ${inputIds.length} REBEL prompt tokens…`);
+          promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running BART/REBEL encoder-decoder relation extraction in direct mode.`;
+          const start = performance.now();
+          const encoderHidden = await Promise.resolve(inferenceRuntime.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
+          const encSeq = inputIds.length;
+          const generatedIds = [decoderStartTokenId];
+          const outputIds = [];
+          for (let step = 0; step < maxTokens; step++) {
+            const logits = await Promise.resolve(inferenceRuntime.florenceDecode(
+              modelHandle,
+              generatedIds,
+              encoderHidden,
+              encoderMask,
+              1,
+              generatedIds.length,
+              encSeq,
+            ));
+            const lastTokenOffset = (generatedIds.length - 1) * vocabSize;
+            let nextToken = 0;
+            let maxLogit = logits[lastTokenOffset];
+            for (let i = 1; i < vocabSize; i++) {
+              const value = logits[lastTokenOffset + i];
+              if (value > maxLogit) {
+                maxLogit = value;
+                nextToken = i;
+              }
+            }
+            if (nextToken === eosTokenId) break;
+            generatedIds.push(nextToken);
+            outputIds.push(nextToken);
+            outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, outputIds);
+            setStatus(`Extracting relations… ${step + 1}/${maxTokens} tokens`);
+          }
+
+          const generatedText = outputIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, outputIds) : '';
+          const triplets = parseRebelTriplets(generatedText, relationConfig ?? defaultRebelConfig());
+          const relationOutput = tripletsToRelationOutput(prompt, triplets);
+          const elapsed = performance.now() - start;
+          outputEl.textContent = JSON.stringify({
+            mode: 'relations',
+            generatedText,
+            triplets,
+            ...relationOutput,
+          }, null, 2);
+          setStatus(
+            `Extracted ${relationOutput.relations.length} relation${relationOutput.relations.length === 1 ? '' : 's'} from ${triplets.length} triplet${triplets.length === 1 ? '' : 's'} in ${elapsed.toFixed(0)}ms.`
+          );
+          return;
+        }
+
+        if (loadedModelTask === 'transcribe') {
+          const audioFile = audioInput.files?.[0] ?? null;
+          if (!audioFile) {
+            throw new Error('Select an audio clip to transcribe.');
+          }
+          setStatus(`Preprocessing audio ${audioFile.name} for Whisper…`);
+          const mel = await inferenceRuntime.preprocessWhisperAudio(audioFile);
+          const nMels = Number(mel.nMels);
+          const timeSteps = Number(mel.nFrames);
+          if (!Number.isFinite(nMels) || !Number.isFinite(timeSteps) || nMels <= 0 || timeSteps <= 0) {
+            throw new Error('Whisper audio preprocessing returned invalid dimensions');
+          }
+
+          setStatus(`Encoding ${timeSteps} Whisper mel frames…`);
+          promptMetaEl.textContent = `Audio frames: ${timeSteps}. Running Whisper encoder-decoder transcription in direct mode.`;
+          const start = performance.now();
+          const encoderHidden = await Promise.resolve(inferenceRuntime.whisperEncode(modelHandle, mel.data, 1, timeSteps));
+          const dModel = Number(modelConfig.d_model ?? modelConfig.hidden_size ?? 0);
+          if (!Number.isFinite(dModel) || dModel <= 0) {
+            throw new Error('Whisper config does not expose a valid d_model');
+          }
+          const encSeq = Math.floor(encoderHidden.length / dModel);
+          if (!Number.isFinite(encSeq) || encSeq <= 0) {
+            throw new Error('Whisper encoder returned an unexpected hidden-state shape');
+          }
+          const encoderMask = new Array(encSeq).fill(1);
+          const maxTokens = Math.max(1, Number(maxTokensInput.value) || 96);
+          const decoderStartTokenId = firstTokenId(modelConfig.decoder_start_token_id) ?? firstTokenId(modelConfig.bos_token_id) ?? firstTokenId(modelConfig.pad_token_id) ?? 0;
+          const eosTokenId = firstTokenId(modelConfig.eos_token_id) ?? 1;
+          const vocabSize = Number(modelConfig.vocab_size);
+          if (!Number.isFinite(vocabSize) || vocabSize <= 0) {
+            throw new Error('Whisper config does not expose a valid vocab_size');
+          }
+
+          const tokens = [decoderStartTokenId];
+          const generatedIds = [];
+          for (let step = 0; step < maxTokens; step++) {
+            const logits = await Promise.resolve(inferenceRuntime.whisperDecode(
+              modelHandle,
+              tokens,
+              encoderHidden,
+              encoderMask,
+              1,
+              tokens.length,
+              encSeq,
+            ));
+            const lastTokenOffset = (tokens.length - 1) * vocabSize;
+            let nextToken = 0;
+            let maxLogit = logits[lastTokenOffset];
+            for (let i = 1; i < vocabSize; i++) {
+              const value = logits[lastTokenOffset + i];
+              if (value > maxLogit) {
+                maxLogit = value;
+                nextToken = i;
+              }
+            }
+            if (nextToken === eosTokenId) break;
+            tokens.push(nextToken);
+            generatedIds.push(nextToken);
+            outputEl.textContent = generatedIds.length > 0
+              ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds)
+              : '[No text generated yet]';
+            setStatus(`Transcribing… ${step + 1}/${maxTokens} tokens`);
+          }
+
+          const elapsed = performance.now() - start;
+          const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
+          outputEl.textContent = finalText || '[No text generated before EOS]';
+          setStatus(
+            `Transcribed ${generatedIds.length} tokens from ${audioFile.name} in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
+          );
+          return;
+        }
+
+        if (loadedModelTask === 'seq2seq') {
+          if (String(modelConfig?.model_type ?? '').toLowerCase() === 'bart') {
+            const maxIds = Math.max(8, Math.min(Number(modelConfig.max_position_embeddings) || 1024, 2048));
+            const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+            const inputIds = Array.from(rawIds);
+            if (inputIds.length === 0) {
+              throw new Error('Prompt tokenization returned no tokens');
+            }
+            const encoderMask = new Array(inputIds.length).fill(1);
+            const vocabSize = Number(modelConfig.vocab_size);
+            if (!Number.isFinite(vocabSize) || vocabSize <= 0) {
+              throw new Error('Model config does not expose a valid vocab_size');
+            }
+            const maxTokens = Math.max(1, Number(maxTokensInput.value) || 96);
+            const decoderStartTokenId = firstTokenId(modelConfig.decoder_start_token_id) ?? firstTokenId(modelConfig.bos_token_id) ?? firstTokenId(modelConfig.pad_token_id) ?? 2;
+            const eosTokenId = firstTokenId(modelConfig.eos_token_id) ?? 2;
+            setStatus(`Encoding ${inputIds.length} BART prompt tokens…`);
+            promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running BART-style encoder-decoder generation in direct mode.`;
+            const start = performance.now();
+            const encoderHidden = await Promise.resolve(inferenceRuntime.florenceEncodeText(modelHandle, inputIds, 1, inputIds.length));
+            const encSeq = inputIds.length;
+            const generatedIds = [decoderStartTokenId];
+            const outputIds = [];
+            for (let step = 0; step < maxTokens; step++) {
+              const logits = await Promise.resolve(inferenceRuntime.florenceDecode(
+                modelHandle,
+                generatedIds,
+                encoderHidden,
+                encoderMask,
+                1,
+                generatedIds.length,
+                encSeq,
+              ));
+              const lastTokenOffset = (generatedIds.length - 1) * vocabSize;
+              let nextToken = 0;
+              let maxLogit = logits[lastTokenOffset];
+              for (let i = 1; i < vocabSize; i++) {
+                const value = logits[lastTokenOffset + i];
+                if (value > maxLogit) {
+                  maxLogit = value;
+                  nextToken = i;
+                }
+              }
+              if (nextToken === eosTokenId) break;
+              generatedIds.push(nextToken);
+              outputIds.push(nextToken);
+              outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, outputIds);
+              setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
+            }
+            const elapsed = performance.now() - start;
+            const finalText = outputIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, outputIds) : '';
+            outputEl.textContent = finalText || '[No text generated before EOS]';
+            setStatus(
+              `Generated ${outputIds.length} seq2seq tokens in ${elapsed.toFixed(0)}ms (${outputIds.length > 0 ? (elapsed / outputIds.length).toFixed(1) : '0.0'} ms/token).`
+            );
+            return;
+          }
+
+          const maxIds = Math.max(8, Math.min(Number(modelConfig.n_positions) || Number(modelConfig.max_position_embeddings) || 512, 2048));
+          const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, prompt, maxIds));
+          const inputIds = Array.from(rawIds);
+          if (inputIds.length === 0) {
+            throw new Error('Prompt tokenization returned no tokens');
+          }
+          const attentionMask = new Array(inputIds.length).fill(1);
+          const vocabSize = Number(modelConfig.vocab_size);
+          if (!Number.isFinite(vocabSize) || vocabSize <= 0) {
+            throw new Error('Model config does not expose a valid vocab_size');
+          }
+          const maxTokens = Math.max(1, Number(maxTokensInput.value) || 96);
+          const temperature = Math.max(0, Number(temperatureInput.value) || 0);
+          const topK = Math.max(0, Number(topKInput.value) || 0);
+          const topP = Math.max(0, Number(topPInput.value) || 0);
+          const decoderStartTokenId = firstTokenId(modelConfig.decoder_start_token_id) ?? firstTokenId(modelConfig.pad_token_id) ?? 0;
+          const eosTokenId = firstTokenId(modelConfig.eos_token_id) ?? 1;
+          const generatedIds = [];
+          setStatus(`Generating seq2seq output from ${inputIds.length} prompt tokens…`);
+          promptMetaEl.textContent = `Prompt tokens: ${inputIds.length}. Running T5-style encoder-decoder generation in direct mode.`;
+          const start = performance.now();
+          const outputIds = inferenceRuntime.t5Generate(modelHandle, vocabSize, inputIds, attentionMask, {
+            maxTokens,
+            decoderStartTokenId,
+            eosTokenId,
+            temperature,
+            topK,
+            topP,
+            onToken: (tokenId, step) => {
+              generatedIds.push(tokenId);
+              outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
+              setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
+            },
+          });
+          const elapsed = performance.now() - start;
+          const finalIds = outputIds.length > 0 ? outputIds : generatedIds;
+          const finalText = finalIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, finalIds) : '';
+          outputEl.textContent = finalText || '[No text generated before EOS]';
+          setStatus(
+            `Generated ${finalIds.length} seq2seq tokens in ${elapsed.toFixed(0)}ms (${finalIds.length > 0 ? (elapsed / finalIds.length).toFixed(1) : '0.0'} ms/token).`
+          );
+          return;
+        }
+
+        if (loadedModelTask === 'generate' && supportsBrowserMultimodal(loadedModelTask, modelConfig, projectorKind) && (((imageInput.files?.length ?? 0) > 0) || ((audioInput.files?.length ?? 0) > 0))) {
+          const useTemplate = !!chatTemplate && useChatTemplateInput.checked;
+          const renderedPrompt = useTemplate
+            ? await inferenceRuntime.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
+                systemPrompt: systemPromptInput.value.trim(),
+                addGenerationPrompt: true,
+              })
+            : prompt;
+          const vocabSize = modelConfig.vocab_size;
+          if (typeof vocabSize !== 'number' || vocabSize <= 0) {
+            throw new Error('Model config does not expose a valid vocab_size');
+          }
+          const maxTokens = Math.max(1, Number(maxTokensInput.value) || 96);
+          const temperature = Math.max(0, Number(temperatureInput.value) || 0);
+          const topK = Math.max(0, Number(topKInput.value) || 0);
+          const topP = Math.max(0, Number(topPInput.value) || 0);
+          const eosTokenId = firstTokenId(modelConfig.eos_token_id);
+
+          if (hasExternalProjector()) {
+            if (isGemma3Projector()) {
+              const imageBitmaps = await loadSelectedImages();
+              try {
+                if ((audioInput.files?.length ?? 0) > 0) {
+                  throw new Error('The external Gemma 3 browser path does not support audio inputs yet.');
+                }
+                const expandedPrompt = buildExpandedMultimodalPrompt(renderedPrompt, modelConfig, imageBitmaps.length);
+                const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+                const promptIds = Array.from(rawIds);
+                const imageOffsets = imageOffsetsFromExpandedTokenIds(promptIds, modelConfig, imageBitmaps.length);
+                const imageSize = Number(modelConfig?.vision_config?.image_size ?? modelConfig?.vision_image_size ?? 0);
+                if (imageSize <= 0) {
+                  throw new Error('Multimodal config does not expose a valid vision image_size');
+                }
+                const imageTensors = imageBitmaps.map((bitmap) => inferenceRuntime.preprocessImageBrowser(bitmap, imageSize));
+                const channels = 3 * imageSize * imageSize;
+                const pixelValues = new Float32Array(imageTensors.length * channels);
+                for (let i = 0; i < imageTensors.length; i++) {
+                  pixelValues.set(imageTensors[i], i * channels);
+                }
+                setStatus(`Encoding ${imageBitmaps.length} image(s) through the external Gemma 3 projector…`);
+                const imageEmbeddings = inferenceRuntime.gptProjectorVisionEncode(modelHandle, projectorHandle, pixelValues, imageBitmaps.length);
+                const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
+                const generatedIds = [];
+                const start = performance.now();
+                promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running external-projector Gemma 3 multimodal GPT prefill with ${imageBitmaps.length} image(s).`;
+                await inferenceRuntime.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
+                  maxTokens,
+                  maxLen,
+                  temperature,
+                  topK,
+                  topP,
+                  eosTokenId,
+                  onToken: (tokenId, step) => {
+                    generatedIds.push(tokenId);
+                    outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
+                    setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
+                  },
+                });
+                const elapsed = performance.now() - start;
+                const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
+                outputEl.textContent = finalText || '[No text generated before EOS]';
+                setStatus(
+                  `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
+                );
+                return;
+              } finally {
+                releaseImageBitmaps(imageBitmaps);
+              }
+            }
+
+            if (isGemma4ImageProjector() || isGemma4AudioProjector()) {
+              const imageBytes = await loadSelectedImageBytes();
+              const audioBytes = await loadSelectedAudioBytes();
+              if (imageBytes.length > 1) {
+                throw new Error('The current external Gemma 4 browser path supports one selected image at a time.');
+              }
+              if (audioBytes.length > 1) {
+                throw new Error('The current external Gemma 4 browser path supports one selected audio clip at a time.');
+              }
+              let imageEmbeddings = new Float32Array(0);
+              let tokensPerImage = [];
+              let audioEmbeddings = new Float32Array(0);
+              let tokensPerAudio = [];
+              if (imageBytes.length > 0) {
+                setStatus('Encoding the selected image through the external Gemma 4 projector…');
+                const encodedImage = inferenceRuntime.gptProjectorImageEncode(projectorHandle, imageBytes[0]);
+                imageEmbeddings = encodedImage.embeddings;
+                tokensPerImage = encodedImage.tokensPerImage;
+              }
+              if (audioBytes.length > 0) {
+                setStatus('Encoding the selected audio clip through the external Gemma 4 projector…');
+                const encodedAudio = inferenceRuntime.gptProjectorAudioEncode(projectorHandle, audioBytes[0]);
+                audioEmbeddings = encodedAudio.embeddings;
+                tokensPerAudio = encodedAudio.tokensPerAudio;
+              }
+              if (tokensPerImage.length === 0 && tokensPerAudio.length === 0) {
+                throw new Error('Select an image or audio file for external Gemma 4 multimodal generation.');
+              }
+              const expandedPrompt = buildExpandedGemma4MultimodalPrompt(renderedPrompt, tokensPerImage, tokensPerAudio);
+              const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+              const promptIds = Array.from(rawIds);
+              const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
+              const generatedIds = [];
+              const start = performance.now();
+              promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running external-projector Gemma 4 multimodal GPT prefill${tokensPerImage.length > 0 && tokensPerAudio.length > 0 ? ' with image + audio' : tokensPerImage.length > 0 ? ' with image' : ' with audio'}.`;
+              await inferenceRuntime.gptGenerateMultimodalGemma4(modelHandle, tokenizerHandle, vocabSize, promptIds, imageEmbeddings, tokensPerImage, audioEmbeddings, tokensPerAudio, {
+                maxTokens,
+                maxLen,
+                temperature,
+                topK,
+                topP,
+                eosTokenId,
+                onToken: (tokenId, step) => {
+                  generatedIds.push(tokenId);
+                  outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
+                  setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
+                },
+              });
+              const elapsed = performance.now() - start;
+              const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
+              outputEl.textContent = finalText || '[No text generated before EOS]';
+              setStatus(
+                `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
+              );
+              return;
+            }
+
+            throw new Error(`External projector kind ${projectorKind} is not wired into the page yet.`);
+          }
+
+          if (!hasExternalProjector() && (audioInput.files?.length ?? 0) > 0) {
+            throw new Error('The integrated browser multimodal path does not support audio inputs yet.');
+          }
+
+          const imageBitmaps = await loadSelectedImages();
+          try {
+            const expandedPrompt = buildExpandedMultimodalPrompt(renderedPrompt, modelConfig, imageBitmaps.length);
+            const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, expandedPrompt, 8192));
+            const promptIds = Array.from(rawIds);
+            const imageOffsets = imageOffsetsFromExpandedTokenIds(promptIds, modelConfig, imageBitmaps.length);
+            const imageSize = Number(modelConfig?.vision_config?.image_size ?? modelConfig?.vision_image_size ?? 0);
+            if (imageSize <= 0) {
+              throw new Error('Multimodal config does not expose a valid vision image_size');
+            }
+            const imageTensors = imageBitmaps.map((bitmap) => inferenceRuntime.preprocessImageBrowser(bitmap, imageSize));
+            const channels = 3 * imageSize * imageSize;
+            const pixelValues = new Float32Array(imageTensors.length * channels);
+            for (let i = 0; i < imageTensors.length; i++) {
+              pixelValues.set(imageTensors[i], i * channels);
+            }
+            setStatus(`Encoding ${imageBitmaps.length} image(s) for multimodal generation…`);
+            const imageEmbeddings = inferenceRuntime.gptVisionEncode(modelHandle, pixelValues, imageBitmaps.length);
+            const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
+            const generatedIds = [];
+            const start = performance.now();
+            promptMetaEl.textContent = `Prompt tokens: ${promptIds.length}. Running integrated multimodal GPT prefill with ${imageBitmaps.length} image(s).`;
+            await inferenceRuntime.gptGenerateMultimodal(modelHandle, vocabSize, promptIds, imageEmbeddings, imageOffsets, {
+              maxTokens,
+              maxLen,
+              temperature,
+              topK,
+              topP,
+              eosTokenId,
+              onToken: (tokenId, step) => {
+                generatedIds.push(tokenId);
+                outputEl.textContent = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
+                setStatus(`Generating multimodal response… ${step + 1}/${maxTokens} tokens`);
+              },
+            });
+            const elapsed = performance.now() - start;
+            const finalText = generatedIds.length > 0 ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds) : '';
+            outputEl.textContent = finalText || '[No text generated before EOS]';
+            setStatus(
+              `Generated ${generatedIds.length} multimodal tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
+            );
+            return;
+          } finally {
+            releaseImageBitmaps(imageBitmaps);
+          }
+        }
+
+        const useTemplate = !!chatTemplate && useChatTemplateInput.checked;
+        const renderedPrompt = useTemplate
+          ? await inferenceRuntime.renderChatPrompt(tokenizerHandle, chatTemplate, prompt, {
+              systemPrompt: systemPromptInput.value.trim(),
+              addGenerationPrompt: true,
+            })
+          : prompt;
+        const rawIds = await Promise.resolve(inferenceRuntime.tokenizeRaw(tokenizerHandle, renderedPrompt, 4096));
+        const promptIds = Array.from(rawIds);
+        const bosTokenId = firstTokenId(modelConfig.bos_token_id);
+        const eosTokenId = firstTokenId(modelConfig.eos_token_id);
+        const vocabSize = modelConfig.vocab_size;
+        if (typeof vocabSize !== 'number' || vocabSize <= 0) {
+          throw new Error('Model config does not expose a valid vocab_size');
+        }
+
+        if (typeof bosTokenId === 'number' && promptIds[0] !== bosTokenId) {
+          promptIds.unshift(bosTokenId);
+        }
+
+        if (promptIds.length === 0) {
+          throw new Error('Prompt tokenization returned no tokens');
+        }
+
+        const maxTokens = Math.max(1, Number(maxTokensInput.value) || 96);
+        const temperature = Math.max(0, Number(temperatureInput.value) || 0);
+        const topK = Math.max(0, Number(topKInput.value) || 0);
+        const topP = Math.max(0, Number(topPInput.value) || 0);
+        const maxLen = Math.max(promptIds.length + maxTokens + 8, modelConfig.max_position_embeddings ?? 0, 2048);
+        const generatedIds = [];
+        const start = performance.now();
+
+        setStatus(`Generating from ${promptIds.length} prompt tokens…`);
+        promptMetaEl.textContent = useTemplate
+          ? `Prompt tokens: ${promptIds.length}. Rendered through the available chat template with GPT KV-cache generation in direct mode.`
+          : `Prompt tokens: ${promptIds.length}. Raw prompt mode with GPT KV-cache generation in direct mode.`;
+
+        await inferenceRuntime.gptGenerateCached(modelHandle, vocabSize, promptIds, {
+          maxTokens,
+          maxLen,
+          temperature,
+          topK,
+          topP,
+          eosTokenId,
+          onToken: (tokenId, step) => {
+            generatedIds.push(tokenId);
+            const text = inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds);
+            outputEl.textContent = text;
+            setStatus(`Generating… ${step + 1}/${maxTokens} tokens`);
+          },
+        });
+
+        const elapsed = performance.now() - start;
+        const finalText = generatedIds.length > 0
+          ? inferenceRuntime.decodeTokens(tokenizerHandle, generatedIds)
+          : '';
+        outputEl.textContent = finalText || '[No text generated before EOS]';
+        setStatus(
+          `Generated ${generatedIds.length} tokens in ${elapsed.toFixed(0)}ms (${generatedIds.length > 0 ? (elapsed / generatedIds.length).toFixed(1) : '0.0'} ms/token).`
+        );
+      } catch (err) {
+        setStatus(`Generation failed: ${err.message}`);
+      } finally {
+        generationRunning = false;
+        generateBtn.disabled = modelHandle == null || tokenizerHandle == null;
+      }
+    }
+
+    async function init() {
+      try {
+        inferenceReady = false;
+        let gpuOps = null;
+        let webgpuNote = null;
+        let workerMode = false;
+        if (navigator.gpu) {
+          try {
+            const { WebGPUOps } = await import(`./webgpu-ops.js?v=${MODULE_CACHE_BUST}`);
+            gpuOps = new WebGPUOps();
+            if (!await gpuOps.init()) {
+              webgpuNote = gpuOps.lastInitError ?? 'WebGPU init returned unavailable';
+              gpuOps = null;
+            }
+          } catch (err) {
+            webgpuNote = err?.message ?? String(err);
+            gpuOps = null;
+          }
+        } else {
+          webgpuNote = 'navigator.gpu is unavailable in this browser context';
+        }
+
+        if (gpuOps) {
+          if (workerModeSupported()) {
+            workerMode = true;
+          } else {
+            webgpuNote = webgpuNote
+              ? `${webgpuNote}; worker mode unavailable without cross-origin isolation (COOP/COEP)`
+              : 'worker mode unavailable without cross-origin isolation (COOP/COEP)';
+          }
+        }
+
+        await inferenceRuntime.init(undefined, {
+          gpu: gpuOps,
+          worker: workerMode,
+          workerUrl: new URL(`./inference-worker.js?v=${MODULE_CACHE_BUST}`, location.href),
+        });
+        currentRuntimeMode = workerMode ? 'worker' : 'direct';
+        inferenceReady = true;
+        runtimeHintEl.textContent = `Runtime: initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMemoryModel() ?? 'unknown ABI'}, ${currentRuntimeMode}${webgpuNote ? `; ${gpuOps ? 'WebGPU note' : 'WebGPU fallback'}: ${webgpuNote}` : ''}).`;
+        if (hasElectronBridge()) {
+          pickerHintEl.textContent = 'Electron can scan the default ~/.antfly/inference/models directory directly, or let you choose another local models directory.';
+          try {
+            const defaultDir = await window.antflyInferenceElectron.getDefaultModelsDirectory();
+            await scanElectronModelsDirectory(defaultDir);
+            if (discoveredModels.length > 0) {
+              setStatus(`Initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMode}). Discovered ${discoveredModels.length} local model bundle${discoveredModels.length === 1 ? '' : 's'} under ~/.antfly/inference/models.`);
+            }
+          } catch (err) {
+            pickerHintEl.textContent = `Electron is available, but automatic ~/.antfly/inference/models scanning failed: ${err.message}`;
+          }
+        } else if (!hasDirectoryPicker()) {
+          pickerHintEl.textContent = 'This browser does not support the File System Access directory picker. Use the single GGUF file picker, or switch to a Chrome-class browser for directory-based model discovery.';
+          pickDirBtn.disabled = true;
+        }
+        setStatus(`Initialized (${gpuOps ? 'WASM + WebGPU' : 'WASM SIMD'}, ${currentRuntimeMode}${webgpuNote ? `; ${gpuOps ? 'WebGPU note' : 'WebGPU fallback'}: ${webgpuNote}` : ''}). Choose a local model bundle or remote GGUF URL to load.`);
+        updateLoadAvailability();
+        refreshPromptMode();
+        updateActionButton();
+      } catch (err) {
+        inferenceReady = false;
+        runtimeHintEl.textContent = `Runtime: initialization failed: ${err.message}`;
+        setStatus(`Initialization failed: ${err.message}`);
+        updateLoadAvailability();
+        updateActionButton();
+      }
+    }
+
+    modelFileInput.addEventListener('change', updateLoadAvailability);
+    imageInput.addEventListener('change', refreshPromptMode);
+    audioInput.addEventListener('change', refreshPromptMode);
+    discoveredModelInput.addEventListener('change', updateLoadAvailability);
+    modelUrlInput.addEventListener('input', updateLoadAvailability);
+    pickDirBtn.addEventListener('click', pickModelsDirectory);
+    sourceModeInput.addEventListener('change', updateLoadAvailability);
+    useChatTemplateInput.addEventListener('change', refreshPromptMode);
+    loadBtn.addEventListener('click', loadModel);
+    unloadBtn.addEventListener('click', () => unloadModel());
+    generateBtn.addEventListener('click', generate);
+
+    init();
+  </script>
+</body>
+</html>

@@ -250,7 +250,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
               <select
                 value={selectedSchemaType}
                 onChange={(e) => setSelectedSchemaType(e.target.value)}
-                className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+                className="rounded-none border border-input bg-background px-3 py-2 text-sm"
               >
                 <option value="">Select a document type</option>
                 {Object.keys(schema.document_schemas).map((schemaName) => (

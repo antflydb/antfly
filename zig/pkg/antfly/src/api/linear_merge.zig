@@ -17,6 +17,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
+const public_limits = @import("public_limits.zig");
 
 pub const OwnedLinearMergeRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
@@ -36,13 +37,18 @@ pub const OwnedLinearMergeRequest = struct {
 };
 
 pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMergeRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{
+        .max_value_len = public_limits.max_json_value_len,
+    }) catch |err| switch (err) {
+        error.ValueTooLong => return error.ValueTooLong,
+        else => return error.InvalidLinearMergeRequest,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidLinearMergeRequest;
 
     const root = parsed.value.object;
     const records_value = root.get("records") orelse return error.InvalidLinearMergeRequest;
-    if (records_value != .object or records_value.object.count() == 0) return error.InvalidLinearMergeRequest;
+    if (records_value != .object) return error.InvalidLinearMergeRequest;
 
     const writes = try alloc.alloc(db_mod.types.BatchWrite, records_value.object.count());
     var initialized: usize = 0;
@@ -81,6 +87,8 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
         try parseSyncLevel(value)
     else
         db_mod.types.SyncLevel.write;
+
+    if (writes.len == 0 and last_merged_id.len == 0) return error.InvalidLinearMergeRequest;
 
     for (writes) |write| {
         if (last_merged_id.len > 0 and !std.mem.lessThan(u8, last_merged_id, write.key)) {
@@ -129,8 +137,6 @@ pub fn executeResponse(
     table_name: []const u8,
     req: OwnedLinearMergeRequest,
 ) !Response {
-    if (req.writes.len == 0) return error.InvalidLinearMergeRequest;
-
     var request_keys = std.StringHashMapUnmanaged(void){};
     defer request_keys.deinit(alloc);
     for (req.writes) |write| try request_keys.put(alloc, write.key, {});
@@ -153,12 +159,12 @@ pub fn executeResponse(
         }
     }
 
-    const next_cursor = req.writes[req.writes.len - 1].key;
+    const next_cursor = if (req.writes.len > 0) req.writes[req.writes.len - 1].key else req.last_merged_id;
     var scanned = (try reads.scan(
         alloc,
         table_name,
         req.last_merged_id,
-        next_cursor,
+        if (req.writes.len > 0) next_cursor else "",
         .{
             .inclusive_from = false,
             .exclusive_to = false,
@@ -334,6 +340,43 @@ test "linear merge request parser sorts keys and accepts sync level aliases" {
     try std.testing.expectEqualStrings("doc:a", req.writes[0].key);
     try std.testing.expectEqualStrings("doc:b", req.writes[1].key);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, req.sync_level);
+}
+
+test "linear merge request parser accepts raw payload value under public request cap" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"records\":{\"doc:a\":{\"raw_payload\":\"");
+    try writer.writeAll(payload);
+    try writer.writeAll("\"}}}");
+
+    var req = try parseRequest(alloc, out.written());
+    defer req.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+    try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "linear merge request parser accepts explicit final cleanup" {
+    var req = try parseRequest(std.testing.allocator,
+        \\{"records":{},"last_merged_id":"doc:z","sync_level":"write"}
+    );
+    defer req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+    try std.testing.expectEqualStrings("doc:z", req.last_merged_id);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+}
+
+test "linear merge request parser rejects unbounded empty cleanup" {
+    try std.testing.expectError(error.InvalidLinearMergeRequest, parseRequest(std.testing.allocator,
+        \\{"records":{},"sync_level":"write"}
+    ));
 }
 
 test "linear merge equality ignores system timestamp" {

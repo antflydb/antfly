@@ -24,11 +24,6 @@ func NewChunkerConfig(config any) (*ChunkerConfig, error) {
 	chunkerConfig := &ChunkerConfig{}
 
 	switch v := config.(type) {
-	case TermiteChunkerConfig:
-		provider = ChunkerProviderTermite
-		if err := chunkerConfig.FromTermiteChunkerConfig(v); err != nil {
-			return nil, fmt.Errorf("failed to convert Termite chunker config: %w", err)
-		}
 	case AntflyChunkerConfig:
 		provider = ChunkerProviderAntfly
 		if err := chunkerConfig.FromAntflyChunkerConfig(v); err != nil {
@@ -47,8 +42,6 @@ func NewChunkerConfig(config any) (*ChunkerConfig, error) {
 // the provider-specific configuration.
 func GetProviderConfig(config ChunkerConfig) (any, error) {
 	switch config.Provider {
-	case ChunkerProviderTermite:
-		return config.AsTermiteChunkerConfig()
 	case ChunkerProviderAntfly:
 		return config.AsAntflyChunkerConfig()
 	case ChunkerProviderMock:

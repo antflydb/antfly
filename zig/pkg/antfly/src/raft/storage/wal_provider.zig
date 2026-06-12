@@ -27,6 +27,19 @@ pub const WalReplicaProviderConfig = struct {
 };
 
 pub const WalReplicaProvider = struct {
+    pub const Diagnostics = struct {
+        groups: usize = 0,
+        entries: usize = 0,
+        entry_capacity: usize = 0,
+        entry_payload_bytes: usize = 0,
+        estimated_bytes: usize = 0,
+        max_entries_per_group: usize = 0,
+        min_first_index: raft_engine.core.types.Index = 0,
+        max_last_index: raft_engine.core.types.Index = 0,
+        max_snapshot_index: raft_engine.core.types.Index = 0,
+        storage_compactions: u64 = 0,
+    };
+
     alloc: std.mem.Allocator,
     cfg: WalReplicaProviderConfig,
     root_dir: []u8,
@@ -95,6 +108,25 @@ pub const WalReplicaProvider = struct {
 
     pub fn stateForGroup(self: *WalReplicaProvider, group_id: u64) ?*wal_replica_state.WalReplicaState {
         return self.states.get(group_id);
+    }
+
+    pub fn diagnostics(self: *const WalReplicaProvider) Diagnostics {
+        var out = Diagnostics{ .groups = self.states.count() };
+        var it = self.states.valueIterator();
+        while (it.next()) |state_ptr| {
+            const state = state_ptr.*;
+            const storage = state.store.diagnostics();
+            out.entries += storage.entries;
+            out.entry_capacity += storage.entry_capacity;
+            out.entry_payload_bytes += storage.entry_payload_bytes;
+            out.estimated_bytes += storage.estimated_bytes;
+            out.max_entries_per_group = @max(out.max_entries_per_group, storage.entries);
+            out.max_last_index = @max(out.max_last_index, storage.last_index);
+            out.max_snapshot_index = @max(out.max_snapshot_index, storage.snapshot_index);
+            if (out.min_first_index == 0 or storage.first_index < out.min_first_index) out.min_first_index = storage.first_index;
+            out.storage_compactions += state.statsSnapshot().storage_compactions;
+        }
+        return out;
     }
 
     fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {

@@ -1336,7 +1336,7 @@ func (i *EmbeddingIndex) LeaderFactory(
 	if i.embedderConf != nil {
 		i.logger.Info("Creating enricher for index v2", zap.String("name", i.name), zap.Any("config", i.embedderConf), zap.Any("summarizerConfig", i.summarizerConf))
 
-		// Use chunking config directly - respects the Provider field (antfly vs termite)
+		// Use chunking config directly and respect the Provider field.
 		var chunkingConfig *chunking.ChunkerConfig
 		if i.conf.Chunker != nil {
 			chunkingConfig = i.conf.Chunker

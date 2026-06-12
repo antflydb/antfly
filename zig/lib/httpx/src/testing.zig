@@ -37,11 +37,31 @@ pub const ResponseSpec = struct {
     content_type: ?[]const u8 = null,
 };
 
+pub const HeaderPair = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const RequestInfo = struct {
+    method: types.Method,
+    path: []const u8,
+    headers: []const HeaderPair,
+    body: []const u8,
+
+    pub fn header(self: RequestInfo, name: []const u8) ?[]const u8 {
+        for (self.headers) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+        }
+        return null;
+    }
+};
+
 /// A canned route: matches method + path, returns a fixed response.
 pub const Route = struct {
     method: types.Method = .GET,
     path: []const u8,
     respond: ResponseSpec = .{},
+    assert_request: ?*const fn (RequestInfo) anyerror!void = null,
 };
 
 /// A lightweight test server that listens on an ephemeral port and
@@ -126,7 +146,8 @@ pub const TestServer = struct {
 
         if (total == 0) return error.EmptyRequest;
 
-        const req_data = buf[0..total];
+        var req_data = buf[0..total];
+        const header_end = mem.indexOf(u8, req_data, "\r\n\r\n") orelse return error.MalformedRequest;
 
         // Parse request line: "METHOD /path HTTP/1.1\r\n"
         const first_line_end = mem.indexOf(u8, req_data, "\r\n") orelse return error.MalformedRequest;
@@ -141,6 +162,28 @@ pub const TestServer = struct {
 
         const method = parseMethod(method_str) orelse return error.UnknownMethod;
 
+        var headers = std.ArrayList(HeaderPair).empty;
+        defer headers.deinit(self.allocator);
+        var line_it = mem.splitSequence(u8, req_data[first_line_end + 2 .. header_end], "\r\n");
+        while (line_it.next()) |line| {
+            if (line.len == 0) continue;
+            const colon = mem.indexOf(u8, line, ":") orelse continue;
+            try headers.append(self.allocator, .{
+                .name = mem.trim(u8, line[0..colon], " \t"),
+                .value = mem.trim(u8, line[colon + 1 ..], " \t"),
+            });
+        }
+        const body_start = header_end + 4;
+        const content_length = contentLength(headers.items);
+        while (total < body_start + content_length and total < buf.len) {
+            const reader = sock.reader();
+            const n = reader.read(buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+        req_data = buf[0..total];
+        const body = if (body_start <= req_data.len) req_data[body_start..] else "";
+
         // Find matching route.
         var matched: ?*const Route = null;
         for (self.routes) |*r| {
@@ -151,6 +194,14 @@ pub const TestServer = struct {
         }
 
         if (matched) |route| {
+            if (route.assert_request) |assert_request| {
+                try assert_request(.{
+                    .method = method,
+                    .path = path,
+                    .headers = headers.items,
+                    .body = body,
+                });
+            }
             try writeResponse(self.allocator, &sock, route.respond);
         } else {
             try writeResponse(self.allocator, &sock, .{ .status = 404, .body = "not found" });
@@ -188,6 +239,14 @@ pub const TestServer = struct {
         if (mem.eql(u8, s, "HEAD")) return .HEAD;
         if (mem.eql(u8, s, "OPTIONS")) return .OPTIONS;
         return null;
+    }
+
+    fn contentLength(headers: []const HeaderPair) usize {
+        for (headers) |entry| {
+            if (!std.ascii.eqlIgnoreCase(entry.name, "Content-Length")) continue;
+            return std.fmt.parseUnsigned(usize, entry.value, 10) catch 0;
+        }
+        return 0;
     }
 
     fn statusReason(code: u16) []const u8 {

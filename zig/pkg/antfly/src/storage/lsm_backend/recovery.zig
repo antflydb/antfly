@@ -20,46 +20,151 @@ const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
 
+fn openDebugLogsEnabled() bool {
+    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+}
+
+fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
+    if (@hasDecl(BackendType, "beginOpenPhase")) return backend.beginOpenPhase(phase);
+    return 0;
+}
+
+fn finishOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype, start_ns: u64) void {
+    if (@hasDecl(BackendType, "finishOpenPhase")) backend.finishOpenPhase(phase, start_ns);
+}
+
+fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, loaded_manifest: bool) void {
+    if (@hasDecl(BackendType, "recordOpenManifestLoaded")) backend.recordOpenManifestLoaded(loaded_manifest);
+}
+
+fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
+}
+
+fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenSuccess")) backend.finishOpenSuccess();
+}
+
+fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenFailure")) backend.finishOpenFailure();
+}
+
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
-    var backend = BackendType.init(allocator, backend_options);
-    backend.root_dir = try allocator.dupe(u8, root_dir);
+    var backend: BackendType = undefined;
+    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    return backend;
+}
 
-    if (backend_options.storage) |storage| {
-        backend.storage = storage;
+pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    if (@hasDecl(BackendType, "initInPlace")) {
+        BackendType.initInPlace(backend, allocator, backend_options);
     } else {
-        const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
-        errdefer std.heap.page_allocator.destroy(owned);
-        owned.* = try storage_io.NativeStorage.init(std.heap.page_allocator, backend_options.io_runtime);
-        backend.storage_owner = owned;
-        backend.storage = owned.storage();
+        backend.* = BackendType.init(allocator, backend_options);
     }
-    errdefer cleanup(BackendType, &backend, false);
+    backend.root_dir = try allocator.dupe(u8, root_dir);
+    const debug_open = openDebugLogsEnabled();
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open begin root={s} read_only={any} create_if_missing={any} wal_enabled={any} storage_provided={any}",
+            .{
+                backend.root_dir.?,
+                options.read_only,
+                options.create_if_missing,
+                backend.options.wal_enabled,
+                backend_options.storage != null,
+            },
+        );
+    }
 
-    const loaded_manifest = try repository_mod.loadManifestIfPresentWithStorage(
-        backend.storage.?,
-        allocator,
-        backend.root_dir.?,
-        &backend.manifest_backing,
-        &backend.next_run_id,
-        &backend.runs,
-        &backend.obsolete_paths,
-    );
+    {
+        const phase_start = beginOpenPhase(BackendType, backend, .initializing_storage);
+        defer finishOpenPhase(BackendType, backend, .initializing_storage, phase_start);
+        if (backend_options.storage) |storage| {
+            backend.storage = storage;
+        } else {
+            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
+            errdefer std.heap.page_allocator.destroy(owned);
+            owned.* = try storage_io.NativeStorage.init(std.heap.page_allocator, backend_options.io_runtime);
+            backend.storage_owner = owned;
+            backend.storage = owned.storage();
+        }
+    }
+    errdefer cleanup(BackendType, backend, false);
+    errdefer finishOpenFailure(BackendType, backend);
+
+    const loaded_manifest = blk: {
+        const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
+        defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
+        break :blk try repository_mod.loadManifestIfPresentWithStorage(
+            backend.storage.?,
+            allocator,
+            backend.root_dir.?,
+            &backend.manifest_backing,
+            &backend.next_run_id,
+            &backend.runs,
+            &backend.obsolete_paths,
+        );
+    };
+    recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
+            .{
+                backend.root_dir.?,
+                loaded_manifest,
+                backend.runs.items.len,
+                backend.obsolete_paths.items.len,
+                backend.next_run_id,
+            },
+        );
+    }
     if (!loaded_manifest and options.create_if_missing) {
-        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, root_dir);
+        const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
+        defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
+        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
+        if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
     }
     {
-        const locked = runtime_mod.lockBackend(BackendType, &backend);
-        defer runtime_mod.unlockBackend(BackendType, &backend, locked);
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
+            if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
+            const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
+            defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
             try backend.replayWalIntoMutable();
+            recordOpenReplayComplete(BackendType, backend);
+            if (debug_open) {
+                std.log.info(
+                    "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
+                    .{
+                        backend.root_dir.?,
+                        backend.mutable.entries.items.len,
+                        if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
+                    },
+                );
+            }
         }
+        const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
+        defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
+        if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+    }
+    if (@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) {
+        _ = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+            std.log.warn("lsm backend open skipped recovered run cleanup root={?s} err={}", .{ backend.root_dir, err });
+        };
     }
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
-    return backend;
+    finishOpenSuccess(BackendType, backend);
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open done root={s} runs={d} mutable_entries={d}",
+            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
+        );
+    }
 }
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {
@@ -113,7 +218,10 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.retired_mutable_snapshots.deinit(backend.allocator);
     }
-    for (backend.runs.items) |*run| run.deinit(backend.allocator);
+    for (backend.runs.items) |*run| {
+        if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+        run.deinit(backend.allocator);
+    }
     backend.runs.deinit(backend.allocator);
     if (@hasField(BackendType, "obsolete_paths")) {
         for (backend.obsolete_paths.items) |*obsolete| {
@@ -123,7 +231,10 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "obsolete_runs")) {
         for (backend.obsolete_runs.items) |*runs| {
-            for (runs.items) |*run| run.deinit(backend.allocator);
+            for (runs.items) |*run| {
+                if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+                run.deinit(backend.allocator);
+            }
             runs.deinit(backend.allocator);
         }
         backend.obsolete_runs.deinit(backend.allocator);

@@ -18,6 +18,7 @@ const distributed_stats = @import("../../search/distributed_stats.zig");
 const types = @import("types.zig");
 
 const preflight_structured_filter_exact_count_limit: u64 = 1024;
+const bool_filter_clause_keys = [_][]const u8{ "must", "filter", "should", "must_not" };
 
 pub const PlanningStatsSummary = query_search.RuntimePreflightSummary;
 
@@ -419,7 +420,7 @@ fn appendPreflightStructuredFilterValueEstimate(
             .object => |inner| inner,
             else => return,
         };
-        for ([_][]const u8{ "must", "should", "must_not" }) |key| {
+        for (bool_filter_clause_keys) |key| {
             const items = bool_object.get(key) orelse continue;
             const array = switch (items) {
                 .array => |array| array,
@@ -588,7 +589,7 @@ fn preflightFilterValueSupportsExactStructuredFilterCount(value: std.json.Value)
             .object => |inner| inner,
             else => return false,
         };
-        for ([_][]const u8{ "must", "should", "must_not" }) |key| {
+        for (bool_filter_clause_keys) |key| {
             const items = bool_object.get(key) orelse continue;
             const array = switch (items) {
                 .array => |array| array,
@@ -655,6 +656,11 @@ fn positiveIdUpperBoundForFilterValue(value: std.json.Value) ?u32 {
         if (bool_object.get("must")) |must_value| {
             if (positiveIdUpperBoundForFilterArray(must_value, .all)) |bound| {
                 must_bound = bound;
+            }
+        }
+        if (bool_object.get("filter")) |filter_value| {
+            if (positiveIdUpperBoundForFilterArray(filter_value, .all)) |bound| {
+                must_bound = if (must_bound) |existing| @min(existing, bound) else bound;
             }
         }
 
@@ -837,4 +843,97 @@ test "exact structured filter counts tighten derived estimates without budget-li
     if (summary.selectivity_upper_bound_ratio) |ratio| {
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), ratio, 0.0001);
     }
+}
+
+test "planning stats treats bool filter clauses as required structured filters" {
+    const alloc = std.testing.allocator;
+
+    const MockCollector = struct {
+        fn resolveTextIndexEstimate(
+            _: *anyopaque,
+            test_alloc: std.mem.Allocator,
+            _: ?[]const u8,
+            _: types.SearchRequest,
+        ) !?query_search.TextIndexEstimate {
+            return .{
+                .name = try test_alloc.dupe(u8, "ft_v1"),
+                .doc_count = 100,
+            };
+        }
+
+        fn resolveEmbeddingIndexEstimate(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: ?[]const u8,
+        ) !?query_search.EmbeddingIndexEstimate {
+            return null;
+        }
+
+        fn resolveGraphIndexEstimate(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !?query_search.GraphIndexEstimate {
+            return null;
+        }
+
+        fn collectTextQueryStats(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: types.SearchRequest,
+        ) ![]const distributed_stats.TextFieldStats {
+            return &.{};
+        }
+
+        fn appendDenseQueryCost(
+            _: *anyopaque,
+            _: *PlanningStatsSummary,
+            _: types.SearchRequest,
+            _: ?[]const u8,
+            _: types.DenseKnnQuery,
+        ) !void {}
+
+        fn estimateStructuredFilterSample(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: types.SearchRequest,
+            _: u32,
+            _: u64,
+        ) !?PlanningStatsCollector.StructuredFilterSampleEstimate {
+            return null;
+        }
+
+        fn searchRequest(
+            _: *anyopaque,
+            test_alloc: std.mem.Allocator,
+            _: types.SearchRequest,
+        ) !types.SearchResult {
+            return try query_search.emptySearchResult(test_alloc);
+        }
+    };
+
+    const collector = PlanningStatsCollector{
+        .ptr = undefined,
+        .vtable = &.{
+            .resolve_text_index_estimate = MockCollector.resolveTextIndexEstimate,
+            .resolve_dense_index_estimate = MockCollector.resolveEmbeddingIndexEstimate,
+            .resolve_sparse_index_estimate = MockCollector.resolveEmbeddingIndexEstimate,
+            .resolve_graph_index_estimate = MockCollector.resolveGraphIndexEstimate,
+            .collect_text_query_stats = MockCollector.collectTextQueryStats,
+            .append_dense_query_cost = MockCollector.appendDenseQueryCost,
+            .estimate_structured_filter_sample = MockCollector.estimateStructuredFilterSample,
+            .search_request = MockCollector.searchRequest,
+        },
+    };
+
+    var summary = try collectSearchRequestStatsAlloc(alloc, collector, .{
+        .index_name = "ft_v1",
+        .filter_query_json = "{\"bool\":{\"must\":[{\"doc_id\":[\"doc:a\",\"doc:b\",\"doc:c\"]}],\"filter\":[{\"doc_id\":[\"doc:a\"]},{\"numeric_range\":{\"field\":\"score\",\"min\":1}}]}}",
+    }, 0);
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), summary.doc_id_value_count);
+    try std.testing.expectEqual(@as(u32, 1), summary.numeric_range_clause_count);
+    try std.testing.expectEqual(@as(?u32, 1), summary.positive_id_result_upper_bound);
+    try std.testing.expect(summary.structured_filter_count_exact);
 }

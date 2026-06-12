@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const wal_types = @import("types.zig");
 const wal_store = @import("store.zig");
@@ -361,7 +362,7 @@ fn logKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const 
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 test "objectstore-backed wal store appends and truncates over file uri" {

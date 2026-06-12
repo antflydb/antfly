@@ -83,7 +83,7 @@ func performCreateTable(t *testing.T, api *TableApi, tableName string, body Crea
 	payload, err := json.Marshal(body)
 	require.NoError(t, err)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/tables/"+tableName, bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/db/v1/tables/"+tableName, bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
 	api.CreateTable(rec, req, tableName)
 	return rec
@@ -97,7 +97,7 @@ func performCreateIndex(t *testing.T, api *TableApi, tableName, indexName string
 
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/tables/"+tableName+"/indexes/"+indexName,
+		"/db/v1/tables/"+tableName+"/indexes/"+indexName,
 		bytes.NewReader(payload),
 	)
 	rec := httptest.NewRecorder()

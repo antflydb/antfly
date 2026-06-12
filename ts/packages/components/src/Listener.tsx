@@ -66,7 +66,8 @@ function isSearchWidgetConfig(config: unknown): config is SearchWidgetConfig {
 }
 
 export default function Listener({ children, onChange }: ListenerProps) {
-  const [{ url, table, listenerEffect, widgets, headers }, dispatch] = useSharedContext();
+  const [{ url, table, listenerEffect, configVersion = 0, widgets, headers }, dispatch] =
+    useSharedContext();
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // We need to prepare some data in each render.
@@ -173,6 +174,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
         defer(() => {
           dispatch({
             type: "setListenerEffect",
+            contextVersion: configVersion,
             value: () => {
               // Determine which request groups changed to avoid re-sending stale queries.
               // Autosuggest updates should not invalidate submitted search results unless the
@@ -522,6 +524,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
     dispatch,
     url,
     headers,
+    configVersion,
     searchWidgets.size,
     configurableWidgets.size,
     facetWidgets.size,

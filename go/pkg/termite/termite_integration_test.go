@@ -53,7 +53,7 @@ func TestTermiteNode_EmbedEndpoint_NoModels(t *testing.T) {
 		body, err := json.Marshal(reqBody)
 		require.NoError(t, err)
 
-		req, err := http.NewRequest("POST", server.URL+"/ml/v1/embed", bytes.NewReader(body))
+		req, err := http.NewRequest("POST", server.URL+"/ai/v1/embed", bytes.NewReader(body))
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 
@@ -74,7 +74,7 @@ func TestTermiteNode_EmbedEndpoint_NoModels(t *testing.T) {
 		body, err := json.Marshal(reqBody)
 		require.NoError(t, err)
 
-		req, err := http.NewRequest("POST", server.URL+"/ml/v1/embed", bytes.NewReader(body))
+		req, err := http.NewRequest("POST", server.URL+"/ai/v1/embed", bytes.NewReader(body))
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", "application/json")
 
@@ -90,7 +90,7 @@ func TestTermiteNode_EmbedEndpoint_NoModels(t *testing.T) {
 	t.Run("EmbedRejectsInvalidJSON", func(t *testing.T) {
 		req, err := http.NewRequest(
 			"POST",
-			server.URL+"/ml/v1/embed",
+			server.URL+"/ai/v1/embed",
 			bytes.NewReader([]byte("invalid json")),
 		)
 		require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestTermiteNode_ModelsEndpoint(t *testing.T) {
 	defer server.Close()
 
 	t.Run("ListModelsReturnsEmptyArrays", func(t *testing.T) {
-		req, err := http.NewRequest("GET", server.URL+"/ml/v1/models", nil)
+		req, err := http.NewRequest("GET", server.URL+"/ai/v1/models", nil)
 		require.NoError(t, err)
 
 		resp, err := http.DefaultClient.Do(req) //nolint:gosec // test server URL

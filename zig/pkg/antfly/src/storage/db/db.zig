@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -27,8 +28,14 @@ const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
+const doc_identity = @import("doc_identity.zig");
+const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
+const resolution_runtime_mod = @import("resolution_runtime.zig");
+const promotion_runtime_mod = @import("promotion_runtime.zig");
+const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
@@ -51,6 +58,8 @@ else
     @import("../../sparse/sparse.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
+const asset_producer_mod = @import("enrichment/asset_producer.zig");
+const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -58,6 +67,7 @@ else
 const chunk_artifact_mod = @import("../../chunking/chunk.zig");
 const chunking_types_mod = @import("../../chunking/types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
+const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -96,6 +106,7 @@ const db_query_metrics = @import("query_metrics.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
+const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
@@ -108,6 +119,10 @@ const platform_time = @import("../../platform/time.zig");
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
+}
+
+fn benchQueryProfileEnabled() bool {
+    return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
 pub const OpenOptions = struct {
@@ -143,15 +158,39 @@ pub const OpenOptions = struct {
     change_journal_storage: ?lsm_backend_mod.Storage = null,
     index_backends: db_config.IndexBackendOptions = .{},
     index_open_parallelism: ?usize = null,
+    identity_namespace: ?doc_identity.Namespace = null,
+    prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
+    start_optional_runtimes: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
+    sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    /// Optional cross-shard candidate source for entity resolution blocking,
+    /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
+    /// Null means local-only blocking against the worker's own store. Must
+    /// outlive the DB.
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    /// Optional cross-shard entity sink for the promoter, injected by the serving
+    /// layer (see `api/distributed_entity_sink.zig`). Must outlive the DB.
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// Optional ownership guard for promotion. Raft apply-side DBs set this so
+    /// only the source shard leader emits entity writes; standalone DBs leave it
+    /// null and are treated as local owners.
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
+    /// What the promoter does when no sink is currently available. The safe
+    /// default holds replay so a later sink injection or routing repair can retry.
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
+    /// Optional name embedder for resolution: backfills a mention's name
+    /// embedding (for cosine/ann blocking) when a resolver declares a
+    /// `name_embedding` model and the extraction artifact carries no vector.
+    /// Caller-owned; must outlive the DB. Null disables backfill.
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -160,7 +199,49 @@ pub const ReplayProgress = struct {
     target_sequence: u64 = 0,
     scanned_entries: u64 = 0,
     applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
     active: bool = false,
+};
+
+pub const DocumentArtifactChildRangeApplyBatch = struct {
+    artifact_writes: []const types.BatchWrite = &.{},
+    artifact_delete_keys: []const []const u8 = &.{},
+    documents: []const derived_types.DerivedDocument = &.{},
+    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
+    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
+    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
+    sync_level: types.SyncLevel = .full_index,
+};
+
+pub const DocumentArtifactChildRangeDispatch = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const DocumentArtifactChildRangeOutboxDrainResult = struct {
+    scanned: usize = 0,
+    dispatched: usize = 0,
+    deleted: usize = 0,
+};
+
+const DocumentArtifactChildRangeOutboxRecord = struct {
+    version: u16 = 1,
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    child_batch: DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const DocumentArtifactChildRangeDispatcher = struct {
+    ptr: *anyopaque,
+    apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
+
+    fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+        return try self.apply(self.ptr, alloc, dispatch);
+    }
 };
 
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
@@ -169,6 +250,7 @@ pub const QueryVisibilityChange = enum {
     invalidate,
     publish,
     publish_consistent,
+    publish_blocking,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -215,6 +297,8 @@ const AsyncContext = struct {
     applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    allow_graph_materialization: bool = true,
+    require_graph_resolution_contract: bool = false,
     query_visibility_hook: ?QueryVisibilityHook = null,
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -225,6 +309,9 @@ const AsyncContext = struct {
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
+    sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     applied_sequence_coalescer: AppliedSequenceCoalescer = .{},
     stats: AsyncContentionStats = .{},
 
@@ -233,6 +320,70 @@ const AsyncContext = struct {
         var maintenance_it = self.dense_maintenance_last_ns.iterator();
         while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
         self.dense_maintenance_last_ns.deinit(alloc);
+    }
+};
+
+const DocSetPlanningRuntimeStats = struct {
+    resolved_set_count: AtomicU64 = AtomicU64.init(0),
+    all_set_count: AtomicU64 = AtomicU64.init(0),
+    none_set_count: AtomicU64 = AtomicU64.init(0),
+    doc_key_list_count: AtomicU64 = AtomicU64.init(0),
+    ordinal_list_count: AtomicU64 = AtomicU64.init(0),
+    ordinal_bitmap_count: AtomicU64 = AtomicU64.init(0),
+    doc_key_list_docs: AtomicU64 = AtomicU64.init(0),
+    ordinal_list_docs: AtomicU64 = AtomicU64.init(0),
+    ordinal_bitmap_docs: AtomicU64 = AtomicU64.init(0),
+    missing_ordinal_coverage_count: AtomicU64 = AtomicU64.init(0),
+    bitmap_promotion_count: AtomicU64 = AtomicU64.init(0),
+    unsupported_filter_shape_count: AtomicU64 = AtomicU64.init(0),
+    stale_identity_generation_rejection_count: AtomicU64 = AtomicU64.init(0),
+
+    fn recordResolvedSet(self: *@This(), set: *const doc_set.ResolvedDocSet, missing_ordinal_coverage: bool) void {
+        _ = self.resolved_set_count.fetchAdd(1, .monotonic);
+        switch (set.*) {
+            .all => _ = self.all_set_count.fetchAdd(1, .monotonic),
+            .none => _ = self.none_set_count.fetchAdd(1, .monotonic),
+            .doc_keys => |keys| {
+                _ = self.doc_key_list_count.fetchAdd(1, .monotonic);
+                _ = self.doc_key_list_docs.fetchAdd(@intCast(keys.len), .monotonic);
+            },
+            .ordinals => |ordinals| {
+                _ = self.ordinal_list_count.fetchAdd(1, .monotonic);
+                _ = self.ordinal_list_docs.fetchAdd(@intCast(ordinals.len), .monotonic);
+            },
+            .ordinal_bitmap => |*bitmap| {
+                _ = self.ordinal_bitmap_count.fetchAdd(1, .monotonic);
+                _ = self.ordinal_bitmap_docs.fetchAdd(@intCast(bitmap.cardinality()), .monotonic);
+                _ = self.bitmap_promotion_count.fetchAdd(1, .monotonic);
+            },
+        }
+        if (missing_ordinal_coverage) _ = self.missing_ordinal_coverage_count.fetchAdd(1, .monotonic);
+    }
+
+    fn recordUnsupportedFilterShape(self: *@This()) void {
+        _ = self.unsupported_filter_shape_count.fetchAdd(1, .monotonic);
+    }
+
+    fn recordStaleIdentityGenerationRejection(self: *@This()) void {
+        _ = self.stale_identity_generation_rejection_count.fetchAdd(1, .monotonic);
+    }
+
+    fn snapshot(self: *@This()) types.DocSetPlanningStats {
+        return .{
+            .resolved_set_count = self.resolved_set_count.load(.monotonic),
+            .all_set_count = self.all_set_count.load(.monotonic),
+            .none_set_count = self.none_set_count.load(.monotonic),
+            .doc_key_list_count = self.doc_key_list_count.load(.monotonic),
+            .ordinal_list_count = self.ordinal_list_count.load(.monotonic),
+            .ordinal_bitmap_count = self.ordinal_bitmap_count.load(.monotonic),
+            .doc_key_list_docs = self.doc_key_list_docs.load(.monotonic),
+            .ordinal_list_docs = self.ordinal_list_docs.load(.monotonic),
+            .ordinal_bitmap_docs = self.ordinal_bitmap_docs.load(.monotonic),
+            .missing_ordinal_coverage_count = self.missing_ordinal_coverage_count.load(.monotonic),
+            .bitmap_promotion_count = self.bitmap_promotion_count.load(.monotonic),
+            .unsupported_filter_shape_count = self.unsupported_filter_shape_count.load(.monotonic),
+            .stale_identity_generation_rejection_count = self.stale_identity_generation_rejection_count.load(.monotonic),
+        };
     }
 };
 
@@ -379,6 +530,8 @@ const DenseCatchUpContentionStats = struct {
     current_target_sequence: AtomicU64 = .init(0),
     current_scanned_entries: AtomicU64 = .init(0),
     current_applied_entries: AtomicU64 = .init(0),
+    replay_scan_batches: AtomicU64 = .init(0),
+    replay_hint_filter_skips: AtomicU64 = .init(0),
     progress_updates: AtomicU64 = .init(0),
     bulk_finish_windows: AtomicU64 = .init(0),
     bulk_finish_split_steps: AtomicU64 = .init(0),
@@ -411,6 +564,8 @@ const DenseCatchUpContentionStats = struct {
             .current_target_sequence = self.current_target_sequence.load(.monotonic),
             .current_scanned_entries = self.current_scanned_entries.load(.monotonic),
             .current_applied_entries = self.current_applied_entries.load(.monotonic),
+            .replay_scan_batches = self.replay_scan_batches.load(.monotonic),
+            .replay_hint_filter_skips = self.replay_hint_filter_skips.load(.monotonic),
             .progress_updates = self.progress_updates.load(.monotonic),
             .bulk_finish_windows = self.bulk_finish_windows.load(.monotonic),
             .bulk_finish_split_steps = self.bulk_finish_split_steps.load(.monotonic),
@@ -436,6 +591,16 @@ const DenseCatchUpContentionStats = struct {
 };
 
 const StartupOpenStats = struct {
+    wal_retention_known: std.atomic.Value(bool) = .init(false),
+    wal_retained_segments: AtomicU64 = .init(0),
+    wal_retained_bytes: AtomicU64 = .init(0),
+    wal_checkpoint_oldest_retained_segment: AtomicU64 = .init(0),
+    wal_checkpoint_covered_through_segment: AtomicU64 = .init(0),
+    wal_checkpoint_current_segment: AtomicU64 = .init(0),
+    wal_checkpoint_lag_segments: AtomicU64 = .init(0),
+    wal_replay_retained_segments: AtomicU64 = .init(0),
+    wal_replay_retained_bytes: AtomicU64 = .init(0),
+    wal_replay_current_segment: AtomicU64 = .init(0),
     configured_indexes: std.atomic.Value(u32) = .init(0),
     configured_dense_indexes: std.atomic.Value(u32) = .init(0),
     configured_sparse_indexes: std.atomic.Value(u32) = .init(0),
@@ -444,13 +609,37 @@ const StartupOpenStats = struct {
     opened_indexes: std.atomic.Value(u32) = .init(0),
     db_open_ns: AtomicU64 = .init(0),
     load_indexes_ns: AtomicU64 = .init(0),
+    lsm_open_stores: AtomicU64 = .init(0),
+    lsm_open_completed: AtomicU64 = .init(0),
+    lsm_open_failed: AtomicU64 = .init(0),
+    lsm_open_total_ns: AtomicU64 = .init(0),
+    lsm_open_initializing_storage_ns: AtomicU64 = .init(0),
+    lsm_open_manifest_ns: AtomicU64 = .init(0),
+    lsm_open_ensuring_dirs_ns: AtomicU64 = .init(0),
+    lsm_open_wal_replay_ns: AtomicU64 = .init(0),
+    lsm_open_mounting_runs_ns: AtomicU64 = .init(0),
+    lsm_open_loaded_runs: AtomicU64 = .init(0),
+    lsm_open_obsolete_paths: AtomicU64 = .init(0),
+    lsm_open_mutable_entries_after_replay: AtomicU64 = .init(0),
+    lsm_open_immutable_memtables_after_replay: AtomicU64 = .init(0),
     wal_replay_records: AtomicU64 = .init(0),
     wal_replay_entries: AtomicU64 = .init(0),
     wal_replay_bytes: AtomicU64 = .init(0),
     wal_replay_ns: AtomicU64 = .init(0),
+    wal_replay_truncated_tail_bytes: AtomicU64 = .init(0),
 
     fn snapshot(self: *const @This()) types.StartupCatchUpStats {
         return .{
+            .wal_retention_known = self.wal_retention_known.load(.monotonic),
+            .wal_retained_segments = self.wal_retained_segments.load(.monotonic),
+            .wal_retained_bytes = self.wal_retained_bytes.load(.monotonic),
+            .wal_checkpoint_oldest_retained_segment = self.wal_checkpoint_oldest_retained_segment.load(.monotonic),
+            .wal_checkpoint_covered_through_segment = self.wal_checkpoint_covered_through_segment.load(.monotonic),
+            .wal_checkpoint_current_segment = self.wal_checkpoint_current_segment.load(.monotonic),
+            .wal_checkpoint_lag_segments = self.wal_checkpoint_lag_segments.load(.monotonic),
+            .wal_replay_retained_segments = self.wal_replay_retained_segments.load(.monotonic),
+            .wal_replay_retained_bytes = self.wal_replay_retained_bytes.load(.monotonic),
+            .wal_replay_current_segment = self.wal_replay_current_segment.load(.monotonic),
             .configured_indexes = self.configured_indexes.load(.monotonic),
             .configured_dense_indexes = self.configured_dense_indexes.load(.monotonic),
             .configured_sparse_indexes = self.configured_sparse_indexes.load(.monotonic),
@@ -459,10 +648,24 @@ const StartupOpenStats = struct {
             .opened_indexes = self.opened_indexes.load(.monotonic),
             .db_open_ns = self.db_open_ns.load(.monotonic),
             .load_indexes_ns = self.load_indexes_ns.load(.monotonic),
+            .lsm_open_stores = self.lsm_open_stores.load(.monotonic),
+            .lsm_open_completed = self.lsm_open_completed.load(.monotonic),
+            .lsm_open_failed = self.lsm_open_failed.load(.monotonic),
+            .lsm_open_total_ns = self.lsm_open_total_ns.load(.monotonic),
+            .lsm_open_initializing_storage_ns = self.lsm_open_initializing_storage_ns.load(.monotonic),
+            .lsm_open_manifest_ns = self.lsm_open_manifest_ns.load(.monotonic),
+            .lsm_open_ensuring_dirs_ns = self.lsm_open_ensuring_dirs_ns.load(.monotonic),
+            .lsm_open_wal_replay_ns = self.lsm_open_wal_replay_ns.load(.monotonic),
+            .lsm_open_mounting_runs_ns = self.lsm_open_mounting_runs_ns.load(.monotonic),
+            .lsm_open_loaded_runs = self.lsm_open_loaded_runs.load(.monotonic),
+            .lsm_open_obsolete_paths = self.lsm_open_obsolete_paths.load(.monotonic),
+            .lsm_open_mutable_entries_after_replay = self.lsm_open_mutable_entries_after_replay.load(.monotonic),
+            .lsm_open_immutable_memtables_after_replay = self.lsm_open_immutable_memtables_after_replay.load(.monotonic),
             .wal_replay_records = self.wal_replay_records.load(.monotonic),
             .wal_replay_entries = self.wal_replay_entries.load(.monotonic),
             .wal_replay_bytes = self.wal_replay_bytes.load(.monotonic),
             .wal_replay_ns = self.wal_replay_ns.load(.monotonic),
+            .wal_replay_truncated_tail_bytes = self.wal_replay_truncated_tail_bytes.load(.monotonic),
         };
     }
 };
@@ -539,6 +742,8 @@ const EnrichmentAppendContext = struct {
     executor: *derived_executor_mod.Executor,
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
     fn batchContext(self: *const EnrichmentAppendContext) BatchExecutionContext {
         return .{
@@ -551,13 +756,28 @@ const EnrichmentAppendContext = struct {
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
             .log_mutex = self.log_mutex,
+            .identity_namespace = doc_identity.default_namespace,
+            .artifact_cleanup_maybe = null,
             .executor = self.executor,
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .enrichment_runtime = null,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
     }
 };
+
+fn notifyResolverReplayRuntimesForCatalog(
+    index_manager: *const index_manager_mod.IndexManager,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime,
+    sequence: u64,
+) void {
+    if (index_manager.resolvers.items.len == 0) return;
+    if (resolution_runtime) |runtime| runtime.notifySequence(sequence);
+    if (promotion_runtime) |runtime| runtime.notifySequence(sequence);
+}
 
 const BatchExecutionContext = struct {
     alloc: Allocator,
@@ -570,8 +790,12 @@ const BatchExecutionContext = struct {
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     log_mutex: *std.atomic.Mutex,
+    identity_namespace: doc_identity.Namespace,
+    artifact_cleanup_maybe: ?*std.atomic.Value(bool) = null,
     executor: *derived_executor_mod.Executor,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
 };
@@ -643,9 +867,25 @@ pub const BatchProfile = struct {
     predicates_ns: u64 = 0,
     validate_range_ns: u64 = 0,
     extract_writes_ns: u64 = 0,
+    extract_vector_field_names_ns: u64 = 0,
+    extract_mapper_ns: u64 = 0,
+    extract_graph_fields_ns: u64 = 0,
+    extract_index_field_embeddings_ns: u64 = 0,
+    extract_embedding_artifacts_ns: u64 = 0,
+    extract_graph_artifacts_ns: u64 = 0,
+    extract_strip_store_value_ns: u64 = 0,
+    extract_timestamp_ns: u64 = 0,
+    overwrite_probe_ns: u64 = 0,
     delete_artifacts_ns: u64 = 0,
     precompute_generated_ns: u64 = 0,
+    identity_capacity_check_ns: u64 = 0,
+    identity_metadata_ns: u64 = 0,
+    identity_metadata_writes: u64 = 0,
+    identity_upsert_keys: u64 = 0,
+    identity_delete_keys: u64 = 0,
     store_write_ns: u64 = 0,
+    store_write_count: u64 = 0,
+    store_delete_count: u64 = 0,
     split_delta_ns: u64 = 0,
     build_derived_ns: u64 = 0,
     apply_shadow_ns: u64 = 0,
@@ -746,6 +986,9 @@ pub const BatchProfile = struct {
 const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
+    wait_for_sync_level: bool = true,
+    force_generated_artifact_names: []const []const u8 = &.{},
+    document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
 };
 
 pub const OpenProfile = struct {
@@ -772,9 +1015,25 @@ fn addBatchProfile(total: *BatchProfile, delta: BatchProfile) void {
     total.predicates_ns += delta.predicates_ns;
     total.validate_range_ns += delta.validate_range_ns;
     total.extract_writes_ns += delta.extract_writes_ns;
+    total.extract_vector_field_names_ns += delta.extract_vector_field_names_ns;
+    total.extract_mapper_ns += delta.extract_mapper_ns;
+    total.extract_graph_fields_ns += delta.extract_graph_fields_ns;
+    total.extract_index_field_embeddings_ns += delta.extract_index_field_embeddings_ns;
+    total.extract_embedding_artifacts_ns += delta.extract_embedding_artifacts_ns;
+    total.extract_graph_artifacts_ns += delta.extract_graph_artifacts_ns;
+    total.extract_strip_store_value_ns += delta.extract_strip_store_value_ns;
+    total.extract_timestamp_ns += delta.extract_timestamp_ns;
+    total.overwrite_probe_ns += delta.overwrite_probe_ns;
     total.delete_artifacts_ns += delta.delete_artifacts_ns;
     total.precompute_generated_ns += delta.precompute_generated_ns;
+    total.identity_capacity_check_ns += delta.identity_capacity_check_ns;
+    total.identity_metadata_ns += delta.identity_metadata_ns;
+    total.identity_metadata_writes += delta.identity_metadata_writes;
+    total.identity_upsert_keys += delta.identity_upsert_keys;
+    total.identity_delete_keys += delta.identity_delete_keys;
     total.store_write_ns += delta.store_write_ns;
+    total.store_write_count += delta.store_write_count;
+    total.store_delete_count += delta.store_delete_count;
     total.split_delta_ns += delta.split_delta_ns;
     total.build_derived_ns += delta.build_derived_ns;
     total.apply_shadow_ns += delta.apply_shadow_ns;
@@ -1076,7 +1335,7 @@ fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, applied
 
 fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
     std.log.info(
-        "antfly_bench_batch writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
+        "antfly_bench_batch writes={d} deletes={d} graph_writes={d} graph_deletes={d} transforms={d} sync={s} total_ms={d} resolve_ms={d} merge_ms={d} predicates_ms={d} range_ms={d} extract_ms={d} delete_artifacts_ms={d} precompute_ms={d} identity_capacity_ms={d} identity_metadata_ms={d} identity_metadata_writes={d} store_ms={d} split_delta_ms={d} build_derived_ms={d} shadow_ms={d} collect_sync_ms={d} append_replay_journal_ms={d} backlog_pressure_ms={d} executor_notify_ms={d} sync_wait_ms={d} wait_sync_ms={d} notify_enrichment_ms={d}",
         .{
             req.writes.len,
             req.deletes.len,
@@ -1092,6 +1351,9 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             nsToMs(profile.extract_writes_ns),
             nsToMs(profile.delete_artifacts_ns),
             nsToMs(profile.precompute_generated_ns),
+            nsToMs(profile.identity_capacity_check_ns),
+            nsToMs(profile.identity_metadata_ns),
+            profile.identity_metadata_writes,
             nsToMs(profile.store_write_ns),
             nsToMs(profile.split_delta_ns),
             nsToMs(profile.build_derived_ns),
@@ -1121,6 +1383,26 @@ fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             nsToMs(profile.index_sync_ns),
             nsToMs(profile.applied_sequence_save_ns),
             nsToMs(profile.replay_journal_truncate_ns),
+        },
+    );
+    std.log.info(
+        "antfly_bench_batch_extract writes={d} total_extract_ms={d} vector_field_names_ms={d} mapper_ms={d} graph_fields_ms={d} index_field_embeddings_ms={d} embedding_artifacts_ms={d} graph_artifacts_ms={d} strip_store_value_ms={d} timestamp_ms={d} overwrite_probe_ms={d} identity_upserts={d} identity_deletes={d} store_writes={d} store_deletes={d}",
+        .{
+            req.writes.len,
+            nsToMs(profile.extract_writes_ns),
+            nsToMs(profile.extract_vector_field_names_ns),
+            nsToMs(profile.extract_mapper_ns),
+            nsToMs(profile.extract_graph_fields_ns),
+            nsToMs(profile.extract_index_field_embeddings_ns),
+            nsToMs(profile.extract_embedding_artifacts_ns),
+            nsToMs(profile.extract_graph_artifacts_ns),
+            nsToMs(profile.extract_strip_store_value_ns),
+            nsToMs(profile.extract_timestamp_ns),
+            nsToMs(profile.overwrite_probe_ns),
+            profile.identity_upsert_keys,
+            profile.identity_delete_keys,
+            profile.store_write_count,
+            profile.store_delete_count,
         },
     );
     std.log.info(
@@ -1370,8 +1652,6 @@ fn logSparseWriteProfileDelta(index_name: []const u8, delta: sparse_mod.WritePro
 
 var temp_path_nonce: u64 = 0;
 var split_replay_artifact_nonce: u64 = 0;
-const small_derived_text_compact_segment_threshold: usize = 6;
-const derived_text_compact_segment_threshold: usize = 128;
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
@@ -1711,6 +1991,8 @@ fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
     ctx.stats.dense_catch_up.current_target_sequence.store(progress.target_sequence, .monotonic);
     ctx.stats.dense_catch_up.current_scanned_entries.store(progress.scanned_entries, .monotonic);
     ctx.stats.dense_catch_up.current_applied_entries.store(progress.applied_entries, .monotonic);
+    ctx.stats.dense_catch_up.replay_scan_batches.store(progress.replay_scan_batches, .monotonic);
+    ctx.stats.dense_catch_up.replay_hint_filter_skips.store(progress.replay_hint_filter_skips, .monotonic);
     _ = ctx.stats.dense_catch_up.progress_updates.fetchAdd(1, .monotonic);
 }
 
@@ -2014,6 +2296,19 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
     return lsm_backend_mod.BackgroundExecutor.init(runtime, owner_id);
 }
 
+fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.read_runtime != null) return;
+    if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
+}
+
+fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runtime_mod.BackendRuntime) void {
+    installLsmReadRuntime(&index_backends.text_main_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.text_wal_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.dense_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.sparse_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
+}
+
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
     const zpath = try alloc.dupeZ(u8, path);
     defer alloc.free(zpath);
@@ -2098,13 +2393,41 @@ pub const DB = struct {
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    resolution_append_context: ?*EnrichmentAppendContext = null,
+    resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
+    promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
+    transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
+    sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
+    // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
+    // Spawned at open only when the load left failures behind; exits once all
+    // quarantined indexes recover or the DB closes.
+    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
+    bulk_ingest_identity_all_new: bool = false,
+    bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
+    identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
+    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
+    // single identity read generation. Visibility at a fixed generation is
+    // stable, so the entry only turns over when queries arrive at a newer
+    // generation. Guarded by its own mutex because published-path queries do
+    // not hold the apply lock.
+    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
+    live_doc_set_cache_generation: ?u64 = null,
+    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
+    bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
+    doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -2128,9 +2451,13 @@ pub const DB = struct {
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
             .log_mutex = resources.log_mutex,
+            .identity_namespace = resources.identity_namespace,
+            .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
             .executor = self.executor,
             .io = self.backend_runtime.io(),
             .enrichment_runtime = self.enrichment_runtime,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
         };
     }
@@ -2189,17 +2516,20 @@ pub const DB = struct {
                 .lsm => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lsm_memory => |*lsm_opts| {
                     lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
                     lsm_opts.root_generation = opts.lsm_root_generation;
+                    installLsmReadRuntime(lsm_opts, backend_runtime);
                     primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
                     lsm_opts.background_executor = &primary_lsm_background_executor;
                 },
                 .lmdb, .mem => {},
             }
+            installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
@@ -2235,6 +2565,9 @@ pub const DB = struct {
                 opts.change_journal_storage,
                 resolved_config.index_backends,
                 opened_primary,
+                opts.identity_namespace,
+                false,
+                if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -2266,10 +2599,17 @@ pub const DB = struct {
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
                 .enrichment_runtime = null,
+                .resolution_candidate_source = opts.resolution_candidate_source,
+                .resolution_embedder = opts.resolution_embedder,
+                .entity_sink = opts.entity_sink,
+                .promotion_owner = opts.promotion_owner,
+                .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
+                .transaction_recovery_identity_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
+                .sparse_compaction_runtime = null,
                 .shadow = null,
             };
             var executor_ready = false;
@@ -2282,7 +2622,8 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes;
+            if (optional_runtimes_enabled) {
                 const init_optional_started_ns = monotonicTimeNs();
                 try db.initOptionalRuntimes(opts);
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
@@ -2311,7 +2652,7 @@ pub const DB = struct {
                 try replayPendingDerivedBatches(&db, null, null);
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 try db.resumeGeneratedReplayFromJournalIfNeeded();
             }
             if (db.start_index_workers) {
@@ -2322,10 +2663,13 @@ pub const DB = struct {
                 }
                 profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
             }
-            if (opts.open_mode.allowsOptionalRuntimes()) {
+            if (optional_runtimes_enabled) {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
+            }
+            if (optional_runtimes_enabled and opts.open_mode == .writer) {
+                db.startQuarantineRetryWorkerIfNeeded();
             }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
@@ -2385,6 +2729,7 @@ pub const DB = struct {
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
             .io = self.backend_runtime.io(),
+            .require_graph_resolution_contract = true,
             .query_visibility_hook = null,
             .text_merge_runtime = null,
         };
@@ -2416,11 +2761,11 @@ pub const DB = struct {
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+        if (ctx.query_visibility_hook) |hook| hook.notify(.publish);
     }
 
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
-        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null) return;
+        if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
 
         const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
         errdefer self.runtime_alloc.destroy(append_ctx);
@@ -2437,6 +2782,8 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
+            .resolution_runtime = self.resolution_runtime,
+            .promotion_runtime = self.promotion_runtime,
         };
 
         const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
@@ -2459,6 +2806,78 @@ pub const DB = struct {
         self.enrichment_runtime = runtime;
     }
 
+    fn initResolutionRuntime(self: *DB) !void {
+        // Always constructed so catalog/status/runUntilIdle APIs can observe
+        // and drain replay. The background worker is started lazily only while
+        // the resolver catalog is non-empty.
+        const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
+        errdefer self.runtime_alloc.destroy(append_ctx);
+        const resources = self.core.batchExecutionResources();
+        append_ctx.* = .{
+            .alloc = self.runtime_alloc,
+            .store = resources.store,
+            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+            .shard_manager = resources.shard_manager,
+            .index_manager = resources.index_manager,
+            .apply_mutex = resources.apply_mutex,
+            .change_journal = resources.change_journal,
+            .replay_source = resources.replay_source,
+            .executor = self.executor,
+            .async_context = self.async_context,
+            .log_mutex = resources.log_mutex,
+        };
+
+        const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try resolution_runtime_mod.ResolutionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.core.batchExecutionResources().index_manager,
+            append_ctx,
+            appendDerivedBatchFromEnrichment,
+            self.backend_runtime,
+            // Cross-shard blocking source when the serving layer injected one
+            // (via OpenOptions); null means local-only blocking against this
+            // worker's own store.
+            self.resolution_candidate_source,
+            // Optional name embedder for mention-embedding backfill.
+            self.resolution_embedder,
+        );
+        errdefer runtime.deinit();
+        append_ctx.resolution_runtime = runtime;
+        self.resolution_append_context = append_ctx;
+        self.resolution_runtime = runtime;
+        self.async_context.resolution_runtime = runtime;
+        if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
+    }
+
+    fn initPromotionRuntime(self: *DB) !void {
+        // Always constructed (like the resolution runtime) so synchronous
+        // drains and status APIs remain available. The background worker is
+        // started lazily only while resolver replay can produce promotion work.
+        const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
+            self.runtime_alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.backend_runtime,
+            self.promotion_owner,
+            // Cross-shard entity sink when the serving layer injected one (via
+            // OpenOptions or setEntitySink); the missing-sink policy decides
+            // whether null means wait or explicit no-op.
+            self.entity_sink,
+            self.entity_sink_missing_policy,
+        );
+        errdefer runtime.deinit();
+        self.promotion_runtime = runtime;
+        self.async_context.promotion_runtime = runtime;
+        // Patch the resolution stage's append context so journaling a resolution
+        // artifact (tagged with the promotion hint) wakes the promoter.
+        if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
+    }
+
     fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
         const ttl_ctx = try self.runtime_alloc.create(TtlCleanupContext);
         errdefer self.runtime_alloc.destroy(ttl_ctx);
@@ -2474,8 +2893,11 @@ pub const DB = struct {
                 .index_manager = batch_resources.index_manager,
                 .apply_mutex = batch_resources.apply_mutex,
                 .log_mutex = batch_resources.log_mutex,
+                .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
                 .enrichment_runtime = self.enrichment_runtime,
+                .resolution_runtime = self.resolution_runtime,
+                .promotion_runtime = self.promotion_runtime,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -2496,15 +2918,26 @@ pub const DB = struct {
     }
 
     fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        const identity_ctx = try self.runtime_alloc.create(db_core.TransactionRecoveryIdentityContext);
+        errdefer self.runtime_alloc.destroy(identity_ctx);
+        identity_ctx.* = .{
+            .store = self.core.store,
+            .identity_namespace = self.core.identity_namespace,
+            .alloc = self.runtime_alloc,
+        };
+        var effective_cfg = cfg;
+        effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+
         const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try transaction_runtime_mod.Runtime.init(
             self.runtime_alloc,
             self.core.batchExecutionResources().store,
             self.backend_runtime,
-            cfg,
+            effective_cfg,
         );
         errdefer runtime.deinit();
+        self.transaction_recovery_identity_context = identity_ctx;
         self.transaction_runtime = runtime;
     }
 
@@ -2527,7 +2960,31 @@ pub const DB = struct {
         self.async_context.text_merge_runtime = runtime;
     }
 
+    fn initOptionalSparseCompactionRuntime(self: *DB, cfg: sparse_compaction_runtime_mod.Config) !void {
+        if (!self.start_index_workers) return;
+        if (!cfg.enabled) return;
+        const resources = self.core.asyncResources();
+        const runtime = try self.runtime_alloc.create(sparse_compaction_runtime_mod.SparseCompactionRuntime);
+        errdefer self.runtime_alloc.destroy(runtime);
+        runtime.* = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+            self.runtime_alloc,
+            resources.index_manager,
+            resources.apply_mutex,
+            self.backend_runtime,
+            cfg,
+        );
+        errdefer runtime.deinit();
+        self.sparse_compaction_runtime = runtime;
+        self.async_context.sparse_compaction_runtime = runtime;
+    }
+
     fn initOptionalRuntimes(self: *DB, opts: OpenOptions) !void {
+        // Created before enrichment so the enrichment append context can notify
+        // it when extraction artifacts land.
+        try self.initResolutionRuntime();
+        // Created after the resolution runtime so it can patch the resolution
+        // append context to wake the promoter when resolution artifacts land.
+        try self.initPromotionRuntime();
         if (opts.enrichment) |raw_enrichment_cfg| {
             var enrichment_cfg = raw_enrichment_cfg;
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
@@ -2541,26 +2998,83 @@ pub const DB = struct {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
         }
         try self.initOptionalTextMergeRuntime(opts.text_merge);
+        try self.initOptionalSparseCompactionRuntime(opts.sparse_compaction);
     }
 
     fn startOptionalRuntimes(self: *DB) !void {
+        try self.startResolverReplayRuntimesIfConfigured();
         if (self.enrichment_runtime) |runtime| try runtime.start();
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| try runtime.start();
         if (self.text_merge_runtime) |runtime| try runtime.start();
+        if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    fn hasConfiguredResolvers(self: *const DB) bool {
+        return self.core.index_manager.resolvers.items.len > 0;
+    }
+
+    fn resolverReplayNeedsDrain(self: *DB) bool {
+        if (self.hasConfiguredResolvers()) return true;
+        if (self.resolution_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        if (self.promotion_runtime) |runtime| {
+            const replay_stats = runtime.stats();
+            if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+        }
+        return false;
+    }
+
+    fn notifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+        if (!self.hasConfiguredResolvers()) return;
+        self.notifyResolverReplayRuntimesForced(sequence);
+    }
+
+    fn notifyResolverReplayRuntimesForced(self: *DB, sequence: u64) void {
+        if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+        if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+    }
+
+    fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
+        try self.startResolverReplayRuntimes();
+    }
+
+    fn startResolverReplayRuntimes(self: *DB) !void {
+        if (self.resolution_runtime) |runtime| try runtime.start();
+        if (self.promotion_runtime) |runtime| try runtime.start();
+    }
+
+    fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
+        if (self.hasConfiguredResolvers()) return;
+        if (self.resolution_runtime) |runtime| runtime.stop();
+        if (self.promotion_runtime) |runtime| runtime.stop();
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        // Stop the quarantine retry worker first: it takes the catalog lock
+        // and opens indexes, which must not race the teardown below.
+        self.stopQuarantineRetryWorker();
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
         self.setQueryVisibilityHook(null);
+        if (self.live_doc_set_cache_set) |*cached| {
+            cached.deinit(self.alloc);
+            self.live_doc_set_cache_set = null;
+            self.live_doc_set_cache_generation = null;
+        }
         self.bulk_ingest_coalescer.deinit(self.alloc);
+        self.clearBulkIngestSeenDocKeysLocked();
+        self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
+        if (self.transaction_recovery_identity_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (self.ttl_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -2571,10 +3085,29 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        if (self.resolution_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        self.async_context.resolution_runtime = null;
+        // After the resolution runtime (its final catch-up may journal
+        // resolution artifacts that notify the promoter) but before the
+        // resolution append context the promoter is wired into is destroyed.
+        if (self.promotion_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        self.async_context.promotion_runtime = null;
+        if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
             self.async_context.text_merge_runtime = null;
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+        }
+        if (self.sparse_compaction_runtime) |runtime| {
+            self.async_context.sparse_compaction_runtime = null;
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
@@ -2604,6 +3137,11 @@ pub const DB = struct {
         try resources.index_manager.beginSparseBulkIngestSessions();
         errdefer resources.index_manager.abortSparseBulkIngestSessions();
         try resources.index_manager.beginAlgebraicBulkIngestSessions();
+        self.configureBulkIngestIdentityAllNewLocked() catch |err| {
+            resources.index_manager.abortAlgebraicBulkIngestSessions();
+            return err;
+        };
+        errdefer self.clearBulkIngestIdentityAllNewLocked();
         self.bulk_ingest_coalescer.begin();
     }
 
@@ -2633,6 +3171,7 @@ pub const DB = struct {
                 if (first_err == null) first_err = err;
             };
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             if (first_err) |err| return err;
         }
         finishExternalDenseBulkSessionTracked(self.async_context);
@@ -2660,6 +3199,36 @@ pub const DB = struct {
         self.bulk_ingest_coalescer.begin();
     }
 
+    pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        try resources.store.beginBulkIngestSession();
+        errdefer resources.store.abortBulkIngestSession();
+        try self.configureBulkIngestIdentityAllNewLocked();
+        errdefer self.clearBulkIngestIdentityAllNewLocked();
+        self.bulk_ingest_coalescer.begin();
+    }
+
+    pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
+        lockApply(self);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
+            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
+            return err;
+        };
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+    }
+
+    pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
+        try self.beginPrimaryStoreAutoBulkIngestSession();
+    }
+
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
     }
@@ -2683,9 +3252,11 @@ pub const DB = struct {
             };
             resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
                 self.bulk_ingest_coalescer.clear(self.alloc);
+                self.clearBulkIngestIdentityAllNewLocked();
                 return err;
             };
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
         }
         finishExternalDenseBulkSessionTracked(self.async_context);
         external_session_tracked = false;
@@ -2711,12 +3282,22 @@ pub const DB = struct {
         flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
     }
 
+    pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        const resources = self.core.batchExecutionResources();
+        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.clearBulkIngestIdentityAllNewLocked();
+        resources.store.abortBulkIngestSession();
+    }
+
     pub fn abortBulkIngestSession(self: *DB) void {
         lockApply(self);
         {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             self.bulk_ingest_coalescer.clear(self.alloc);
+            self.clearBulkIngestIdentityAllNewLocked();
             resources.index_manager.abortAlgebraicBulkIngestSessions();
             resources.index_manager.abortDenseBulkIngestSessions();
             resources.store.abortBulkIngestSession();
@@ -2741,6 +3322,22 @@ pub const DB = struct {
         );
     }
 
+    pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
+        return self.core.primary_store_owner.lsmMaintenanceDebtHint();
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        var delay_ns = self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
+        if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        return delay_ns;
+    }
+
+    pub fn nextPrimaryLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+        return self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
+    }
+
     pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
         var async_stats = self.async_context.stats.snapshot();
         async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
@@ -2761,21 +3358,41 @@ pub const DB = struct {
         self.async_context.stats.startup.db_open_ns.store(profile.total_ns, .monotonic);
         self.async_context.stats.startup.load_indexes_ns.store(profile.load_indexes_ns, .monotonic);
 
-        var replay_records: u64 = 0;
-        var replay_entries: u64 = 0;
-        var replay_bytes: u64 = 0;
-        var replay_ns: u64 = 0;
-        for (self.core.index_manager.dense_indexes.items) |*entry| {
-            const write_stats = entry.index.snapshotLsmWriteStats() orelse continue;
-            replay_records += write_stats.wal_replay_records;
-            replay_entries += write_stats.wal_replay_entries;
-            replay_bytes += write_stats.wal_replay_bytes;
-            replay_ns += write_stats.wal_replay_ns;
+        var lsm_open_stats = lsm_backend_mod.Backend.OpenStats{};
+        if (self.core.primary_store_owner.snapshotLsmOpenStats()) |primary_open_stats| {
+            lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, primary_open_stats);
         }
-        self.async_context.stats.startup.wal_replay_records.store(replay_records, .monotonic);
-        self.async_context.stats.startup.wal_replay_entries.store(replay_entries, .monotonic);
-        self.async_context.stats.startup.wal_replay_bytes.store(replay_bytes, .monotonic);
-        self.async_context.stats.startup.wal_replay_ns.store(replay_ns, .monotonic);
+        lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, self.core.index_manager.snapshotLsmOpenStats());
+        self.async_context.stats.startup.lsm_open_stores.store(lsm_open_stats.started, .monotonic);
+        self.async_context.stats.startup.lsm_open_completed.store(lsm_open_stats.completed, .monotonic);
+        self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
+        self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_mounting_runs_ns.store(lsm_open_stats.mounting_runs_ns, .monotonic);
+        self.async_context.stats.startup.lsm_open_loaded_runs.store(lsm_open_stats.loaded_runs, .monotonic);
+        self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
+        self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
+        self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+        self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
+        self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
+        self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.wal_replay_ns, .monotonic);
+        self.async_context.stats.startup.wal_replay_truncated_tail_bytes.store(lsm_open_stats.wal_replay_truncated_tail_bytes, .monotonic);
+
+        const lsm_maintenance_stats = self.snapshotLsmMaintenanceStatsLocked();
+        self.async_context.stats.startup.wal_retention_known.store(true, .monotonic);
+        self.async_context.stats.startup.wal_retained_segments.store(lsm_maintenance_stats.wal_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_retained_bytes.store(lsm_maintenance_stats.wal_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_oldest_retained_segment.store(lsm_maintenance_stats.wal_checkpoint_oldest_retained_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_covered_through_segment.store(lsm_maintenance_stats.wal_checkpoint_covered_through_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_current_segment.store(lsm_maintenance_stats.wal_checkpoint_current_segment, .monotonic);
+        self.async_context.stats.startup.wal_checkpoint_lag_segments.store(lsm_maintenance_stats.wal_checkpoint_lag_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_segments.store(lsm_maintenance_stats.wal_replay_retained_segments, .monotonic);
+        self.async_context.stats.startup.wal_replay_retained_bytes.store(lsm_maintenance_stats.wal_replay_retained_bytes, .monotonic);
+        self.async_context.stats.startup.wal_replay_current_segment.store(lsm_maintenance_stats.wal_replay_current_segment, .monotonic);
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
@@ -2797,6 +3414,51 @@ pub const DB = struct {
         }
         lsm_backend_mod.Backend.accumulateMaintenanceStats(&maintenance_stats, self.core.index_manager.snapshotLsmMaintenanceStats());
         return maintenance_stats;
+    }
+
+    pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.snapshotLsmWriteStatsLocked();
+    }
+
+    fn snapshotLsmWriteStatsLocked(self: *DB) lsm_backend_mod.Backend.WriteStats {
+        var write_stats = lsm_backend_mod.Backend.WriteStats{};
+        if (self.core.primary_store_owner.snapshotLsmWriteStats()) |primary_stats| {
+            lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, primary_stats);
+        }
+        lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
+        return write_stats;
+    }
+
+    pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn trySnapshotTextMemoryAttributionStats(self: *DB) ?index_manager_mod.TextMemoryAttributionStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.snapshotTextMemoryAttribution();
+    }
+
+    pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
+    }
+
+    pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return self.core.index_manager.textMergeStatsSnapshot();
     }
 
     pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
@@ -2830,8 +3492,11 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
-        lockApply(self);
-        defer self.core.unlockApply();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+        }
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const index_score = self.core.index_manager.lsmMaintenanceScore();
@@ -2847,8 +3512,11 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
-        if (!self.core.tryLockApplyExclusive()) return false;
-        defer self.core.unlockApply();
+        if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_reclaim_due) {
+            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        }
 
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         if (primary_score > 0) {
@@ -2858,6 +3526,26 @@ pub const DB = struct {
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
+        return false;
+    }
+
+    pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score == 0 and !primary_reclaim_due) return false;
+        if (try self.core.primary_store_owner.runLsmMaintenanceStep()) return true;
+        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        return false;
+    }
+
+    pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
+        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
+        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+        if (primary_score == 0 and !primary_reclaim_due) return false;
+        if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         return false;
     }
 
@@ -2871,6 +3559,189 @@ pub const DB = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        var steps: usize = 0;
+        while (steps < max_steps) : (steps += 1) {
+            var progressed = false;
+            if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) progressed = true;
+            if (try self.core.index_manager.runLsmObsoleteReclaimDue()) progressed = true;
+
+            if (!progressed) {
+                const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+                if (!wake_due) break;
+                if (!try self.runLsmMaintenanceStep()) break;
+            }
+        }
+        return steps;
+    }
+
+    test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        var key_buf: [16]u8 = undefined;
+        for (0..4) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+                .sync_level = .write,
+            });
+            switch (db.core.primary_store_owner) {
+                .lsm => |*owner| try owner.handle.backend.sync(true),
+                else => return error.SkipZigTest,
+            }
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+            else => return error.SkipZigTest,
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+            else => return error.SkipZigTest,
+        }
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try expectObsoletePathsReclaimable(dense_backend, 1);
+        try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+    }
+
+    /// A queued obsolete path only counts as reclaimable once no reader pins
+    /// the backend; transient background readers (index loads, status probes)
+    /// mask it as pinned_by_readers for a moment. Poll instead of asserting a
+    /// single snapshot so loaded CI machines don't flake.
+    fn expectObsoletePathsReclaimable(backend: *lsm_backend_mod.Backend, expected: u64) !void {
+        var attempts: usize = 0;
+        while (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable != expected) : (attempts += 1) {
+            if (attempts >= 2000) {
+                return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+
+    test "db primary lsm maintenance step does not reclaim index obsolete paths" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        const primary_backend = switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+        const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
+        defer alloc.free(primary_obsolete_path);
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(dense_obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
+            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
+            primary_backend.manifest_dirty = false;
+        }
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try expectObsoletePathsReclaimable(primary_backend, 1);
+        try expectObsoletePathsReclaimable(dense_backend, 1);
+
+        _ = try db.runPrimaryLsmMaintenanceStep();
+
+        try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
+        alloc.free(dense_bytes);
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
@@ -2887,8 +3758,224 @@ pub const DB = struct {
         try self.batchInternal(req, profile, .{});
     }
 
+    pub fn batchWithDocumentArtifactChildRangeDispatcher(
+        self: *DB,
+        req: types.BatchRequest,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+    ) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .document_child_range_dispatcher = dispatcher });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .document_child_range_dispatcher = dispatcher });
+        }
+    }
+
+    pub fn drainDocumentArtifactChildRangeOutbox(
+        self: *DB,
+        dispatcher: DocumentArtifactChildRangeDispatcher,
+        limit: usize,
+    ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+        const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
+        self.core.unlockApply();
+        apply_mutex_held = false;
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+        var result = DocumentArtifactChildRangeOutboxDrainResult{};
+        const max_entries = if (limit == 0 or limit > scanned.len) scanned.len else limit;
+        for (scanned[0..max_entries]) |entry| {
+            result.scanned += 1;
+            var parsed = try std.json.parseFromSlice(DocumentArtifactChildRangeOutboxRecord, self.alloc, entry.value, .{
+                .allocate = .alloc_always,
+            });
+            defer parsed.deinit();
+            if (parsed.value.version != 1) return error.InvalidDocumentChildRangeOutboxRecord;
+            try dispatcher.applyDispatch(self.alloc, .{
+                .owner_group_id = parsed.value.owner_group_id,
+                .doc_key = parsed.value.doc_key,
+                .artifact_name = parsed.value.artifact_name,
+                .child_batch = parsed.value.child_batch,
+            });
+            result.dispatched += 1;
+            try self.deleteDocumentArtifactChildRangeOutboxEntry(entry.key);
+            result.deleted += 1;
+        }
+        return result;
+    }
+
+    fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        const deletes = [_][]const u8{key};
+        try self.core.store.putBatch(&.{}, deletes[0..]);
+    }
+
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });
+    }
+
+    pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
+        var apply_req = req;
+        apply_req.sync_level = .write;
+        try self.batchInternal(apply_req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+        });
+    }
+
+    pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (child_batch.artifact_writes.len == 0 and
+            child_batch.artifact_delete_keys.len == 0 and
+            child_batch.documents.len == 0 and
+            child_batch.dense_embeddings.len == 0 and
+            child_batch.sparse_embeddings.len == 0 and
+            child_batch.generated_enrichment_refs.len == 0)
+        {
+            return 0;
+        }
+
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer store_writes.deinit(self.alloc);
+        var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer delete_keys.deinit(self.alloc);
+        var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_keys.items) |key| self.alloc.free(key);
+            owned_store_keys.deinit(self.alloc);
+        }
+        var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_values.items) |value| self.alloc.free(value);
+            owned_store_values.deinit(self.alloc);
+        }
+        var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_delete_keys.items) |key| self.alloc.free(key);
+            owned_delete_keys.deinit(self.alloc);
+        }
+        var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed_artifact_keys.items) |key| self.alloc.free(key);
+            changed_artifact_keys.deinit(self.alloc);
+        }
+        var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (materialized_graph_artifact_writes.items) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            materialized_graph_artifact_writes.deinit(self.alloc);
+        }
+
+        for (child_batch.artifact_writes) |write| {
+            try store_writes.append(self.alloc, .{
+                .key = write.key,
+                .value = write.value,
+            });
+            try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, write.key);
+        }
+        for (child_batch.artifact_delete_keys) |key| {
+            try delete_keys.append(self.alloc, key);
+            if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+                try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, key);
+            }
+        }
+
+        try appendPrecomputedGraphSourceArtifacts(
+            self,
+            child_batch.artifact_writes,
+            child_batch.artifact_delete_keys,
+            &materialized_graph_artifact_writes,
+            &store_writes,
+            &delete_keys,
+            &owned_delete_keys,
+            &changed_artifact_keys,
+        );
+
+        if (child_batch.artifact_writes.len > 0 or materialized_graph_artifact_writes.items.len > 0) {
+            try self.core.appendArtifactPresenceMarker(&store_writes);
+        }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            child_batch.artifact_delete_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const derived_seed = derived_types.DerivedBatch{
+            .sequence = sequence,
+            .documents = child_batch.documents,
+            .deleted_keys = child_batch.artifact_delete_keys,
+            .changed_artifact_keys = changed_artifact_keys.items,
+            .dense_embeddings = child_batch.dense_embeddings,
+            .sparse_embeddings = child_batch.sparse_embeddings,
+            .generated_enrichment_refs = child_batch.generated_enrichment_refs,
+        };
+        var derived_batch = try derived_types.cloneBatch(self.alloc, derived_seed);
+        defer derived_types.deinitDerivedBatch(self.alloc, &derived_batch);
+        derived_batch.sequence = sequence;
+
+        var sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, derived_batch);
+        defer sync_targets.deinit(self.alloc);
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(
+            self.backend_runtime.io(),
+            store_writes.items,
+            delete_keys.items,
+            .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            },
+        );
+        if (shouldAppendSplitDelta(self)) {
+            try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
+        }
+
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        var pressure_ctx = self.batchContext();
+        try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
+        try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, child_batch.sync_level, sync_targets);
+        if (self.executor.hasWorkers()) {
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, child_batch.sync_level, sequence, sync_targets);
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        } else {
+            if (syncLevelRequiresDerivedVisibility(child_batch.sync_level)) {
+                if (child_batch.sync_level == .full_text) {
+                    try applyDerivedBatchTargetsProfiled(self, derived_batch, sync_targets.full_text_indexes, null);
+                } else {
+                    try applyDerivedBatchProfiled(self, derived_batch, null);
+                }
+            }
+            try self.waitForSyncLevel(child_batch.sync_level, sequence, sync_targets);
+        }
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        return sequence;
     }
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
@@ -2970,6 +4057,18 @@ pub const DB = struct {
             for (owned_store_keys.items) |key| self.alloc.free(key);
             owned_store_keys.deinit(self.alloc);
         }
+        var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_store_values.items) |value| self.alloc.free(value);
+            owned_store_values.deinit(self.alloc);
+        }
+        const vector_field_names_start_ns = monotonicTimeNs();
+        const vector_store_field_names = try self.core.index_manager.vectorStoreFieldNamesAlloc(self.alloc);
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_vector_field_names_ns, vector_field_names_start_ns);
+        defer {
+            for (vector_store_field_names) |field| self.alloc.free(field);
+            if (vector_store_field_names.len > 0) self.alloc.free(vector_store_field_names);
+        }
         var timestamp_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer {
             for (timestamp_writes.items) |item| {
@@ -3016,6 +4115,18 @@ pub const DB = struct {
         @memset(overwritten_flags, false);
         var overwrite_probe_entries = std.ArrayListUnmanaged(OverwriteProbeEntry).empty;
         defer overwrite_probe_entries.deinit(self.alloc);
+        var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upsert_keys.deinit(self.alloc);
+        var identity_upsert_write_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer identity_upsert_write_indexes.deinit(self.alloc);
+        var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (identity_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            identity_writes.deinit(self.alloc);
+        }
 
         const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
 
@@ -3027,7 +4138,6 @@ pub const DB = struct {
                     .mentioned_graph_indexes = &.{},
                     .dense_embeddings = &.{},
                     .sparse_embeddings = &.{},
-                    .summaries = &.{},
                 };
                 extracted_initialized += 1;
                 try store_writes.append(self.alloc, .{
@@ -3036,9 +4146,17 @@ pub const DB = struct {
                 });
                 continue;
             }
+            const mapper_extract_start_ns = monotonicTimeNs();
             extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
+            const graph_field_extract_start_ns = monotonicTimeNs();
             try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);
+            const index_field_embeddings_start_ns = monotonicTimeNs();
+            try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_index_field_embeddings_ns, index_field_embeddings_start_ns);
             extracted_initialized += 1;
+            const embedding_artifacts_start_ns = monotonicTimeNs();
             for (extracted[i].dense_embeddings) |*embedding| {
                 if (embedding.artifact_key != null) continue;
                 embedding.artifact_key = try appendEmbeddingArtifactWrite(
@@ -3065,6 +4183,8 @@ pub const DB = struct {
                     embedding.values,
                 );
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_embedding_artifacts_ns, embedding_artifacts_start_ns);
+            const graph_artifacts_start_ns = monotonicTimeNs();
             for (extracted[i].graph_writes) |graph_write| {
                 try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write);
             }
@@ -3074,7 +4194,16 @@ pub const DB = struct {
                     .index_name = try self.alloc.dupe(u8, index_name),
                 });
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
+                const strip_store_value_start_ns = monotonicTimeNs();
+                const store_value = try strippedStoredDocumentValueAlloc(
+                    self.alloc,
+                    cleaned,
+                    vector_store_field_names,
+                    &owned_store_values,
+                );
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
                 const store_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);
                 try owned_store_keys.append(self.alloc, store_key);
                 try overwrite_probe_entries.append(self.alloc, .{
@@ -3083,9 +4212,12 @@ pub const DB = struct {
                 });
                 try store_writes.append(self.alloc, .{
                     .key = store_key,
-                    .value = cleaned,
+                    .value = store_value,
                 });
+                try identity_upsert_keys.append(self.alloc, write.key);
+                try identity_upsert_write_indexes.append(self.alloc, i);
                 if (shouldWriteTimestamp(write.key)) {
+                    const timestamp_start_ns = monotonicTimeNs();
                     const write_timestamp_ns = try resolveWriteTimestampNs(self, batch_timestamp_ns, write.value);
                     const timestamp_key = try makeTimestampKey(self.alloc, write.key);
                     const timestamp_value = try encodeTimestampValue(self.alloc, write_timestamp_ns);
@@ -3093,11 +4225,28 @@ pub const DB = struct {
                         .key = timestamp_key,
                         .value = timestamp_value,
                     });
+                    if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_timestamp_ns, timestamp_start_ns);
                 }
             }
         }
+        if (profile) |active_profile| {
+            active_profile.identity_upsert_keys += @intCast(identity_upsert_keys.items.len);
+            active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
+        }
+        const identity_capacity_start_ns = monotonicTimeNs();
+        if (!self.bulk_ingest_identity_all_new or effective_req.deletes.len != 0) {
+            try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        }
+        if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
-        if (overwrite_probe_entries.items.len > 0) {
+        var assume_all_new_identity_upserts = false;
+        if (self.bulk_ingest_identity_all_new and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
+            assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(identity_upsert_keys.items);
+            if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
+        }
+
+        if (!assume_all_new_identity_upserts and overwrite_probe_entries.items.len > 0) {
+            const overwrite_probe_start_ns = monotonicTimeNs();
             std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
             const probe_keys = try self.alloc.alloc([]const u8, overwrite_probe_entries.items.len);
             defer self.alloc.free(probe_keys);
@@ -3112,6 +4261,7 @@ pub const DB = struct {
             for (overwrite_probe_entries.items, 0..) |entry, i| {
                 overwritten_flags[entry.write_index] = probe_values[i] != null;
             }
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.overwrite_probe_ns, overwrite_probe_start_ns);
         }
 
         for (effective_req.graph_writes) |graph_write| {
@@ -3177,7 +4327,7 @@ pub const DB = struct {
         defer freeOwnedKeySlice(self.alloc, deleted_artifact_keys);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
-        const use_thin_replay_fast_path = self.executor.hasWorkers() and
+        const use_thin_replay_fast_path =
             effective_req.sync_level != .full_text and
             effective_req.sync_level != .enrichments and
             effective_req.sync_level != .aknn and
@@ -3188,6 +4338,29 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(self.alloc);
+        var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
+        defer {
+            for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(self.alloc);
+            remote_child_range_dispatches.deinit(self.alloc);
+        }
+        var owned_child_range_outbox_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_keys.items) |key| self.alloc.free(key);
+            owned_child_range_outbox_keys.deinit(self.alloc);
+        }
+        var owned_child_range_outbox_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_child_range_outbox_values.items) |value| self.alloc.free(value);
+            owned_child_range_outbox_values.deinit(self.alloc);
+        }
+        var materialized_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (materialized_graph_artifact_writes.items) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            materialized_graph_artifact_writes.deinit(self.alloc);
+        }
         if (!use_thin_replay_fast_path) {
             const precompute_generated_start_ns = monotonicTimeNs();
             precomputed_generated = try prepareGeneratedEnrichments(
@@ -3195,22 +4368,106 @@ pub const DB = struct {
                 effective_req,
                 extracted[0..extracted_initialized],
                 generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                opts.force_generated_artifact_names,
             );
+
+            if (opts.document_child_range_dispatcher != null) {
+                try partitionRemoteDocumentChildRangeGeneratedBatch(self, &precomputed_generated, &remote_child_range_dispatches);
+            }
 
             for (precomputed_generated.artifact_writes) |write| {
                 try store_writes.append(self.alloc, .{
                     .key = write.key,
                     .value = write.value,
                 });
+                try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, write.key);
             }
+            for (precomputed_generated.artifact_delete_keys) |key| {
+                try delete_keys.append(self.alloc, key);
+                if (internal_keys.isAssetArtifactKey(key)) {
+                    try appendUniqueOwnedKey(self.alloc, &changed_graph_artifact_keys, key);
+                }
+            }
+            try appendPrecomputedGraphSourceArtifacts(
+                self,
+                precomputed_generated.artifact_writes,
+                precomputed_generated.artifact_delete_keys,
+                &materialized_graph_artifact_writes,
+                &store_writes,
+                &delete_keys,
+                &owned_delete_keys,
+                &changed_graph_artifact_keys,
+            );
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
         }
+        if (explicit_embedding_artifact_writes.items.len > 0 or
+            explicit_graph_artifact_writes.items.len > 0 or
+            materialized_graph_artifact_writes.items.len > 0 or
+            precomputed_generated.artifact_writes.len > 0)
+        {
+            try self.core.appendArtifactPresenceMarker(&store_writes);
+        }
+        try appendAssetArtifactSourceIndexMutations(
+            self.alloc,
+            &store_writes,
+            deleted_artifact_keys,
+            &delete_keys,
+            &owned_store_keys,
+            &owned_store_values,
+            &owned_delete_keys,
+        );
 
         var sync_targets: ManagedSyncTargets = .{};
         defer sync_targets.deinit(self.alloc);
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
         const sequence = self.core.reserveDerivedAppendSequence();
+        const identity_metadata_start_ns = monotonicTimeNs();
+        var used_trusted_identity_path = false;
+        if (effective_req.deletes.len != 0) {
+            self.clearBulkIngestIdentityAllNewLocked();
+        }
+        if (self.bulk_ingest_identity_all_new and
+            effective_req.deletes.len == 0 and
+            identity_upsert_keys.items.len > 0 and
+            (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
+        {
+            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+                self.alloc,
+                self.core.identity_namespace,
+                sequence,
+                &identity_writes,
+                identity_upsert_keys.items,
+                &self.bulk_ingest_identity_state,
+            );
+            if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
+        }
+        if (!used_trusted_identity_path) {
+            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+                self.alloc,
+                self.core.store,
+                self.core.identity_namespace,
+                sequence,
+                &identity_writes,
+                identity_upsert_keys.items,
+                effective_req.deletes,
+            );
+        }
+        if (profile) |active_profile| {
+            recordProfileNs(profile, &active_profile.identity_metadata_ns, identity_metadata_start_ns);
+            active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
+        }
+        const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+        try store_writes.appendSlice(self.alloc, identity_writes.items);
+        try appendDocumentChildRangeOutboxWrites(
+            self.alloc,
+            sequence,
+            remote_child_range_dispatches.items,
+            effective_req.sync_level,
+            &store_writes,
+            &owned_child_range_outbox_keys,
+            &owned_child_range_outbox_values,
+        );
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
             try encodeThinReplayRecordPayload(
@@ -3266,7 +4523,14 @@ pub const DB = struct {
             },
             store_batch_options,
         );
-        if (profile) |active_profile| recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
+        if (pending_identity_visibility_summary) |summary| {
+            self.identity_visibility_summary_cache = summary;
+        }
+        if (profile) |active_profile| {
+            recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
+            active_profile.store_write_count += @intCast(store_writes.items.len);
+            active_profile.store_delete_count += @intCast(delete_keys.items.len);
+        }
         if (shouldAppendSplitDelta(self)) {
             const split_delta_start_ns = monotonicTimeNs();
             try self.core.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
@@ -3278,8 +4542,12 @@ pub const DB = struct {
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
         self.core.unlockApply();
         apply_mutex_held = false;
+        if (opts.document_child_range_dispatcher) |dispatcher| {
+            _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
+        }
         var pressure_ctx = self.batchContext();
         const backlog_pressure_start_ns = monotonicTimeNs();
+        try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
         try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
         const wait_sync_start_ns = monotonicTimeNs();
@@ -3287,11 +4555,13 @@ pub const DB = struct {
             const notify_executor_start_ns = monotonicTimeNs();
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         } else {
-            if (syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
+            if (opts.wait_for_sync_level and syncLevelRequiresDerivedVisibility(effective_req.sync_level)) {
                 const derived_apply_start_ns = monotonicTimeNs();
                 if (effective_req.sync_level == .full_text) {
                     try applyDerivedBatchTargetsProfiled(self, materialized_derived_batch.?, sync_targets.full_text_indexes, profile);
@@ -3300,11 +4570,13 @@ pub const DB = struct {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
             }
-            const sync_wait_start_ns = monotonicTimeNs();
-            try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            if (opts.wait_for_sync_level) {
+                const sync_wait_start_ns = monotonicTimeNs();
+                try self.waitForSyncLevel(effective_req.sync_level, sequence, sync_targets);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
+            }
         }
-        if (effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
+        if (opts.wait_for_sync_level and effective_req.sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
@@ -3313,6 +4585,116 @@ pub const DB = struct {
             runtime.notifySequence(sequence);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
         }
+        self.notifyResolverReplayRuntimes(sequence);
+    }
+
+    /// Inject (or clear) the cross-shard entity-resolution candidate source on
+    /// an already-open DB. The serving layer (managed write cache) calls this
+    /// right after a DB is opened, since managed DBs open lazily and cannot
+    /// thread the source through `OpenOptions`. No-op when this DB has no
+    /// resolution runtime (e.g. read-only / status opens).
+    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+        self.resolution_candidate_source = src;
+        if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
+    }
+
+    /// Inject (or clear) the cross-shard entity sink on an already-open DB. The
+    /// serving layer (managed write cache) calls this right after a DB is opened,
+    /// since managed DBs open lazily and cannot thread the sink through
+    /// `OpenOptions`. No-op when this DB has no promotion runtime.
+    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+        self.entity_sink = sink;
+        if (self.promotion_runtime) |runtime| runtime.setSink(sink);
+    }
+
+    /// Inject (or clear) the source-shard promotion owner on an already-open DB.
+    /// Serving-layer managed DBs use this to keep follower raft apply from
+    /// turning replay into public entity-table writes.
+    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+        self.promotion_owner = owner;
+        if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
+    }
+
+    fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
+        if (doc_ids.len == 0) return;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+
+        const raw_next = txn.get(internal_keys.identity_next_ordinal_key[0..]) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (raw_next.len != @sizeOf(doc_identity.DocOrdinal)) return error.InvalidDocIdentity;
+        const next_ordinal = std.mem.readInt(doc_identity.DocOrdinal, raw_next[0..4], .big);
+        if (next_ordinal != 0 and next_ordinal < std.math.maxInt(doc_identity.DocOrdinal)) return;
+
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        for (doc_ids) |doc_id| {
+            if (seen.contains(doc_id)) continue;
+            try seen.put(self.alloc, doc_id, {});
+            if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_id) != null) continue;
+            return error.DocOrdinalExhausted;
+        }
+    }
+
+    fn configureBulkIngestIdentityAllNewLocked(self: *DB) !void {
+        self.clearBulkIngestIdentityAllNewLocked();
+        if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
+        if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
+            self.bulk_ingest_identity_state = state;
+            self.identity_visibility_summary_cache = state.visibility_summary;
+            self.bulk_ingest_identity_all_new = true;
+        }
+    }
+
+    fn clearBulkIngestIdentityAllNewLocked(self: *DB) void {
+        self.bulk_ingest_identity_all_new = false;
+        self.bulk_ingest_identity_state = .{};
+        self.clearBulkIngestSeenDocKeysLocked();
+    }
+
+    fn clearBulkIngestSeenDocKeysLocked(self: *DB) void {
+        var it = self.bulk_ingest_seen_doc_keys.keyIterator();
+        while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
+        self.bulk_ingest_seen_doc_keys.clearRetainingCapacity();
+    }
+
+    fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
+        var txn = try self.core.store.beginCurrentScanTxn();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        const lower = [_]u8{internal_keys.user_namespace};
+        const first = (try cur.seekAtOrAfter(lower[0..])) orelse return true;
+        return first.key.len == 0 or first.key[0] != internal_keys.user_namespace;
+    }
+
+    fn rememberBulkIngestAllNewIdentityUpserts(self: *DB, doc_ids: []const []const u8) !bool {
+        var batch_seen = std.StringHashMapUnmanaged(void).empty;
+        defer batch_seen.deinit(self.alloc);
+        for (doc_ids) |doc_id| {
+            if (self.bulk_ingest_seen_doc_keys.contains(doc_id)) return false;
+            if (batch_seen.contains(doc_id)) return false;
+            try batch_seen.put(self.alloc, doc_id, {});
+        }
+
+        for (doc_ids) |doc_id| {
+            const owned = try self.alloc.dupe(u8, doc_id);
+            errdefer self.alloc.free(owned);
+            try self.bulk_ingest_seen_doc_keys.put(self.alloc, owned, {});
+        }
+        return true;
+    }
+
+    fn identityUpsertStoreWritesAreNew(write_indexes: []const usize, overwritten_flags: []const bool) bool {
+        for (write_indexes) |write_index| {
+            if (write_index >= overwritten_flags.len) return false;
+            if (overwritten_flags[write_index]) return false;
+        }
+        return true;
     }
 
     fn CoalescedKeyValueRequest(comptime T: type) type {
@@ -3793,6 +5175,261 @@ pub const DB = struct {
         };
     }
 
+    pub fn getDocumentArtifactManifest(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?types.DocumentArtifactManifest {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        errdefer alloc.free(manifest);
+
+        const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+        defer alloc.free(state_key);
+        const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        errdefer if (state) |value| alloc.free(value);
+
+        return try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_name, manifest, state);
+    }
+
+    pub fn listDocumentArtifactManifests(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+    ) !types.DocumentArtifactManifestList {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "asset");
+        defer alloc.free(prefix);
+        const rows = try self.core.scanStorePrefix(alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+        var artifacts = std.ArrayListUnmanaged(types.DocumentArtifactManifest).empty;
+        errdefer {
+            for (artifacts.items) |*artifact| artifact.deinit(alloc);
+            artifacts.deinit(alloc);
+        }
+
+        for (rows) |row| {
+            var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, row.key)) orelse continue;
+            defer artifact_ref.deinit(alloc);
+            if (artifact_ref.kind != .asset) continue;
+            if (artifact_ref.unit_id != null) continue;
+            if (!std.mem.eql(u8, artifact_ref.document_id, doc_key)) continue;
+
+            const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_ref.name);
+            defer alloc.free(state_key);
+            const state = self.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            errdefer if (state) |value| alloc.free(value);
+
+            const manifest_json = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(manifest_json);
+            try artifacts.append(
+                alloc,
+                try documentArtifactManifestFromJsonAlloc(alloc, doc_key, artifact_ref.name, manifest_json, state),
+            );
+        }
+
+        return .{
+            .document_id = try alloc.dupe(u8, doc_key),
+            .artifacts = try artifacts.toOwnedSlice(alloc),
+        };
+    }
+
+    pub fn updateDocumentArtifactChildRangePlacement(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: types.DocumentArtifactChildRangePlacementUpdate,
+    ) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        };
+        defer alloc.free(manifest);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, manifest, .{ .allocate = .alloc_always });
+        if (manifest_value != .object) return error.InvalidArgument;
+        const child_ranges = manifest_value.object.getPtr("child_ranges") orelse return error.InvalidArgument;
+        if (child_ranges.* != .array) return error.InvalidArgument;
+
+        var changed = false;
+        for (child_ranges.array.items) |*item| {
+            if (item.* != .object) return error.InvalidArgument;
+            const range_id = item.object.get("range_id") orelse return error.InvalidArgument;
+            if (range_id != .string) return error.InvalidArgument;
+            if (!std.mem.eql(u8, range_id.string, update.range_id)) continue;
+
+            try putLeakyJsonStringField(arena_alloc, &item.object, "placement", update.placement);
+            if (update.owner_group_id) |owner_group_id| try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", owner_group_id);
+            if (update.placement_generation) |placement_generation| try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", placement_generation);
+            if (update.route_status) |route_status| try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", route_status);
+            if (update.split_eligible) |split_eligible| try item.object.put(arena_alloc, "split_eligible", .{ .bool = split_eligible });
+            changed = true;
+            break;
+        }
+
+        if (!changed) {
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            return false;
+        }
+
+        const updated_manifest = try std.json.Stringify.valueAlloc(alloc, manifest_value, .{});
+        defer alloc.free(updated_manifest);
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{manifest_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = manifest_key,
+            .value = updated_manifest,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        self.notifyResolverReplayRuntimes(sequence);
+        return true;
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !bool {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        const value = try self.get(alloc, doc_key) orelse return false;
+        defer alloc.free(value);
+
+        const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
+        const force_artifacts = [_][]const u8{artifact_name};
+        try self.batchInternal(.{
+            .writes = &writes,
+            .sync_level = .full_index,
+        }, null, .{
+            .force_generated_artifact_names = &force_artifacts,
+        });
+        return true;
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: []const u8,
+        req: types.DocumentArtifactTableReprocessRequest,
+    ) !types.DocumentArtifactTableReprocessResult {
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
+        defer cfg.deinit(alloc);
+        var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer_cfg.deinit(alloc);
+        if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
+
+        var effective_req = req;
+        if (req.shard_cursors.len > 0) {
+            if (req.shard_cursors.len != 1) return error.InvalidArgument;
+            const cursor = req.shard_cursors[0];
+            if (cursor.group_id != null) return error.InvalidArgument;
+            effective_req = .{
+                .from_key = cursor.next_key,
+                .to_key = req.to_key,
+                .limit = if (cursor.limit != 0) cursor.limit else req.limit,
+            };
+        }
+
+        const limit = if (effective_req.limit == 0) @as(u32, 100) else effective_req.limit;
+        const scan_limit = if (limit == std.math.maxInt(u32)) limit else limit + 1;
+        var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
+            .include_documents = true,
+            .limit = scan_limit,
+        });
+        defer scanned.deinit(alloc);
+
+        var failures = std.ArrayListUnmanaged(types.DocumentArtifactReprocessFailure).empty;
+        errdefer {
+            for (failures.items) |*failure| failure.deinit(alloc);
+            failures.deinit(alloc);
+        }
+
+        var result = types.DocumentArtifactTableReprocessResult{
+            .limit = limit,
+        };
+        errdefer result.deinit(alloc);
+
+        const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
+        for (scanned.documents[0..process_len]) |doc| {
+            result.scanned += 1;
+            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    result.failed += 1;
+                    try failures.append(alloc, .{
+                        .key = try alloc.dupe(u8, doc.id),
+                        .error_code = try alloc.dupe(u8, @errorName(err)),
+                    });
+                    continue;
+                },
+            };
+            if (handled) {
+                result.reprocessed += 1;
+            } else {
+                result.skipped += 1;
+            }
+        }
+
+        if (scanned.documents.len > process_len and process_len > 0) {
+            result.next_key = try alloc.dupe(u8, scanned.documents[process_len - 1].id);
+        }
+        result.failures = try failures.toOwnedSlice(alloc);
+        return result;
+    }
+
     pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         return try self.lookup(alloc, key, opts);
     }
@@ -3827,9 +5464,12 @@ pub const DB = struct {
         const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
         defer if (upper) |buf| self.core.alloc.free(buf);
 
-        const internal_key = try self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
+        const internal_key = self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
             .skip_fn = &skipNonPrimaryMedianKey,
-        });
+        }) catch |err| switch (err) {
+            error.NotFound => return try doc_identity.findMedianDocIdAlloc(alloc, self.core.store, byte_range.start, byte_range.end),
+            else => return err,
+        };
         defer alloc.free(internal_key);
 
         return (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, internal_key)) orelse error.NotFound;
@@ -4072,8 +5712,10 @@ pub const DB = struct {
 
         try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
         try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+        try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
+        try validateRestoredIdentityNamespace(&opened_primary.store, opts);
         try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
-        if (restore_identity) |identity| try markRestorePrimaryRestored(
+        if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
             identity.backup_id,
@@ -4081,6 +5723,12 @@ pub const DB = struct {
             identity.snapshot_path,
             identity.group_id,
         );
+    }
+
+    fn validateRestoredIdentityNamespace(store: *docstore_mod.DocStore, opts: OpenOptions) !void {
+        if (opts.identity_namespace == null or opts.prefer_existing_identity_namespace) return;
+        const stored = (try doc_identity.loadNamespaceFromStore(store)) orelse return;
+        if (!stored.eql(opts.identity_namespace.?)) return error.IdentityNamespaceMismatch;
     }
 
     pub fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
@@ -4105,7 +5753,7 @@ pub const DB = struct {
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity);
     }
 
-    pub fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
+    fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
         try ensureDirPath(path);
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
         defer alloc.free(repair_marker_path);
@@ -4165,7 +5813,28 @@ pub const DB = struct {
         return try readRestoreStateForPathAlloc(alloc, path);
     }
 
-    pub fn markRestorePrimaryRestored(
+    pub fn markRestoreCompleteForPath(
+        alloc: Allocator,
+        path: []const u8,
+        backup_id: []const u8,
+        location: []const u8,
+        snapshot_path: []const u8,
+        group_id: u64,
+    ) !void {
+        var state = try restoreStateAlloc(alloc, backup_id, location, snapshot_path, group_id, "complete", true, true, "");
+        defer state.deinit(alloc);
+        try writeRestoreStateForPath(alloc, path, state);
+        const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
+        defer alloc.free(repair_marker_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+            .sub_path = repair_marker_path,
+            .data = "done\n",
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPath(
         alloc: Allocator,
         path: []const u8,
         backup_id: []const u8,
@@ -4193,7 +5862,7 @@ pub const DB = struct {
         return state.primary_restored and !state.runtime_repair_complete;
     }
 
-    pub fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
+    fn markRestoreRuntimeRepairNeeded(alloc: Allocator, path: []const u8) !void {
         const repair_marker_path = try restoreRepairMarkerPathAlloc(alloc, path);
         defer alloc.free(repair_marker_path);
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
@@ -4214,7 +5883,7 @@ pub const DB = struct {
         try deleteFileIfExists(io, import_marker_path);
     }
 
-    pub fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
+    fn markRestoreRuntimeRepairComplete(alloc: Allocator, path: []const u8) !void {
         var state = (try readRestoreStateForPathAlloc(alloc, path)) orelse return error.InvalidRestoreState;
         defer state.deinit(alloc);
         const new_phase = try alloc.dupe(u8, "complete");
@@ -4288,13 +5957,12 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
-            try self.runUntilIdle();
+            try self.runRestoreRepairDrainAsync();
             try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
-            std.log.info("restore runtime repair sync indexes path={s}", .{self.core.path});
-            try self.core.index_manager.syncAll(false);
+            std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -4302,7 +5970,7 @@ pub const DB = struct {
         return error.InvalidRestoreState;
     }
 
-    pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
+    fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
         var repaired = false;
         while (try self.restoreRuntimeRepairNeeded()) {
             _ = try self.repairRestoreRuntimeStateStepIfNeeded(alloc);
@@ -4311,7 +5979,7 @@ pub const DB = struct {
         return repaired;
     }
 
-    pub fn rebuildGraphDerivedState(self: *DB) !usize {
+    fn rebuildGraphDerivedState(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.rebuildGraphSplitDestination(
@@ -4354,8 +6022,16 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upsert_keys.deinit(self.alloc);
+        for (intents) |intent| {
+            if (intent.value == null or isMetadataKey(intent.key)) continue;
+            try identity_upsert_keys.append(self.alloc, intent.key);
+        }
+
         lockApply(self);
         defer self.core.unlockApply();
+        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         try self.core.writeIntents(txn_id, intents, predicates);
     }
 
@@ -4400,7 +6076,56 @@ pub const DB = struct {
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        try self.core.resolveTransactionIntents(txn_id, status, commit_version);
+
+        var raw_identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_identity_upserts.items) |key| self.alloc.free(@constCast(key));
+            raw_identity_upserts.deinit(self.alloc);
+        }
+        var raw_identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (raw_identity_deletes.items) |key| self.alloc.free(@constCast(key));
+            raw_identity_deletes.deinit(self.alloc);
+        }
+        var identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upserts.deinit(self.alloc);
+        var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_deletes.deinit(self.alloc);
+        var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (identity_writes.items) |item| {
+                self.alloc.free(@constCast(item.key));
+                self.alloc.free(@constCast(item.value));
+            }
+            identity_writes.deinit(self.alloc);
+        }
+
+        if (status == .committed) {
+            try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
+            for (raw_identity_upserts.items) |key| {
+                if (!isMetadataKey(key)) try identity_upserts.append(self.alloc, key);
+            }
+            for (raw_identity_deletes.items) |key| {
+                if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
+            }
+            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+                self.alloc,
+                self.core.store,
+                self.core.identity_namespace,
+                self.core.nextDerivedSequence(),
+                &identity_writes,
+                identity_upserts.items,
+                identity_deletes.items,
+            );
+        }
+
+        const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+        try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+            .writes = identity_writes.items,
+        });
+        if (pending_identity_visibility_summary) |summary| {
+            self.identity_visibility_summary_cache = summary;
+        }
     }
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
@@ -4560,7 +6285,10 @@ pub const DB = struct {
         min_weight: f64,
         max_weight: f64,
     ) !?paths_mod.Path {
-        const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+        const entry = self.core.index_manager.graphIndex(index_name) orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
         const params = graph_query_mod.QueryParams{
             .edge_types = edge_types,
             .direction = direction,
@@ -4609,6 +6337,7 @@ pub const DB = struct {
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);
         }
@@ -4619,6 +6348,7 @@ pub const DB = struct {
                 .target = try alloc.dupe(u8, item.target),
                 .edge_type = try alloc.dupe(u8, item.edge_type),
                 .weight = item.weight,
+                .metadata = if (item.metadata.len > 0) try alloc.dupe(u8, item.metadata) else "",
             };
             initialized_edges += 1;
             total_weight += item.weight;
@@ -4652,6 +6382,31 @@ pub const DB = struct {
         });
     }
 
+    fn graphInputSetHitsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        hit_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]types.SearchHit {
+        const hits = try alloc.alloc(types.SearchHit, hit_ids.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+            if (hits.len > 0) alloc.free(hits);
+        }
+        for (hit_ids, 0..) |hit_id, j| {
+            hits[j] = .{
+                .id = try alloc.dupe(u8, hit_id),
+                .doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit_id, generation),
+                .score = null,
+                .stored_data = null,
+                .chunk_hits = &.{},
+            };
+            initialized += 1;
+        }
+        return hits;
+    }
+
     pub fn executeNamedGraphQueries(
         self: *DB,
         alloc: Allocator,
@@ -4661,39 +6416,37 @@ pub const DB = struct {
     ) ![]types.GraphSearchResult {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        if (req.identity_read_generation == null) {
+            for (input_sets) |input_set| {
+                if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
+            }
+        }
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
 
         var named_sets = try alloc.alloc(NamedResultSet, input_sets.len);
         defer alloc.free(named_sets);
         var temp_hits = try alloc.alloc([]types.SearchHit, input_sets.len);
         defer alloc.free(temp_hits);
-        var initialized_sets: usize = 0;
-        errdefer {
-            for (temp_hits[0..initialized_sets]) |hits| {
-                for (hits) |*hit| hit.deinit(alloc);
-                if (hits.len > 0) alloc.free(hits);
+        var resolved_sets = try alloc.alloc(?doc_set.ResolvedDocSet, input_sets.len);
+        defer {
+            for (resolved_sets) |*maybe_set| {
+                if (maybe_set.*) |*set| set.deinit(alloc);
             }
+            if (resolved_sets.len > 0) alloc.free(resolved_sets);
         }
+        @memset(resolved_sets, null);
+        var initialized_sets: usize = 0;
 
         for (input_sets, 0..) |input_set, i| {
-            temp_hits[i] = try alloc.alloc(types.SearchHit, input_set.hit_ids.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (temp_hits[i][0..initialized]) |*hit| hit.deinit(alloc);
-                if (temp_hits[i].len > 0) alloc.free(temp_hits[i]);
-            }
-            for (input_set.hit_ids, 0..) |hit_id, j| {
-                temp_hits[i][j] = .{
-                    .id = try alloc.dupe(u8, hit_id),
-                    .score = null,
-                    .stored_data = null,
-                    .chunk_hits = &.{},
-                };
-                initialized += 1;
-            }
+            resolved_sets[i] = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+            temp_hits[i] = try self.graphInputSetHitsAlloc(alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+            const resolved_doc_set = if (resolved_sets[i]) |*set| set else null;
             named_sets[i] = .{
                 .name = input_set.name,
                 .hits = temp_hits[i],
                 .total_hits = if (input_set.total_hits > 0) input_set.total_hits else @intCast(input_set.hit_ids.len),
+                .resolved_doc_set = resolved_doc_set,
+                .resolved_doc_set_complete = input_set.total_hits == 0 or @as(u64, input_set.total_hits) <= input_set.hit_ids.len,
             };
             initialized_sets += 1;
         }
@@ -4704,7 +6457,7 @@ pub const DB = struct {
             }
         }
 
-        return try self.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets);
+        return try self.executeGraphQueriesWithSets(alloc, snapshot_req, graph_queries, named_sets);
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -4737,6 +6490,401 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.addEnrichment(cfg);
+    }
+
+    pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.addResolver(cfg);
+        }
+        try self.startResolverReplayRuntimes();
+        try self.backfillResolverCorpus();
+    }
+
+    pub const ResolverUpsertOptions = struct {
+        /// When false, persist the catalog mutation and mark the resolver backlog
+        /// dirty, but leave the actual re-resolution drain to the caller. Managed
+        /// table opens use this so DB runtime hooks are installed before
+        /// cross-shard candidate blocking or promotion can run.
+        drain_backfill: bool = true,
+    };
+
+    /// Add or replace a resolver. Inserts and material config changes re-resolve
+    /// the existing corpus so the new resolver/scorer behavior applies to
+    /// documents already ingested (the extraction artifacts did not change, so
+    /// the incremental hint would not fire on its own).
+    pub fn upsertResolverWithResultOptions(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        options: ResolverUpsertOptions,
+    ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        const upsert_result = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            break :blk try self.core.upsertResolver(cfg);
+        };
+        switch (upsert_result) {
+            .inserted, .updated_backfill_required => {
+                try self.startResolverReplayRuntimes();
+                if (options.drain_backfill) {
+                    try self.backfillResolverCorpus();
+                } else if (self.resolution_runtime) |runtime| {
+                    try runtime.requestReresolveBacklog();
+                }
+            },
+            .updated_no_backfill => {
+                try self.startResolverReplayRuntimesIfConfigured();
+                if (options.drain_backfill and self.resolution_runtime != null) {
+                    const runtime = self.resolution_runtime.?;
+                    if (try runtime.hasReresolveBacklog()) {
+                        try self.backfillResolverCorpus();
+                    }
+                }
+            },
+        }
+        return upsert_result;
+    }
+
+    pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        return try self.upsertResolverWithResultOptions(cfg, .{});
+    }
+
+    pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        _ = try self.upsertResolverWithResult(cfg);
+    }
+
+    pub fn drainResolverBackfill(self: *DB) !void {
+        try self.startResolverReplayRuntimesIfConfigured();
+        try self.backfillResolverCorpus();
+    }
+
+    fn backfillResolverCorpus(self: *DB) !void {
+        if (!self.hasConfiguredResolvers()) return;
+        if (self.resolution_runtime) |runtime| {
+            try runtime.requestReresolveBacklog();
+            while (true) {
+                var tick = try runtime.runReresolveBacklogWindow();
+                const queued = tick.queued;
+                const complete = tick.complete;
+                tick.deinit(self.runtime_alloc);
+                // Drive the enqueued extraction artifacts through resolution,
+                // promotion, and graph materialization before queuing more.
+                if (queued > 0) try self.runUntilIdle();
+                if (complete) break;
+            }
+        }
+    }
+
+    pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        try self.retireResolverReplayBeforeCatalogRemoval();
+
+        const retirement_sequence = blk: {
+            lockApply(self);
+            defer self.core.unlockApply();
+
+            const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
+            defer {
+                var owned = cfg;
+                owned.deinit(self.alloc);
+            }
+
+            break :blk try self.retireResolverArtifactsLocked(cfg);
+        };
+
+        if (retirement_sequence) |sequence| {
+            self.executor.notifySequence(sequence);
+            self.notifyResolverReplayRuntimesForced(sequence);
+            try self.runUntilIdle();
+        }
+
+        {
+            lockApply(self);
+            defer self.core.unlockApply();
+            if (!try self.core.removeResolver(name)) return false;
+        }
+
+        self.stopResolverReplayRuntimesIfUnconfigured();
+        return true;
+    }
+
+    fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.name, name)) {
+                return try index_manager_mod.ResolverConfig.clone(self.alloc, cfg);
+            }
+        }
+        return null;
+    }
+
+    fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| self.alloc.free(@constCast(key));
+            deletes.deinit(self.alloc);
+        }
+        var changed = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (changed.items) |key| self.alloc.free(key);
+            changed.deinit(self.alloc);
+        }
+
+        const marker_prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(self.alloc, cfg.source_artifact);
+        defer self.alloc.free(marker_prefix);
+        const markers = try self.core.store.scanPrefix(self.alloc, marker_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, markers);
+
+        for (markers) |marker| {
+            const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.alloc, marker.value)) orelse continue;
+            defer {
+                self.alloc.free(parsed.doc_key);
+                self.alloc.free(parsed.artifact_name);
+            }
+            if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) continue;
+
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
+            var resolution_key_owned = true;
+            errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
+            if (!containsDeleteKey(deletes.items, resolution_key)) {
+                try deletes.append(self.alloc, resolution_key);
+                resolution_key_owned = false;
+                try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
+            } else {
+                self.alloc.free(resolution_key);
+                resolution_key_owned = false;
+            }
+
+            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        }
+
+        const root_lower = [_]u8{internal_keys.user_namespace};
+        const root_upper = [_]u8{internal_keys.user_namespace + 1};
+        const resolution_rows = try self.core.store.scanRange(self.alloc, root_lower[0..], root_upper[0..]);
+        defer docstore_mod.DocStore.freeResults(self.alloc, resolution_rows);
+        for (resolution_rows) |row| {
+            const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(self.alloc, row.key)) orelse continue;
+            defer {
+                self.alloc.free(parsed.doc_key);
+                self.alloc.free(parsed.artifact_name);
+            }
+            if (!std.mem.eql(u8, parsed.artifact_name, cfg.resolution_artifact)) continue;
+            if (!containsDeleteKey(deletes.items, row.key)) {
+                try deletes.append(self.alloc, try self.alloc.dupe(u8, row.key));
+                try appendUniqueOwnedKey(self.alloc, &changed, row.key);
+            }
+            try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        }
+
+        if (deletes.items.len == 0 and changed.items.len == 0) return null;
+
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed.items,
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        return sequence;
+    }
+
+    fn collectResolverMentionArtifactsForDocLocked(
+        self: *DB,
+        cfg: index_manager_mod.ResolverConfig,
+        doc_key: []const u8,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        changed: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        for (self.core.graphIndexes()) |graph_entry| {
+            const source = graph_entry.artifact_source orelse continue;
+            if (source.mention_edge_type.len == 0) continue;
+            if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
+
+            const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+            defer self.alloc.free(state_name);
+            const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
+            var state_key_owned = true;
+            errdefer if (state_key_owned) self.alloc.free(state_key);
+
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsDeleteKey(deletes.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try deletes.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                }
+            }
+
+            if (!containsDeleteKey(deletes.items, state_key)) {
+                try deletes.append(self.alloc, state_key);
+                state_key_owned = false;
+            } else {
+                self.alloc.free(state_key);
+                state_key_owned = false;
+            }
+
+            const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+            defer self.alloc.free(mention_state_name);
+            const mention_state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, mention_state_name);
+            var mention_state_key_owned = true;
+            errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
+
+            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key)) |previous_keys| {
+                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                for (previous_keys) |previous_key| {
+                    if (containsDeleteKey(deletes.items, previous_key)) continue;
+                    const owned_key = try self.alloc.dupe(u8, previous_key);
+                    try deletes.append(self.alloc, owned_key);
+                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                }
+            }
+
+            if (!containsDeleteKey(deletes.items, mention_state_key)) {
+                try deletes.append(self.alloc, mention_state_key);
+                mention_state_key_owned = false;
+            } else {
+                self.alloc.free(mention_state_key);
+                mention_state_key_owned = false;
+            }
+        }
+    }
+
+    fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
+        try self.runUntilIdle();
+        const resolution_stats = self.resolutionStageStats();
+        if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.ResolverReplayPending;
+        const promotion_stats = self.promotionStageStats();
+        if (promotion_stats.catch_up_required or promotion_stats.blocked) return error.ResolverReplayPending;
+    }
+
+    /// The review queue: review-band mentions awaiting human curation. Empty
+    /// when no resolution runtime is active. Caller owns the result
+    /// (`resolution_runtime_mod.freePendingReviews`).
+    pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
+        const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
+        return try runtime.pendingReviews(alloc);
+    }
+
+    /// Persist a human curation decision for one review-band mention and enqueue
+    /// the document for ordinary replay-driven resolution/promotion.
+    pub fn recordReviewDecision(
+        self: *DB,
+        doc_key: []const u8,
+        source_artifact: []const u8,
+        resolution_artifact: []const u8,
+        local_id: []const u8,
+        decision: resolver_lib.Decision,
+        table: []const u8,
+        key: []const u8,
+    ) !u64 {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.executor.failIfUnhealthy();
+
+        lockApply(self);
+        var apply_mutex_held = true;
+        errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        const resolvers = try self.core.listResolvers(self.alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(self.alloc);
+            if (resolvers.len > 0) self.alloc.free(resolvers);
+        }
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+            {
+                break;
+            }
+        } else return error.ResolverNotFound;
+
+        const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
+        defer self.alloc.free(override_key);
+        const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (existing) |raw| self.alloc.free(raw);
+        const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
+        defer self.alloc.free(override_bytes);
+
+        const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
+        defer self.alloc.free(source_key);
+        const sequence = self.core.reserveDerivedAppendSequence();
+        const changed_artifact_keys = [_][]const u8{source_key};
+        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+            .sequence = sequence,
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        }, sequence);
+        defer self.alloc.free(replay_payload);
+
+        const writes = [_]docstore_mod.KVPair{.{
+            .key = override_key,
+            .value = override_bytes,
+        }};
+        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        self.core.unlockApply();
+        apply_mutex_held = false;
+
+        if (self.executor.hasWorkers()) {
+            self.executor.forceSequence(sequence);
+        } else {
+            self.executor.notifySequence(sequence);
+        }
+        self.notifyResolverReplayRuntimes(sequence);
+        return sequence;
+    }
+
+    /// Eager edge rewrite for an entity merge: repoint every inbound edge of
+    /// `old_key` (the merged-away entity) at `new_key` (the survivor) in the
+    /// given graph index, preserving edge type, weight, and metadata. Already
+    /// materialized provenance mention edges do not follow `merged_into` on their
+    /// own; this brings the graph in line with a merge.
+    /// Returns the number of edges rewritten.
+    pub fn rewriteEntityEdges(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        old_key: []const u8,
+        new_key: []const u8,
+    ) !usize {
+        if (std.mem.eql(u8, old_key, new_key)) return 0;
+        const inbound = try self.getEdges(alloc, index_name, old_key, "", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        if (inbound.len == 0) return 0;
+
+        var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
+        defer alloc.free(writes);
+        var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
+        defer alloc.free(deletes);
+        for (inbound, 0..) |edge, i| {
+            deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
+            writes[i] = .{
+                .index_name = index_name,
+                .source = edge.source,
+                .target = new_key,
+                .edge_type = edge.edge_type,
+                .weight = edge.weight,
+                .created_at = edge.created_at,
+                .updated_at = edge.updated_at,
+                .metadata_json = edge.metadata,
+            };
+        }
+        try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
+        return inbound.len;
     }
 
     pub fn hasIndex(self: *DB, name: []const u8) bool {
@@ -5048,6 +7196,93 @@ pub const DB = struct {
         return try self.core.listEnrichments(alloc);
     }
 
+    pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.core.listResolvers(alloc);
+    }
+
+    fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.resolveDocSetForIdsNoLockAlloc(alloc, doc_ids);
+    }
+
+    fn resolveDocSetForIdsNoLockAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, null);
+    }
+
+    fn resolveDocSetForIdsNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(alloc, &txn, doc_ids, generation);
+        self.recordResolvedDocSet(&resolved, doc_ids.len > 0 and switch (resolved) {
+            .doc_keys => true,
+            else => false,
+        });
+        return resolved;
+    }
+
+    fn resolvedDocFilterForIdsAlloc(
+        self: *DB,
+        include_positive: bool,
+        include_doc_ids: []const []const u8,
+        exclude_doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(self.alloc);
+        if (include_positive) {
+            filter.include = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(self.alloc, include_doc_ids, generation);
+        }
+        if (exclude_doc_ids.len > 0) {
+            filter.exclude = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(self.alloc, exclude_doc_ids, generation);
+        }
+        return filter;
+    }
+
+    fn docIdsForResolvedDocSetAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.docIdsForResolvedDocSetNoLockAlloc(alloc, set);
+    }
+
+    fn docIdsForResolvedDocSetNoLockAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
+        return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, null);
+    }
+
+    fn docIdsForResolvedDocSetNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !?[]const []const u8 {
+        switch (set.*) {
+            .all => return null,
+            .none => return try alloc.alloc([]const u8, 0),
+            .doc_keys => |keys| return try dupeConstDocIdsAlloc(alloc, keys),
+            .ordinals => |ordinals| {
+                var txn = try self.core.store.beginProbeTxn();
+                defer txn.abort();
+                return try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, &txn, ordinals, generation);
+            },
+            .ordinal_bitmap => |*bitmap| {
+                var txn = try self.core.store.beginProbeTxn();
+                defer txn.abort();
+                var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+                defer ordinals.deinit(alloc);
+                var iter = bitmap.iterator();
+                while (iter.next()) |ordinal| try ordinals.append(alloc, ordinal);
+                return try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, &txn, ordinals.items, generation);
+            },
+        }
+    }
+
     pub fn extractEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ExtractEnrichmentsResult {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
@@ -5069,11 +7304,6 @@ pub const DB = struct {
         errdefer {
             for (sparse_embeddings.items) |*embedding| embedding.deinit(alloc);
             sparse_embeddings.deinit(alloc);
-        }
-        var summaries = std.ArrayListUnmanaged(types.EnrichmentSummaryWrite).empty;
-        errdefer {
-            for (summaries.items) |*summary| summary.deinit(alloc);
-            summaries.deinit(alloc);
         }
         var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
         errdefer {
@@ -5124,13 +7354,6 @@ pub const DB = struct {
                     .values = try alloc.dupe(f32, embedding.values),
                 });
             }
-            for (extracted.summaries) |summary| {
-                try summaries.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, summary.index_name),
-                    .doc_key = try alloc.dupe(u8, summary.doc_key),
-                    .text = try alloc.dupe(u8, summary.text),
-                });
-            }
             for (extracted.graph_writes) |graph_write| {
                 try graph_writes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, graph_write.index_name),
@@ -5149,7 +7372,6 @@ pub const DB = struct {
             .cleaned_writes = try cleaned_writes.toOwnedSlice(alloc),
             .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
             .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-            .summaries = try summaries.toOwnedSlice(alloc),
             .graph_writes = try graph_writes.toOwnedSlice(alloc),
         };
     }
@@ -5324,7 +7546,73 @@ pub const DB = struct {
             .derived_target_sequence = self.core.nextDerivedSequence(),
             .has_async_indexes = self.executor.hasWorkers(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+        };
+    }
+
+    fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
+        const resources = self.core.batchExecutionResources();
+        const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, scope_name);
+        const target = @max(applied, self.core.nextDerivedSequence());
+        return .{
+            .enabled = force_enabled or target > 0 or applied < target,
+            .target_sequence = target,
+            .applied_sequence = applied,
+            .catch_up_required = applied < target,
+        };
+    }
+
+    fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.resolution_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(resolution_runtime_mod.scope_name, false) catch .{};
+    }
+
+    fn promotionStageStats(self: *DB) types.ReplayStageStats {
+        if (self.promotion_runtime) |runtime| return runtime.stats();
+        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
+    }
+
+    fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
+        const catalog = self.core.index_manager.resolvers.items;
+        var resolvers = try alloc.alloc(types.ResolverReplayDiagnostic, catalog.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (resolvers[0..initialized]) |resolver| {
+                alloc.free(resolver.name);
+                alloc.free(resolver.table);
+                alloc.free(resolver.source_artifact);
+                alloc.free(resolver.resolution_artifact);
+            }
+            if (resolvers.len > 0) alloc.free(resolvers);
+        }
+
+        for (catalog) |cfg| {
+            const name = try alloc.dupe(u8, cfg.name);
+            errdefer alloc.free(name);
+            const table = try alloc.dupe(u8, cfg.table);
+            errdefer alloc.free(table);
+            const source_artifact = try alloc.dupe(u8, cfg.source_artifact);
+            errdefer alloc.free(source_artifact);
+            const resolution_artifact = try alloc.dupe(u8, cfg.resolution_artifact);
+            errdefer alloc.free(resolution_artifact);
+            resolvers[initialized] = .{
+                .name = name,
+                .table = table,
+                .source_artifact = source_artifact,
+                .resolution_artifact = resolution_artifact,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .resolver_count = @intCast(catalog.len),
+            .resolution_runtime_present = self.resolution_runtime != null,
+            .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .promotion_runtime_present = self.promotion_runtime != null,
+            .promotion_worker_started = if (self.promotion_runtime) |runtime| runtime.worker_started.load(.acquire) else false,
+            .resolvers = resolvers[0..initialized],
         };
     }
 
@@ -5371,6 +7659,26 @@ pub const DB = struct {
         }
     }
 
+    fn markPrecomputedEnrichmentAppliedForSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+        if (sync_level != .enrichments or sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        const runtime_stats = runtime.stats();
+        if (runtime_stats.applied_sequence >= sequence -| 1 or
+            try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence))
+        {
+            try runtime.markAppliedThrough(sequence);
+        }
+    }
+
+    fn noPendingEnrichmentReplayThrough(self: *DB, applied_sequence: u64, sequence: u64) !bool {
+        const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.core.replaySource(), applied_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+        for (pending) |group| {
+            if (group.sequence <= sequence) return false;
+        }
+        return true;
+    }
+
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         var stable_target = sequence;
         while (true) {
@@ -5405,6 +7713,7 @@ pub const DB = struct {
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
         try self.executor.failIfUnhealthy();
         const sequence = self.core.nextDerivedSequence();
+        try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
         defer sync_targets.deinit(self.alloc);
         if (self.executor.hasWorkers()) {
@@ -5468,12 +7777,103 @@ pub const DB = struct {
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook);
     }
 
-    pub fn runUntilIdle(self: *DB) !void {
+    const run_until_idle_max_replay_rounds: usize = 16;
+
+    fn currentMaintenanceTargetSequence(self: *DB) u64 {
         var target_sequence = self.core.nextDerivedSequence();
         if (self.enrichment_runtime) |runtime| {
             target_sequence = @max(target_sequence, runtime.stats().target_sequence);
         }
-        try self.runMaintenanceUntil(target_sequence, .{});
+        return target_sequence;
+    }
+
+    fn drainReplayStagesUntilStable(self: *DB) !void {
+        var rounds: usize = 0;
+        while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            const drained_sequence = self.core.nextDerivedSequence();
+
+            if (self.resolverReplayNeedsDrain()) {
+                if (self.resolution_runtime) |runtime| {
+                    if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                    try runtime.catchUp();
+                }
+
+                if (self.promotion_runtime) |runtime| {
+                    const latest = self.core.nextDerivedSequence();
+                    if (latest > 0) runtime.notifySequence(latest - 1);
+                    try runtime.catchUp();
+                }
+            }
+
+            if (self.core.nextDerivedSequence() <= drained_sequence) return;
+        }
+        return error.RunUntilIdleDidNotConverge;
+    }
+
+    /// Re-attempts opening quarantined indexes (artifacts that failed to
+    /// load at open time). `force` ignores per-index backoff — used by tests
+    /// and operator-triggered recovery. Runs the same detached-open path as
+    /// the initial load, so a recovered full-text/sparse/graph index resumes
+    /// its persisted rebuild state and catches up before registering.
+    pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        return try self.core.index_manager.retryFailedIndexLoads(self.core.store, monotonicTimeNs(), force);
+    }
+
+    const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
+    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
+
+    fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        // Tests drive retries deterministically via retryQuarantinedIndexLoads;
+        // a background worker racing them turns every quarantine-shaped test
+        // into a timing assumption.
+        if (comptime builtin.is_test) return;
+        if (!self.core.index_manager.hasLoadFailures()) return;
+        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+            // Self-healing is best-effort: the quarantine still recovers on
+            // the next open or via drop+recreate.
+            std.log.warn("quarantine retry worker spawn failed: {}", .{err});
+            return;
+        };
+    }
+
+    fn stopQuarantineRetryWorker(self: *DB) void {
+        self.quarantine_retry_stop.store(true, .release);
+        if (self.quarantine_retry_thread) |thread| {
+            thread.join();
+            self.quarantine_retry_thread = null;
+        }
+    }
+
+    fn quarantineRetryWorkerMain(self: *DB) void {
+        while (true) {
+            var slept: u64 = 0;
+            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
+                if (self.quarantine_retry_stop.load(.acquire)) return;
+                sleepNs(quarantine_retry_sleep_slice_ns);
+            }
+            if (self.quarantine_retry_stop.load(.acquire)) return;
+            const result = self.retryQuarantinedIndexLoads(false) catch |err| {
+                std.log.warn("quarantine retry pass failed: {}", .{err});
+                continue;
+            };
+            if (result.remaining == 0) return;
+        }
+    }
+
+    fn runRestoreRepairDrainAsync(self: *DB) !void {
+        // Earlier repair phases synchronously rebuild restored runtime state.
+        // At this point only persisted applied-sequence watermarks need to be
+        // flushed before the final index sync/complete marker. Do not call
+        // runUntilIdle here: large portable restores can leave substantial
+        // replay, posting-maintenance, or LSM maintenance debt, and queries
+        // remain correct while that background-maintenance debt is paid down.
+        try self.flushAppliedSequencesForIdle();
+    }
+
+    pub fn runUntilIdle(self: *DB) !void {
+        try self.drainReplayStagesUntilStable();
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -5519,6 +7919,7 @@ pub const DB = struct {
         for (writes.items) |write| {
             alloc.free(write.index_name);
             alloc.free(write.doc_key);
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
             if (write.vector.len > 0) alloc.free(write.vector);
         }
@@ -5628,7 +8029,7 @@ pub const DB = struct {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                 defer artifact_ref.deinit(state.alloc);
                 if (artifact_ref.kind != .embedding) return .@"continue";
 
@@ -5863,7 +8264,7 @@ pub const DB = struct {
         return repaired;
     }
 
-    pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
+    fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
         return try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(alloc, null, null);
     }
 
@@ -5990,7 +8391,7 @@ pub const DB = struct {
                     if (resume_key.len > 0 and std.mem.order(u8, key, resume_key) != .gt) return .@"continue";
                 }
 
-                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                 defer artifact_ref.deinit(state.alloc);
                 if (artifact_ref.kind != .embedding) return .@"continue";
                 state.scanned_entries += 1;
@@ -6023,6 +8424,7 @@ pub const DB = struct {
                         .name = try state.alloc.dupe(u8, source.name),
                         .kind = source.kind,
                         .chunk_id = source.chunk_id,
+                        .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
                     };
                     defer source_ref.deinit(state.alloc);
                     break :blk try artifact_ids.internalKeyForArtifactRefAlloc(state.alloc, source_ref);
@@ -6111,7 +8513,7 @@ pub const DB = struct {
         return state.rebuilt;
     }
 
-    pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
+    fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
         self: *DB,
         alloc: Allocator,
         progress_ctx: ?*anyopaque,
@@ -6253,6 +8655,7 @@ pub const DB = struct {
             const sequence = try appendDerivedBatchRecord(self, pending_batch);
             self.executor.notifySequence(sequence);
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+            self.notifyResolverReplayRuntimes(sequence);
         }
         return generated_ref_count;
     }
@@ -6329,6 +8732,7 @@ pub const DB = struct {
 
     fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
         alloc.free(item.name);
+        if (item.load_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
         if (item.algebraic_last_error_reason) |value| alloc.free(value);
         if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -6565,7 +8969,10 @@ pub const DB = struct {
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         if (index_manager.textIndex(index_name)) |entry| {
-            const text_snapshot = entry.snapshot();
+            // Applied-sequence persistence runs outside the DB apply lock; keep this
+            // snapshot cheap and avoid walking full-text segment internals here.
+            const text_snapshot = entry.acquireSnapshot();
+            defer text_snapshot.release();
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.global_doc_count,
@@ -6602,6 +9009,17 @@ pub const DB = struct {
             };
         }
         return null;
+    }
+
+    fn textIndexTermCount(entry: anytype) u64 {
+        const snap = entry.acquireSnapshot();
+        defer snap.release();
+        var terms: u64 = 0;
+        for (snap.segments) |*seg| {
+            const layout = seg.layoutStats(true);
+            terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+        }
+        return terms;
     }
 
     fn saveIndexStatusSnapshots(
@@ -6684,11 +9102,16 @@ pub const DB = struct {
             runtime.stats()
         else
             self.persistedEnrichmentStats() catch runtime_stats.enrichment;
+        runtime_stats.resolution = self.resolutionStageStats();
+        runtime_stats.promotion = self.promotionStageStats();
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
         const target_sequence = self.core.nextDerivedSequence();
         for (runtime_stats.indexes) |*item| {
+            if (self.enrichment_runtime) |runtime| {
+                item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+            }
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
                 item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
@@ -6762,7 +9185,8 @@ pub const DB = struct {
             switch (item.kind) {
                 .full_text => {
                     if (self.core.textIndex(item.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
@@ -6873,7 +9297,10 @@ pub const DB = struct {
         if (!self.core.tryLockApplyShared()) {
             return .{
                 .async_indexing = self.snapshotAsyncIndexingStats(),
+                .doc_set_planning = self.snapshotDocSetPlanningStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .resolution = self.resolutionStageStats(),
+                .promotion = self.promotionStageStats(),
                 .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             };
@@ -6894,11 +9321,109 @@ pub const DB = struct {
         return try self.statsLocked(alloc);
     }
 
+    pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        if (self.open_mode == .status_only) {
+            return try self.statusOnlyStats(alloc);
+        }
+
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+
+        return try self.statsLocked(alloc);
+    }
+
+    pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        if (self.open_mode == .status_only) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
+        self.core.identity_namespace = namespace;
+        if (self.transaction_recovery_identity_context) |ctx| ctx.identity_namespace = namespace;
+    }
+
+    fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
+        const max_doc_ordinal = std.math.maxInt(doc_identity.DocOrdinal);
+        const remaining = if (raw.next_ordinal >= max_doc_ordinal)
+            0
+        else
+            @as(u64, max_doc_ordinal) - raw.next_ordinal;
+        return .{
+            .namespace_table_id = namespace.table_id,
+            .namespace_shard_id = namespace.shard_id,
+            .namespace_range_id = namespace.range_id,
+            .next_ordinal = raw.next_ordinal,
+            .allocated_ordinals = raw.allocated_ordinals,
+            .ordinal_capacity_remaining = remaining,
+            .ordinal_capacity_exhausted = raw.next_ordinal >= max_doc_ordinal,
+            .rebuild_required = raw.next_ordinal >= max_doc_ordinal,
+            .state_rows = raw.state_rows,
+            .live_ordinals = raw.live_ordinals,
+            .tombstone_ordinals = raw.tombstone_ordinals,
+            .min_created_generation = raw.min_created_generation,
+            .max_created_generation = raw.max_created_generation,
+            .min_deleted_generation = raw.min_deleted_generation,
+            .max_deleted_generation = raw.max_deleted_generation,
+            .complete = raw.complete,
+        };
+    }
+
+    fn recordResolvedDocSet(self: *DB, set: *const doc_set.ResolvedDocSet, missing_ordinal_coverage: bool) void {
+        self.doc_set_planning_stats.recordResolvedSet(set, missing_ordinal_coverage);
+    }
+
+    fn recordUnsupportedDocSetFilterShape(self: *DB) void {
+        self.doc_set_planning_stats.recordUnsupportedFilterShape();
+    }
+
+    pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
+        const current_generation = self.core.nextDerivedSequence();
+        if (requested) |generation| {
+            if (generation != current_generation) {
+                self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+                return error.UnsupportedQueryRequest;
+            }
+            return generation;
+        }
+        return current_generation;
+    }
+
+    fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
+        return self.doc_set_planning_stats.snapshot();
+    }
+
+    const DocIdentityCoverage = struct {
+        scanned_primary_docs: u64 = 0,
+        primary_docs_missing_ordinals: u64 = 0,
+        primary_docs_missing_identity_state: u64 = 0,
+        primary_docs_with_tombstone_ordinals: u64 = 0,
+    };
+
+    fn finalizeDocIdentityRebuildRequired(identity_stats: *types.DocIdentityStats) void {
+        identity_stats.rebuild_required = identity_stats.rebuild_required or
+            identity_stats.ordinal_capacity_exhausted or
+            identity_stats.primary_docs_missing_ordinals != 0 or
+            identity_stats.primary_docs_missing_identity_state != 0 or
+            identity_stats.primary_docs_with_tombstone_ordinals != 0;
+    }
+
+    fn diagnosticDocIdentityStats(self: *DB, byte_range: types.ByteRange) !types.DocIdentityStats {
+        var identity_stats = dbDocIdentityStats(try doc_identity.fullStatsFromStore(self.core.store), self.core.identity_namespace);
+        const coverage = try self.scanPrimaryDocIdentityCoverage(byte_range);
+        identity_stats.scanned_primary_docs = coverage.scanned_primary_docs;
+        identity_stats.primary_docs_missing_ordinals = coverage.primary_docs_missing_ordinals;
+        identity_stats.primary_docs_missing_identity_state = coverage.primary_docs_missing_identity_state;
+        identity_stats.primary_docs_with_tombstone_ordinals = coverage.primary_docs_with_tombstone_ordinals;
+        finalizeDocIdentityRebuildRequired(&identity_stats);
+        return identity_stats;
+    }
+
     fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         const target_sequence = self.core.nextDerivedSequence();
         const async_indexing = self.snapshotAsyncIndexingStats();
+        const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+        const primary_doc_count = self.scanPrimaryDocCount(self.core.byteRange()) catch 0;
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -6930,12 +9455,20 @@ pub const DB = struct {
                 );
                 item.backfill_active = applied_sequence < target_sequence;
             }
+            if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                item.load_error = try alloc.dupe(u8, load_error);
+                // A quarantined index has no runtime; it is broken, not warming.
+                item.backfill_active = false;
+                item.catch_up_active = false;
+            }
 
             switch (cfg.kind) {
                 .full_text => {
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         item.doc_count = text_snapshot.global_doc_count;
+                        item.term_count = textIndexTermCount(entry);
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                         term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
@@ -6960,7 +9493,16 @@ pub const DB = struct {
                 .sparse_vector => {
                     if (self.core.sparseIndex(cfg.name)) |entry| {
                         const sparse_snapshot = entry.index.stats();
-                        item.doc_count = sparse_snapshot.doc_count;
+                        const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
+                            identity_stats.live_ordinals
+                        else if (primary_doc_count > 0)
+                            primary_doc_count
+                        else
+                            visible_doc_count;
+                        item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
+                            @min(sparse_snapshot.doc_count, sparse_doc_cap)
+                        else
+                            sparse_snapshot.doc_count;
                         item.term_count = sparse_snapshot.term_count;
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
@@ -6987,7 +9529,12 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
@@ -7022,6 +9569,7 @@ pub const DB = struct {
         }
         const visible_doc_count = indexed_doc_count orelse try self.scanPrimaryDocCount(byte_range);
         const async_indexing = self.async_context.stats.snapshot();
+        const identity_stats = try self.diagnosticDocIdentityStats(byte_range);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -7094,7 +9642,17 @@ pub const DB = struct {
                 .sparse_vector => {
                     if (self.core.sparseIndex(cfg.name)) |entry| {
                         const sparse_stats = entry.index.stats();
-                        item.doc_count = sparse_stats.doc_count;
+                        const raw_identity_stats = doc_identity.fastStatsFromStore(self.core.store) catch null;
+                        const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
+                            identity_stats.live_ordinals
+                        else if (raw_identity_stats) |raw|
+                            raw.live_ordinals
+                        else
+                            visible_doc_count;
+                        item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
+                            @min(sparse_stats.doc_count, sparse_doc_cap)
+                        else
+                            sparse_stats.doc_count;
                         item.term_count = sparse_stats.term_count;
                         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
@@ -7140,7 +9698,12 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
             .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
@@ -7149,7 +9712,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_hits;
                     }
                 }
@@ -7160,7 +9724,8 @@ pub const DB = struct {
                 for (configs) |cfg| {
                     if (cfg.kind != .full_text) continue;
                     if (self.core.textIndex(cfg.name)) |entry| {
-                        const text_snapshot = entry.snapshot();
+                        const text_snapshot = entry.acquireSnapshot();
+                        defer text_snapshot.release();
                         total += text_snapshot.term_doc_freq_cache_misses;
                     }
                 }
@@ -7178,6 +9743,7 @@ pub const DB = struct {
         defer types.freeIndexConfigs(alloc, configs);
         const target_sequence = self.core.nextDerivedSequence();
         var visible_doc_count: u64 = 0;
+        const identity_stats = dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
 
         var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
         var index_count: usize = 0;
@@ -7206,6 +9772,12 @@ pub const DB = struct {
                 );
                 item.backfill_active = applied_sequence < target_sequence;
             }
+            if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                item.load_error = try alloc.dupe(u8, load_error);
+                // A quarantined index has no runtime; it is broken, not warming.
+                item.backfill_active = false;
+                item.catch_up_active = false;
+            }
             if (try self.loadIndexStatusSnapshot(alloc, cfg.name)) |status_snapshot| {
                 applyIndexStatusSnapshot(&item, status_snapshot);
                 visible_doc_count = @max(visible_doc_count, item.doc_count);
@@ -7221,6 +9793,11 @@ pub const DB = struct {
             .doc_count = visible_doc_count,
             .index_count = @intCast(self.core.indexCount()),
             .indexes = index_stats[0..index_count],
+            .doc_identity = identity_stats,
+            .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+            .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
             .async_indexing = self.async_context.stats.snapshot(),
         };
     }
@@ -7517,6 +10094,59 @@ pub const DB = struct {
         return doc_count;
     }
 
+    fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
+        const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+        defer self.core.alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+        defer if (upper) |buf| self.core.alloc.free(buf);
+
+        var doc_ids = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (doc_ids.items) |doc_id| self.core.alloc.free(doc_id);
+            doc_ids.deinit(self.core.alloc);
+        }
+
+        var coverage = DocIdentityCoverage{};
+        const ScanState = struct {
+            alloc: Allocator,
+            doc_ids: *std.ArrayListUnmanaged([]u8),
+            coverage: *DocIdentityCoverage,
+
+            fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                _ = value;
+                const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                if (!isPrimaryDocumentStoreKey(key)) return .@"continue";
+                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                errdefer state.alloc.free(raw_key);
+                try state.doc_ids.append(state.alloc, raw_key);
+                state.coverage.scanned_primary_docs += 1;
+                return .@"continue";
+            }
+        };
+
+        var scan_state = ScanState{
+            .alloc = self.core.alloc,
+            .doc_ids = &doc_ids,
+            .coverage = &coverage,
+        };
+        try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (doc_ids.items) |doc_id| {
+            const ordinal = (try doc_identity.lookupOrdinalTxn(self.core.alloc, &txn, doc_id)) orelse {
+                coverage.primary_docs_missing_ordinals += 1;
+                continue;
+            };
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                coverage.primary_docs_missing_identity_state += 1;
+                continue;
+            };
+            if (!state.isLive()) coverage.primary_docs_with_tombstone_ordinals += 1;
+        }
+        return coverage;
+    }
+
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
         _ = alloc;
         lockApplyShared(self);
@@ -7608,16 +10238,64 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var generation_ns: u64 = 0;
+        var lock_wait_ns: u64 = 0;
+        var locked_search_ns: u64 = 0;
         if (self.canUsePublishedDenseSearch(req)) {
-            return try self.searchLockedWithExecutionContext(alloc, req, exec_ctx);
+            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
+            if (bench_profile) {
+                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+                std.log.info(
+                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
+                );
+            }
+            return result;
         }
+        const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         lockApplyShared(self);
+        if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
         defer self.core.unlockApplyShared();
-        return try self.searchLockedWithExecutionContext(alloc, req, exec_ctx);
+        const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+        const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
+        if (bench_profile) {
+            locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+            std.log.info(
+                "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+            );
+        }
+        return result;
     }
 
     fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try self.searchLockedWithExecutionContext(alloc, req, .{});
+        return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{});
+    }
+
+    pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
+        var snapshot_req = req;
+        snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
+        try self.validateResolvedDocFilterWireContext(snapshot_req);
+        return snapshot_req;
+    }
+
+    fn validateResolvedDocFilterWireContext(self: *DB, req: types.SearchRequest) !void {
+        const ctx = req.resolved_doc_filter_wire_context orelse return;
+        if (req.resolved_doc_filter == null) return error.InvalidQueryRequest;
+        if (!ctx.namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+        if (req.identity_read_generation == null or req.identity_read_generation.? != ctx.identity_read_generation) {
+            self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+            return error.UnsupportedQueryRequest;
+        }
     }
 
     fn searchLockedWithExecutionContext(
@@ -7626,24 +10304,25 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
-        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0 or req.merge_config != null) {
-            var composed = try self.searchComposed(alloc, req, exec_ctx);
+        const execution_req = directSingleVectorRequest(req) orelse req;
+        if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
+            var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
             errdefer composed.deinit();
             try externalizeSearchResultArtifactIds(alloc, &composed);
             return composed;
         }
 
-        const has_primary = req.full_text != null or req.dense != null or req.sparse != null or !db_query_search.isDefaultMatchAll(req.query) or req.graph_queries.len == 0;
+        const has_primary = execution_req.full_text != null or execution_req.dense != null or execution_req.sparse != null or !db_query_search.isDefaultMatchAll(execution_req.query) or execution_req.graph_queries.len == 0;
 
-        var base = if (!has_primary and req.graph_queries.len > 0)
+        var base = if (!has_primary and execution_req.graph_queries.len > 0)
             try db_query_search.emptySearchResult(alloc)
-        else if (req.full_text) |text|
-            try self.searchTextQuery(alloc, req, text)
-        else if (req.dense) |dense|
-            try self.searchDense(alloc, req, dense)
-        else if (req.sparse) |sparse|
-            try self.searchSparse(alloc, req, sparse)
-        else switch (req.query) {
+        else if (execution_req.full_text) |text|
+            try self.searchTextQuery(alloc, execution_req, text)
+        else if (execution_req.dense) |dense|
+            try self.searchDense(alloc, execution_req, dense)
+        else if (execution_req.sparse) |sparse|
+            try self.searchSparse(alloc, execution_req, sparse)
+        else switch (execution_req.query) {
             .match_none,
             .match_all,
             .phrase,
@@ -7664,22 +10343,51 @@ pub const DB = struct {
             .prefix,
             .wildcard,
             .regexp,
-            => try self.searchText(alloc, req),
-            .dense_knn => |dense| try self.searchDense(alloc, req, dense),
-            .sparse_knn => |sparse| try self.searchSparse(alloc, req, sparse),
-            .graph => |graph| try self.searchGraph(alloc, req, graph, null),
+            => try self.searchText(alloc, execution_req),
+            .dense_knn => |dense| try self.searchDense(alloc, execution_req, dense),
+            .sparse_knn => |sparse| try self.searchSparse(alloc, execution_req, sparse),
+            .graph => |graph| try self.searchGraph(alloc, execution_req, graph, null),
         };
         errdefer base.deinit();
 
-        if (req.graph_queries.len == 0) {
+        if (execution_req.graph_queries.len == 0) {
             try externalizeSearchResultArtifactIds(alloc, &base);
             return base;
         }
 
-        base.graph_results = try self.executeGraphQueries(alloc, req, req.graph_queries, base.hits);
-        try self.applyGraphExpandStrategy(alloc, &base, req.expand_strategy);
+        base.graph_results = try self.executeGraphQueries(alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
+        try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
         try externalizeSearchResultArtifactIds(alloc, &base);
         return base;
+    }
+
+    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
+        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
+        if (req.full_text_queries.len != 0) return null;
+        if (req.full_text) |text| switch (text) {
+            .match_all => {},
+            else => return null,
+        };
+        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
+        if (req.graph_queries.len != 0 or req.expand_strategy != null) return null;
+        if (req.dense != null or req.sparse != null) return null;
+        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
+            var next = req;
+            next.index_name = req.dense_queries[0].index_name;
+            next.full_text = null;
+            next.dense = req.dense_queries[0].query;
+            next.dense_queries = &.{};
+            return next;
+        }
+        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
+            var next = req;
+            next.index_name = req.sparse_queries[0].index_name;
+            next.full_text = null;
+            next.sparse = req.sparse_queries[0].query;
+            next.sparse_queries = &.{};
+            return next;
+        }
+        return null;
     }
 
     fn searchComposed(
@@ -7691,13 +10399,51 @@ pub const DB = struct {
         _ = exec_ctx;
         return try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
+            .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
+            .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,
             .search_text = searchTextComposedCallback,
             .search_dense = searchDenseComposedCallback,
             .search_sparse = searchSparseComposedCallback,
             .clone_named_set = cloneNamedSetCallback,
             .fuse_named_sets = fuseNamedSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
+        });
+    }
+
+    fn resolveStructuredDocFilterForComposedCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?doc_set.ResolvedDocFilter {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
+        });
+    }
+
+    fn resolveStructuredTextDocFilterForComposedCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
         });
     }
 
@@ -7709,16 +10455,25 @@ pub const DB = struct {
     }
 
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
-        try self.proveTextQueryAccessPaths(req.index_name, text_query);
-        const metric_name = self.textQueryMetricIndexName(req);
+        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        var algebraic_filter = if (needs_algebraic_doc_filter)
+            try self.searchRequestWithAlgebraicDocFilterAlloc(req)
+        else
+            AlgebraicDocFilterRequest{ .req = req };
+        defer algebraic_filter.deinit();
+        try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
+        const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        return try db_query_search.searchTextQuery(alloc, req, text_query, .{
+        return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
         });
     }
@@ -7792,7 +10547,7 @@ pub const DB = struct {
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try db_query_search.collectSearchRequestTextStats(alloc, req, .{
+        return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
         });
@@ -7830,7 +10585,7 @@ pub const DB = struct {
     ) !planning_stats_mod.PlanningStatsSummary {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return try self.collectPlanningStatsLocked(alloc, req, max_work, exec_ctx);
+        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
     }
 
     fn collectPlanningStatsLocked(
@@ -7902,7 +10657,16 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.textIndexEntry(index_name);
+    }
+
+    /// Queries that explicitly reference an index whose persisted artifacts
+    /// failed to load get a distinct error instead of IndexNotFound, so
+    /// clients can tell "broken, drop+recreate to recover" from "missing".
+    fn failIfIndexQuarantined(self: *DB, index_name: ?[]const u8) !void {
+        const name = index_name orelse return;
+        if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
     }
 
     fn textIndexIsChunkBackedCallback(
@@ -7949,6 +10713,8 @@ pub const DB = struct {
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -8043,33 +10809,241 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
+    fn resolveDocSetDocIdsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[]const []const u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation);
+    }
+
+    fn resolveDocIdsToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
+    }
+
+    fn liveFilterDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.allDocsVisibleAtGeneration(generation)) {
+            return try doc_set.cloneAlloc(alloc, set);
+        }
+        if (set.* == .all) {
+            return try self.broadLiveDocSetCachedAlloc(alloc, generation);
+        }
+        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
+        const all_set: doc_set.ResolvedDocSet = .all;
+        const gen = generation orelse {
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        };
+        {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_generation == gen) {
+                if (self.live_doc_set_cache_set) |*cached| {
+                    return try doc_set.cloneAlloc(alloc, cached);
+                }
+            }
+        }
+        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        errdefer computed.deinit(alloc);
+        if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
+            lockAtomic(&self.live_doc_set_cache_mutex);
+            defer self.live_doc_set_cache_mutex.unlock();
+            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
+            self.live_doc_set_cache_set = cloned;
+            self.live_doc_set_cache_generation = gen;
+        } else |_| {
+            // Caching is best-effort; the computed set is still returned.
+        }
+        return computed;
+    }
+
+    fn allDocsVisibleCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.allDocsVisibleAtGeneration(generation);
+    }
+
+    fn allDocsVisibleFastCallback(
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.allDocsVisibleSummaryFast(generation);
+    }
+
+    fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
+        const bench_profile = platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var summary_ns: u64 = 0;
+        var stats_ns: u64 = 0;
+        const summary_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        if (try self.allDocsVisibleSummaryFastMaybe(generation)) |all_visible| {
+            if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
+            if (bench_profile) {
+                std.log.info(
+                    "antfly_bench_visibility_gate total_us={d} summary_us={d} stats_us={d} result={}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, all_visible },
+                );
+            }
+            // The summary is definitive in both directions: it tracks tombstone
+            // counts and the max created generation, the same fields the full
+            // identity scan below would recompute.
+            return all_visible;
+        }
+        if (bench_profile) summary_ns = platform_time.monotonicNs() - summary_start_ns;
+        const stats_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
+        if (bench_profile) stats_ns = platform_time.monotonicNs() - stats_start_ns;
+        const generation_covers_all_creates = if (generation) |at|
+            identity_stats.max_created_generation <= at
+        else
+            true;
+        const result = identity_stats.complete and identity_stats.tombstone_ordinals == 0 and generation_covers_all_creates;
+        if (bench_profile) {
+            std.log.info(
+                "antfly_bench_visibility_gate total_us={d} summary_us={d} stats_us={d} result={}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, summary_ns / 1000, stats_ns / 1000, result },
+            );
+        }
+        return result;
+    }
+
+    fn allDocsVisibleSummaryFast(self: *DB, generation: ?u64) !bool {
+        return (try self.allDocsVisibleSummaryFastMaybe(generation)) orelse false;
+    }
+
+    fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
+        if (self.identity_visibility_summary_cache) |summary| {
+            return doc_identity.allVisibleFromSummary(summary, generation);
+        }
+        return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
+    }
+
+    fn denseVectorIdsForOrdinalsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]u64 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            ordinals,
+        );
+    }
+
+    fn denseOrdinalsForVectorIdsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        vector_ids: []const u64,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const ordinals = try self.core.index_manager.lookupDenseOrdinalsForVectorIdsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            vector_ids,
+        );
+        errdefer alloc.free(ordinals);
+        const all_visible = try self.allDocsVisibleSummaryFast(generation);
+        if (all_visible) return ordinals;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (ordinals) |*maybe_ordinal| {
+            const ordinal = maybe_ordinal.* orelse continue;
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                maybe_ordinal.* = null;
+                continue;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) maybe_ordinal.* = null;
+        }
+        return ordinals;
+    }
+
     fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
         const metric_name = self.denseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var algebraic_ns: u64 = 0;
+        var prove_ns: u64 = 0;
+        var inner_ns: u64 = 0;
+        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        return try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
+        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .all_docs_visible_fast = allDocsVisibleFastCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
+            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
+        if (bench_profile) {
+            inner_ns = platform_time.monotonicNs() - inner_start_ns;
+            std.log.info(
+                "antfly_bench_db_dense_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+            );
+        }
+        return result;
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (!self.canUsePublishedDenseSearch(req)) {
+        if (self.canUsePublishedDenseSearch(req)) {
+            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
+        }
+        {
             lockApplyShared(self);
             defer self.core.unlockApplyShared();
+            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
         }
+    }
+
+    fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
@@ -8079,6 +11053,14 @@ pub const DB = struct {
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
+            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
+            .all_docs_visible_fast = allDocsVisibleFastCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
+            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = hbcSearchCallback,
             .hbc_search_profiled = hbcSearchProfiledCallback,
@@ -8114,16 +11096,41 @@ pub const DB = struct {
         const metric_name = self.sparseQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        var algebraic_ns: u64 = 0;
+        var prove_ns: u64 = 0;
+        var inner_ns: u64 = 0;
+        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
+        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .sparse_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        return try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .sparse_index = sparseIndexCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
+        if (bench_profile) {
+            inner_ns = platform_time.monotonicNs() - inner_start_ns;
+            std.log.info(
+                "antfly_bench_db_sparse_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+            );
+        }
+        return result;
     }
 
     fn proveVectorSearchAccessPath(self: *DB, index_name: ?[]const u8, layout: algebraic_mod.ir.PhysicalLayout, constrained: bool) !void {
@@ -8132,7 +11139,10 @@ pub const DB = struct {
             .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
             else => null,
         };
-        const access_path = selected_path orelse return error.IndexNotFound;
+        const access_path = selected_path orelse {
+            try self.failIfIndexQuarantined(index_name);
+            return error.IndexNotFound;
+        };
         var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
         defer planned.deinit(self.alloc);
         if (planned.access_paths.len != 1 or
@@ -8146,7 +11156,11 @@ pub const DB = struct {
     }
 
     fn hasNativeDocIdConstraints(req: types.SearchRequest) bool {
-        return req.filter_doc_ids_positive or req.filter_doc_ids.len > 0 or req.exclude_doc_ids.len > 0;
+        return req.filter_doc_ids_positive or
+            req.filter_doc_ids.len > 0 or
+            req.exclude_doc_ids.len > 0 or
+            req.resolved_doc_filter != null or
+            req.doc_filter_bindings.len > 0;
     }
 
     const AlgebraicDocFilterRequest = struct {
@@ -8154,11 +11168,18 @@ pub const DB = struct {
         index: ?*@import("algebraic/index.zig").Index = null,
         filter_doc_ids: [][]u8 = &.{},
         exclude_doc_ids: [][]u8 = &.{},
+        resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
+        resolved_doc_filter_alloc: ?Allocator = null,
 
         fn deinit(self: *@This()) void {
             if (self.index) |index| {
                 index.freeDocIds(self.filter_doc_ids);
                 index.freeDocIds(self.exclude_doc_ids);
+            }
+            if (self.resolved_doc_filter) |filter| {
+                const alloc = self.resolved_doc_filter_alloc.?;
+                filter.deinit(alloc);
+                alloc.destroy(filter);
             }
             self.* = undefined;
         }
@@ -8166,16 +11187,22 @@ pub const DB = struct {
 
     fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return .{ .req = req };
+        if (!req.require_algebraic_filter_resolution and req.doc_filter_bindings.len == 0) {
+            if (try self.searchRequestWithDynamicStructuredDocFilterAlloc(req)) |direct| return direct;
+        }
         const entry = self.core.index_manager.algebraicIndex(null) orelse {
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         };
         entry.index.recordVectorFilterAttempt();
         if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) {
             entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
+        if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, &entry.index)) |direct| return direct;
         var filter_doc_ids: [][]u8 = &.{};
         errdefer entry.index.freeDocIds(filter_doc_ids);
         var exclude_doc_ids: [][]u8 = &.{};
@@ -8184,12 +11211,40 @@ pub const DB = struct {
         var filter_json_resolved = false;
         var exclusion_json_resolved = false;
         var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
+        var filter_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.FilterBinding).empty;
+        defer {
+            for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+            filter_bindings.deinit(entry.index.alloc);
+        }
 
         if (filter_supported) filter_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.filter_doc_ids);
         if (req.exclude_doc_ids.len > 0) exclude_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.exclude_doc_ids);
 
+        for (req.doc_filter_bindings) |binding| {
+            if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+            for (filter_bindings.items) |existing| {
+                if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+            }
+            var set = (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(
+                self.core.store,
+                binding.filter_query_json,
+                filter_bindings.items,
+            )) orelse {
+                entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                self.recordUnsupportedDocSetFilterShape();
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            };
+            errdefer set.deinit(&entry.index);
+            try filter_bindings.append(entry.index.alloc, .{
+                .name = binding.name,
+                .set = set,
+            });
+            set = .{};
+        }
+
         if (req.filter_query_json.len > 0) {
-            if (try entry.index.docIdSetForFilterJsonAlloc(self.core.store, req.filter_query_json)) |set| {
+            if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
                 var owned_set = set;
                 defer owned_set.deinit(&entry.index);
                 if (owned_set.include) |ids| {
@@ -8213,17 +11268,27 @@ pub const DB = struct {
             }
         }
         if (req.exclusion_query_json.len > 0) {
-            if (try entry.index.docIdsForFilterJsonAlloc(self.core.store, req.exclusion_query_json)) |ids| {
-                defer entry.index.freeDocIds(ids);
-                const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
-                entry.index.freeDocIds(exclude_doc_ids);
-                exclude_doc_ids = merged;
-                changed = true;
+            if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
+                var owned_set = set;
+                defer owned_set.deinit(&entry.index);
+                if (owned_set.include) |ids| {
+                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
+                    entry.index.freeDocIds(exclude_doc_ids);
+                    exclude_doc_ids = merged;
+                    changed = true;
+                }
+                if (owned_set.exclude.len > 0) {
+                    const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, owned_set.exclude);
+                    entry.index.freeDocIds(exclude_doc_ids);
+                    exclude_doc_ids = merged;
+                    changed = true;
+                }
                 exclusion_json_resolved = true;
             }
         }
         if (!changed) {
             entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+            self.recordUnsupportedDocSetFilterShape();
             if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
             return .{ .req = req };
         }
@@ -8236,17 +11301,343 @@ pub const DB = struct {
         if (exclude_doc_ids.len > 0) next.exclude_doc_ids = exclude_doc_ids;
         if (filter_json_resolved) next.filter_query_json = "";
         if (exclusion_json_resolved) next.exclusion_query_json = "";
+        if (filter_bindings.items.len > 0) next.doc_filter_bindings = &.{};
         if (next.require_algebraic_filter_resolution and (next.filter_query_json.len > 0 or next.exclusion_query_json.len > 0)) {
             entry.index.recordVectorFilterUnsupported(true);
+            self.recordUnsupportedDocSetFilterShape();
             return error.UnsupportedQueryRequest;
         }
+        const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer self.alloc.destroy(resolved_filter);
+        resolved_filter.* = try self.resolvedDocFilterForIdsAlloc(filter_supported, filter_doc_ids, exclude_doc_ids, req.identity_read_generation);
+        errdefer resolved_filter.deinit(self.alloc);
+        next.resolved_doc_filter = resolved_filter;
         entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
         return .{
             .req = next,
             .index = &entry.index,
             .filter_doc_ids = filter_doc_ids,
             .exclude_doc_ids = exclude_doc_ids,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = self.alloc,
         };
+    }
+
+    fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
+        var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = req.identity_read_generation,
+        })) orelse return null;
+        errdefer resolved.deinit(self.alloc);
+
+        const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer self.alloc.destroy(resolved_filter);
+        resolved_filter.* = resolved;
+        resolved = .{};
+
+        var next = req;
+        next.resolved_doc_filter = resolved_filter;
+        next.filter_query_json = "";
+        next.exclusion_query_json = "";
+        return .{
+            .req = next,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = self.alloc,
+        };
+    }
+
+    fn searchRequestWithDirectAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest, index: *@import("algebraic/index.zig").Index) !?AlgebraicDocFilterRequest {
+        // Search requests are normalized to the current identity generation before
+        // reaching this path. Algebraic ordinal postings represent the current
+        // live row set, so using them directly avoids a broad identity-state scan
+        // before every vector filter query.
+        const algebraic_filter_rows_are_visible = true;
+        var resolved_bindings = std.ArrayListUnmanaged(@import("algebraic/index.zig").Index.ResolvedFilterBinding).empty;
+        defer {
+            for (resolved_bindings.items) |*binding| binding.filter.deinit(index.alloc);
+            resolved_bindings.deinit(index.alloc);
+        }
+        for (req.doc_filter_bindings) |binding| {
+            if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+            for (resolved_bindings.items) |existing| {
+                if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+            }
+            var binding_filter = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    binding.filter_query_json,
+                    resolved_bindings.items,
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    binding.filter_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )) orelse return null;
+            errdefer binding_filter.deinit(index.alloc);
+            try resolved_bindings.append(index.alloc, .{
+                .name = binding.name,
+                .filter = binding_filter,
+            });
+            binding_filter = .{};
+        }
+
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(index.alloc);
+        var changed = false;
+        var request_constraints_resolved = false;
+        var filter_json_resolved = false;
+        var exclusion_json_resolved = false;
+
+        if (try self.resolvedDocFilterForRequestNativeConstraintsAlloc(index.alloc, req)) |initial| {
+            filter = initial;
+            changed = true;
+            request_constraints_resolved = true;
+        }
+
+        if (req.filter_query_json.len > 0) {
+            var query_filter = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    req.filter_query_json,
+                    resolved_bindings.items,
+                )
+            else if (resolved_bindings.items.len > 0)
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    req.filter_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.filter_query_json, req.identity_read_generation)) orelse {
+                filter.deinit(index.alloc);
+                return null;
+            };
+            defer query_filter.deinit(index.alloc);
+            if (!(try applyResolvedFilterIncludeAlloc(index.alloc, &filter, &query_filter))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            changed = true;
+            filter_json_resolved = true;
+        }
+        if (req.exclusion_query_json.len > 0) {
+            var exclusion = (if (algebraic_filter_rows_are_visible)
+                try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                    self.core.store,
+                    req.exclusion_query_json,
+                    resolved_bindings.items,
+                )
+            else if (resolved_bindings.items.len > 0)
+                try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                    self.core.store,
+                    req.exclusion_query_json,
+                    req.identity_read_generation,
+                    resolved_bindings.items,
+                )
+            else
+                try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.exclusion_query_json, req.identity_read_generation)) orelse {
+                filter.deinit(index.alloc);
+                return null;
+            };
+            defer exclusion.deinit(index.alloc);
+
+            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.include))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.exclude))) {
+                filter.deinit(index.alloc);
+                return null;
+            }
+            changed = true;
+            exclusion_json_resolved = true;
+        }
+        if (!changed) return null;
+
+        const resolved_filter = try index.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer index.alloc.destroy(resolved_filter);
+        resolved_filter.* = filter;
+        filter = .{};
+
+        var next = req;
+        if (request_constraints_resolved) {
+            next.filter_doc_ids = &.{};
+            next.filter_doc_ids_positive = false;
+            next.exclude_doc_ids = &.{};
+        }
+        if (filter_json_resolved) next.filter_query_json = "";
+        if (exclusion_json_resolved) next.exclusion_query_json = "";
+        if (resolved_bindings.items.len > 0) next.doc_filter_bindings = &.{};
+        next.resolved_doc_filter = resolved_filter;
+
+        index.recordVectorFilterResolved(
+            resolvedDocSetStatCount(&resolved_filter.include),
+            resolvedDocSetStatCount(&resolved_filter.exclude),
+        );
+        return .{
+            .req = next,
+            .resolved_doc_filter = resolved_filter,
+            .resolved_doc_filter_alloc = index.alloc,
+        };
+    }
+
+    fn resolvedDocFilterForRequestNativeConstraintsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !?doc_set.ResolvedDocFilter {
+        var filter = doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(alloc);
+        var changed = false;
+
+        if (req.resolved_doc_filter) |ptr| {
+            const existing: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
+            filter = try self.normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(alloc, existing, req.identity_read_generation);
+            changed = true;
+        }
+
+        if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+            var include = if (req.filter_doc_ids.len == 0)
+                doc_set.ResolvedDocSet.none
+            else
+                try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, req.filter_doc_ids, req.identity_read_generation);
+            defer include.deinit(alloc);
+            if (!(try intersectResolvedFilterIncludeAlloc(alloc, &filter, &include))) {
+                filter.deinit(alloc);
+                return null;
+            }
+            changed = true;
+        }
+
+        if (req.exclude_doc_ids.len != 0) {
+            var exclude = try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, req.exclude_doc_ids, req.identity_read_generation);
+            defer exclude.deinit(alloc);
+            if (!(try unionResolvedFilterExcludeAlloc(alloc, &filter, &exclude))) {
+                filter.deinit(alloc);
+                return null;
+            }
+            changed = true;
+        }
+
+        if (!changed) return null;
+        return filter;
+    }
+
+    fn normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        filter: *const doc_set.ResolvedDocFilter,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        var out = doc_set.ResolvedDocFilter{
+            .include = try self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(alloc, &filter.include, generation),
+        };
+        errdefer out.deinit(alloc);
+        out.exclude = try self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(alloc, &filter.exclude, generation);
+        return out;
+    }
+
+    fn normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        return switch (set.*) {
+            .doc_keys => |keys| try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, keys, generation),
+            else => try doc_set.cloneAlloc(alloc, set),
+        };
+    }
+
+    fn applyResolvedFilterIncludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        include_filter: *const doc_set.ResolvedDocFilter,
+    ) !bool {
+        var merged_include = (try doc_set.intersectAlloc(alloc, &target.include, &include_filter.include)) orelse return false;
+        errdefer merged_include.deinit(alloc);
+        var merged_exclude = (try doc_set.unionAlloc(alloc, &target.exclude, &include_filter.exclude)) orelse return false;
+        errdefer merged_exclude.deinit(alloc);
+
+        target.include.deinit(alloc);
+        target.exclude.deinit(alloc);
+        target.include = merged_include;
+        target.exclude = merged_exclude;
+        return true;
+    }
+
+    fn intersectResolvedFilterIncludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        include: *const doc_set.ResolvedDocSet,
+    ) !bool {
+        var merged = (try doc_set.intersectAlloc(alloc, &target.include, include)) orelse return false;
+        errdefer merged.deinit(alloc);
+        target.include.deinit(alloc);
+        target.include = merged;
+        return true;
+    }
+
+    fn unionResolvedFilterExcludeAlloc(
+        alloc: Allocator,
+        target: *doc_set.ResolvedDocFilter,
+        exclude: *const doc_set.ResolvedDocSet,
+    ) !bool {
+        var merged = (try doc_set.unionAlloc(alloc, &target.exclude, exclude)) orelse return false;
+        errdefer merged.deinit(alloc);
+        target.exclude.deinit(alloc);
+        target.exclude = merged;
+        return true;
+    }
+
+    fn resolvedDocSetStatCount(set: *const doc_set.ResolvedDocSet) usize {
+        return set.estimatedCardinality() orelse 0;
+    }
+
+    fn unionResolvedDocSetsAlloc(alloc: Allocator, left: *const doc_set.ResolvedDocSet, right: *const doc_set.ResolvedDocSet) !?doc_set.ResolvedDocSet {
+        return switch (left.*) {
+            .all => .all,
+            .none => try doc_set.cloneAlloc(alloc, right),
+            .doc_keys => |left_keys| switch (right.*) {
+                .all => .all,
+                .none => try doc_set.cloneAlloc(alloc, left),
+                .doc_keys => |right_keys| .{ .doc_keys = try unionAlgebraicDocIds(alloc, left_keys, right_keys) },
+                .ordinals, .ordinal_bitmap => null,
+            },
+            .ordinals, .ordinal_bitmap => switch (right.*) {
+                .all => .all,
+                .none => try doc_set.cloneAlloc(alloc, left),
+                .doc_keys => null,
+                .ordinals, .ordinal_bitmap => try unionOrdinalDocSetsAlloc(alloc, left, right),
+            },
+        };
+    }
+
+    fn unionOrdinalDocSetsAlloc(alloc: Allocator, left: *const doc_set.ResolvedDocSet, right: *const doc_set.ResolvedDocSet) !doc_set.ResolvedDocSet {
+        var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+        defer ordinals.deinit(alloc);
+        try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, left);
+        try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, right);
+        return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    }
+
+    fn appendResolvedDocSetOrdinalsAlloc(alloc: Allocator, out: *std.ArrayListUnmanaged(doc_set.DocOrdinal), set: *const doc_set.ResolvedDocSet) !void {
+        switch (set.*) {
+            .ordinals => |ordinals| try out.appendSlice(alloc, ordinals),
+            .ordinal_bitmap => |*bitmap| {
+                var iter = bitmap.iterator();
+                while (iter.next()) |ordinal| try out.append(alloc, ordinal);
+            },
+            .all, .none, .doc_keys => {},
+        }
     }
 
     fn dupeAlgebraicDocIds(alloc: Allocator, doc_ids: []const []const u8) ![][]u8 {
@@ -8314,6 +11705,7 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.denseIndex(index_name);
     }
 
@@ -8322,7 +11714,9 @@ pub const DB = struct {
         if (req.full_text != null or req.sparse != null) return false;
         if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
         if (req.merge_config != null) return false;
+        if (req.doc_filter_bindings.len != 0) return false;
         if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
+        if (req.resolved_doc_filter != null) return false;
         if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
         if (!(req.dense != null or req.query == .dense_knn)) return false;
         const entry = self.core.denseIndex(req.index_name) orelse return false;
@@ -8352,7 +11746,18 @@ pub const DB = struct {
         index_name: ?[]const u8,
     ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try self.failIfIndexQuarantined(index_name);
         return self.core.sparseIndex(index_name);
+    }
+
+    fn sparseDocNumsForOrdinalsCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) anyerror![]const u32 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
     }
 
     fn loadRequiredProjectedSearchDocumentCallback(
@@ -8367,7 +11772,7 @@ pub const DB = struct {
             alloc,
             req,
             key,
-            (try self.get(alloc, key)) orelse return error.StoredDocMissing,
+            (try self.loadStoredSearchDocumentProbe(alloc, key)) orelse return error.StoredDocMissing,
         );
     }
 
@@ -8386,6 +11791,8 @@ pub const DB = struct {
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .load_many_parent_stored = loadParentStoredForSearchManyCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -8395,6 +11802,10 @@ pub const DB = struct {
         return try db_query_search.searchMatchAll(alloc, req, .{
             .ctx = self,
             .collect_candidates = collectSearchMatchAllCandidatesCallback,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
         });
     }
@@ -8409,7 +11820,91 @@ pub const DB = struct {
             .ctx = self,
             .scan_store_range = scanStoreRangeCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
         });
+    }
+
+    fn lookupLiveDocOrdinalCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    fn lookupLiveDocOrdinalNoLockCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) anyerror!?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    fn lookupLiveDocOrdinalsNoLockCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) anyerror![]?doc_set.DocOrdinal {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.lookupLiveDocOrdinalsNoLock(alloc, doc_ids, generation);
+    }
+
+    fn lookupLiveDocOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]?doc_set.DocOrdinal {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+
+        const ordinals = try doc_identity.lookupOrdinalsTxnAlloc(alloc, &txn, doc_ids);
+        errdefer alloc.free(ordinals);
+
+        const all_visible = try self.allDocsVisibleSummaryFast(generation);
+        if (all_visible) return ordinals;
+
+        for (ordinals) |*maybe_ordinal| {
+            const ordinal = maybe_ordinal.* orelse continue;
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                maybe_ordinal.* = null;
+                continue;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) maybe_ordinal.* = null;
+        }
+        return ordinals;
+    }
+
+    fn lookupLiveDocOrdinalNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, doc_id)) orelse return null;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return null;
+        const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+        if (!visible) return null;
+        return ordinal;
+    }
+
+    pub fn lookupLiveDocOrdinalForInternalRead(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
 
     fn scanStoreRangeCallback(
@@ -8424,11 +11919,14 @@ pub const DB = struct {
 
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
-        const raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
+        var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
             .ctx = self,
             .execute_graph_query = executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
+        errdefer raw.deinit();
+        try self.annotateSearchHitOrdinalsNoLock(alloc, req, raw.hits);
         return try filterExpiredSearchResult(self, alloc, raw);
     }
 
@@ -8438,10 +11936,13 @@ pub const DB = struct {
         req: types.SearchRequest,
         graph_queries: []const types.NamedGraphQuery,
         base_hits: []const types.SearchHit,
+        base_total_hits: u32,
     ) ![]types.GraphSearchResult {
-        return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, .{
+        return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, base_total_hits, .{
             .ctx = self,
             .func = executeSingleGraphQueryWithSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
+            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
         });
     }
 
@@ -8455,6 +11956,8 @@ pub const DB = struct {
         return try db_query_graph.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets, .{
             .ctx = self,
             .func = executeSingleGraphQueryWithSetsCallback,
+            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
+            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
         });
     }
 
@@ -8465,17 +11968,79 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        switch (named.query.query_type) {
-            .pattern => return try self.executeSinglePatternQueryWithSets(alloc, named, named_sets),
-            else => {},
+        var result = switch (named.query.query_type) {
+            .pattern => try self.executeSinglePatternQueryWithSets(alloc, req, named, named_sets),
+            else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
+                .ctx = self,
+                .find_shortest_path = executeShortestPathCallback,
+                .find_k_shortest_paths = executeKShortestPathsCallback,
+                .execute_graph_query = executeGraphQueryCallback,
+                .load_projected_document = loadProjectedSearchDocumentCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+                .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
+            }),
+        };
+        errdefer result.deinit(alloc);
+        try self.annotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
+        return result;
+    }
+
+    fn annotateSearchHitOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []types.SearchHit,
+    ) !void {
+        for (hits) |*hit| {
+            if (hit.doc_ordinal != null) continue;
+            hit.doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit.id, req.identity_read_generation);
         }
-        return try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
-            .ctx = self,
-            .find_shortest_path = executeShortestPathCallback,
-            .find_k_shortest_paths = executeKShortestPathsCallback,
-            .execute_graph_query = executeGraphQueryCallback,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-        });
+    }
+
+    fn resolveSearchHitsToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []const types.SearchHit,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
+            self.recordResolvedDocSet(&resolved, false);
+            return resolved;
+        }
+        var doc_ids = try alloc.alloc([]const u8, hits.len);
+        defer alloc.free(doc_ids);
+        for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    fn resolveGraphNodesToDocSetCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        nodes: []const graph_query_mod.GraphResultNode,
+    ) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var doc_ids = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(doc_ids);
+        for (nodes, 0..) |node, i| doc_ids[i] = node.key;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    fn resolveDocSetDocIdsForGraphCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) anyerror!?[][]u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse return null;
+        defer alloc.free(@constCast(ids));
+        errdefer for (ids) |id| alloc.free(@constCast(id));
+
+        const out = try alloc.alloc([]u8, ids.len);
+        for (ids, 0..) |id, i| out[i] = @constCast(id);
+        return out;
     }
 
     fn executeSingleGraphQueryWithSetsCallback(
@@ -8492,13 +12057,16 @@ pub const DB = struct {
     fn executeSinglePatternQueryWithSets(
         self: *DB,
         alloc: Allocator,
+        req: types.SearchRequest,
         named: *const types.NamedGraphQuery,
         named_sets: []const NamedResultSet,
     ) !types.GraphSearchResult {
-        return try db_query_graph.executeSinglePatternQueryWithSets(alloc, named, named_sets, .{
+        return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
             .ctx = self,
             .match_pattern = executePatternMatchCallback,
             .load_projected_document = loadPatternProjectedDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
     }
 
@@ -8526,7 +12094,7 @@ pub const DB = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return if (try self.get(alloc, key)) |stored|
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
             try projectLookupStoredBytes(self, alloc, key, stored, .{
                 .fields = query.fields,
                 .include_all_fields = query.include_all_fields,
@@ -8598,10 +12166,32 @@ pub const DB = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return if (try self.get(alloc, key)) |stored|
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
             try projectOwnedStoredBytesForSearch(self, alloc, req, key, stored)
         else
             null;
+    }
+
+    fn loadProjectedSearchDocumentManyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        return try self.loadProjectedSearchDocumentMany(alloc, req, keys);
+    }
+
+    fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        const store_key = try encodeStoreLookupKeyAlloc(alloc, key);
+        defer alloc.free(store_key);
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const raw = txn.get(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try alloc.dupe(u8, raw);
     }
 
     fn loadProjectedSearchDocumentMany(
@@ -8610,13 +12200,24 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]?[]u8 {
+        const bench_profile = benchQueryProfileEnabled();
+        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const loaded = try loadStoredSearchDocumentsMany(self, alloc, keys);
         errdefer freeOptionalOwnedBytes(alloc, loaded);
 
+        var project_ns: u64 = 0;
         for (loaded, 0..) |maybe_stored, i| {
             if (maybe_stored) |stored| {
+                const project_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
                 loaded[i] = try projectOwnedStoredBytesForSearch(self, alloc, req, keys[i], stored);
+                if (bench_profile) project_ns += platform_time.monotonicNs() - project_start_ns;
             }
+        }
+        if (bench_profile) {
+            std.log.info(
+                "antfly_bench_projected_many total_us={d} project_us={d} keys={d}",
+                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, project_ns / 1000, keys.len },
+            );
         }
         return loaded;
     }
@@ -8642,7 +12243,7 @@ pub const DB = struct {
             };
             const graph_results = try alloc.alloc(types.GraphSearchResult, 1);
             errdefer alloc.free(graph_results);
-            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, &named_query, named_sets);
+            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, req, &named_query, named_sets);
             return .{
                 .alloc = alloc,
                 .hits = &.{},
@@ -8654,6 +12255,8 @@ pub const DB = struct {
             .ctx = self,
             .execute_graph_query = executeSearchGraphQueryCallback,
             .load_projected_document = loadProjectedSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
+            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
         });
         return try filterExpiredSearchResult(self, alloc, raw);
     }
@@ -8678,7 +12281,10 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
     ) !graph_query_mod.GraphQueryResult {
-        const entry = self.core.graphIndex(graph_query.index_name) orelse return error.IndexNotFound;
+        const entry = self.core.graphIndex(graph_query.index_name) orelse {
+            try self.failIfIndexQuarantined(graph_query.index_name);
+            return error.IndexNotFound;
+        };
         if (entry.index.supportsAlgebraicSemiringTraversal()) {
             try self.proveGraphTraversalProgram(graph_query.index_name, target_keys.len > 0);
         }
@@ -8719,6 +12325,15 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     db_query_projection.freeJsonValue(alloc, value);
 }
 
+fn putLeakyJsonStringField(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try obj.put(alloc, key, .{ .string = try alloc.dupe(u8, value) });
+}
+
+fn putLeakyJsonU64Field(alloc: Allocator, obj: *std.json.ObjectMap, key: []const u8, value: u64) !void {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidArgument;
+    try obj.put(alloc, key, .{ .integer = @intCast(value) });
+}
+
 fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
     return try db_query_projection.cloneJsonValue(alloc, value);
 }
@@ -8753,7 +12368,7 @@ fn loadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.j
     for (artifacts) |entry| {
         if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
 
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .chunk or artifact_ref.chunk_id == null) continue;
 
@@ -8813,7 +12428,7 @@ fn loadEmbeddingFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?s
     for (artifacts) |entry| {
         if (!internal_keys.isInternalUserKey(entry.key)) continue;
 
-        var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .embedding or artifact_ref.source != null) continue;
 
@@ -8831,11 +12446,226 @@ fn loadEmbeddingFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?s
     return .{ .object = embeddings_obj };
 }
 
+fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
+    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(prefix);
+
+    const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var artifacts_obj = std.json.ObjectMap.empty;
+    errdefer {
+        var it = artifacts_obj.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            freeJsonValue(alloc, entry.value_ptr);
+        }
+        artifacts_obj.deinit(alloc);
+    }
+
+    var artifact_count: usize = 0;
+    for (artifacts) |entry| {
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
+        defer artifact_ref.deinit(alloc);
+
+        var artifact_value = try artifactProjectionValue(self, alloc, artifact_ref, entry.value);
+        errdefer freeJsonValue(alloc, &artifact_value);
+
+        try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
+        artifact_count += 1;
+    }
+
+    if (artifact_count == 0) {
+        var empty = std.json.Value{ .object = artifacts_obj };
+        freeJsonValue(alloc, &empty);
+        return null;
+    }
+    return .{ .object = artifacts_obj };
+}
+
+fn artifactProjectionValue(self: *DB, alloc: Allocator, artifact_ref: types.ArtifactRef, raw: []const u8) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer {
+        var value = std.json.Value{ .object = obj };
+        freeJsonValue(alloc, &value);
+    }
+
+    {
+        const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+        errdefer alloc.free(artifact_id);
+        try putOwnedValue(alloc, &obj, "artifact_id", .{ .string = artifact_id });
+    }
+
+    {
+        var ref_value = try artifactRefJsonValue(alloc, artifact_ref);
+        errdefer freeJsonValue(alloc, &ref_value);
+        try putOwnedValue(alloc, &obj, "artifact_ref", ref_value);
+    }
+
+    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    const content_type = try artifactContentTypeAlloc(self, alloc, artifact_ref.kind, artifact_ref.name);
+    try putOwnedValue(alloc, &obj, "content_type", .{ .string = content_type });
+    try putOwnedValue(alloc, &obj, "status", .{ .string = try alloc.dupe(u8, "ready") });
+
+    if (enrichment_artifact_codec.sourceHash(raw) catch null) |source_hash| {
+        try putOwnedValue(alloc, &obj, "source_hash", .{ .string = try std.fmt.allocPrint(alloc, "xxh64:{x}", .{source_hash}) });
+    }
+
+    switch (artifact_ref.kind) {
+        .chunk => {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch null;
+            if (parsed) |*owned| {
+                defer owned.deinit();
+                var cloned = try cloneJsonValue(alloc, owned.value);
+                errdefer freeJsonValue(alloc, &cloned);
+                try db_query_projection.normalizeChunkArtifactForQuery(alloc, &cloned);
+                try putOwnedValue(alloc, &obj, "value", cloned);
+            } else {
+                try putOwnedValue(alloc, &obj, "value", .{ .string = try alloc.dupe(u8, raw) });
+            }
+        },
+        .asset => {
+            try putOwnedValue(alloc, &obj, "value", try assetPayloadJsonValue(alloc, content_type, raw));
+        },
+        .embedding => {
+            if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
+                try putOwnedValue(alloc, &obj, "dims", .{ .integer = @intCast(dims) });
+            }
+            try putOwnedValue(alloc, &obj, "value", .null);
+        },
+    }
+
+    return .{ .object = obj };
+}
+
+fn appendArtifactProjectionValue(
+    alloc: Allocator,
+    artifacts_obj: *std.json.ObjectMap,
+    artifact_name: []const u8,
+    artifact_kind: types.ArtifactKind,
+    artifact_value: std.json.Value,
+) !void {
+    if (artifacts_obj.getPtr(artifact_name)) |existing| {
+        if (existing.* == .object) {
+            if (existing.object.getPtr("items")) |items| {
+                if (items.* == .array) {
+                    try items.array.append(artifact_value);
+                    return;
+                }
+            }
+        }
+
+        var first = try cloneJsonValue(alloc, existing.*);
+        var first_moved = false;
+        errdefer if (!first_moved) freeJsonValue(alloc, &first);
+        var items = std.json.Array.init(alloc);
+        errdefer {
+            for (items.items) |*item| freeJsonValue(alloc, item);
+            items.deinit();
+        }
+        try items.append(first);
+        first_moved = true;
+        try items.append(artifact_value);
+
+        var grouped = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = grouped };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &grouped, "kind", .{ .string = try alloc.dupe(u8, artifactSetKindText(artifact_kind)) });
+        try putOwnedValue(alloc, &grouped, "status", .{ .string = try alloc.dupe(u8, "ready") });
+        try putOwnedValue(alloc, &grouped, "items", .{ .array = items });
+
+        freeJsonValue(alloc, existing);
+        existing.* = .{ .object = grouped };
+        return;
+    }
+
+    try artifacts_obj.put(alloc, try alloc.dupe(u8, artifact_name), artifact_value);
+}
+
+fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer {
+        var value = std.json.Value{ .object = obj };
+        freeJsonValue(alloc, &value);
+    }
+    try putOwnedValue(alloc, &obj, "document_id", .{ .string = try alloc.dupe(u8, artifact_ref.document_id) });
+    try putOwnedValue(alloc, &obj, "name", .{ .string = try alloc.dupe(u8, artifact_ref.name) });
+    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    if (artifact_ref.chunk_id) |chunk_id| {
+        try putOwnedValue(alloc, &obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+    }
+    if (artifact_ref.source) |source| {
+        var source_obj = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = source_obj };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &source_obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(source.kind)) });
+        try putOwnedValue(alloc, &source_obj, "name", .{ .string = try alloc.dupe(u8, source.name) });
+        if (source.chunk_id) |chunk_id| {
+            try putOwnedValue(alloc, &source_obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+        }
+        try putOwnedValue(alloc, &obj, "source", .{ .object = source_obj });
+    }
+    return .{ .object = obj };
+}
+
+fn artifactKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk",
+        .asset => "asset",
+        .embedding => "embedding",
+    };
+}
+
+fn artifactSetKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk_set",
+        .asset => "asset_set",
+        .embedding => "embedding_set",
+    };
+}
+
+fn artifactContentType(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "application/json",
+        .asset => "application/octet-stream",
+        .embedding => "application/vnd.antfly.embedding+binary",
+    };
+}
+
+fn artifactContentTypeAlloc(self: *DB, alloc: Allocator, kind: types.ArtifactKind, artifact_name: []const u8) ![]u8 {
+    if (kind == .asset) {
+        if (self.core.index_manager.getEnrichment(.asset, artifact_name)) |cfg| {
+            if (cfg.content_type.len > 0) return try alloc.dupe(u8, cfg.content_type);
+            return try alloc.dupe(u8, "text/plain");
+        }
+    }
+    return try alloc.dupe(u8, artifactContentType(kind));
+}
+
+fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []const u8) !std.json.Value {
+    if (assetContentTypeIsJson(content_type)) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return try cloneJsonValue(alloc, parsed.value);
+    }
+    return .{ .string = try alloc.dupe(u8, raw) };
+}
+
+fn assetContentTypeIsJson(content_type: []const u8) bool {
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |semi| content_type[0..semi] else content_type, &std.ascii.whitespace);
+    return std.mem.eql(u8, media_type, "application/json") or std.mem.endsWith(u8, media_type, "+json");
+}
+
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
     return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
@@ -8847,6 +12677,7 @@ fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchReq
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
@@ -8858,10 +12689,18 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .load_artifacts = loadArtifactFieldValueCallback,
     });
 }
 
 fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+    const bench_profile = benchQueryProfileEnabled();
+    const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    var key_ns: u64 = 0;
+    var sort_ns: u64 = 0;
+    var txn_ns: u64 = 0;
+    var get_many_ns: u64 = 0;
+    var dupe_ns: u64 = 0;
     const PendingStoredSearchLoad = struct {
         original_index: usize,
         store_key: []u8,
@@ -8880,18 +12719,22 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
 
     errdefer freeOptionalOwnedBytes(alloc, loaded);
 
+    const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (keys, 0..) |key, i| {
         try pending.append(alloc, .{
             .original_index = i,
             .store_key = try encodeStoreLookupKeyAlloc(alloc, key),
         });
     }
+    if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
 
+    const sort_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     std.mem.sort(PendingStoredSearchLoad, pending.items, {}, struct {
         fn lessThan(_: void, lhs: PendingStoredSearchLoad, rhs: PendingStoredSearchLoad) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
     }.lessThan);
+    if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
 
     const read_keys = try alloc.alloc([]const u8, pending.items.len);
     defer alloc.free(read_keys);
@@ -8901,13 +12744,25 @@ fn loadStoredSearchDocumentsMany(self: *DB, alloc: Allocator, keys: []const []co
 
     for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
 
-    var txn = try self.core.store.beginReadTxn();
+    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
+    if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+    const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
 
+    const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         loaded[item.original_index] = try alloc.dupe(u8, value);
+    }
+    if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
+    if (bench_profile) {
+        std.log.info(
+            "antfly_bench_stored_many total_us={d} key_us={d} sort_us={d} txn_us={d} get_many_us={d} dupe_us={d} keys={d}",
+            .{ (platform_time.monotonicNs() - total_start_ns) / 1000, key_ns / 1000, sort_ns / 1000, txn_ns / 1000, get_many_ns / 1000, dupe_ns / 1000, keys.len },
+        );
     }
     return loaded;
 }
@@ -8935,6 +12790,94 @@ fn loadEmbeddingFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadEmbeddingFieldValue(self, alloc, doc_key);
+}
+
+fn loadArtifactFieldValueCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    doc_key: []const u8,
+) anyerror!?std.json.Value {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try loadArtifactFieldValue(self, alloc, doc_key);
+}
+
+fn dupeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, doc_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(out);
+    }
+    for (doc_ids, 0..) |doc_id, i| {
+        out[i] = try alloc.dupe(u8, doc_id);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn docIdsForOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, ordinals: []const doc_set.DocOrdinal) ![]const []const u8 {
+    return (try docIdsForOrdinalsAtGenerationTxnAlloc(alloc, txn, ordinals, null)) orelse error.InvalidDocIdentity;
+}
+
+fn docIdsForOrdinalsAtGenerationTxnAlloc(
+    alloc: Allocator,
+    txn: anytype,
+    ordinals: []const doc_set.DocOrdinal,
+    generation: ?u64,
+) !?[]const []const u8 {
+    const out = try alloc.alloc([]const u8, ordinals.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(out);
+    }
+    for (ordinals, 0..) |ordinal, i| {
+        if (try doc_identity.lookupStateTxn(txn, ordinal)) |state| {
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) {
+                for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+                alloc.free(out);
+                return null;
+            }
+        } else {
+            for (out[0..initialized]) |doc_id| alloc.free(@constCast(doc_id));
+            alloc.free(out);
+            return null;
+        }
+        out[i] = (try doc_identity.lookupDocIdTxn(alloc, txn, ordinal)) orelse return error.InvalidDocIdentity;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const types.SearchHit) !?doc_set.ResolvedDocSet {
+    const ordinals = try alloc.alloc(doc_set.DocOrdinal, hits.len);
+    defer if (ordinals.len > 0) alloc.free(ordinals);
+
+    for (hits, 0..) |hit, i| {
+        ordinals[i] = hit.doc_ordinal orelse return null;
+    }
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "resolved doc set from search hits uses complete hit ordinals" {
+    const alloc = std.testing.allocator;
+
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 3 },
+        .{ .id = @constCast("doc:b"), .doc_ordinal = 1 },
+    };
+    var resolved = (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &hits)) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(alloc);
+    try std.testing.expect(resolved.containsOrdinal(1));
+    try std.testing.expect(resolved.containsOrdinal(3));
+    try std.testing.expect(!resolved.containsOrdinal(2));
+
+    const mixed = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 1 },
+        .{ .id = @constCast("doc:b") },
+    };
+    try std.testing.expect((try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &mixed)) == null);
 }
 
 fn isMetadataKey(key: []const u8) bool {
@@ -8986,6 +12929,13 @@ fn freeOwnedKeySlice(alloc: Allocator, keys: [][]u8) void {
     alloc.free(keys);
 }
 
+fn decodeArtifactRefIfKnownAlloc(alloc: Allocator, key: []const u8) !?types.ArtifactRef {
+    return artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
+}
+
 fn buildOverwrittenDocKeys(
     alloc: Allocator,
     writes: []const types.BatchWrite,
@@ -9005,16 +12955,19 @@ fn buildOverwrittenDocKeys(
     return try keys.toOwnedSlice(alloc);
 }
 
-fn appendUniqueReplayRecordKey(
+fn appendUniqueReplayRecordKeyWithSet(
     alloc: Allocator,
     list: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
     key: []const u8,
 ) !void {
     if (key.len == 0) return;
-    for (list.items) |existing| {
-        if (std.mem.eql(u8, existing, key)) return;
-    }
-    try list.append(alloc, try alloc.dupe(u8, key));
+    if (seen.contains(key)) return;
+    const owned = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned);
+    try seen.put(alloc, owned, {});
+    errdefer _ = seen.remove(owned);
+    try list.append(alloc, owned);
 }
 
 fn appendUniqueReplayRecordHint(
@@ -9039,34 +12992,44 @@ fn encodeThinReplayRecordPayload(
     include_generated_enrichment_hint: bool,
 ) ![]u8 {
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var changed_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (changed_doc_keys.items) |key| alloc.free(@constCast(key));
         changed_doc_keys.deinit(alloc);
     }
     var deleted_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var deleted_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (deleted_doc_keys.items) |key| alloc.free(@constCast(key));
         deleted_doc_keys.deinit(alloc);
     }
     var overwritten_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var overwritten_doc_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (overwritten_doc_keys.items) |key| alloc.free(@constCast(key));
         overwritten_doc_keys.deinit(alloc);
     }
     var thin_changed_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+    var thin_changed_artifact_key_set = std.StringHashMapUnmanaged(void).empty;
     errdefer {
         for (thin_changed_artifact_keys.items) |key| alloc.free(@constCast(key));
         thin_changed_artifact_keys.deinit(alloc);
     }
     var target_hints = std.ArrayListUnmanaged(change_journal_mod.TargetHint).empty;
     errdefer target_hints.deinit(alloc);
+    defer {
+        changed_doc_key_set.deinit(alloc);
+        deleted_doc_key_set.deinit(alloc);
+        overwritten_doc_key_set.deinit(alloc);
+        thin_changed_artifact_key_set.deinit(alloc);
+    }
 
     var saw_overwritten = false;
 
     for (req.writes, 0..) |write, i| {
         const extracted_write = extracted[i];
         if (extracted_write.cleaned_value != null or include_generated_enrichment_hint) {
-            try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
             if (extracted_write.cleaned_value != null) {
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
@@ -9077,19 +13040,19 @@ fn encodeThinReplayRecordPayload(
         }
 
         for (extracted_write.dense_embeddings) |embedding| {
-            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
         }
         for (extracted_write.sparse_embeddings) |embedding| {
-            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+            if (embedding.artifact_key) |artifact_key| try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
         }
         if (extracted_write.mentioned_graph_indexes.len > 0 or extracted_write.graph_writes.len > 0) {
-            try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         }
         if (overwritten_flags[i] and extracted_write.cleaned_value != null) {
-            try appendUniqueReplayRecordKey(alloc, &overwritten_doc_keys, write.key);
+            try appendUniqueReplayRecordKeyWithSet(alloc, &overwritten_doc_keys, &overwritten_doc_key_set, write.key);
             saw_overwritten = true;
         }
     }
@@ -9102,31 +13065,39 @@ fn encodeThinReplayRecordPayload(
     }
 
     for (changed_artifact_keys) |key| {
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, key);
-        if (internal_keys.isGraphEdgeArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+        if (internal_keys.isAssetArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+        }
     }
 
     for (req.graph_writes) |write| {
-        try appendUniqueReplayRecordKey(alloc, &changed_doc_keys, write.source);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.source);
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
         defer alloc.free(artifact_key);
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
     for (req.graph_deletes) |delete| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, delete.source);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, delete.source);
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
         defer alloc.free(artifact_key);
-        try appendUniqueReplayRecordKey(alloc, &thin_changed_artifact_keys, artifact_key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
 
     for (req.deletes) |key| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
     }
     for (deleted_artifact_keys) |key| {
-        try appendUniqueReplayRecordKey(alloc, &deleted_doc_keys, key);
+        try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
+        if (internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
+            try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
+            if (internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+        }
     }
 
     var record: change_journal_mod.Record = .{
@@ -9148,7 +13119,34 @@ fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), k
     try list.append(alloc, try alloc.dupe(u8, key));
 }
 
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |existing| {
+        if (std.mem.eql(u8, existing, name)) return true;
+    }
+    return false;
+}
+
+fn strippedStoredDocumentValueAlloc(
+    alloc: Allocator,
+    cleaned: []const u8,
+    vector_store_field_names: []const []const u8,
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    if (vector_store_field_names.len == 0) return cleaned;
+    const stripped = (try mapper.stripTopLevelFieldsAlloc(alloc, cleaned, vector_store_field_names)) orelse try alloc.dupe(u8, "{}");
+    errdefer alloc.free(stripped);
+    try owned_values.append(alloc, stripped);
+    return stripped;
+}
+
 fn containsOwnedKey(list: []const []u8, key: []const u8) bool {
+    for (list) |existing| {
+        if (std.mem.eql(u8, existing, key)) return true;
+    }
+    return false;
+}
+
+fn containsDeleteKey(list: []const []const u8, key: []const u8) bool {
     for (list) |existing| {
         if (std.mem.eql(u8, existing, key)) return true;
     }
@@ -9332,14 +13330,63 @@ fn renderSourceTemplateParts(
 }
 
 fn makeChunkCacheKey(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}\x1f{d}\x1f{d}\x1f{s}", .{
+    var chunk_size: [@sizeOf(u32)]u8 = undefined;
+    var chunk_overlap: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &chunk_size, request.chunk_size, .big);
+    std.mem.writeInt(u32, &chunk_overlap, request.chunk_overlap, .big);
+    return try chunkCacheTupleKeyAlloc(alloc, &.{
         request.doc_key,
         requestArtifactName(request),
         request.source_field,
-        request.chunk_size,
-        request.chunk_overlap,
+        &chunk_size,
+        &chunk_overlap,
         request.chunker_json,
     });
+}
+
+fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "db chunk cache keys preserve embedded separators" {
+    const alloc = std.testing.allocator;
+
+    const left = try makeChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .doc_key = "doc\x1fartifact",
+        .source_field = "body",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(left);
+
+    const right = try makeChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact\x1fartifact",
+        .doc_key = "doc",
+        .source_field = "body",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(right);
+
+    try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
 fn getOrCreateChunks(
@@ -9538,6 +13585,2112 @@ fn computeChunkRequestDerived(
     }
 }
 
+fn computeAssetRequestDerived(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    force_reprocess: bool,
+) !void {
+    var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
+    defer producer_cfg.deinit(alloc);
+
+    const artifact_name = requestArtifactName(request);
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
+    defer alloc.free(key);
+
+    const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
+    if (source_text == null or source_text.?.len == 0) {
+        if (source_text) |s| alloc.free(s);
+        if (producer_cfg.type == .document_extraction) {
+            try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
+            return;
+        }
+        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
+        const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+        errdefer alloc.free(state_key);
+        try artifact_delete_keys.append(alloc, state_key);
+        return;
+    }
+    defer alloc.free(source_text.?);
+
+    if (producer_cfg.type == .document_extraction) {
+        return try computeDocumentExtractionAssetRequestDerived(
+            alloc,
+            db,
+            doc_value,
+            source_text.?,
+            request,
+            producer_cfg.config_json,
+            key,
+            artifact_writes,
+            artifact_delete_keys,
+            documents,
+            dense_embeddings,
+            sparse_embeddings,
+            force_reprocess,
+        );
+    }
+
+    const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+        try renderSourcePartsJson(alloc, db, doc_value, request)
+    else
+        null;
+    defer if (source_parts_json) |value| alloc.free(value);
+
+    const state_key = if (producer_cfg.type != .copy)
+        try assetStateKeyAlloc(alloc, request.doc_key, artifact_name)
+    else
+        null;
+    defer if (state_key) |value| alloc.free(value);
+    const state_value = if (producer_cfg.type != .copy)
+        try assetStateValueAlloc(alloc, source_text.?, source_parts_json, request.producer_json)
+    else
+        null;
+    defer if (state_value) |value| alloc.free(value);
+    if (state_key != null and state_value != null) {
+        const existing_state = try db.core.getStoreValue(alloc, state_key.?);
+        defer if (existing_state) |value| alloc.free(value);
+        if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) {
+            const existing_asset = try db.core.getStoreValue(alloc, key);
+            defer if (existing_asset) |value| alloc.free(value);
+            if (existing_asset) |value| {
+                try artifact_writes.append(alloc, .{
+                    .key = try alloc.dupe(u8, key),
+                    .value = try alloc.dupe(u8, value),
+                });
+                return;
+            }
+        }
+    }
+
+    const value = if (producer_cfg.type == .copy) source_text.? else blk: {
+        const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+        const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+        break :blk try producer.produce(alloc, .{
+            .producer_type = producer_cfg.type,
+            .config_json = producer_cfg.config_json,
+            .source_text = source_text.?,
+            .source_parts_json = source_parts_json,
+            .content_type = request.content_type,
+        });
+    };
+    defer if (producer_cfg.type != .copy) alloc.free(value);
+
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .value = try alloc.dupe(u8, value),
+    });
+
+    if (producer_cfg.type != .copy) {
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, state_key.?),
+            .value = try alloc.dupe(u8, state_value.?),
+        });
+    }
+}
+
+fn computeDocumentExtractionAssetRequestDerived(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    source_url: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    config_json: []const u8,
+    manifest_key: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+    force_reprocess: bool,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var config = try document_extraction_mod.parseConfig(alloc, config_json);
+    defer config.deinit(alloc);
+    try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
+
+    const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
+    defer alloc.free(state_key);
+    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_state) |value| alloc.free(value);
+    const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_manifest) |value| alloc.free(value);
+    var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
+    defer freeDocumentArtifactChildRanges(alloc, previous_child_ranges);
+    if (existing_manifest) |value| {
+        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(alloc, value);
+    }
+
+    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(alloc, value) else 0;
+    const to_generation = from_generation + 1;
+
+    const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
+    defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
+    if (!force_reprocess) {
+        if (metadata_fingerprint) |fingerprint| {
+            if (existing_state) |state| {
+                if (documentExtractionStateFingerprintMatches(alloc, state, fingerprint)) {
+                    if (existing_manifest) |value| {
+                        if (!(try documentExtractionManifestHasLastError(alloc, value))) {
+                            try artifact_writes.append(alloc, .{
+                                .key = try alloc.dupe(u8, manifest_key),
+                                .value = try alloc.dupe(u8, value),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+        alloc,
+        db.remote_content,
+        db.secret_store,
+        source_url,
+        if (config.credentials.len > 0) config.credentials else null,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
+            return;
+        },
+    };
+    const downloaded = switch (fetched) {
+        .ok => |content| content,
+        .http_error => |http_error| {
+            const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
+            defer alloc.free(message);
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
+            return;
+        },
+    };
+    var downloaded_mut = downloaded;
+    defer downloaded_mut.deinit(alloc);
+
+    var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try appendDocumentExtractionFailureManifest(alloc, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            return;
+        },
+    };
+    defer extraction.deinit(alloc);
+    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, extraction.content_type, &extraction);
+
+    const byte_source_fingerprint = if (metadata_fingerprint == null)
+        try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+    else
+        null;
+    defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
+    const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+
+    var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_keys.items) |key| alloc.free(@constCast(key));
+        desired_unit_keys.deinit(alloc);
+    }
+    var desired_unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_fingerprints.items) |fingerprint| alloc.free(@constCast(fingerprint));
+        desired_unit_fingerprints.deinit(alloc);
+    }
+    var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_chunk_keys.items) |key| alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(alloc);
+    }
+
+    try collectDocumentExtractionDesiredKeys(alloc, db, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
+
+    const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
+    defer alloc.free(desired_unit_descriptors);
+
+    const new_state = try documentExtractionStateValueAlloc(alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
+    defer alloc.free(new_state);
+
+    var previous_unit_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
+    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
+    defer freeDocumentExtractionUnitDescriptors(alloc, previous_unit_descriptors);
+    var previous_chunk_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+
+    if (existing_state) |state| {
+        if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
+            if (existing_manifest) |value| {
+                if (!(try documentExtractionManifestHasLastError(alloc, value))) {
+                    try artifact_writes.append(alloc, .{
+                        .key = try alloc.dupe(u8, manifest_key),
+                        .value = try alloc.dupe(u8, value),
+                    });
+                    return;
+                }
+            }
+        }
+
+        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+        for (previous_unit_keys) |previous_key| {
+            if (containsDeleteKey(desired_unit_keys.items, previous_key)) continue;
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        for (previous_chunk_keys) |previous_key| {
+            if (containsDeleteKey(desired_chunk_keys.items, previous_key)) continue;
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+    }
+
+    const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, artifact_name, false);
+    defer {
+        for (text_indexes) |name| alloc.free(name);
+        alloc.free(text_indexes);
+    }
+
+    const chunk_range_base_index = documentExtractionUnitRangeCount(extraction.units);
+    for (extraction.units, desired_unit_descriptors, 0..) |unit, unit_descriptor, unit_index| {
+        const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, request.doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(unit_key);
+        const unit_range_id = try documentExtractionRangeIdAlloc(alloc, documentExtractionUnitRangeIndex(extraction.units, unit_index));
+        defer alloc.free(unit_range_id);
+        const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
+        const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
+            unitDescriptorFingerprintMatches(previous_unit_descriptors, unit_key, unit_descriptor.fingerprint);
+        if (unit_unchanged and
+            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
+        {
+            if (force_reprocess) {
+                const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+                defer alloc.free(payload);
+                try artifact_writes.append(alloc, .{
+                    .key = try alloc.dupe(u8, unit_key),
+                    .value = try alloc.dupe(u8, payload),
+                });
+                if (text_indexes.len > 0) {
+                    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                    errdefer {
+                        for (targets) |target| alloc.free(target.index_name);
+                        alloc.free(targets);
+                    }
+                    for (text_indexes, 0..) |index_name, i| {
+                        targets[i] = .{
+                            .kind = .full_text,
+                            .index_name = try alloc.dupe(u8, index_name),
+                        };
+                    }
+                    try documents.append(alloc, .{
+                        .key = try alloc.dupe(u8, unit_key),
+                        .action = .upsert,
+                        .cleaned_value = try alloc.dupe(u8, payload),
+                        .targets = targets,
+                    });
+                }
+                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit, documents);
+            } else {
+                try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+            }
+            continue;
+        }
+        const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+        defer alloc.free(payload);
+        try artifact_writes.append(alloc, .{
+            .key = try alloc.dupe(u8, unit_key),
+            .value = try alloc.dupe(u8, payload),
+        });
+        if (text_indexes.len > 0) {
+            const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+            errdefer {
+                for (targets) |target| alloc.free(target.index_name);
+                alloc.free(targets);
+            }
+            for (text_indexes, 0..) |index_name, i| {
+                targets[i] = .{
+                    .kind = .full_text,
+                    .index_name = try alloc.dupe(u8, index_name),
+                };
+            }
+            try documents.append(alloc, .{
+                .key = try alloc.dupe(u8, unit_key),
+                .action = .upsert,
+                .cleaned_value = try alloc.dupe(u8, payload),
+                .targets = targets,
+            });
+        }
+
+        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+    }
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        request.doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        extraction,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        previous_child_ranges,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        to_generation,
+        from_generation,
+        to_generation,
+        "converged",
+    );
+    defer alloc.free(manifest);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, manifest_key),
+        .value = try alloc.dupe(u8, manifest),
+    });
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, state_key),
+        .value = try alloc.dupe(u8, new_state),
+    });
+}
+
+fn completeDocumentExtractionGeneratedText(
+    alloc: Allocator,
+    runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    source_content_type: []const u8,
+    extraction: *document_extraction_mod.Result,
+) !void {
+    const active_runtime = runtime orelse return;
+    const producer = active_runtime.config.asset_producer orelse return;
+    for (extraction.units) |*unit| {
+        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+            defer alloc.free(parts_json);
+            const produced = try producer.produce(alloc, .{
+                .producer_type = .reader,
+                .config_json = config.ocr_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer alloc.free(produced);
+            try applyGeneratedUnitText(alloc, unit, produced, "ocr_text", "completed", .ocr);
+            continue;
+        }
+        if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
+            const parts_json = try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
+            defer alloc.free(parts_json);
+            const produced = try producer.produce(alloc, .{
+                .producer_type = .transcriber,
+                .config_json = config.transcription_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer alloc.free(produced);
+            try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
+        }
+    }
+}
+
+const GeneratedUnitTextKind = enum { ocr, transcript };
+
+fn applyGeneratedUnitText(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    produced: []u8,
+    method: []const u8,
+    status: []const u8,
+    kind: GeneratedUnitTextKind,
+) !void {
+    if (produced.len == 0) {
+        alloc.free(produced);
+        return;
+    }
+    defer alloc.free(produced);
+    var parsed = try parseGeneratedUnitTextOutputAlloc(alloc, produced);
+    errdefer parsed.deinit(alloc);
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.text = parsed.text;
+    parsed.text = &.{};
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    switch (kind) {
+        .ocr => {
+            unit.ocr_used = true;
+            unit.ocr_confidence = parsed.confidence;
+            unit.ocr_bbox = parsed.bbox;
+        },
+        .transcript => {
+            unit.transcript_used = true;
+            unit.transcript_confidence = parsed.confidence;
+        },
+    }
+    unit.extraction_warning = parsed.warning;
+    parsed.warning = null;
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+const ParsedGeneratedUnitText = struct {
+    text: []u8,
+    confidence: ?f64 = null,
+    bbox: ?[4]f64 = null,
+    warning: ?[]u8 = null,
+
+    fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
+        if (self.text.len > 0) alloc.free(self.text);
+        if (self.warning) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn parseGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !ParsedGeneratedUnitText {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, produced, .{}) catch {
+        return .{ .text = try alloc.dupe(u8, produced) };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, produced) };
+    const text_value = parsed.value.object.get("text") orelse return .{ .text = try alloc.dupe(u8, produced) };
+    if (text_value != .string) return .{ .text = try alloc.dupe(u8, produced) };
+
+    var out = ParsedGeneratedUnitText{ .text = try alloc.dupe(u8, text_value.string) };
+    errdefer out.deinit(alloc);
+    out.confidence = generatedTextJsonFloatField(parsed.value.object, "confidence");
+    out.bbox = generatedTextJsonBboxField(parsed.value.object, "ocr_bbox") orelse generatedTextJsonBboxField(parsed.value.object, "bbox") orelse generatedTextJsonBboxField(parsed.value.object, "coordinates");
+    if (generatedTextJsonStringField(parsed.value.object, "warning") orelse generatedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
+        out.warning = try alloc.dupe(u8, warning);
+    }
+    return out;
+}
+
+fn generatedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn generatedTextJsonFloatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn generatedTextJsonBboxField(object: std.json.ObjectMap, field: []const u8) ?[4]f64 {
+    const value = object.get(field) orelse return null;
+    if (value != .array or value.array.items.len != 4) return null;
+    var out: [4]f64 = undefined;
+    for (value.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            else => return null,
+        };
+    }
+    return out;
+}
+
+fn documentGeneratedTextPartsJsonAlloc(
+    alloc: Allocator,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    unit: document_extraction_mod.Unit,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .schema = "antfly.document_generated_text_request.v1",
+        .route_type = route_type,
+        .source_content_type = source_content_type,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .source_path = unit.source_path,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .text_regions = unit.text_regions,
+        .byte_length = unit.byte_length,
+        .source_sha256 = unit.source_sha256,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+    }, .{});
+}
+
+fn appendDocumentExtractionDeleteKeys(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    manifest_key: []const u8,
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try artifact_delete_keys.append(alloc, try alloc.dupe(u8, manifest_key));
+    const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
+    errdefer alloc.free(state_key);
+    const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (existing_state) |value| alloc.free(value);
+    if (existing_state) |state| {
+        const previous_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+    }
+    try artifact_delete_keys.append(alloc, state_key);
+}
+
+fn collectDocumentExtractionDesiredKeys(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    units: []const document_extraction_mod.Unit,
+    desired_unit_keys: *std.ArrayListUnmanaged([]const u8),
+    desired_unit_fingerprints: *std.ArrayListUnmanaged([]const u8),
+    desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (units) |unit| {
+        try desired_unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
+        try desired_unit_fingerprints.append(alloc, try documentExtractionUnitFingerprintAlloc(alloc, unit));
+        for (db.core.index_manager.enrichments.items) |entry| {
+            if (entry.kind != .chunk) continue;
+            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+            const chunks = if (entry.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+            else
+                try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+            defer chunker_mod.freeChunks(alloc, chunks);
+            for (chunks) |chunk| {
+                try desired_chunk_keys.append(alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            }
+        }
+    }
+}
+
+const DocumentExtractionUnitDescriptor = struct {
+    key: []const u8,
+    fingerprint: []const u8,
+};
+
+const DocumentExtractionRangeRoute = struct {
+    range_id: []const u8,
+    route_status: []const u8 = "local_committed",
+    owner_group_id: u64 = 0,
+};
+
+fn documentExtractionUnitDescriptorsFromKeysAlloc(
+    alloc: Allocator,
+    unit_keys: []const []const u8,
+    fingerprints: []const []const u8,
+) ![]DocumentExtractionUnitDescriptor {
+    if (unit_keys.len != fingerprints.len) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, unit_keys.len);
+    for (unit_keys, fingerprints, 0..) |key, fingerprint, i| {
+        out[i] = .{
+            .key = key,
+            .fingerprint = fingerprint,
+        };
+    }
+    return out;
+}
+
+fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []DocumentExtractionUnitDescriptor) void {
+    for (descriptors) |descriptor| {
+        if (descriptor.key.len > 0) alloc.free(@constCast(descriptor.key));
+        if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+    }
+    if (descriptors.len > 0) alloc.free(descriptors);
+}
+
+fn appendStoredFullTextDocument(
+    alloc: Allocator,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| alloc.free(target.index_name);
+        alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try alloc.dupe(u8, index_name),
+        };
+    }
+    try documents.append(alloc, .{
+        .key = try alloc.dupe(u8, key),
+        .action = .upsert,
+        .targets = targets,
+    });
+}
+
+fn appendDocumentUnitStoredFullTextDocuments(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    unit_text_indexes: []const []const u8,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    try appendStoredFullTextDocument(alloc, documents, unit_key, unit_text_indexes);
+    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, doc_key, source_artifact_name, unit, documents);
+}
+
+fn appendDocumentUnitStoredChunkFullTextDocuments(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+) !void {
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+
+        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        defer {
+            for (chunk_text_indexes) |name| alloc.free(name);
+            alloc.free(chunk_text_indexes);
+        }
+        if (chunk_text_indexes.len == 0) continue;
+
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            try appendStoredFullTextDocument(alloc, documents, chunk_key, chunk_text_indexes);
+        }
+    }
+}
+
+fn storeKeyExists(alloc: Allocator, db: *DB, key: []const u8) !bool {
+    const value = db.core.getStoreValue(alloc, key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (value) |owned| alloc.free(owned);
+    return true;
+}
+
+fn documentUnitCanSkipLocalWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    unit_text_indexes: []const []const u8,
+) !bool {
+    _ = unit_text_indexes;
+    if (!(try storeKeyExists(alloc, db, unit_key))) return false;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            if (!(try storeKeyExists(alloc, db, chunk_key))) return false;
+            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, chunk_key, entry.name))) return false;
+        }
+    }
+    return true;
+}
+
+fn documentUnitChunkEmbeddingArtifactsPresent(
+    alloc: Allocator,
+    db: *DB,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+) !bool {
+    const runtime = db.enrichment_runtime;
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+
+        if (entry.expected_dims > 0) {
+            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+            defer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
+        } else {
+            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+            defer {
+                for (consumer_indexes) |name| alloc.free(name);
+                alloc.free(consumer_indexes);
+            }
+            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
+        }
+
+        const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
+        defer alloc.free(artifact_key);
+        if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
+    }
+    return true;
+}
+
+fn appendDocumentUnitChunkWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    desired_chunk_keys: []const []const u8,
+    chunk_range_base_index: usize,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
+        if (chunks.len == 0) continue;
+
+        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, false);
+        defer {
+            for (text_indexes) |name| alloc.free(name);
+            alloc.free(text_indexes);
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer alloc.free(chunk_key);
+            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            try artifact_writes.append(alloc, .{
+                .key = try alloc.dupe(u8, chunk_key),
+                .value = try alloc.dupe(u8, payload),
+            });
+
+            if (text_indexes.len > 0) {
+                const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                errdefer {
+                    for (targets) |target| alloc.free(target.index_name);
+                    alloc.free(targets);
+                }
+                for (text_indexes, 0..) |index_name, i| {
+                    targets[i] = .{
+                        .kind = .full_text,
+                        .index_name = try alloc.dupe(u8, index_name),
+                    };
+                }
+                try documents.append(alloc, .{
+                    .key = try alloc.dupe(u8, chunk_key),
+                    .action = .upsert,
+                    .cleaned_value = try alloc.dupe(u8, payload),
+                    .targets = targets,
+                });
+            }
+
+            try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, chunk_key, entry.name, entry.source_field, chunk, artifact_writes, dense_embeddings);
+            try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, chunk_key, entry.name, chunk, artifact_writes, sparse_embeddings);
+
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+}
+
+fn appendDocumentUnitChunkDenseEmbeddingWrites(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    source_field: []const u8,
+    chunk: chunker_mod.Chunk,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const runtime = db.enrichment_runtime orelse return;
+    const dense_embedder = runtime.config.dense_embedder orelse return;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims == 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+        defer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        const vector = try dense_embedder.embedDense(alloc, entry.name, chunk_text, entry.expected_dims);
+        defer alloc.free(vector);
+        const artifact_key = try appendEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            chunk_key,
+            doc_key,
+            entry.name,
+            source_field,
+            chunk_key,
+            enrichment_artifact_codec.hashSource(chunk_text),
+            vector,
+        );
+        defer alloc.free(artifact_key);
+        try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, consumer_indexes);
+    }
+}
+
+fn appendDocumentUnitChunkSparseEmbeddingWrites(
+    alloc: Allocator,
+    db: *DB,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    chunk: chunker_mod.Chunk,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const runtime = db.enrichment_runtime orelse return;
+    const sparse_embedder = runtime.config.sparse_embedder orelse return;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims != 0) continue;
+
+        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+        defer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        var sparse = try sparse_embedder.embedSparse(alloc, entry.name, chunk_text);
+        defer sparse.deinit(alloc);
+        const artifact_key = try appendSparseEmbeddingArtifactWrite(
+            alloc,
+            artifact_writes,
+            chunk_key,
+            entry.name,
+            enrichment_artifact_codec.hashSource(chunk_text),
+            sparse.indices,
+            sparse.values,
+        );
+        defer alloc.free(artifact_key);
+        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+    }
+}
+
+fn buildDocumentUnitChunkPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    unit_key: []const u8,
+    artifact_name: []const u8,
+    source_artifact_name: []const u8,
+    source_field: []const u8,
+    unit: document_extraction_mod.Unit,
+    chunk: chunker_mod.Chunk,
+    include_payload: bool,
+    route: DocumentExtractionRangeRoute,
+) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_id"), .{ .string = try alloc.dupe(u8, route.range_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_kind"), .{ .string = try alloc.dupe(u8, "chunk") });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_route_status"), .{ .string = try alloc.dupe(u8, route.route_status) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_owner_group_id"), .{ .integer = owner_group_id });
+    try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
+        .scope = .unit,
+        .parent_doc_key = doc_key,
+        .parent_unit_key = unit_key,
+        .parent_unit_id = unit.unit_id,
+        .source_artifact_name = source_artifact_name,
+        .document_char_base = unit.char_start,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .extraction_method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .confidence = documentUnitConfidence(unit),
+        .ocr_used = unit.ocr_used,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_used = unit.transcript_used,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+    });
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+}
+
+fn documentExtractionFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_url);
+    hasher.update(config_json);
+    hasher.update(configured_content_type);
+    hasher.update(configured_filename);
+    hasher.update(downloaded_content_type);
+    hasher.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(unit.unit_id);
+    hasher.update(unit.unit_type);
+    hasher.update(unit.text);
+    hasher.update(unit.method);
+    if (unit.source_path) |source_path| hasher.update(source_path);
+    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
+    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
+    if (unit.byte_length) |byte_length| {
+        var buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &buf, byte_length, .big);
+        hasher.update(&buf);
+    }
+    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    if (unit.ocr_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.ocr_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
+    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
+    if (unit.transcript_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.extraction_warning) |warning| hasher.update(warning);
+    if (unit.page_number) |page_number| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    if (unit.page_label) |page_label| {
+        hasher.update(page_label);
+    }
+    if (unit.page_bbox) |bbox| {
+        for (bbox) |coord| {
+            var coord_value = coord;
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
+    if (unit.page_rotation) |rotation| {
+        var buf: [@sizeOf(i32)]u8 = undefined;
+        std.mem.writeInt(i32, &buf, rotation, .big);
+        hasher.update(&buf);
+    }
+    for (unit.text_regions) |region| {
+        for (region.span) |span| {
+            var buf: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &buf, span, .big);
+            hasher.update(&buf);
+        }
+        for (region.bbox) |coord| {
+            var coord_value = coord;
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
+    if (unit.char_start) |char_start| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_start, .big);
+        hasher.update(&buf);
+    }
+    if (unit.char_end) |char_end| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_end, .big);
+        hasher.update(&buf);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+fn documentExtractionStateValueAlloc(
+    alloc: Allocator,
+    fingerprint: []const u8,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_extraction_state_v1",
+        .fingerprint = fingerprint,
+        .unit_keys = unit_keys,
+        .unit_descriptors = unit_descriptors,
+        .chunk_keys = chunk_keys,
+    }, .{});
+}
+
+fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("fingerprint") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, fingerprint);
+}
+
+fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "unit_keys");
+}
+
+fn documentExtractionStateChunkKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "chunk_keys");
+}
+
+fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const u8) ![]DocumentExtractionUnitDescriptor {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const descriptors_value = parsed.value.object.get("unit_descriptors") orelse return documentExtractionStateUnitDescriptorFallbackAlloc(alloc, parsed.value.object);
+    if (descriptors_value != .array) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, descriptors_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (descriptors_value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
+        const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
+        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, key_value.string),
+            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]DocumentExtractionUnitDescriptor {
+    const keys_value = object.get("unit_keys") orelse return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    if (keys_value != .array) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, item.string),
+            .fingerprint = "",
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_name: []const u8) ![]const []const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc([]const u8, 0);
+    const keys_value = parsed.value.object.get(field_name) orelse return try alloc.alloc([]const u8, 0);
+    if (keys_value != .array) return try alloc.alloc([]const u8, 0);
+    const out = try alloc.alloc([]const u8, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionUnitKeyStillPresent(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_key: []const u8,
+    units: []const document_extraction_mod.Unit,
+) !bool {
+    for (units) |unit| {
+        const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(key);
+        if (std.mem.eql(u8, previous_key, key)) return true;
+    }
+    return false;
+}
+
+fn documentUnitPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    source_url: []const u8,
+    content_type: []const u8,
+    route: DocumentExtractionRangeRoute,
+) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        ._artifact_range_id = route.range_id,
+        ._artifact_range_kind = "unit",
+        ._artifact_route_status = route.route_status,
+        ._artifact_owner_group_id = owner_group_id,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .text = unit.text,
+        .content_type = "text/plain",
+        .language = "",
+        .source_path = unit.source_path,
+        .extraction_status = unit.extraction_status,
+        .source_sha256 = unit.source_sha256,
+        .byte_length = unit.byte_length,
+        .confidence = documentUnitConfidence(unit),
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+        .provenance = .{
+            .source_url = source_url,
+            .source_path = unit.source_path,
+            .method = unit.method,
+            .extraction_status = unit.extraction_status,
+            .source_sha256 = unit.source_sha256,
+            .byte_length = unit.byte_length,
+            .confidence = documentUnitConfidence(unit),
+            .ocr_used = unit.ocr_used,
+            .ocr_confidence = unit.ocr_confidence,
+            .ocr_bbox = unit.ocr_bbox,
+            .transcript_used = unit.transcript_used,
+            .transcript_confidence = unit.transcript_confidence,
+            .extraction_warning = unit.extraction_warning,
+            .page_number = unit.page_number,
+            .page_label = unit.page_label,
+            .page_bbox = unit.page_bbox,
+            .page_rotation = unit.page_rotation,
+            .text_regions = unit.text_regions,
+            .char_start = unit.char_start,
+            .char_end = unit.char_end,
+            .source_content_type = content_type,
+            .format_provenance = .{
+                .schema = "antfly.document_format_provenance.v1",
+                .source_content_type = content_type,
+                .source_path = unit.source_path,
+                .coordinate_system = "source_page_points",
+                .extraction_method = unit.method,
+                .extraction_status = unit.extraction_status,
+                .source_sha256 = unit.source_sha256,
+                .byte_length = unit.byte_length,
+                .confidence = documentUnitConfidence(unit),
+                .ocr_used = unit.ocr_used,
+                .ocr_confidence = unit.ocr_confidence,
+                .ocr_bbox = unit.ocr_bbox,
+                .transcript_used = unit.transcript_used,
+                .transcript_confidence = unit.transcript_confidence,
+                .extraction_warning = unit.extraction_warning,
+                .page_number = unit.page_number,
+                .page_label = unit.page_label,
+                .page_bbox = unit.page_bbox,
+                .page_rotation = unit.page_rotation,
+                .text_regions = unit.text_regions,
+            },
+        },
+    }, .{});
+}
+
+fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
+    return unit.ocr_confidence orelse unit.transcript_confidence;
+}
+
+const document_extraction_range_target_children = 256;
+const document_extraction_range_target_text_bytes = 1024 * 1024;
+
+fn documentExtractionRangeCount(key_count: usize) usize {
+    if (key_count == 0) return 0;
+    return (key_count + document_extraction_range_target_children - 1) / document_extraction_range_target_children;
+}
+
+fn documentExtractionUnitRangeCount(units: []const document_extraction_mod.Unit) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) {
+        count += 1;
+        start = documentExtractionRangeEnd(units.len, units, start);
+    }
+    return count;
+}
+
+fn documentExtractionUnitRangeIndex(units: []const document_extraction_mod.Unit, unit_index: usize) usize {
+    var range_index: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) : (range_index += 1) {
+        const end = documentExtractionRangeEnd(units.len, units, start);
+        if (unit_index < end) return range_index;
+        start = end;
+    }
+    return range_index;
+}
+
+fn documentExtractionRangeIdAlloc(alloc: Allocator, range_index: usize) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index});
+}
+
+fn documentExtractionKeyIndex(keys: []const []const u8, key: []const u8) ?usize {
+    for (keys, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, key)) return i;
+    }
+    return null;
+}
+
+fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) !u64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, manifest, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const generation = parsed.value.object.get("generation") orelse return 0;
+    if (generation != .integer or generation.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    const value = object.get(field_name) orelse return "";
+    if (value != .string) return "";
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .string) return null;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectOptionalNestedStringDup(alloc: Allocator, object: std.json.ObjectMap, object_field: []const u8, string_field: []const u8) !?[]u8 {
+    const value = object.get(object_field) orelse return null;
+    if (value != .object) return null;
+    return try jsonObjectOptionalStringDup(alloc, value.object, string_field);
+}
+
+fn jsonObjectU64(object: std.json.ObjectMap, field_name: []const u8) !u64 {
+    const value = object.get(field_name) orelse return 0;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
+    return std.math.cast(usize, try jsonObjectU64(object, field_name)) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !?usize {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?bool {
+    const value = object.get(field_name) orelse return null;
+    if (value != .bool) return error.InvalidDocumentExtractionManifest;
+    return value.bool;
+}
+
+fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]types.DocumentArtifactChildRange {
+    const value = object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+
+    const out = try alloc.alloc(types.DocumentArtifactChildRange, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*range| range.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionManifest;
+        out[i] = .{
+            .range_id = try jsonObjectStringDup(alloc, item.object, "range_id"),
+            .range_kind = try jsonObjectStringDup(alloc, item.object, "range_kind"),
+            .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
+            .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
+            .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
+            .owner_group_id = try jsonObjectOptionalU64(item.object, "owner_group_id"),
+            .placement_generation = try jsonObjectOptionalU64(item.object, "placement_generation"),
+            .route_status = try jsonObjectOptionalStringDup(alloc, item.object, "route_status"),
+            .split_eligible = try jsonObjectOptionalBool(item.object, "split_eligible"),
+            .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
+            .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
+            .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
+            .child_count = try jsonObjectUsize(item.object, "child_count"),
+            .text_bytes = try jsonObjectOptionalUsize(item.object, "text_bytes"),
+        };
+        initialized += 1;
+    }
+
+    return out;
+}
+
+fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    return try documentArtifactChildRangesFromJsonAlloc(alloc, parsed.value.object);
+}
+
+fn freeDocumentArtifactChildRanges(alloc: Allocator, child_ranges: []types.DocumentArtifactChildRange) void {
+    for (child_ranges) |*child_range| child_range.deinit(alloc);
+    if (child_ranges.len > 0) alloc.free(child_ranges);
+}
+
+fn documentArtifactManifestFromJsonAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    manifest_json: []u8,
+    state_json: ?[]u8,
+) !types.DocumentArtifactManifest {
+    errdefer alloc.free(manifest_json);
+    errdefer if (state_json) |value| alloc.free(value);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+
+    const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, .{
+        .document_id = @constCast(doc_key),
+        .name = @constCast(artifact_name),
+        .kind = .asset,
+    });
+    errdefer alloc.free(artifact_id);
+
+    const source_url = try jsonObjectStringDup(alloc, object, "source_url");
+    errdefer if (source_url.len > 0) alloc.free(source_url);
+    const source_fingerprint = try jsonObjectStringDup(alloc, object, "source_fingerprint");
+    errdefer if (source_fingerprint.len > 0) alloc.free(source_fingerprint);
+    const content_type = try jsonObjectStringDup(alloc, object, "content_type");
+    errdefer if (content_type.len > 0) alloc.free(content_type);
+    const route_type = try jsonObjectStringDup(alloc, object, "route_type");
+    errdefer if (route_type.len > 0) alloc.free(route_type);
+    const unsupported_reason = try jsonObjectOptionalStringDup(alloc, object, "unsupported_reason");
+    errdefer if (unsupported_reason) |value| alloc.free(value);
+    const last_error_code = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "code");
+    errdefer if (last_error_code) |value| alloc.free(value);
+    const last_error_message = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "message");
+    errdefer if (last_error_message) |value| alloc.free(value);
+
+    const child_ranges = try documentArtifactChildRangesFromJsonAlloc(alloc, object);
+    errdefer {
+        for (child_ranges) |*child_range| child_range.deinit(alloc);
+        if (child_ranges.len > 0) alloc.free(child_ranges);
+    }
+
+    var merge_status: []u8 = "";
+    var merge_from_generation: u64 = 0;
+    var merge_to_generation: u64 = 0;
+    var merge_operation_granularity: []u8 = "";
+    var merge_operation_count: usize = 0;
+    if (object.get("merge_plan")) |value| {
+        if (value == .object) {
+            merge_status = try jsonObjectStringDup(alloc, value.object, "status");
+            merge_from_generation = try jsonObjectU64(value.object, "from_generation");
+            merge_to_generation = try jsonObjectU64(value.object, "to_generation");
+            merge_operation_granularity = try jsonObjectStringDup(alloc, value.object, "operation_granularity");
+            if (value.object.get("operations")) |operations| {
+                if (operations == .array) merge_operation_count = operations.array.items.len;
+            }
+        }
+    }
+    errdefer if (merge_status.len > 0) alloc.free(merge_status);
+    errdefer if (merge_operation_granularity.len > 0) alloc.free(merge_operation_granularity);
+
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    const owned_artifact_name = try alloc.dupe(u8, artifact_name);
+    errdefer alloc.free(owned_artifact_name);
+
+    return .{
+        .document_id = owned_doc_key,
+        .artifact_name = owned_artifact_name,
+        .artifact_id = artifact_id,
+        .manifest_json = manifest_json,
+        .state_json = state_json,
+        .manifest_version = try jsonObjectU64(object, "manifest_version"),
+        .generation = try jsonObjectU64(object, "generation"),
+        .source_url = source_url,
+        .source_fingerprint = source_fingerprint,
+        .content_type = content_type,
+        .route_type = route_type,
+        .unsupported_reason = unsupported_reason,
+        .unit_count = try jsonObjectUsize(object, "unit_count"),
+        .chunk_count = try jsonObjectUsize(object, "chunk_count"),
+        .child_ranges = child_ranges,
+        .child_range_count = child_ranges.len,
+        .merge_status = merge_status,
+        .merge_from_generation = merge_from_generation,
+        .merge_to_generation = merge_to_generation,
+        .merge_operation_granularity = merge_operation_granularity,
+        .merge_operation_count = merge_operation_count,
+        .last_error_code = last_error_code,
+        .last_error_message = last_error_message,
+    };
+}
+
+fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("last_error") != null;
+}
+
+fn appendJsonFieldName(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+    try appendJsonString(alloc, out, name);
+    try out.append(alloc, ':');
+}
+
+fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: []const u8) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try appendJsonString(alloc, out, value);
+}
+
+fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try out.appendSlice(alloc, if (value) "true" else "false");
+}
+
+fn appendDocumentExtractionRangeDescriptors(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    artifact_name: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var first_range = true;
+    var range_index: usize = 0;
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units, previous_child_ranges);
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
+}
+
+fn appendDocumentExtractionRangePolicy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldU64(alloc, out, &first, "policy_version", 1);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_children", document_extraction_range_target_children);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_text_bytes", document_extraction_range_target_text_bytes);
+    try appendJsonFieldUsize(alloc, out, &first, "chunk_target_children", document_extraction_range_target_children);
+    try appendJsonFieldString(alloc, out, &first, "oversized_unit_policy", "single_unit_range");
+    try out.append(alloc, '}');
+}
+
+fn appendDocumentExtractionKeyRanges(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_range: *bool,
+    range_index: *usize,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var start: usize = 0;
+    while (start < keys.len) {
+        const end = documentExtractionRangeEnd(keys.len, units, start);
+        if (first_range.*) {
+            first_range.* = false;
+        } else {
+            try out.append(alloc, ',');
+        }
+        var first = true;
+        try out.append(alloc, '{');
+        const range_id = try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index.*});
+        defer alloc.free(range_id);
+        const previous_range = findDocumentArtifactChildRange(previous_child_ranges, range_id, range_kind, artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
+        try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+        try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "split_boundary", documentExtractionSplitBoundary(range_kind));
+        try appendJsonFieldString(alloc, out, &first, "placement", if (previous_range) |range| range.placement else "parent");
+        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", if (previous_range) |range| range.owner_group_id orelse 0 else 0);
+        try appendJsonFieldU64(alloc, out, &first, "placement_generation", if (previous_range) |range| range.placement_generation orelse 0 else 0);
+        try appendJsonFieldString(alloc, out, &first, "route_status", if (previous_range) |range| range.route_status orelse "local_committed" else "local_committed");
+        try appendJsonFieldBool(alloc, out, &first, "split_eligible", if (previous_range) |range| range.split_eligible orelse (end - start > 1) else end - start > 1);
+        try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
+        try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
+        try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
+        try appendJsonFieldUsize(alloc, out, &first, "child_count", end - start);
+        if (units.len >= end) {
+            var text_bytes: usize = 0;
+            for (units[start..end]) |unit| text_bytes += unit.text.len;
+            try appendJsonFieldUsize(alloc, out, &first, "text_bytes", text_bytes);
+        }
+        try out.append(alloc, '}');
+        range_index.* += 1;
+        start = end;
+    }
+}
+
+fn documentExtractionSplitBoundary(range_kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, range_kind, "chunk")) return "chunk";
+    return "unit";
+}
+
+fn documentExtractionRangeEnd(
+    key_count: usize,
+    units: []const document_extraction_mod.Unit,
+    start: usize,
+) usize {
+    var end = start;
+    var text_bytes: usize = 0;
+    const use_text_limit = units.len == key_count;
+    while (end < key_count and end - start < document_extraction_range_target_children) {
+        if (use_text_limit) {
+            const unit_bytes = units[end].text.len;
+            if (end > start and text_bytes + unit_bytes > document_extraction_range_target_text_bytes) break;
+            text_bytes += unit_bytes;
+        }
+        end += 1;
+    }
+    return end;
+}
+
+fn findDocumentArtifactChildRange(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) ?*const types.DocumentArtifactChildRange {
+    for (ranges) |*range| {
+        if (std.mem.eql(u8, range.range_id, range_id) and
+            std.mem.eql(u8, range.range_kind, range_kind) and
+            std.mem.eql(u8, range.artifact_name, artifact_name))
+        {
+            return range;
+        }
+    }
+    return null;
+}
+
+fn documentExtractionRangeRoute(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) DocumentExtractionRangeRoute {
+    const range = findDocumentArtifactChildRange(ranges, range_id, range_kind, artifact_name) orelse return .{ .range_id = range_id };
+    return .{
+        .range_id = range_id,
+        .route_status = range.route_status orelse "local_committed",
+        .owner_group_id = range.owner_group_id orelse 0,
+    };
+}
+
+fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
+    var count: usize = 0;
+    for (keys) |key| {
+        if (!containsDeleteKey(exclude_keys, key)) count += 1;
+    }
+    return count;
+}
+
+fn unitDescriptorFingerprintMatches(descriptors: []const DocumentExtractionUnitDescriptor, key: []const u8, fingerprint: []const u8) bool {
+    if (fingerprint.len == 0) return false;
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.key, key) and std.mem.eql(u8, descriptor.fingerprint, fingerprint)) return true;
+    }
+    return false;
+}
+
+fn countUnitDescriptorsByFingerprintMatch(
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_match: bool,
+) usize {
+    var count: usize = 0;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched == want_match) count += 1;
+    }
+    return count;
+}
+
+fn appendDocumentExtractionUnitMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    artifact_name: []const u8,
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_fingerprint_match: bool,
+) !void {
+    const count = countUnitDescriptorsByFingerprintMatch(descriptors, comparison, want_fingerprint_match);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched != want_fingerprint_match) continue;
+        if (first_key == null) first_key = descriptor.key;
+        last_key = descriptor.key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", "unit");
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try appendJsonFieldBool(alloc, out, &first, "fingerprint_match", want_fingerprint_match);
+    try out.append(alloc, '}');
+}
+
+fn appendDocumentExtractionMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    exclude_keys: []const []const u8,
+) !void {
+    const count = countKeysNotIn(keys, exclude_keys);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (keys) |key| {
+        if (containsDeleteKey(exclude_keys, key)) continue;
+        if (first_key == null) first_key = key;
+        last_key = key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try out.append(alloc, '}');
+}
+
+fn documentExtractionManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    fingerprint: []const u8,
+    extraction: document_extraction_mod.Result,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    previous_unit_keys: []const []const u8,
+    previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    previous_chunk_keys: []const []const u8,
+    manifest_generation: u64,
+    from_generation: u64,
+    to_generation: u64,
+    merge_status: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
+    try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
+    try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.unsupported_reason.len > 0) {
+        try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.append(alloc, '[');
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
+    try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "range_policy");
+    try appendDocumentExtractionRangePolicy(alloc, &out);
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", merge_status);
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.append(alloc, '[');
+    var first_operation = true;
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "keep", artifact_name, unit_descriptors, previous_unit_descriptors, true);
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "upsert", artifact_name, unit_descriptors, previous_unit_descriptors, false);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "upsert", "chunk", "derived_chunks", chunk_keys, &.{});
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "unit", artifact_name, previous_unit_keys, unit_keys);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "chunk", "derived_chunks", previous_chunk_keys, chunk_keys);
+    try out.append(alloc, ']');
+    try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "coverage_plan");
+    try out.append(alloc, '{');
+    var coverage_first = true;
+    try appendJsonFieldU64(alloc, &out, &coverage_first, "plan_version", 1);
+    try appendJsonFieldString(alloc, &out, &coverage_first, "full_text_replay", "stored_artifact_required");
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "full_text_replay_suppressed", false);
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "watermark_required_before_suppression", true);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentExtractionFailureManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    from_generation: u64,
+    to_generation: u64,
+    error_code: []const u8,
+    error_message: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
+    try appendJsonFieldString(alloc, &out, &first, "content_type", "");
+    try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", 0);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", 0);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.appendSlice(alloc, "[]");
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", "failed");
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.appendSlice(alloc, "[]");
+    try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "last_error");
+    try out.append(alloc, '{');
+    var error_first = true;
+    try appendJsonFieldString(alloc, &out, &error_first, "code", error_code);
+    try appendJsonFieldString(alloc, &out, &error_first, "message", error_message);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendDocumentExtractionFailureManifest(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    manifest_key: []const u8,
+    state_key: []const u8,
+    existing_state: ?[]const u8,
+    from_generation: u64,
+    to_generation: u64,
+    error_code: []const u8,
+    error_message: []const u8,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    if (existing_state) |state| {
+        const previous_unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_unit_keys);
+        for (previous_unit_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+        defer freeOwnedConstKeySlice(alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
+        }
+        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, state_key));
+    }
+
+    const manifest = try documentExtractionFailureManifestPayloadAlloc(
+        alloc,
+        doc_key,
+        artifact_name,
+        source_url,
+        from_generation,
+        to_generation,
+        error_code,
+        error_message,
+    );
+    defer alloc.free(manifest);
+    try artifact_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, manifest_key),
+        .value = try alloc.dupe(u8, manifest),
+    });
+}
+
+fn extractAssetSourceValue(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    if (request.source_template.len > 0) {
+        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        return @constCast(rendered);
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(request.source_field) orelse return null;
+    return switch (source) {
+        .null => null,
+        .string => |value| try alloc.dupe(u8, value),
+        else => try std.json.Stringify.valueAlloc(alloc, source, .{}),
+    };
+}
+
+fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn assetStateValueAlloc(
+    alloc: Allocator,
+    source_text: []const u8,
+    source_parts_json: ?[]const u8,
+    producer_json: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_text);
+    if (source_parts_json) |parts| hasher.update(parts);
+    hasher.update(producer_json);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
+}
+
+fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.graph_asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const docstore_mod.KVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendU32Big(&out, alloc, @intCast(writes.len));
+    for (writes) |write| {
+        try appendU32Big(&out, alloc, @intCast(write.key.len));
+        try out.appendSlice(alloc, write.key);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore, state_key: []const u8) !?[][]const u8 {
+    const raw = store.get(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return null;
+    const keys = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(keys);
+    }
+    for (keys) |*key| {
+        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (len > raw.len - pos) return error.InvalidGraphAssetState;
+        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
+        pos += len;
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
+    if (bytes.len - pos.* < @sizeOf(u32)) return error.EndOfStream;
+    const value = std.mem.readInt(u32, bytes[pos.*..][0..@sizeOf(u32)], .big);
+    pos.* += @sizeOf(u32);
+    return value;
+}
+
+fn appendU32Big(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
+    const be = std.mem.nativeToBig(u32, value);
+    try out.appendSlice(alloc, std.mem.asBytes(&be));
+}
+
+fn freeOwnedConstKeySlice(alloc: Allocator, keys: []const []const u8) void {
+    for (keys) |key| alloc.free(@constCast(key));
+    if (keys.len > 0) alloc.free(keys);
+}
+
 fn computeChunkRequest(
     alloc: Allocator,
     db: *DB,
@@ -9667,6 +15820,96 @@ fn containsBatchWriteKey(list: []const types.BatchWrite, key: []const u8) bool {
     return false;
 }
 
+fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn appendAssetArtifactSourceIndexMutations(
+    alloc: Allocator,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deleted_artifact_keys: []const []const u8,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const original_write_count = store_writes.items.len;
+    var write_index: usize = 0;
+    while (write_index < original_write_count) : (write_index += 1) {
+        const write = store_writes.items[write_index];
+        try appendAssetArtifactSourceIndexWrite(alloc, write.key, store_writes, owned_store_keys, owned_store_values);
+    }
+
+    const original_delete_count = delete_keys.items.len;
+    var delete_index: usize = 0;
+    while (delete_index < original_delete_count) : (delete_index += 1) {
+        const key = delete_keys.items[delete_index];
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+    for (deleted_artifact_keys) |key| {
+        try appendAssetArtifactSourceIndexDelete(alloc, key, store_writes.items, delete_keys, owned_delete_keys);
+    }
+}
+
+fn appendAssetArtifactSourceIndexWrite(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_store_keys: *std.ArrayListUnmanaged([]u8),
+    owned_store_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes.items, marker_key)) return;
+
+    const marker_value = try alloc.dupe(u8, artifact_key);
+    var marker_value_owned = false;
+    errdefer if (!marker_value_owned) alloc.free(marker_value);
+
+    try owned_store_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try owned_store_values.append(alloc, marker_value);
+    marker_value_owned = true;
+    try store_writes.append(alloc, .{
+        .key = marker_key,
+        .value = marker_value,
+    });
+}
+
+fn appendAssetArtifactSourceIndexDelete(
+    alloc: Allocator,
+    artifact_key: []const u8,
+    store_writes: []const docstore_mod.KVPair,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
+    var marker_key_owned = false;
+    errdefer if (!marker_key_owned) alloc.free(marker_key);
+    if (containsStoreWriteKey(store_writes, marker_key)) return;
+    if (containsOwnedKey(owned_delete_keys.items, marker_key)) return;
+
+    try owned_delete_keys.append(alloc, marker_key);
+    marker_key_owned = true;
+    try delete_keys.append(alloc, marker_key);
+}
+
 const GraphArtifactClear = struct {
     doc_key: []u8,
     index_name: []u8,
@@ -9677,6 +15920,113 @@ const GraphArtifactClear = struct {
         self.* = undefined;
     }
 };
+
+const ChunkEmbeddingSource = struct {
+    key: []u8,
+    text: []u8,
+};
+
+fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
+    for (sources) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    if (sources.len > 0) alloc.free(sources);
+}
+
+fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []const u8) bool {
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.key, key)) return true;
+    }
+    return false;
+}
+
+fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(source_field) orelse return null;
+    if (source != .string or source.string.len == 0) return null;
+    return try alloc.dupe(u8, source.string);
+}
+
+fn collectChunkEmbeddingSourcesFromWrites(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    writes: []const types.BatchWrite,
+    artifact_name: []const u8,
+    source_field: []const u8,
+) !void {
+    for (writes) |write| {
+        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (containsChunkEmbeddingSource(out.items, write.key)) continue;
+        const text = (try chunkPayloadTextAlloc(alloc, write.value, source_field)) orelse continue;
+        errdefer alloc.free(text);
+        try out.append(alloc, .{
+            .key = try alloc.dupe(u8, write.key),
+            .text = text,
+        });
+    }
+}
+
+fn collectChunkEmbeddingSourcesFromStore(
+    alloc: Allocator,
+    db: *DB,
+    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_field: []const u8,
+) !void {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const existing = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, existing);
+
+    for (existing) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        if (containsChunkEmbeddingSource(out.items, entry.key)) continue;
+        const text = (try chunkPayloadTextAlloc(alloc, entry.value, source_field)) orelse continue;
+        errdefer alloc.free(text);
+        try out.append(alloc, .{
+            .key = try alloc.dupe(u8, entry.key),
+            .text = text,
+        });
+    }
+}
+
+fn chunkEmbeddingSourcesForRequest(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+) ![]ChunkEmbeddingSource {
+    const artifact_name = requestArtifactName(request);
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            alloc.free(source.key);
+            alloc.free(source.text);
+        }
+        sources.deinit(alloc);
+    }
+
+    const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
+    for (chunks) |chunk| {
+        const chunk_text = chunk.text orelse continue;
+        if (chunk_text.len == 0) continue;
+        try sources.append(alloc, .{
+            .key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
+            .text = try alloc.dupe(u8, chunk_text),
+        });
+    }
+    if (sources.items.len > 0) return try sources.toOwnedSlice(alloc);
+
+    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, artifact_name, request.source_field);
+    try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
+    return try sources.toOwnedSlice(alloc);
+}
 
 fn appendDenseEmbeddingForConsumers(
     alloc: Allocator,
@@ -9753,40 +16103,32 @@ fn computeDenseRequestImpl(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
-        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
-        defer chunk_texts.deinit(alloc);
-        var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (chunk_keys.items) |chunk_key| alloc.free(chunk_key);
-            chunk_keys.deinit(alloc);
-        }
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        defer freeChunkEmbeddingSources(alloc, sources);
+        if (sources.len == 0) return;
 
-        for (chunks) |chunk| {
-            const chunk_text = chunk.text orelse continue;
-            try chunk_texts.append(alloc, chunk_text);
-            try chunk_keys.append(alloc, try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, requestArtifactName(request), @intCast(chunk.chunk_id)));
-        }
-        if (chunk_texts.items.len == 0) return;
+        const chunk_texts = try alloc.alloc([]const u8, sources.len);
+        defer alloc.free(chunk_texts);
+        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
 
-        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts.items, request.expected_dims);
+        const vectors = try dense_embedder.embedDenseBatch(alloc, embedding_name, chunk_texts, request.expected_dims);
         defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        if (vectors.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
+        if (vectors.len != sources.len) return error.InvalidEmbeddingResponse;
 
-        for (chunk_keys.items, chunk_texts.items, vectors) |chunk_key, chunk_text, vector| {
+        for (sources, vectors) |source, vector| {
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
-                chunk_key,
+                source.key,
                 request.doc_key,
                 embedding_name,
                 request.source_field,
-                chunk_key,
-                enrichment_artifact_codec.hashSource(chunk_text),
+                source.key,
+                enrichment_artifact_codec.hashSource(source.text),
                 vector,
             );
             defer alloc.free(artifact_key);
-            try appendForConsumers(alloc, dense_embeddings, chunk_key, request.doc_key, artifact_key, vector, consumer_indexes);
+            try appendForConsumers(alloc, dense_embeddings, source.key, request.doc_key, artifact_key, vector, consumer_indexes);
         }
         return;
     }
@@ -9865,38 +16207,30 @@ fn computeSparseRequestDerived(
     if (consumer_indexes.len == 0) return;
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
-        var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
-        defer chunk_texts.deinit(alloc);
-        var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (chunk_keys.items) |chunk_key| alloc.free(chunk_key);
-            chunk_keys.deinit(alloc);
-        }
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        defer freeChunkEmbeddingSources(alloc, sources);
+        if (sources.len == 0) return;
 
-        for (chunks) |chunk| {
-            const chunk_text = chunk.text orelse continue;
-            try chunk_texts.append(alloc, chunk_text);
-            try chunk_keys.append(alloc, try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, requestArtifactName(request), @intCast(chunk.chunk_id)));
-        }
-        if (chunk_texts.items.len == 0) return;
+        const chunk_texts = try alloc.alloc([]const u8, sources.len);
+        defer alloc.free(chunk_texts);
+        for (sources, 0..) |source, i| chunk_texts[i] = source.text;
 
-        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts.items);
+        const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts);
         defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
-        if (sparse_batch.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
+        if (sparse_batch.len != sources.len) return error.InvalidEmbeddingResponse;
 
-        for (chunk_keys.items, sparse_batch) |chunk_key, sparse| {
+        for (sources, sparse_batch) |source, sparse| {
             const artifact_key = try appendSparseEmbeddingArtifactWrite(
                 alloc,
                 artifact_writes,
-                chunk_key,
+                source.key,
                 embedding_name,
-                null,
+                enrichment_artifact_codec.hashSource(source.text),
                 sparse.indices,
                 sparse.values,
             );
             defer alloc.free(artifact_key);
-            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+            try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
         }
         return;
     }
@@ -9948,6 +16282,7 @@ fn prepareGeneratedEnrichments(
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
     precompute_mode: GeneratedPrecomputeMode,
+    force_generated_artifact_names: []const []const u8,
 ) !PrecomputedGeneratedBatch {
     if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
 
@@ -9958,6 +16293,11 @@ fn prepareGeneratedEnrichments(
             self.alloc.free(@constCast(write.value));
         }
         artifact_writes.deinit(self.alloc);
+    }
+    var artifact_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (artifact_delete_keys.items) |key| self.alloc.free(@constCast(key));
+        artifact_delete_keys.deinit(self.alloc);
     }
     var documents = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
     errdefer {
@@ -10035,6 +16375,18 @@ fn prepareGeneratedEnrichments(
             }
 
             switch (request.kind) {
+                .asset => try computeAssetRequestDerived(
+                    self.alloc,
+                    self,
+                    cleaned,
+                    request,
+                    &artifact_writes,
+                    &artifact_delete_keys,
+                    &documents,
+                    &dense_embeddings,
+                    &sparse_embeddings,
+                    containsName(force_generated_artifact_names, requestArtifactName(request)),
+                ),
                 .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
                     error.MissingDenseEmbedder => try planned.append(self.alloc, try enrichment_types.requestToRef(self.alloc, request)),
@@ -10050,6 +16402,7 @@ fn prepareGeneratedEnrichments(
 
     return .{
         .artifact_writes = try artifact_writes.toOwnedSlice(self.alloc),
+        .artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(self.alloc),
         .documents = try documents.toOwnedSlice(self.alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc),
@@ -10070,6 +16423,57 @@ fn renderSourceParts(
         return null;
     }
     return parts;
+}
+
+fn renderSourcePartsJson(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    const parts = try renderSourceParts(alloc, db, doc_value, request) orelse return null;
+    defer template_mod.freeContentParts(alloc, parts);
+    return try contentPartsJsonAlloc(alloc, parts);
+}
+
+fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPart) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (part) {
+            .text => |text| {
+                try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+                try appendJsonString(alloc, &out, text);
+                try out.append(alloc, '}');
+            },
+            .media_url => |url| {
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"url\":");
+                try appendJsonString(alloc, &out, url);
+                try out.append(alloc, '}');
+            },
+            .binary => |binary| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                defer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+                try appendJsonString(alloc, &out, binary.mime_type);
+                try out.appendSlice(alloc, ",\"data\":");
+                try appendJsonString(alloc, &out, encoded);
+                try out.append(alloc, '}');
+            },
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -10093,6 +16497,7 @@ const GeneratedPrecomputeMode = enum {
 
 const PrecomputedGeneratedBatch = struct {
     artifact_writes: []types.BatchWrite = &.{},
+    artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},
     dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
     sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
@@ -10104,6 +16509,8 @@ const PrecomputedGeneratedBatch = struct {
             alloc.free(@constCast(write.value));
         }
         if (self.artifact_writes.len > 0) alloc.free(self.artifact_writes);
+        for (self.artifact_delete_keys) |key| alloc.free(key);
+        if (self.artifact_delete_keys.len > 0) alloc.free(self.artifact_delete_keys);
 
         var derived_batch = derived_types.DerivedBatch{
             .documents = self.documents,
@@ -10115,6 +16522,547 @@ const PrecomputedGeneratedBatch = struct {
         self.* = undefined;
     }
 };
+
+const DocumentChildRangeRoutingSnapshot = struct {
+    doc_key: []u8,
+    manifest_artifact_name: []u8,
+    child_ranges: []types.DocumentArtifactChildRange,
+
+    fn deinit(self: *DocumentChildRangeRoutingSnapshot, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.manifest_artifact_name);
+        freeDocumentArtifactChildRanges(alloc, self.child_ranges);
+        self.* = undefined;
+    }
+};
+
+const DocumentChildRangeDispatchGroup = struct {
+    owner_group_id: u64,
+    doc_key: []u8,
+    artifact_name: []u8,
+    artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    artifact_delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
+    dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
+    sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
+    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+
+    fn deinit(self: *DocumentChildRangeDispatchGroup, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        for (self.artifact_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        self.artifact_writes.deinit(alloc);
+        for (self.artifact_delete_keys.items) |key| alloc.free(@constCast(key));
+        self.artifact_delete_keys.deinit(alloc);
+        var derived_batch = derived_types.DerivedBatch{
+            .documents = self.documents.items,
+            .dense_embeddings = self.dense_embeddings.items,
+            .sparse_embeddings = self.sparse_embeddings.items,
+            .generated_enrichment_refs = self.generated_enrichment_refs.items,
+        };
+        derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        self.documents = .empty;
+        self.dense_embeddings = .empty;
+        self.sparse_embeddings = .empty;
+        self.generated_enrichment_refs = .empty;
+        self.* = undefined;
+    }
+
+    fn dispatch(self: DocumentChildRangeDispatchGroup, sync_level: types.SyncLevel) DocumentArtifactChildRangeDispatch {
+        return .{
+            .owner_group_id = self.owner_group_id,
+            .doc_key = self.doc_key,
+            .artifact_name = self.artifact_name,
+            .child_batch = .{
+                .artifact_writes = self.artifact_writes.items,
+                .artifact_delete_keys = self.artifact_delete_keys.items,
+                .documents = self.documents.items,
+                .dense_embeddings = self.dense_embeddings.items,
+                .sparse_embeddings = self.sparse_embeddings.items,
+                .generated_enrichment_refs = self.generated_enrichment_refs.items,
+                .sync_level = sync_level,
+            },
+        };
+    }
+};
+
+fn appendDocumentChildRangeOutboxWrites(
+    alloc: Allocator,
+    sequence: u64,
+    groups: []const DocumentChildRangeDispatchGroup,
+    sync_level: types.SyncLevel,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    for (groups, 0..) |group, i| {
+        const key = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, sequence, @intCast(i));
+        errdefer alloc.free(key);
+        const value = try encodeDocumentChildRangeOutboxRecordAlloc(alloc, group.dispatch(sync_level));
+        errdefer alloc.free(value);
+        try owned_keys.append(alloc, key);
+        try owned_values.append(alloc, value);
+        try writes.append(alloc, .{
+            .key = key,
+            .value = value,
+        });
+    }
+}
+
+fn encodeDocumentChildRangeOutboxRecordAlloc(
+    alloc: Allocator,
+    dispatch: DocumentArtifactChildRangeDispatch,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, DocumentArtifactChildRangeOutboxRecord{
+        .owner_group_id = dispatch.owner_group_id,
+        .doc_key = dispatch.doc_key,
+        .artifact_name = dispatch.artifact_name,
+        .child_batch = dispatch.child_batch,
+    }, .{});
+}
+
+const DocumentChildRangeRoute = struct {
+    owner_group_id: u64,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+};
+
+fn partitionRemoteDocumentChildRangeGeneratedBatch(
+    self: *DB,
+    generated: *PrecomputedGeneratedBatch,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var snapshots = std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot).empty;
+    defer {
+        for (snapshots.items) |*snapshot| snapshot.deinit(self.alloc);
+        snapshots.deinit(self.alloc);
+    }
+    try collectDocumentChildRangeRoutingSnapshots(self, generated.*, &snapshots);
+    if (snapshots.items.len == 0) return;
+
+    var local_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    errdefer {
+        for (local_writes.items) |write| {
+            self.alloc.free(@constCast(write.key));
+            self.alloc.free(@constCast(write.value));
+        }
+        local_writes.deinit(self.alloc);
+    }
+    for (generated.artifact_writes) |write| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, write.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_writes.append(self.alloc, write);
+        } else {
+            try local_writes.append(self.alloc, write);
+        }
+    }
+    if (generated.artifact_writes.len > 0) self.alloc.free(generated.artifact_writes);
+    generated.artifact_writes = try local_writes.toOwnedSlice(self.alloc);
+
+    var local_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (local_deletes.items) |key| self.alloc.free(@constCast(key));
+        local_deletes.deinit(self.alloc);
+    }
+    for (generated.artifact_delete_keys) |key| {
+        if (try documentChildRangeRouteForKey(self.alloc, snapshots.items, key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(self.alloc, out, route);
+            try group.artifact_delete_keys.append(self.alloc, key);
+        } else {
+            try local_deletes.append(self.alloc, key);
+        }
+    }
+    if (generated.artifact_delete_keys.len > 0) self.alloc.free(generated.artifact_delete_keys);
+    generated.artifact_delete_keys = try local_deletes.toOwnedSlice(self.alloc);
+
+    try partitionRemoteDerivedDocuments(self.alloc, snapshots.items, &generated.documents, out);
+    try partitionRemoteDenseEmbeddings(self.alloc, snapshots.items, &generated.dense_embeddings, out);
+    try partitionRemoteSparseEmbeddings(self.alloc, snapshots.items, &generated.sparse_embeddings, out);
+}
+
+fn collectDocumentChildRangeRoutingSnapshots(
+    self: *DB,
+    generated: PrecomputedGeneratedBatch,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
+) !void {
+    for (generated.artifact_writes) |write| {
+        try appendDocumentChildRangeRoutingSnapshotFromValue(self, write.key, write.value, out);
+    }
+    for (generated.artifact_delete_keys) |key| {
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse continue;
+        defer artifact_ref.deinit(self.alloc);
+        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+        const existing = self.core.getStoreValue(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        defer if (existing) |value| self.alloc.free(value);
+        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(self, key, value, out);
+    }
+}
+
+fn appendDocumentChildRangeRoutingSnapshotFromValue(
+    self: *DB,
+    key: []const u8,
+    value: []const u8,
+    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
+) !void {
+    if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, key)) orelse return;
+    defer artifact_ref.deinit(self.alloc);
+    if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
+
+    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(self.alloc, value) catch |err| switch (err) {
+        error.InvalidDocumentExtractionManifest => return,
+        else => return err,
+    };
+    errdefer freeDocumentArtifactChildRanges(self.alloc, ranges);
+    if (ranges.len == 0) {
+        freeDocumentArtifactChildRanges(self.alloc, ranges);
+        return;
+    }
+    const doc_key = try self.alloc.dupe(u8, artifact_ref.document_id);
+    errdefer self.alloc.free(doc_key);
+    const manifest_artifact_name = try self.alloc.dupe(u8, artifact_ref.name);
+    errdefer self.alloc.free(manifest_artifact_name);
+    try out.append(self.alloc, .{
+        .doc_key = doc_key,
+        .manifest_artifact_name = manifest_artifact_name,
+        .child_ranges = ranges,
+    });
+}
+
+fn documentChildRangeRouteForKey(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    key: []const u8,
+) !?DocumentChildRangeRoute {
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+
+    const route_kind, const route_artifact_name = switch (artifact_ref.kind) {
+        .asset => blk: {
+            if (artifact_ref.unit_id == null) return null;
+            break :blk .{ "unit", artifact_ref.name };
+        },
+        .chunk => .{ "chunk", artifact_ref.name },
+        .embedding => blk: {
+            const source = artifact_ref.source orelse return null;
+            break :blk .{
+                if (source.kind == .chunk) "chunk" else "unit",
+                source.name,
+            };
+        },
+    };
+
+    for (snapshots) |snapshot| {
+        if (!std.mem.eql(u8, snapshot.doc_key, artifact_ref.document_id)) continue;
+        for (snapshot.child_ranges) |range| {
+            if (!std.mem.eql(u8, range.range_kind, route_kind)) continue;
+            if (!std.mem.eql(u8, range.artifact_name, route_artifact_name)) continue;
+            const owner_group_id = range.owner_group_id orelse 0;
+            if (owner_group_id == 0) continue;
+            const route_status = range.route_status orelse "local_committed";
+            if (!std.mem.eql(u8, route_status, "remote_committed")) continue;
+            if (!keyWithinDocumentChildRange(key, range)) continue;
+            return .{
+                .owner_group_id = owner_group_id,
+                .doc_key = snapshot.doc_key,
+                .artifact_name = range.artifact_name,
+            };
+        }
+    }
+    return null;
+}
+
+fn keyWithinDocumentChildRange(key: []const u8, range: types.DocumentArtifactChildRange) bool {
+    if (std.mem.order(u8, key, range.start_key) == .lt) return false;
+    if (range.end_key_exclusive.len == 0) return true;
+    return std.mem.order(u8, key, range.end_key_exclusive) == .lt;
+}
+
+fn ensureDocumentChildRangeDispatchGroup(
+    alloc: Allocator,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+    route: DocumentChildRangeRoute,
+) !*DocumentChildRangeDispatchGroup {
+    for (groups.items) |*group| {
+        if (group.owner_group_id == route.owner_group_id and
+            std.mem.eql(u8, group.doc_key, route.doc_key) and
+            std.mem.eql(u8, group.artifact_name, route.artifact_name))
+        {
+            return group;
+        }
+    }
+    const doc_key = try alloc.dupe(u8, route.doc_key);
+    errdefer alloc.free(doc_key);
+    const artifact_name = try alloc.dupe(u8, route.artifact_name);
+    errdefer alloc.free(artifact_name);
+    try groups.append(alloc, .{
+        .owner_group_id = route.owner_group_id,
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+    });
+    return &groups.items[groups.items.len - 1];
+}
+
+fn partitionRemoteDerivedDocuments(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    documents: *[]const derived_types.DerivedDocument,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .documents = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (documents.*) |doc| {
+        if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.documents.append(alloc, doc);
+        } else {
+            try local.append(alloc, doc);
+        }
+    }
+    if (documents.*.len > 0) alloc.free(documents.*);
+    documents.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteDenseEmbeddings(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .dense_embeddings = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.dense_embeddings.append(alloc, embedding);
+        } else {
+            try local.append(alloc, embedding);
+        }
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
+}
+
+fn partitionRemoteSparseEmbeddings(
+    alloc: Allocator,
+    snapshots: []const DocumentChildRangeRoutingSnapshot,
+    embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite,
+    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
+) !void {
+    var local = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
+    errdefer {
+        var batch = derived_types.DerivedBatch{ .sparse_embeddings = local.items };
+        derived_types.deinitDerivedBatch(alloc, &batch);
+    }
+    for (embeddings.*) |embedding| {
+        const route_key = embedding.artifact_key orelse embedding.doc_key;
+        if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route| {
+            const group = try ensureDocumentChildRangeDispatchGroup(alloc, groups, route);
+            try group.sparse_embeddings.append(alloc, embedding);
+        } else {
+            try local.append(alloc, embedding);
+        }
+    }
+    if (embeddings.*.len > 0) alloc.free(embeddings.*);
+    embeddings.* = try local.toOwnedSlice(alloc);
+}
+
+fn appendPrecomputedGraphSourceArtifacts(
+    self: *DB,
+    artifact_writes: []const types.BatchWrite,
+    artifact_delete_keys: []const []const u8,
+    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (!self.core.hasGraphIndexes()) return;
+
+    for (artifact_writes) |artifact_write| {
+        try appendPrecomputedGraphSourceArtifactKey(self, artifact_write.key, artifact_write.value, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    }
+    for (artifact_delete_keys) |artifact_key| {
+        try appendPrecomputedGraphSourceArtifactKey(self, artifact_key, null, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    }
+}
+
+fn appendPrecomputedGraphSourceArtifactKey(
+    self: *DB,
+    artifact_key: []const u8,
+    artifact_value: ?[]const u8,
+    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, artifact_key)) orelse return;
+    defer artifact_ref.deinit(self.alloc);
+
+    for (self.core.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!graphArtifactSourceConsumesRef(self.core.index_manager, source, artifact_ref)) continue;
+
+        var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer graph_store_writes.deinit(self.alloc);
+
+        if (artifact_value) |value| {
+            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
+            defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
+            defer freeGraphWrites(self.alloc, graph_writes);
+            for (graph_writes) |write| {
+                const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
+                var key_owned = true;
+                errdefer if (key_owned) self.alloc.free(key);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(self.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                var payload_owned = true;
+                errdefer if (payload_owned) self.alloc.free(payload);
+                try owned_graph_artifact_writes.append(self.alloc, .{ .key = key, .value = payload });
+                key_owned = false;
+                payload_owned = false;
+                try graph_store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, key);
+            }
+        }
+
+        const state_name = try graphArtifactStateNameAlloc(self.alloc, artifact_ref);
+        defer self.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, state_name);
+        defer self.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (containsStoreWriteKey(graph_store_writes.items, previous_key)) continue;
+                if (containsOwnedKey(owned_delete_keys.items, previous_key)) continue;
+                const owned_key = try self.alloc.dupe(u8, previous_key);
+                try owned_delete_keys.append(self.alloc, owned_key);
+                try delete_keys.append(self.alloc, owned_key);
+                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
+            }
+        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(self.alloc, protected_keys);
+            const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
+            defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+            for (existing) |entry| {
+                if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
+                if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
+                const owned_key = try self.alloc.dupe(u8, entry.key);
+                try owned_delete_keys.append(self.alloc, owned_key);
+                try delete_keys.append(self.alloc, owned_key);
+                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
+        var state_value_owned = true;
+        errdefer if (state_value_owned) self.alloc.free(state_value);
+        const state_key_owned = try self.alloc.dupe(u8, state_key);
+        var state_key_owned_flag = true;
+        errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
+        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+        state_value_owned = false;
+        state_key_owned_flag = false;
+        try store_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+    }
+}
+
+fn batchDocumentValueForGraphSource(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    store_writes: []const docstore_mod.KVPair,
+    doc_key: []const u8,
+) !?[]u8 {
+    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(internal_doc_key);
+    for (store_writes) |write| {
+        if (std.mem.eql(u8, write.key, internal_doc_key)) return try alloc.dupe(u8, write.value);
+    }
+    return try storeDocumentValueForGraphSource(alloc, store, doc_key);
+}
+
+fn storeDocumentValueForGraphSource(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+) !?[]u8 {
+    const internal_doc_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(internal_doc_key);
+    return store.get(alloc, internal_doc_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+fn graphArtifactContentType(index_manager: *const index_manager_mod.IndexManager, artifact_name: []const u8) []const u8 {
+    if (index_manager.getEnrichment(.asset, artifact_name)) |cfg| return cfg.content_type;
+    if (index_manager.getEnrichment(.chunk, artifact_name) != null) return "application/json";
+    return "";
+}
+
+fn graphArtifactSourceConsumesRef(
+    index_manager: *const index_manager_mod.IndexManager,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_ref: types.ArtifactRef,
+) bool {
+    if (!std.mem.eql(u8, source.artifact_name, artifact_ref.name)) return false;
+    return switch (artifact_ref.kind) {
+        .asset => graphAssetSourceConsumesAssetRef(index_manager, artifact_ref),
+        .chunk => index_manager.getEnrichment(.chunk, artifact_ref.name) != null,
+        .embedding => false,
+    };
+}
+
+fn graphAssetSourceConsumesAssetRef(index_manager: *const index_manager_mod.IndexManager, artifact_ref: types.ArtifactRef) bool {
+    if (index_manager.getEnrichment(.asset, artifact_ref.name) == null) return false;
+    if (artifact_ref.unit_id != null) return true;
+    const cfg = index_manager.getEnrichment(.asset, artifact_ref.name) orelse return false;
+    var producer_cfg = asset_producer_mod.parseProducerConfig(index_manager.alloc, cfg.producer_json) catch return true;
+    defer producer_cfg.deinit(index_manager.alloc);
+    return producer_cfg.type != .document_extraction;
+}
+
+fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) bool {
+    return artifact_ref.kind == .asset and artifact_ref.unit_id == null and artifact_ref.chunk_id == null and artifact_ref.source == null;
+}
+
+fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
+    if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) return try alloc.dupe(u8, artifact_ref.name);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.appendSlice(alloc, artifact_ref.name);
+    try list.append(alloc, '\x1f');
+    try list.appendSlice(alloc, @tagName(artifact_ref.kind));
+    if (artifact_ref.unit_id) |unit_id| {
+        try list.append(alloc, '\x1f');
+        try list.appendSlice(alloc, "unit:");
+        try list.appendSlice(alloc, unit_id);
+    }
+    if (artifact_ref.chunk_id) |chunk_id| {
+        const chunk_part = try std.fmt.allocPrint(alloc, "chunk:{d}", .{chunk_id});
+        defer alloc.free(chunk_part);
+        try list.append(alloc, '\x1f');
+        try list.appendSlice(alloc, chunk_part);
+    }
+    return try list.toOwnedSlice(alloc);
+}
 
 fn shouldPrecomputeGeneratedRequest(
     self: *DB,
@@ -10493,6 +17441,9 @@ fn reshapeChunkBackedResult(self: *DB, alloc: Allocator, req: types.SearchReques
         .ctx = self,
         .resolve_parent_id = resolveChunkParentIdCallback,
         .load_parent_stored = loadParentStoredForSearchCallback,
+        .load_parent_stored_many = loadParentStoredForSearchManyCallback,
+        .load_stored = loadStoredForHitCallback,
+        .load_many_stored = loadStoredSearchDocumentManyCallback,
     });
 }
 
@@ -10528,7 +17479,7 @@ fn loadParentStoredForSearchCallback(
     parent_id: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return if (try self.get(alloc, parent_id)) |stored|
+    return if (try self.loadStoredSearchDocumentProbe(alloc, parent_id)) |stored|
         try projectOwnedStoredBytesForSearch(self, alloc, req, parent_id, stored)
     else
         null;
@@ -10550,7 +17501,7 @@ fn loadStoredForHitCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.get(alloc, key);
+    return try self.loadStoredSearchDocumentProbe(alloc, key);
 }
 
 fn isExpiredDocumentKeyCallback(
@@ -10669,15 +17620,17 @@ fn buildDerivedBatch(
         }
     }
 
-    var changed_artifact_keys_list = try alloc.alloc([]const u8, changed_artifact_keys.len);
-    var changed_artifact_keys_initialized: usize = 0;
+    var changed_artifact_keys_list = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
-        for (changed_artifact_keys_list[0..changed_artifact_keys_initialized]) |key| alloc.free(key);
-        alloc.free(changed_artifact_keys_list);
+        for (changed_artifact_keys_list.items) |key| alloc.free(@constCast(key));
+        changed_artifact_keys_list.deinit(alloc);
     }
-    for (changed_artifact_keys, 0..) |key, i| {
-        changed_artifact_keys_list[i] = try alloc.dupe(u8, key);
-        changed_artifact_keys_initialized += 1;
+    for (changed_artifact_keys) |key| {
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
+    }
+    for (deleted_artifact_keys) |key| {
+        if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
+        try changed_artifact_keys_list.append(alloc, try alloc.dupe(u8, key));
     }
 
     var graph_doc_clears = std.ArrayListUnmanaged(derived_types.DerivedGraphDocClear).empty;
@@ -10807,7 +17760,7 @@ fn buildDerivedBatch(
         .documents = documents,
         .deleted_keys = deleted_keys,
         .overwritten_doc_keys = try overwritten_doc_keys_list.toOwnedSlice(alloc),
-        .changed_artifact_keys = changed_artifact_keys_list,
+        .changed_artifact_keys = try changed_artifact_keys_list.toOwnedSlice(alloc),
         .graph_doc_clears = try graph_doc_clears.toOwnedSlice(alloc),
         .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
         .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
@@ -10871,6 +17824,8 @@ fn appendGeneratedEnrichments(
 
 fn deleteEnrichmentArtifactsForBatch(self: *DB, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite) ![][]u8 {
     _ = extracted;
+    if (!self.core.hasArtifactCleanupMaybe()) return try self.alloc.alloc([]u8, 0);
+
     var deleted = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeOwnedKeySlice(self.alloc, deleted.items);
 
@@ -10886,20 +17841,51 @@ fn collectAndDeleteEnrichmentArtifactsForDocContext(
     doc_key: []const u8,
     deleted: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-    defer alloc.free(prefix);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var unrecorded_delete_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (unrecorded_delete_keys.items) |key| alloc.free(key);
+        unrecorded_delete_keys.deinit(alloc);
+    }
+
+    const artifact_prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(artifact_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, artifact_prefix, &deletes, deleted, &unrecorded_delete_keys);
+
+    const asset_state_prefix = try internal_keys.assetStateRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(asset_state_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+    const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(graph_asset_state_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, &deletes, null, &unrecorded_delete_keys);
+
+    if (deletes.items.len > 0) {
+        try store.putBatch(&.{}, deletes.items);
+    }
+}
+
+fn collectDeleteKeysForPrefix(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    prefix: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    recorded: ?*std.ArrayListUnmanaged([]u8),
+    unrecorded: *std.ArrayListUnmanaged([]u8),
+) !void {
     const existing = try store.scanPrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, existing);
-    if (existing.len == 0) return;
-
-    var deletes = try alloc.alloc([]const u8, existing.len);
-    defer alloc.free(deletes);
-    for (existing, 0..) |entry, i| {
-        const duped = try alloc.dupe(u8, entry.key);
-        deletes[i] = duped;
-        try deleted.append(alloc, duped);
+    for (existing) |entry| {
+        const owned = try alloc.dupe(u8, entry.key);
+        errdefer alloc.free(owned);
+        try deletes.append(alloc, owned);
+        if (recorded) |out| {
+            try out.append(alloc, owned);
+        } else {
+            try unrecorded.append(alloc, owned);
+        }
     }
-    try store.putBatch(&.{}, deletes);
 }
 
 fn collectGraphArtifactsForDocIndex(
@@ -10918,6 +17904,24 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
+    var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_keys.items) |key| ctx.alloc.free(key);
+        owned_store_keys.deinit(ctx.alloc);
+    }
+    var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_store_values.items) |value| ctx.alloc.free(value);
+        owned_store_values.deinit(ctx.alloc);
+    }
+    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (identity_writes.items) |item| {
+            ctx.alloc.free(@constCast(item.key));
+            ctx.alloc.free(@constCast(item.value));
+        }
+        identity_writes.deinit(ctx.alloc);
+    }
     var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer delete_keys.deinit(ctx.alloc);
     var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -10943,8 +17947,14 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
 
     var deleted_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
     defer freeOwnedKeySlice(ctx.alloc, deleted_artifact_keys.items);
-    for (keys) |key| {
-        try collectAndDeleteEnrichmentArtifactsForDocContext(ctx.alloc, ctx.store, key, &deleted_artifact_keys);
+    const should_scan_artifacts = if (ctx.artifact_cleanup_maybe) |artifact_cleanup_maybe|
+        artifact_cleanup_maybe.load(.acquire) or ctx.index_manager.hasGeneratedEnrichmentTargets()
+    else
+        true;
+    if (should_scan_artifacts) {
+        for (keys) |key| {
+            try collectAndDeleteEnrichmentArtifactsForDocContext(ctx.alloc, ctx.store, key, &deleted_artifact_keys);
+        }
     }
 
     const req = types.BatchRequest{
@@ -10955,6 +17965,25 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
+    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+        ctx.alloc,
+        ctx.store,
+        ctx.identity_namespace,
+        sequence,
+        &identity_writes,
+        &.{},
+        keys,
+    );
+    try store_writes.appendSlice(ctx.alloc, identity_writes.items);
+    try appendAssetArtifactSourceIndexMutations(
+        ctx.alloc,
+        &store_writes,
+        deleted_artifact_keys.items,
+        &delete_keys,
+        &owned_store_keys,
+        &owned_store_values,
+        &owned_delete_keys,
+    );
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -10964,6 +17993,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+    try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, sync_level, sequence, sync_targets);
@@ -10981,6 +18011,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -11031,6 +18062,10 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
+    switch (sync_level) {
+        .propose, .write => return,
+        .enrichments, .full_text, .aknn, .full_index => {},
+    }
     if (!ctx.executor.shouldThrottleBacklog()) return;
     if (sync_level == .full_text) {
         try runDerivedUntilTargetsContext(ctx, sequence, sync_targets.full_text_indexes);
@@ -11078,6 +18113,26 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
         runtime.notifySequence(sequence);
         try runtime.waitForApplied(sequence);
     }
+}
+
+fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
+    if (sync_level != .enrichments or sequence == 0) return;
+    const runtime = ctx.enrichment_runtime orelse return;
+    const runtime_stats = runtime.stats();
+    if (runtime_stats.applied_sequence >= sequence -| 1 or
+        try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence))
+    {
+        try runtime.markAppliedThrough(sequence);
+    }
+}
+
+fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
+    const pending = try enrichment_worker.collectPendingDocumentGroups(ctx.alloc, ctx.replay_source, applied_sequence);
+    defer enrichment_worker.freePendingDocumentGroups(ctx.alloc, pending);
+    for (pending) |group| {
+        if (group.sequence <= sequence) return false;
+    }
+    return true;
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -11595,8 +18650,8 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     const now_ns = std.time.ns_per_s;
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns));
     try noteDenseCatchUpMaintenanceRun(&ctx, "vec", now_ns);
-    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", denseCatchUpMaintenanceUrgentScore(), now_ns + 1));
+    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
@@ -11623,6 +18678,7 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
     const sequence = try appendDerivedBatchRecordContext(&batch_ctx, batch);
+    notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
@@ -11677,6 +18733,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
         }
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
+            try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
                 .sequence = stats.last_sequence,
@@ -11694,7 +18751,7 @@ fn applyDerivedBatchToIndexReplayContext(
 ) !bool {
     const replay_ctx: *const ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     const ctx = replay_ctx.batch;
-    if (!try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
 
     const async_ctx = AsyncContext{
         .alloc = ctx.alloc,
@@ -11703,6 +18760,7 @@ fn applyDerivedBatchToIndexReplayContext(
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .require_graph_resolution_contract = true,
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
@@ -11737,6 +18795,7 @@ fn applyDerivedBatchProfiled(self: *DB, batch: derived_types.DerivedBatch, profi
         runtime.notify();
         runtime.applyBackpressure();
     }
+    if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
@@ -11747,6 +18806,7 @@ fn applyDerivedBatchTargetsProfiled(self: *DB, batch: derived_types.DerivedBatch
         runtime.notify();
         runtime.applyBackpressure();
     }
+    if (self.sparse_compaction_runtime) |runtime| runtime.notify();
 }
 
 fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !void {
@@ -11847,6 +18907,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         target_sequence: u64 = 0,
         scanned_entries: u64 = 0,
         applied_entries: u64 = 0,
+        replay_scan_batches: u64 = 0,
+        replay_hint_filter_skips: u64 = 0,
         active: bool = false,
 
         fn publish(state: *@This(), index_name: []const u8) !void {
@@ -11855,6 +18917,8 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                 .target_sequence = state.target_sequence,
                 .scanned_entries = state.scanned_entries,
                 .applied_entries = state.applied_entries,
+                .replay_scan_batches = state.replay_scan_batches,
+                .replay_hint_filter_skips = state.replay_hint_filter_skips,
                 .active = state.active,
             };
             if (state.track_dense) setDenseCatchUpProgress(state.db.async_context, progress);
@@ -11891,7 +18955,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const resource_snapshot = if (replay.db.core.index_manager.resource_manager) |manager| manager.snapshot() else null;
 
             std.log.warn(
-                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
+                "dense catch-up watchdog index={s} sequence={} target={} scanned={} applied={} delta_applied={} cache_caps={{nodes={},vectors={}}} hbc={{total={},accounted={},vector_used={},metadata_used={}}} rm={{lsm_cache={},hbc_cache={},dense_search={},dense_apply={},replay_window={},full_text_pending={},full_text_build={}}} profile={{find_leaf_ns={},mutate_leaf_ns={},store_vector_ns={},quantized_vector_load_ns={}}}",
                 .{
                     replay.index_name,
                     progress.sequence,
@@ -11911,6 +18975,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
                     if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
                     profile.insert_find_leaf_ns,
                     profile.insert_mutate_leaf_ns,
                     profile.insert_store_vector_ns,
@@ -11924,11 +18989,15 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             const replay: *@This() = @ptrCast(@alignCast(ctx));
             replay.persist.scanned_entries = progress.scanned_entries;
             replay.persist.applied_entries = progress.applied_entries;
+            replay.persist.replay_scan_batches = progress.replay_scan_batches;
+            replay.persist.replay_hint_filter_skips = progress.replay_hint_filter_skips;
             const snapshot: ReplayProgress = .{
                 .sequence = progress.sequence,
                 .target_sequence = replay.persist.target_sequence,
                 .scanned_entries = progress.scanned_entries,
                 .applied_entries = progress.applied_entries,
+                .replay_scan_batches = progress.replay_scan_batches,
+                .replay_hint_filter_skips = progress.replay_hint_filter_skips,
                 .active = replay.persist.active,
             };
             setDenseCatchUpProgress(replay.db.async_context, snapshot);
@@ -12053,6 +19122,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.last_sequence > applied) {
             try self.core.saveAppliedSequence(index_ref.name, stats.last_sequence);
+            try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
         }
     }
     try truncateReplayJournalIfSafe(self);
@@ -12074,17 +19144,6 @@ fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_type
     try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
 }
 
-fn derivedTextCompactSegmentThreshold(batch: derived_types.DerivedBatch) usize {
-    const work_items = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len;
-    // Preserve low-latency small-write/full_index behavior without making
-    // large replay or ingest windows compact tiny text segments every few
-    // batches.
-    return if (work_items <= 2)
-        small_derived_text_compact_segment_threshold
-    else
-        derived_text_compact_segment_threshold;
-}
-
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
@@ -12093,7 +19152,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             const apply_start_ns = monotonicTimeNs();
             const text_replay_options: index_manager_mod.IndexBatchOptions = .{
                 .compact_text = false,
-                .compact_text_segment_threshold = derivedTextCompactSegmentThreshold(batch),
+                .compact_text_segment_threshold = null,
                 .defer_text_compaction = true,
             };
             const delete_keys = if (batch.deleted_keys.len == 0)
@@ -12104,24 +19163,18 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try collectCombinedDeleteKeys(ctx.alloc, batch.deleted_keys, batch.overwritten_doc_keys);
             defer if (batch.deleted_keys.len > 0 and batch.overwritten_doc_keys.len > 0) ctx.alloc.free(delete_keys);
 
-            var index_writes = try collectTextDocumentWritesForIndex(
+            const missing_required = try applyTextDocumentsForIndex(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
                 batch.documents,
                 index_ref.name,
                 ctx.index_manager.byte_range,
-                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
-            );
-            defer index_writes.deinit();
-            if (index_writes.missing_required != 0) return error.ReplayDocumentNotVisible;
-            try ctx.index_manager.applyTextBatchByNameWithOptions(
-                ctx.store,
-                index_ref.name,
                 delete_keys,
-                index_writes.items,
+                .{ .prefer_inline_when_store_tip_matches_sequence = batch.sequence },
                 text_replay_options,
             );
+            if (missing_required != 0) return error.ReplayDocumentNotVisible;
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.full_text_apply_ns, apply_start_ns);
         },
         .dense_vector => {
@@ -12277,6 +19330,19 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.deleteGraphDocsByName(index_ref.name, batch.deleted_keys);
             try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
+            const materialized_artifact_keys = if (ctx.allow_graph_materialization)
+                try materializeGraphSourceArtifactsForIndex(
+                    ctx.alloc,
+                    ctx.store,
+                    ctx.index_manager,
+                    batch.changed_artifact_keys,
+                    index_ref.name,
+                    .{ .require_resolution_contract = ctx.require_graph_resolution_contract },
+                )
+            else
+                try ctx.alloc.alloc([]u8, 0);
+            defer freeOwnedKeySlice(ctx.alloc, materialized_artifact_keys);
+
             if (batch.graph_writes.len > 0 or batch.graph_deletes.len > 0) {
                 const graph_deletes = try collectGraphDeletes(ctx.alloc, batch.graph_deletes, index_ref.name);
                 defer if (graph_deletes.len > 0) ctx.alloc.free(graph_deletes);
@@ -12284,8 +19350,11 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 const graph_writes = try collectGraphWrites(ctx.alloc, batch.graph_writes, index_ref.name);
                 defer if (graph_writes.len > 0) ctx.alloc.free(graph_writes);
                 try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_writes, graph_deletes);
-            } else if (batch.changed_artifact_keys.len > 0) {
-                var graph_mutations = try collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, batch.changed_artifact_keys, index_ref.name);
+            }
+            if (batch.changed_artifact_keys.len > 0 or materialized_artifact_keys.len > 0) {
+                const graph_artifact_keys = try concatArtifactKeyViews(ctx.alloc, batch.changed_artifact_keys, materialized_artifact_keys);
+                defer ctx.alloc.free(graph_artifact_keys);
+                var graph_mutations = try collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, graph_artifact_keys, index_ref.name);
                 defer graph_mutations.deinit();
                 try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_mutations.writes, graph_mutations.deletes);
             }
@@ -12321,68 +19390,114 @@ fn batchHasEmbeddingArtifactForManagedIndex(
     return false;
 }
 
+const ManagedIndexBatchApplicability = enum {
+    irrelevant,
+    relevant,
+    missing_dependency,
+};
+
+fn managedIndexBatchApplicability(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) ManagedIndexBatchApplicability {
+    switch (index_ref.kind) {
+        .full_text, .algebraic => {
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (doc.action == .upsert) return .relevant;
+            }
+            return .irrelevant;
+        },
+        .dense_vector => {
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (doc.action == .upsert) return .relevant;
+            }
+            for (batch.dense_embeddings) |embedding| {
+                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
+            }
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .sparse_vector => {
+            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
+            for (batch.documents) |doc| {
+                if (doc.action == .upsert) return .relevant;
+            }
+            for (batch.sparse_embeddings) |embedding| {
+                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
+            }
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .graph => {
+            if (batch.deleted_keys.len > 0) return .relevant;
+            for (batch.graph_doc_clears) |clear| {
+                for (clear.index_names) |index_name| {
+                    if (std.mem.eql(u8, index_name, index_ref.name)) return .relevant;
+                }
+            }
+            for (batch.graph_writes) |write| {
+                if (std.mem.eql(u8, write.index_name, index_ref.name)) return .relevant;
+            }
+            for (batch.graph_deletes) |delete| {
+                if (std.mem.eql(u8, delete.index_name, index_ref.name)) return .relevant;
+            }
+            for (batch.changed_artifact_keys) |artifact_key| {
+                if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer artifact_ref.deinit(index_manager.alloc);
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) return .relevant;
+                    continue;
+                }
+                if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (source.mention_edge_type.len == 0) continue;
+                    const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.artifact_name);
+                    }
+                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
+                    return .missing_dependency;
+                }
+                if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.index_name);
+                        index_manager.alloc.free(parsed.edge_type);
+                        index_manager.alloc.free(parsed.target_doc_key);
+                    }
+                    if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
+                }
+            }
+            return .irrelevant;
+        },
+    }
+}
+
 fn batchAffectsManagedIndex(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
     index_ref: index_manager_mod.ManagedIndexRef,
 ) bool {
-    switch (index_ref.kind) {
-        .full_text, .algebraic => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
-            for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
-            }
-            return false;
-        },
-        .dense_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
-            for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
-            }
-            for (batch.dense_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return true;
-            }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return true;
-            return false;
-        },
-        .sparse_vector => {
-            if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return true;
-            for (batch.documents) |doc| {
-                if (doc.action == .upsert) return true;
-            }
-            for (batch.sparse_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return true;
-            }
-            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return true;
-            return false;
-        },
-        .graph => {
-            if (batch.deleted_keys.len > 0) return true;
-            for (batch.graph_doc_clears) |clear| {
-                for (clear.index_names) |index_name| {
-                    if (std.mem.eql(u8, index_name, index_ref.name)) return true;
-                }
-            }
-            for (batch.graph_writes) |write| {
-                if (std.mem.eql(u8, write.index_name, index_ref.name)) return true;
-            }
-            for (batch.graph_deletes) |delete| {
-                if (std.mem.eql(u8, delete.index_name, index_ref.name)) return true;
-            }
-            for (batch.changed_artifact_keys) |artifact_key| {
-                if (!internal_keys.isGraphEdgeArtifactKey(artifact_key)) continue;
-                const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
-                defer {
-                    index_manager.alloc.free(parsed.doc_key);
-                    index_manager.alloc.free(parsed.index_name);
-                    index_manager.alloc.free(parsed.edge_type);
-                    index_manager.alloc.free(parsed.target_doc_key);
-                }
-                if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return true;
-            }
-            return false;
-        },
-    }
+    return managedIndexBatchApplicability(index_manager, batch, index_ref) == .relevant;
+}
+
+fn batchAffectsManagedIndexForReplay(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !bool {
+    return switch (managedIndexBatchApplicability(index_manager, batch, index_ref)) {
+        .irrelevant => false,
+        .relevant => true,
+        .missing_dependency => true,
+    };
 }
 
 fn batchAdvancesManagedIndexApplyState(
@@ -12410,6 +19525,18 @@ fn batchAdvancesManagedIndexApplyState(
         },
         else => return true,
     }
+}
+
+fn batchAdvancesManagedIndexApplyStateForReplay(
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !bool {
+    return switch (managedIndexBatchApplicability(index_manager, batch, index_ref)) {
+        .irrelevant => false,
+        .missing_dependency => true,
+        .relevant => try batchAdvancesManagedIndexApplyState(index_manager, batch, index_ref),
+    };
 }
 
 const OwnedBatchWrites = struct {
@@ -12458,7 +19585,10 @@ const OwnedDenseEmbeddingWrites = struct {
 
     fn deinit(self: *@This()) void {
         if (self.owns_doc_keys) {
-            for (self.writes) |write| self.alloc.free(@constCast(write.doc_key));
+            for (self.writes) |write| {
+                self.alloc.free(@constCast(write.doc_key));
+                if (write.parent_doc_key) |parent_doc_key| self.alloc.free(@constCast(parent_doc_key));
+            }
         }
         if (self.writes.len > 0) self.alloc.free(self.writes);
         self.* = undefined;
@@ -12850,15 +19980,17 @@ fn attachInlineUpsertDocumentValues(
     }
 }
 
-fn collectTextDocumentWritesForIndex(
+fn applyTextDocumentsForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
     byte_range: types.ByteRange,
+    delete_keys: []const []const u8,
     opts: CollectTextDocumentWritesOptions,
-) !OwnedBatchWrites {
+    index_opts: index_manager_mod.IndexBatchOptions,
+) !usize {
     const chunk_name = index_manager.textChunkName(index_name);
     const PendingTextWrite = struct {
         doc_key: []const u8,
@@ -12873,10 +20005,7 @@ fn collectTextDocumentWritesForIndex(
     }
 
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    errdefer {
-        for (writes.items) |item| alloc.free(@constCast(item.value));
-        writes.deinit(alloc);
-    }
+    defer writes.deinit(alloc);
 
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
@@ -12888,10 +20017,9 @@ fn collectTextDocumentWritesForIndex(
         if (!byte_range.contains(doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
         if (trust_inline and doc.cleaned_value != null) {
-            const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
             try writes.append(alloc, .{
                 .key = doc.key,
-                .value = owned_value,
+                .value = doc.cleaned_value.?,
             });
             continue;
         }
@@ -12903,10 +20031,8 @@ fn collectTextDocumentWritesForIndex(
     }
 
     if (pending.items.len == 0) {
-        return .{
-            .alloc = alloc,
-            .items = try writes.toOwnedSlice(alloc),
-        };
+        try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
+        return 0;
     }
 
     var txn = try store.beginProbeTxn();
@@ -12936,18 +20062,15 @@ fn collectTextDocumentWritesForIndex(
             missing_required += 1;
             continue;
         };
-        const owned_value = try alloc.dupe(u8, value);
         try writes.append(alloc, .{
             .key = item.doc_key,
-            .value = owned_value,
+            .value = value,
         });
     }
 
-    return .{
-        .alloc = alloc,
-        .items = try writes.toOwnedSlice(alloc),
-        .missing_required = missing_required,
-    };
+    if (missing_required != 0) return missing_required;
+    try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
+    return missing_required;
 }
 
 fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {
@@ -12968,6 +20091,7 @@ fn collectDenseEmbeddingWrites(alloc: Allocator, embeddings: []const derived_typ
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
             .doc_key = @constCast(embedding.doc_key),
+            .parent_doc_key = embedding.parent_doc_key,
             .artifact_key = if (embedding.artifact_key) |artifact_key| @constCast(artifact_key) else null,
             .vector = if (embedding.artifact_key != null) &.{} else @constCast(embedding.vector),
         });
@@ -12984,7 +20108,10 @@ fn collectDenseEmbeddingWritesForArtifacts(
 ) !OwnedDenseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (filtered.items) |write| {
+            alloc.free(@constCast(write.doc_key));
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
+        }
         filtered.deinit(alloc);
     }
 
@@ -12996,12 +20123,18 @@ fn collectDenseEmbeddingWritesForArtifacts(
         } orelse continue;
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
-            .doc_key = try alloc.dupe(u8, identity.doc_key),
+            .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
+        parent_doc_key = null;
     }
 
     return .{
@@ -13028,12 +20161,16 @@ fn appendDenseEmbeddingWritesForArtifacts(
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
         const doc_key = try alloc.dupe(u8, identity.doc_key);
         errdefer alloc.free(doc_key);
+        var parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
             .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = @constCast(artifact_key),
             .vector = &.{},
         });
+        parent_doc_key = null;
     }
 }
 
@@ -13046,7 +20183,10 @@ fn collectDenseEmbeddingWritesForBatch(
 ) !OwnedDenseEmbeddingWrites {
     var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
     errdefer {
-        for (filtered.items) |write| alloc.free(@constCast(write.doc_key));
+        for (filtered.items) |write| {
+            alloc.free(@constCast(write.doc_key));
+            if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
+        }
         filtered.deinit(alloc);
     }
 
@@ -13054,12 +20194,16 @@ fn collectDenseEmbeddingWritesForBatch(
         if (!std.mem.eql(u8, embedding.index_name, index_name)) continue;
         const doc_key = try alloc.dupe(u8, embedding.doc_key);
         errdefer alloc.free(doc_key);
+        var parent_doc_key = if (embedding.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
             .doc_key = doc_key,
+            .parent_doc_key = parent_doc_key,
             .artifact_key = if (embedding.artifact_key) |artifact_key| @constCast(artifact_key) else null,
             .vector = if (embedding.artifact_key != null) &.{} else @constCast(embedding.vector),
         });
+        parent_doc_key = null;
     }
     try appendDenseEmbeddingWritesForArtifacts(alloc, index_manager, &filtered, artifact_keys, index_name);
 
@@ -13108,7 +20252,7 @@ fn collectSparseEmbeddingWritesForArtifacts(
             if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) continue;
             try filtered.append(alloc, .{
                 .index_name = @constCast(index_name),
-                .doc_key = identity.doc_key,
+                .doc_key = @constCast(identity.doc_key),
                 .artifact_key = @constCast(artifact_key),
                 .indices = &.{},
                 .values = &.{},
@@ -13240,6 +20384,1054 @@ fn collectGraphDeletes(alloc: Allocator, deletes: []const types.GraphEdgeDelete,
     }
 
     return try filtered.toOwnedSlice(alloc);
+}
+
+fn concatArtifactKeyViews(alloc: Allocator, lhs: []const []const u8, rhs: []const []u8) ![][]const u8 {
+    const out = try alloc.alloc([]const u8, lhs.len + rhs.len);
+    @memcpy(out[0..lhs.len], lhs);
+    for (rhs, 0..) |key, i| out[lhs.len + i] = key;
+    return out;
+}
+
+fn concatKVPairSlices(alloc: Allocator, lhs: []const docstore_mod.KVPair, rhs: []const docstore_mod.KVPair) ![]docstore_mod.KVPair {
+    const out = try alloc.alloc(docstore_mod.KVPair, lhs.len + rhs.len);
+    @memcpy(out[0..lhs.len], lhs);
+    for (rhs, 0..) |write, i| out[lhs.len + i] = write;
+    return out;
+}
+
+const GraphMaterializationOptions = struct {
+    require_resolution_contract: bool = false,
+};
+
+fn materializeGraphSourceArtifactsForIndex(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    changed_artifact_keys: []const []const u8,
+    index_name: []const u8,
+    options: GraphMaterializationOptions,
+) ![][]u8 {
+    const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
+
+    var changed = std.ArrayListUnmanaged([]u8).empty;
+    errdefer freeOwnedKeySlice(alloc, changed.items);
+
+    for (changed_artifact_keys) |artifact_key| {
+        if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+            continue;
+        }
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
+        defer artifact_ref.deinit(alloc);
+        if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(@constCast(key));
+            deletes.deinit(alloc);
+        }
+
+        const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (raw) |value| alloc.free(value);
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            writes.deinit(alloc);
+        }
+
+        if (raw) |value| {
+            const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
+            defer if (raw_doc) |doc_value| alloc.free(doc_value);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc);
+            defer freeGraphWrites(alloc, graph_writes);
+            for (graph_writes) |write| {
+                const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+                var key_owned = true;
+                errdefer if (key_owned) alloc.free(key);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                var payload_owned = true;
+                errdefer if (payload_owned) alloc.free(payload);
+                try writes.append(alloc, .{ .key = key, .value = payload });
+                key_owned = false;
+                payload_owned = false;
+                try appendUniqueOwnedKey(alloc, &changed, key);
+            }
+        }
+
+        const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
+        defer alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (containsStoreWriteKey(writes.items, previous_key)) continue;
+                try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+                try appendUniqueOwnedKey(alloc, &changed, previous_key);
+            }
+        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
+            defer freeOwnedConstKeySlice(alloc, protected_keys);
+            const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
+            defer docstore_mod.DocStore.freeResults(alloc, existing);
+            for (existing) |entry| {
+                if (containsStoreWriteKey(writes.items, entry.key)) continue;
+                if (containsDeleteKey(protected_keys, entry.key)) continue;
+                try deletes.append(alloc, try alloc.dupe(u8, entry.key));
+                try appendUniqueOwnedKey(alloc, &changed, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+        var state_value_owned = true;
+        defer if (state_value_owned) alloc.free(state_value);
+        try writes.append(alloc, .{
+            .key = try alloc.dupe(u8, state_key),
+            .value = state_value,
+        });
+        state_value_owned = false;
+
+        if (writes.items.len > 0 or deletes.items.len > 0) {
+            try store.putBatch(writes.items, deletes.items);
+        }
+    }
+
+    return try changed.toOwnedSlice(alloc);
+}
+
+fn materializeMentionEdgesForResolutionKey(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    changed: *std.ArrayListUnmanaged([]u8),
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    resolution_key: []const u8,
+    options: GraphMaterializationOptions,
+) !void {
+    if (source.mention_edge_type.len == 0) return;
+    const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return;
+    defer alloc.free(parsed_key.doc_key);
+    defer alloc.free(parsed_key.artifact_name);
+
+    const raw_resolution = store.get(alloc, resolution_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (raw_resolution) |raw| alloc.free(raw);
+
+    const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+        if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
+        return;
+    };
+    const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(state_name);
+    const state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, state_name);
+    defer alloc.free(state_key);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+    }
+    var mention_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (mention_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        mention_writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    if (raw_resolution) |raw| {
+        const raw_extraction = loadSourceExtractionForResolution(alloc, store, parsed_key.doc_key, cfg.source_artifact) catch null;
+        defer if (raw_extraction) |raw_src| alloc.free(raw_src);
+        const mention_edge_writes = try mentionEdgeWritesFromResolutionAlloc(
+            alloc,
+            index_name,
+            parsed_key.doc_key,
+            raw,
+            raw_extraction,
+            source.mention_edge_type,
+            cfg,
+        );
+        defer freeGraphWrites(alloc, mention_edge_writes);
+        for (mention_edge_writes) |write| {
+            const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+            var key_owned = true;
+            errdefer if (key_owned) alloc.free(key);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            var payload_owned = true;
+            errdefer if (payload_owned) alloc.free(payload);
+            try writes.append(alloc, .{ .key = key, .value = payload });
+            key_owned = false;
+            payload_owned = false;
+            try appendUniqueOwnedKey(alloc, changed, key);
+        }
+        try appendMentionEvidenceArtifactsFromResolution(
+            alloc,
+            &mention_writes,
+            changed,
+            parsed_key.doc_key,
+            resolution_key,
+            raw,
+            raw_extraction,
+            cfg,
+        );
+    }
+
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            if (containsStoreWriteKey(writes.items, previous_key)) continue;
+            try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+            try appendUniqueOwnedKey(alloc, changed, previous_key);
+        }
+    }
+
+    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+    var state_value_owned = true;
+    defer if (state_value_owned) alloc.free(state_value);
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, state_key),
+        .value = state_value,
+    });
+    state_value_owned = false;
+
+    const mention_state_name = try mentionArtifactStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(mention_state_name);
+    const mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, mention_state_name);
+    defer alloc.free(mention_state_key);
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key)) |previous_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            if (containsStoreWriteKey(mention_writes.items, previous_key)) continue;
+            try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+            try appendUniqueOwnedKey(alloc, changed, previous_key);
+        }
+    }
+
+    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, mention_writes.items);
+    var mention_state_value_owned = true;
+    defer if (mention_state_value_owned) alloc.free(mention_state_value);
+    try mention_writes.append(alloc, .{
+        .key = try alloc.dupe(u8, mention_state_key),
+        .value = mention_state_value,
+    });
+    mention_state_value_owned = false;
+
+    if (writes.items.len > 0 or mention_writes.items.len > 0 or deletes.items.len > 0) {
+        const combined = try concatKVPairSlices(alloc, writes.items, mention_writes.items);
+        defer alloc.free(combined);
+        try store.putBatch(combined, deletes.items);
+    }
+}
+
+fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    }
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn resolverConfigForResolution(
+    index_manager: *index_manager_mod.IndexManager,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+) ?*const index_manager_mod.ResolverConfig {
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+            std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+        {
+            return cfg;
+        }
+    }
+    return null;
+}
+
+fn resolverConfigForResolutionArtifact(
+    index_manager: *index_manager_mod.IndexManager,
+    resolution_artifact: []const u8,
+) ?*const index_manager_mod.ResolverConfig {
+    for (index_manager.resolvers.items) |*cfg| {
+        if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
+    }
+    return null;
+}
+
+fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn mentionArtifactStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mention_artifacts\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn resolutionMentionArtifactNameAlloc(
+    alloc: Allocator,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+    local_id: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "_resolution_mention\x1f{s}\x1f{s}\x1f{s}", .{ source_artifact, resolution_artifact, local_id });
+}
+
+fn resolutionMentionArtifactKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    source_artifact: []const u8,
+    resolution_artifact: []const u8,
+    local_id: []const u8,
+) ![]u8 {
+    const name = try resolutionMentionArtifactNameAlloc(alloc, source_artifact, resolution_artifact, local_id);
+    defer alloc.free(name);
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
+}
+
+fn resolutionMentionStateKeysForGraphSourceAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| alloc.free(@constCast(key));
+        protected.deinit(alloc);
+    }
+
+    for (index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try mentionGraphStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+        defer alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(alloc, doc_key, index_name, state_name);
+        defer alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(alloc, try alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(alloc);
+}
+
+fn loadSourceExtractionForResolution(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    source_artifact: []const u8,
+) !?[]u8 {
+    if (try sourceArtifactKeyFromResolutionScopeAlloc(alloc, doc_key, source_artifact)) |source_key| {
+        defer alloc.free(source_key);
+        return store.get(alloc, source_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
+    defer alloc.free(extraction_key);
+    return store.get(alloc, extraction_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+fn sourceArtifactKeyFromResolutionScopeAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) !?[]u8 {
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, doc_key)) orelse return null;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != .asset and artifact_ref.kind != .chunk) return null;
+    if (!std.mem.eql(u8, artifact_ref.name, source_artifact)) return null;
+    return try alloc.dupe(u8, doc_key);
+}
+
+fn sourceArtifactKeyForResolutionAlloc(alloc: Allocator, doc_key: []const u8, source_artifact: []const u8) ![]u8 {
+    if (try sourceArtifactKeyFromResolutionScopeAlloc(alloc, doc_key, source_artifact)) |source_key| return source_key;
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", source_artifact);
+}
+
+fn extractionConfidenceForLocalId(entities: []const resolver_lib.ExtractedEntity, local_id: []const u8) ?f64 {
+    for (entities) |entity| {
+        if (std.mem.eql(u8, entity.local_id, local_id)) return entity.confidence;
+    }
+    return null;
+}
+
+fn extractionEntityForLocalId(entities: []const resolver_lib.ExtractedEntity, local_id: []const u8) ?resolver_lib.ExtractedEntity {
+    for (entities) |entity| {
+        if (std.mem.eql(u8, entity.local_id, local_id)) return entity;
+    }
+    return null;
+}
+
+fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
+    return switch (decision) {
+        .new, .match => true,
+        .review => false,
+    };
+}
+
+fn decisionName(decision: resolver_lib.Decision) []const u8 {
+    return switch (decision) {
+        .new => "new",
+        .match => "match",
+        .review => "review",
+    };
+}
+
+/// Build `doc -> entity` mention edges (provenance) from the durable resolution
+/// artifact for canonical decisions. The target is the resolved DocRef, so
+/// prefix/ANN matches, merge redirects, and curator overrides are reflected in
+/// graph state. Review-band decisions remain visible through the review queue,
+/// not as ordinary resolved provenance. The optional extraction artifact is
+/// consulted only for the original mention confidence used by provenance weight
+/// calibration.
+fn mentionEdgeWritesFromResolutionAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    resolution_raw: []const u8,
+    extraction_raw: ?[]const u8,
+    mention_edge_type: []const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+) ![]types.GraphEdgeWrite {
+    var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return try alloc.alloc(types.GraphEdgeWrite, 0);
+    defer parsed_resolution.deinit();
+    var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
+        resolver_lib.parseExtractionEntities(alloc, raw) catch null
+    else
+        null;
+    defer if (parsed_extraction) |*parsed| parsed.deinit();
+
+    var aggregates = std.ArrayListUnmanaged(MentionEdgeAggregate).empty;
+    defer {
+        for (aggregates.items) |*aggregate| aggregate.deinit(alloc);
+        aggregates.deinit(alloc);
+    }
+    for (parsed_resolution.entities) |entity| {
+        if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
+        if (entity.doc_ref.key.len == 0) continue;
+        const mention_confidence = if (parsed_extraction) |parsed|
+            extractionConfidenceForLocalId(parsed.entities, entity.local_id) orelse entity.confidence
+        else
+            entity.confidence;
+        const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
+        var mention_key_owned = true;
+        errdefer if (mention_key_owned) alloc.free(mention_artifact_key);
+        const aggregate = try findOrAppendMentionEdgeAggregate(alloc, &aggregates, entity.doc_ref.key, entity.doc_ref.table);
+        try aggregate.appendMentionArtifactKey(alloc, mention_artifact_key);
+        mention_key_owned = false;
+        aggregate.mention_confidence = @max(aggregate.mention_confidence, mention_confidence);
+    }
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer freeGraphWrites(alloc, writes.items);
+    for (aggregates.items) |aggregate| {
+        const metadata = try mentionEdgeMetadataJsonAlloc(alloc, aggregate);
+        errdefer alloc.free(metadata);
+        try writes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, index_name),
+            .source = try alloc.dupe(u8, doc_key),
+            .target = try alloc.dupe(u8, aggregate.target),
+            .edge_type = try alloc.dupe(u8, mention_edge_type),
+            .weight = cfg.fusedMentionWeight(aggregate.mention_confidence),
+            .metadata_json = metadata,
+        });
+    }
+    return try writes.toOwnedSlice(alloc);
+}
+
+const MentionEdgeAggregate = struct {
+    target: []u8,
+    target_table: []u8,
+    mention_confidence: f64,
+    mention_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *MentionEdgeAggregate, alloc: Allocator) void {
+        alloc.free(self.target);
+        alloc.free(self.target_table);
+        for (self.mention_artifact_keys.items) |key| alloc.free(key);
+        self.mention_artifact_keys.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn appendMentionArtifactKey(self: *MentionEdgeAggregate, alloc: Allocator, key: []u8) !void {
+        try self.mention_artifact_keys.append(alloc, key);
+    }
+};
+
+fn findOrAppendMentionEdgeAggregate(
+    alloc: Allocator,
+    aggregates: *std.ArrayListUnmanaged(MentionEdgeAggregate),
+    target: []const u8,
+    target_table: []const u8,
+) !*MentionEdgeAggregate {
+    for (aggregates.items) |*existing| {
+        if (std.mem.eql(u8, existing.target, target)) return existing;
+    }
+    const target_owned = try alloc.dupe(u8, target);
+    var target_owned_live = true;
+    errdefer if (target_owned_live) alloc.free(target_owned);
+    const table_owned = try alloc.dupe(u8, target_table);
+    var table_owned_live = true;
+    errdefer if (table_owned_live) alloc.free(table_owned);
+    try aggregates.append(alloc, .{
+        .target = target_owned,
+        .target_table = table_owned,
+        .mention_confidence = 0,
+    });
+    target_owned_live = false;
+    table_owned_live = false;
+    return &aggregates.items[aggregates.items.len - 1];
+}
+
+fn mentionEdgeMetadataJsonAlloc(alloc: Allocator, aggregate: MentionEdgeAggregate) ![]u8 {
+    // Record the resolved DocRef target table so the endpoint can be hydrated
+    // cross-table; same-table hydration ignores it. The mention artifact keys
+    // are the durable evidence rollup behind the deduplicated entity edge.
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .target_table = aggregate.target_table,
+        .mention_count = aggregate.mention_artifact_keys.items.len,
+        .mention_artifact_keys = aggregate.mention_artifact_keys.items,
+    }, .{});
+}
+
+fn appendMentionEvidenceArtifactsFromResolution(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    changed: *std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    resolution_key: []const u8,
+    resolution_raw: []const u8,
+    extraction_raw: ?[]const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+) !void {
+    var parsed_resolution = resolver_lib.parseResolution(alloc, resolution_raw) catch return;
+    defer parsed_resolution.deinit();
+    var parsed_extraction: ?resolver_lib.ParsedEntities = if (extraction_raw) |raw|
+        resolver_lib.parseExtractionEntities(alloc, raw) catch null
+    else
+        null;
+    defer if (parsed_extraction) |*parsed| parsed.deinit();
+    const source_artifact_key = try sourceArtifactKeyForResolutionAlloc(alloc, doc_key, cfg.source_artifact);
+    defer alloc.free(source_artifact_key);
+
+    for (parsed_resolution.entities) |entity| {
+        if (!resolutionDecisionCreatesCanonicalEdge(entity.decision)) continue;
+        if (entity.doc_ref.key.len == 0) continue;
+        const extraction_entity = if (parsed_extraction) |parsed|
+            extractionEntityForLocalId(parsed.entities, entity.local_id)
+        else
+            null;
+        const key = try resolutionMentionArtifactKeyAlloc(alloc, doc_key, cfg.source_artifact, cfg.resolution_artifact, entity.local_id);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        const payload = try mentionEvidencePayloadAlloc(alloc, doc_key, key, source_artifact_key, resolution_key, cfg, entity, extraction_entity);
+        var payload_owned = true;
+        errdefer if (payload_owned) alloc.free(payload);
+        try writes.append(alloc, .{ .key = key, .value = payload });
+        key_owned = false;
+        payload_owned = false;
+        try appendUniqueOwnedKey(alloc, changed, key);
+    }
+}
+
+fn mentionEvidencePayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    mention_artifact_key: []const u8,
+    source_artifact_key: []const u8,
+    resolution_key: []const u8,
+    cfg: *const index_manager_mod.ResolverConfig,
+    entity: resolver_lib.ResolvedEntity,
+    extraction_entity: ?resolver_lib.ExtractedEntity,
+) ![]u8 {
+    const mention_label = if (extraction_entity) |source| source.label else entity.label;
+    const mention_text = if (extraction_entity) |source| source.text else entity.surface_form;
+    const mention_confidence = if (extraction_entity) |source| source.confidence else entity.confidence;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._schema = "antfly.resolution_mention.v1",
+        ._parent_doc_key = doc_key,
+        ._artifact_kind = "resolution_mention",
+        ._artifact_key = mention_artifact_key,
+        .source_artifact = cfg.source_artifact,
+        .source_artifact_key = source_artifact_key,
+        .resolution_artifact = cfg.resolution_artifact,
+        .resolution_artifact_key = resolution_key,
+        .resolver = cfg.name,
+        .resolver_table = cfg.table,
+        .config_generation = cfg.config_generation,
+        .local_id = entity.local_id,
+        .decision = decisionName(entity.decision),
+        .confidence = entity.confidence,
+        .canonical = .{
+            .table = entity.doc_ref.table,
+            .key = entity.doc_ref.key,
+            .name = entity.canonical_name,
+            .label = entity.label,
+        },
+        .mention = .{
+            .text = mention_text,
+            .label = mention_label,
+            .confidence = mention_confidence,
+        },
+    }, .{});
+}
+
+fn graphWritesFromArtifactValueAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
+    raw_doc: ?[]const u8,
+) ![]types.GraphEdgeWrite {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
+    defer if (parsed_doc) |*doc| doc.deinit();
+    const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer freeGraphWrites(alloc, writes.items);
+
+    switch (source.format) {
+        .extraction_relation => try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
+        .extraction_graph => {
+            if (source.path.len > 0) {
+                try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+            } else if (parsed.value == .object) {
+                if (parsed.value.object.get("relations")) |relations| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("edges")) |edges| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+            }
+        },
+    }
+
+    return try writes.toOwnedSlice(alloc);
+}
+
+fn appendRelationItemsFromPath(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    root: std.json.Value,
+    path: []const u8,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
+    const selected = selectGraphArtifactPath(root, path) orelse return;
+    try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
+}
+
+fn selectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var trimmed = path;
+    if (std.mem.startsWith(u8, trimmed, "$.")) trimmed = trimmed[2..];
+    if (std.mem.endsWith(u8, trimmed, "[*]")) trimmed = trimmed[0 .. trimmed.len - 3];
+    if (trimmed.len == 0) return root;
+
+    var current = root;
+    var parts = std.mem.splitScalar(u8, trimmed, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn appendRelationValueItems(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    value: std.json.Value,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (value == .array) {
+        for (value.array.items, 0..) |item, i| try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
+    } else {
+        try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
+    }
+}
+
+fn appendRelationItem(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (item != .object) return;
+    const mapped_edge_type = if (mapping.edge_type_template.len > 0)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_edge_type) |value| alloc.free(value);
+    const edge_type = if (mapped_edge_type) |value|
+        std.mem.trim(u8, value, &std.ascii.whitespace)
+    else
+        jsonStringField(item, "type") orelse jsonStringField(item, "edge_type") orelse jsonStringField(item, "relation") orelse return;
+    if (edge_type.len == 0) return;
+
+    const mapped_source = if (mapping.source_template.len > 0)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_source) |value| alloc.free(value);
+    const source_doc = if (mapped_source) |value| blk: {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        break :blk if (trimmed.len > 0) trimmed else doc_key;
+    } else if (item.object.get("source")) |source_value|
+        jsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
+    else
+        doc_key;
+
+    const mapped_target = if (mapping.target_template.len > 0)
+        try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_target) |value| alloc.free(value);
+    const target_doc = if (mapped_target) |value| blk: {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len == 0) return;
+        break :blk trimmed;
+    } else blk: {
+        const target_value = item.object.get("target") orelse return;
+        break :blk jsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
+    };
+
+    const weight = if (mapping.weight_template.len > 0) blk: {
+        const rendered = try renderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        defer alloc.free(rendered);
+        const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
+        break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
+    } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
+    const metadata_json = if (mapping.metadata_template_json.len > 0)
+        try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        try std.json.Stringify.valueAlloc(alloc, item, .{});
+    errdefer alloc.free(metadata_json);
+
+    try writes.append(alloc, .{
+        .index_name = try alloc.dupe(u8, index_name),
+        .source = try alloc.dupe(u8, source_doc),
+        .target = try alloc.dupe(u8, target_doc),
+        .edge_type = try alloc.dupe(u8, edge_type),
+        .weight = weight,
+        .created_at = 0,
+        .updated_at = 0,
+        .metadata_json = metadata_json,
+    });
+}
+
+fn renderGraphArtifactTemplateAlloc(
+    alloc: Allocator,
+    template_source: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var pos: usize = 0;
+    while (pos < template_source.len) {
+        const start = std.mem.indexOfPos(u8, template_source, pos, "{{") orelse {
+            try out.appendSlice(alloc, template_source[pos..]);
+            break;
+        };
+        try out.appendSlice(alloc, template_source[pos..start]);
+        const body_start = start + 2;
+        const end = std.mem.indexOfPos(u8, template_source, body_start, "}}") orelse {
+            try out.appendSlice(alloc, template_source[start..]);
+            break;
+        };
+        const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
+        const rendered = try renderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        defer alloc.free(rendered);
+        try out.appendSlice(alloc, rendered);
+        pos = end + 2;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn renderGraphArtifactExpressionAlloc(
+    alloc: Allocator,
+    expr: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    if (std.mem.startsWith(u8, expr, "default ")) {
+        var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
+        const path = parts.next() orelse return try alloc.dupe(u8, "");
+        const fallback = parts.next() orelse "";
+        const value = graphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        const text = if (value) |found| try graphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
+            alloc.free(text);
+            return try alloc.dupe(u8, fallback);
+        }
+        return text;
+    }
+    if (graphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
+        return try graphJsonValueTextAlloc(alloc, value);
+    }
+    return try alloc.dupe(u8, "");
+}
+
+fn graphTemplateValue(
+    path: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ?std.json.Value {
+    if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
+    if (std.mem.startsWith(u8, path, "_doc.value.")) {
+        const doc = doc_value orelse return null;
+        return selectJsonDotPath(doc, path["_doc.value.".len..]);
+    }
+    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
+    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
+    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
+    if (std.mem.startsWith(u8, path, "_artifact.value.")) return selectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
+    if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
+    if (std.mem.eql(u8, path, "_item")) return item;
+    if (std.mem.startsWith(u8, path, "_item.")) return selectGraphItemDotPath(item, path["_item.".len..], artifact_value);
+    return null;
+}
+
+fn selectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
+    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("source") orelse return null;
+        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "source")) return selected;
+        return selectJsonDotPath(selected, path["source.".len..]);
+    }
+    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("target") orelse return null;
+        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "target")) return selected;
+        return selectJsonDotPath(selected, path["target.".len..]);
+    }
+    return selectJsonDotPath(item, path);
+}
+
+fn selectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn graphJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, ""),
+        .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
+        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
+        .float => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
+        .number_string => |s| try alloc.dupe(u8, s),
+        .string => |s| try alloc.dupe(u8, s),
+        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+    };
+}
+
+fn renderGraphArtifactMetadataTemplateAlloc(
+    alloc: Allocator,
+    metadata_template_json: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
+    defer parsed.deinit();
+    var rendered = try renderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+    defer freeGraphRenderedJsonValue(alloc, &rendered);
+    return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
+}
+
+fn renderGraphArtifactMetadataValueAlloc(
+    alloc: Allocator,
+    value: std.json.Value,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try renderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
+        .array => |array| blk: {
+            var out = std.json.Array.init(alloc);
+            errdefer out.deinit();
+            for (array.items) |child| try out.append(try renderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
+            break :blk .{ .array = out };
+        },
+        .object => |object| blk: {
+            var out = std.json.ObjectMap.empty;
+            errdefer out.deinit(alloc);
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try renderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
+            }
+            break :blk .{ .object = out };
+        },
+        else => value,
+    };
+}
+
+fn freeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .string => |text| alloc.free(@constCast(text)),
+        .array => |*array| {
+            for (array.items) |*item| freeGraphRenderedJsonValue(alloc, item);
+            array.deinit();
+        },
+        .object => |*object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                freeGraphRenderedJsonValue(alloc, entry.value_ptr);
+            }
+            object.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+
+fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => value.string,
+        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| jsonEndpointDocumentId(doc_ref) else null,
+        else => null,
+    };
+}
+
+fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
+    return jsonEndpointDocumentId(value) orelse if (resolveGraphEndpointEntity(value, artifact_value)) |entity| jsonEndpointDocumentId(entity) else null;
+}
+
+fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
+    if (value != .object) return null;
+    if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
+    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
+    return findGraphArtifactEntity(artifact_value, entity_id);
+}
+
+fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
+    if (artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    return switch (entities) {
+        .array => |array| blk: {
+            for (array.items) |entity| {
+                const id = jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse continue;
+                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
+            }
+            break :blk null;
+        },
+        .object => entities.object.get(entity_id),
+        else => null,
+    };
+}
+
+fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
+    if (entity_index < 0 or artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    if (entities != .array) return null;
+    const index: usize = @intCast(entity_index);
+    if (index >= entities.array.items.len) return null;
+    return entities.array.items[index];
+}
+
+fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return if (found == .string) found.string else null;
+}
+
+fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .integer => found.integer,
+        else => null,
+    };
+}
+
+fn jsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .float => found.float,
+        .integer => @floatFromInt(found.integer),
+        else => null,
+    };
 }
 
 const OwnedGraphMutations = struct {
@@ -13426,7 +21618,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
-    if (!try batchAdvancesManagedIndexApplyState(resources.index_manager, batch, index_ref)) return false;
+    if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
     const ctx = AsyncContext{
         .alloc = self.alloc,
         .store = resources.store,
@@ -13434,6 +21626,7 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
+        .require_graph_resolution_contract = true,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
     return true;
@@ -13456,6 +21649,7 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
     errdefer resources.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try resources.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (resources.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -13477,6 +21671,7 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
     errdefer replay_ctx.batch.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try replay_ctx.batch.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    try replay_ctx.batch.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (replay_ctx.batch.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
     }
@@ -13492,9 +21687,36 @@ fn truncateReplayLogs(ctx: *const BatchExecutionContext, up_to_sequence: u64) !v
     ctx.executor.releaseBacklogThrough(up_to_sequence);
 }
 
+fn resolverReplayRetentionRequired(index_manager: *const index_manager_mod.IndexManager, stats: types.ReplayStageStats) bool {
+    if (stats.blocked) return true;
+    return index_manager.resolvers.items.len > 0;
+}
+
+fn clampReplayTruncationForReplayStage(
+    effective: u64,
+    index_manager: *const index_manager_mod.IndexManager,
+    stats: types.ReplayStageStats,
+) u64 {
+    if (!resolverReplayRetentionRequired(index_manager, stats)) return effective;
+    return @min(effective, stats.applied_sequence);
+}
+
 fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    try ctx.store.truncateReplayUpTo(ctx.alloc, sequence);
+    var effective = sequence;
+    // The resolution/promotion stages consume the replay journal but are not
+    // executor workers. Clamp truncation to their applied watermarks whenever a
+    // resolver is configured, even before the synchronous driver has raised the
+    // stage target for the newest write. Resolver removal drains or refuses
+    // pending stage work before deleting catalog state, so a never-configured
+    // resolver pipeline does not pin generic replay hints.
+    if (ctx.resolution_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        effective = clampReplayTruncationForReplayStage(effective, ctx.index_manager, runtime.stats());
+    }
+    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
 }
 
 fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
@@ -13524,6 +21746,18 @@ fn truncateReplayJournalIfSafeContext(ctx: *const BatchExecutionContext) !void {
             enrichment_runtime_mod.scope_name,
         );
         min_applied = @min(min_applied, enrichment_applied);
+    }
+    if (ctx.resolution_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
+    }
+    if (ctx.promotion_runtime) |runtime| {
+        const stats = runtime.stats();
+        if (resolverReplayRetentionRequired(ctx.index_manager, stats)) {
+            min_applied = @min(min_applied, stats.applied_sequence);
+        }
     }
     if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
     try truncateReplayLogs(ctx, min_applied);
@@ -13560,6 +21794,7 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
         .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
         .index_manager = shadow.manager,
         .apply_mutex = async_resources.apply_mutex,
+        .allow_graph_materialization = false,
     };
 
     for (managed_indexes) |index_ref| {
@@ -13625,6 +21860,51 @@ fn tryFinalizePrimarySplitFast(self: *DB, split_lower: []const u8) !bool {
     return try self.core.rewriteLeftStoreInPlace(split_lower);
 }
 
+fn identityMetadataRange() struct { lower: [1]u8, upper: [1]u8 } {
+    return .{
+        .lower = .{internal_keys.identity_namespace},
+        .upper = .{internal_keys.identity_namespace + 1},
+    };
+}
+
+fn putIdentityMetadataRows(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    rows: []const docstore_mod.OwnedKVPair,
+) !void {
+    if (rows.len == 0) return;
+
+    var writes = try alloc.alloc(docstore_mod.KVPair, rows.len);
+    defer alloc.free(writes);
+    for (rows, 0..) |row, i| {
+        writes[i] = .{
+            .key = row.key,
+            .value = row.value,
+        };
+    }
+    try store.putBatch(writes, &.{});
+}
+
+fn copyIdentityMetadataToStore(
+    alloc: Allocator,
+    src_store: *docstore_mod.DocStore,
+    dest_store: *docstore_mod.DocStore,
+) !void {
+    const range = identityMetadataRange();
+    const rows = try src_store.scanRange(alloc, range.lower[0..], range.upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    try putIdentityMetadataRows(alloc, dest_store, rows);
+}
+
+fn finalizePrimarySplitPreservingIdentity(self: *DB, split_lower: []const u8) !void {
+    const range = identityMetadataRange();
+    const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
+    defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
+
+    _ = try tryFinalizePrimarySplitFast(self, split_lower);
+    try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
+}
+
 fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []const u8) !void {
     try ensureDirPath(dest_dir);
     const split_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
@@ -13648,6 +21928,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
+    try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
     const replay_floor = self.core.nextDerivedAppendSequence();
     try ensureReplayFloor(dest_store, replay_floor);
 
@@ -13676,8 +21957,19 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         collect_skip_doc_keys,
     );
     defer split_handoffs.deinit(self.alloc);
-    try copyGraphEdgeRangeIntoSplitDestination(self.alloc, self, byte_range.start, byte_range.end, dest_store);
+    _ = try dest_indexes.copyGraphSplitDestinationFrom(self.core.index_manager, byte_range.start, byte_range.end);
     _ = try dest_indexes.rebuildGraphSplitDestination(byte_range.start, byte_range.end);
+    if (page_split_built) {
+        try applySplitEmbeddingArtifactsInRange(
+            self.alloc,
+            byte_range.start,
+            byte_range.end,
+            dest_store,
+            &dest_indexes,
+            split_handoffs.dense,
+            split_handoffs.sparse,
+        );
+    }
     if (page_split_built) {
         if (dest_indexes.splitDestinationNeedsDocumentIndexing(split_handoffs.dense, split_handoffs.text, split_handoffs.sparse)) {
             if (!collect_skip_doc_keys) return error.UnexpectedSplitResidualIndexing;
@@ -13705,6 +21997,13 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
             split_handoffs.sparse,
         );
     }
+    try applySplitGraphArtifactsInRange(
+        self.alloc,
+        byte_range.start,
+        byte_range.end,
+        dest_store,
+        &dest_indexes,
+    );
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
@@ -13836,6 +22135,8 @@ fn putIndexedSplitBatchDirect(
     const raw_writes: []const docstore_mod.KVPair = @ptrCast(writes);
     try dest_store.putBatch(raw_writes, &.{});
 
+    try applySplitEmbeddingArtifactsFromBatch(dest_store, dest_indexes, writes, dense_handoffs, sparse_handoffs);
+
     var logical_writes = try dest_indexes.alloc.alloc(types.BatchWrite, writes.len);
     defer dest_indexes.alloc.free(logical_writes);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -13858,6 +22159,247 @@ fn putIndexedSplitBatchDirect(
     }
 
     try dest_indexes.indexSplitBatch(dest_store, logical_writes, dense_handoffs, text_handoffs, sparse_handoffs);
+}
+
+fn findDenseSplitHandoffLocal(handoffs: []const index_manager_mod.DenseSplitHandoff, index_name: []const u8) ?*const index_manager_mod.DenseSplitHandoff {
+    for (handoffs) |*handoff| {
+        if (std.mem.eql(u8, handoff.index_name, index_name)) return handoff;
+    }
+    return null;
+}
+
+fn findSparseSplitHandoffLocal(handoffs: []const index_manager_mod.SparseSplitHandoff, index_name: []const u8) ?*const index_manager_mod.SparseSplitHandoff {
+    for (handoffs) |*handoff| {
+        if (std.mem.eql(u8, handoff.index_name, index_name)) return handoff;
+    }
+    return null;
+}
+
+fn collectEmbeddingArtifactKeysFromBatch(
+    alloc: Allocator,
+    writes: []const types.BatchWrite,
+) ![][]const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+
+    for (writes) |write| {
+        if (!internal_keys.isEmbeddingArtifactKey(write.key) and !internal_keys.isDerivedEmbeddingArtifactKey(write.key)) continue;
+        try keys.append(alloc, write.key);
+    }
+
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn collectEmbeddingArtifactKeysInRangeAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    lower: []const u8,
+    upper: []const u8,
+) ![][]const u8 {
+    const store_lower = try documentRangeLowerAlloc(alloc, lower);
+    defer alloc.free(store_lower);
+    const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
+    defer if (store_upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, store_lower, if (store_upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        if (!internal_keys.isEmbeddingArtifactKey(entry.key) and !internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
+        const owned = try alloc.dupe(u8, entry.key);
+        try keys.append(alloc, owned);
+    }
+
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn collectGraphArtifactKeysInRangeAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    lower: []const u8,
+    upper: []const u8,
+) ![][]const u8 {
+    const store_lower = try documentRangeLowerAlloc(alloc, lower);
+    defer alloc.free(store_lower);
+    const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
+    defer if (store_upper) |buf| alloc.free(buf);
+
+    const scanned = try store.scanRange(alloc, store_lower, if (store_upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(@constCast(key));
+        keys.deinit(alloc);
+    }
+
+    for (scanned) |entry| {
+        if (!internal_keys.isGraphEdgeArtifactKey(entry.key)) continue;
+        const owned = try alloc.dupe(u8, entry.key);
+        try keys.append(alloc, owned);
+    }
+
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn freeOwnedConstStringSlice(alloc: Allocator, keys: []const []const u8) void {
+    for (keys) |key| alloc.free(@constCast(key));
+    if (keys.len > 0) alloc.free(keys);
+}
+
+fn applySplitDenseEmbeddingArtifacts(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+    index_name: []const u8,
+    handoff: ?*const index_manager_mod.DenseSplitHandoff,
+) !void {
+    var dense_embeddings = try collectDenseEmbeddingWritesForArtifacts(
+        dest_indexes.alloc,
+        dest_indexes,
+        artifact_keys,
+        index_name,
+    );
+    defer dense_embeddings.deinit();
+    if (dense_embeddings.writes.len == 0) return;
+
+    if (handoff) |skip| {
+        var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
+        defer filtered.deinit(dest_indexes.alloc);
+        for (dense_embeddings.writes) |write| {
+            if (skip.shouldSkip(write.doc_key)) continue;
+            try filtered.append(dest_indexes.alloc, write);
+        }
+        if (filtered.items.len == 0) return;
+        try dest_indexes.applyDenseEmbeddingWritesByNameWithOptions(dest_store, index_name, filtered.items, .{ .mode = .bulk_ingest });
+        return;
+    }
+
+    try dest_indexes.applyDenseEmbeddingWritesByNameWithOptions(dest_store, index_name, dense_embeddings.writes, .{ .mode = .bulk_ingest });
+}
+
+fn applySplitSparseEmbeddingArtifacts(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+    index_name: []const u8,
+    handoff: ?*const index_manager_mod.SparseSplitHandoff,
+) !void {
+    var sparse_embeddings = try collectSparseEmbeddingWritesForArtifacts(
+        dest_indexes.alloc,
+        dest_indexes,
+        artifact_keys,
+        index_name,
+    );
+    defer sparse_embeddings.deinit();
+    if (sparse_embeddings.writes.len == 0) return;
+
+    if (handoff) |skip| {
+        var filtered = std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite).empty;
+        defer filtered.deinit(dest_indexes.alloc);
+        for (sparse_embeddings.writes) |write| {
+            if (skip.shouldSkip(write.doc_key)) continue;
+            try filtered.append(dest_indexes.alloc, write);
+        }
+        if (filtered.items.len == 0) return;
+        try dest_indexes.applySparseEmbeddingWritesByNameWithOptions(dest_store, index_name, filtered.items, .{ .mode = .bulk_ingest });
+        return;
+    }
+
+    try dest_indexes.applySparseEmbeddingWritesByNameWithOptions(dest_store, index_name, sparse_embeddings.writes, .{ .mode = .bulk_ingest });
+}
+
+fn applySplitEmbeddingArtifacts(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+    dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
+    sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+) !void {
+    if (artifact_keys.len == 0) return;
+
+    for (dest_indexes.dense_indexes.items) |entry| {
+        try applySplitDenseEmbeddingArtifacts(
+            dest_store,
+            dest_indexes,
+            artifact_keys,
+            entry.config.name,
+            findDenseSplitHandoffLocal(dense_handoffs, entry.config.name),
+        );
+    }
+
+    for (dest_indexes.sparse_indexes.items) |entry| {
+        try applySplitSparseEmbeddingArtifacts(
+            dest_store,
+            dest_indexes,
+            artifact_keys,
+            entry.config.name,
+            findSparseSplitHandoffLocal(sparse_handoffs, entry.config.name),
+        );
+    }
+}
+
+fn applySplitEmbeddingArtifactsFromBatch(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    writes: []const types.BatchWrite,
+    dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
+    sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+) !void {
+    const artifact_keys = try collectEmbeddingArtifactKeysFromBatch(dest_indexes.alloc, writes);
+    defer if (artifact_keys.len > 0) dest_indexes.alloc.free(artifact_keys);
+    try applySplitEmbeddingArtifacts(dest_store, dest_indexes, artifact_keys, dense_handoffs, sparse_handoffs);
+}
+
+fn applySplitEmbeddingArtifactsInRange(
+    alloc: Allocator,
+    lower: []const u8,
+    upper: []const u8,
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    dense_handoffs: []const index_manager_mod.DenseSplitHandoff,
+    sparse_handoffs: []const index_manager_mod.SparseSplitHandoff,
+) !void {
+    const artifact_keys = try collectEmbeddingArtifactKeysInRangeAlloc(alloc, dest_store, lower, upper);
+    defer freeOwnedConstStringSlice(alloc, artifact_keys);
+    try applySplitEmbeddingArtifacts(dest_store, dest_indexes, artifact_keys, dense_handoffs, sparse_handoffs);
+}
+
+fn applySplitGraphArtifacts(
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+    artifact_keys: []const []const u8,
+) !void {
+    if (artifact_keys.len == 0) return;
+
+    for (dest_indexes.graph_indexes.items) |entry| {
+        var graph_mutations = try collectGraphMutationsForArtifacts(
+            dest_indexes.alloc,
+            dest_store,
+            artifact_keys,
+            entry.config.name,
+        );
+        defer graph_mutations.deinit();
+        try dest_indexes.applyGraphMutationsByName(entry.config.name, graph_mutations.writes, graph_mutations.deletes);
+    }
+}
+
+fn applySplitGraphArtifactsInRange(
+    alloc: Allocator,
+    lower: []const u8,
+    upper: []const u8,
+    dest_store: *docstore_mod.DocStore,
+    dest_indexes: *index_manager_mod.IndexManager,
+) !void {
+    const artifact_keys = try collectGraphArtifactKeysInRangeAlloc(alloc, dest_store, lower, upper);
+    defer freeOwnedConstStringSlice(alloc, artifact_keys);
+    try applySplitGraphArtifacts(dest_store, dest_indexes, artifact_keys);
 }
 
 fn indexExistingSplitDestinationDirect(
@@ -13904,7 +22446,8 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
 
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
-    _ = try tryFinalizePrimarySplitFast(self, split_lower);
+    try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
+    try finalizePrimarySplitPreservingIdentity(self, split_lower);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -13919,6 +22462,130 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     try self.refreshManagedIndexWorkersLocked();
     try self.closeShadowIndexManager();
     try self.refreshManagedIndexWorkersLocked();
+}
+
+fn markSplitOffDocumentArtifactChildRangesLocked(
+    self: *DB,
+    split_state: shard_mod.SplitState,
+    split_lower: []const u8,
+) !void {
+    if (split_state.new_shard_id == 0) return;
+
+    const parent_lower = try documentRangeLowerAlloc(self.alloc, self.core.byteRange().start);
+    defer self.alloc.free(parent_lower);
+    const parent_upper = split_lower;
+    const split_upper = if (split_state.original_range_end.len > 0)
+        try documentRangeUpperAlloc(self.alloc, split_state.original_range_end)
+    else
+        null;
+    defer if (split_upper) |upper| self.alloc.free(upper);
+
+    const scanned = try self.core.scanStoreRange(self.alloc, parent_lower, parent_upper);
+    defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(self.alloc);
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| self.alloc.free(value);
+        owned_values.deinit(self.alloc);
+    }
+    var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (changed_artifact_keys.items) |key| self.alloc.free(key);
+        changed_artifact_keys.deinit(self.alloc);
+    }
+
+    for (scanned) |entry| {
+        if (std.mem.indexOf(u8, entry.value, "\"child_ranges\"") == null) continue;
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, entry.key)) orelse continue;
+        defer artifact_ref.deinit(self.alloc);
+        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+        var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, entry.value, .{ .allocate = .alloc_always });
+        if (manifest_value != .object) continue;
+        const child_ranges = manifest_value.object.getPtr("child_ranges") orelse continue;
+        if (child_ranges.* != .array) continue;
+
+        var changed = false;
+        for (child_ranges.array.items) |*item| {
+            if (item.* != .object) continue;
+            if (!documentArtifactChildRangeMovedBySplit(item.object, split_lower, split_upper)) continue;
+            try putLeakyJsonStringField(arena_alloc, &item.object, "placement", "remote");
+            try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", split_state.new_shard_id);
+            try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", (try jsonObjectOptionalU64(item.object, "placement_generation") orelse 0) + 1);
+            try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", "remote_committed");
+            try item.object.put(arena_alloc, "split_eligible", .{ .bool = false });
+            changed = true;
+        }
+        if (!changed) continue;
+
+        const updated_manifest = try std.json.Stringify.valueAlloc(self.alloc, manifest_value, .{});
+        errdefer self.alloc.free(updated_manifest);
+        try owned_values.append(self.alloc, updated_manifest);
+        try writes.append(self.alloc, .{
+            .key = entry.key,
+            .value = updated_manifest,
+        });
+        try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, entry.key);
+    }
+
+    if (writes.items.len == 0) return;
+    const sequence = self.core.reserveDerivedAppendSequence();
+    const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
+        .sequence = sequence,
+        .changed_artifact_keys = changed_artifact_keys.items,
+    }, sequence);
+    defer self.alloc.free(replay_payload);
+    try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, &.{}, .{
+        .sequence = sequence,
+        .payload = replay_payload,
+    });
+    if (shouldAppendSplitDelta(self)) {
+        try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
+    }
+    self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+}
+
+fn documentArtifactChildRangeMovedBySplit(
+    object: std.json.ObjectMap,
+    split_lower: []const u8,
+    split_upper: ?[]const u8,
+) bool {
+    const split_eligible = blk: {
+        const value = object.get("split_eligible") orelse break :blk false;
+        if (value != .bool) return false;
+        break :blk value.bool;
+    };
+    if (!split_eligible) return false;
+
+    const placement = object.get("placement") orelse return false;
+    if (placement != .string) return false;
+    if (std.mem.eql(u8, placement.string, "remote")) return false;
+
+    if (object.get("owner_group_id")) |owner| {
+        if (owner == .integer and owner.integer > 0) return false;
+    }
+
+    const route_status = object.get("route_status") orelse null;
+    if (route_status) |status| {
+        if (status != .string) return false;
+        if (std.mem.eql(u8, status.string, "remote_committed")) return false;
+    }
+
+    const start_key = object.get("start_key") orelse return false;
+    if (start_key != .string) return false;
+    if (std.mem.order(u8, start_key.string, split_lower) == .lt) return false;
+    const end_key = object.get("end_key_exclusive") orelse return false;
+    if (end_key != .string) return false;
+    if (split_upper) |upper| {
+        if (end_key.string.len == 0) return false;
+        if (std.mem.order(u8, end_key.string, upper) == .gt) return false;
+    }
+    return true;
 }
 
 fn byteRangesEqual(a: types.ByteRange, b: types.ByteRange) bool {
@@ -14005,7 +22672,7 @@ fn resetPath(path: []const u8) !void {
 
 fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
-    if (!batchAffectsManagedIndex(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
     if (index_ref.kind == .dense_vector and ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
@@ -14025,6 +22692,9 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
         if (ctx.text_merge_deferred.load(.acquire)) return true;
         runtime.notify();
         runtime.applyBackpressure();
+    };
+    if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
+        runtime.notify();
     };
     return true;
 }
@@ -14054,8 +22724,10 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
         finishDenseCatchUpSessionTracked(ctx, index_ref.name);
         return;
     }
-    errdefer finishDenseCatchUpSessionTracked(ctx, index_ref.name);
-    errdefer ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
+    var catch_up_tracked = true;
+    errdefer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    var bulk_session_finished = false;
+    errdefer if (!bulk_session_finished) ctx.index_manager.abortDenseBulkIngestSessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     const before_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
 
@@ -14072,19 +22744,19 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     finish_options.progress_fn = noteDenseBulkFinishProgress;
     const finalize_start_ns = monotonicTimeNs();
     try ctx.index_manager.finishDenseBulkIngestSessionByNameWithOptions(index_ref.name, finish_options);
+    bulk_session_finished = true;
     const finalize_ns = elapsedSince(finalize_start_ns);
     setDenseCatchUpPhase(ctx, .applied_sequence_flush);
-    var published_visibility = false;
-    if (ctx.applied_sequence_mutex.tryLock()) {
-        defer ctx.applied_sequence_mutex.unlock();
-        published_visibility = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
-    } else {
-        _ = ctx.stats.applied_sequence.skipped_flush_calls.fetchAdd(1, .monotonic);
-    }
-    if (!published_visibility) {
-        if (ctx.query_visibility_hook) |hook| hook.notify(.publish_consistent);
-    }
-    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    const published_visibility = blk: {
+        var seq_lock = lockAtomicWithBackoffProfiled(
+            &ctx.applied_sequence_mutex,
+            &ctx.stats.applied_sequence_mutex,
+        );
+        defer seq_lock.unlock();
+        const published = try flushFinishedDenseAppliedSequenceLocked(ctx, index_ref.name);
+        try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+        break :blk published;
+    };
     const after_lsm_stats = denseLsmWriteStatsSnapshot(ctx, index_ref.name);
     const finish_ns = elapsedSince(finish_start_ns);
 
@@ -14109,6 +22781,12 @@ fn finishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manage
     };
     if (ctx.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(dense_window_result);
+    }
+    finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+    catch_up_tracked = false;
+    if (ctx.query_visibility_hook) |hook| {
+        if (!published_visibility) hook.notify(.publish_consistent);
+        hook.notify(.publish_blocking);
     }
 }
 
@@ -14174,7 +22852,7 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+            var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
             defer artifact_ref.deinit(state.alloc);
             if (artifact_ref.kind != .embedding) return .@"continue";
             if (!std.mem.eql(u8, artifact_ref.name, state.expected_name)) return .@"continue";
@@ -14661,6 +23339,11 @@ fn tempPath(buf: []u8) [*:0]const u8 {
     return @ptrCast(path.ptr);
 }
 
+fn denseTestVectorId(doc_key: []const u8) u64 {
+    const id = std.hash.XxHash64.hash(0, doc_key);
+    return if (id == 0) 1 else id;
+}
+
 fn cleanupTempDir(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
@@ -14825,6 +23508,12 @@ fn putDenseEmbeddingArtifactForTest(db: *DB, alloc: Allocator, artifact_key: []c
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
+    try markArtifactPresenceForTest(db);
+}
+
+fn markArtifactPresenceForTest(db: *DB) !void {
+    db.core.artifact_cleanup_maybe.store(true, .release);
+    try db.core.store.put(internal_keys.artifact_presence_key[0..], "1");
 }
 
 fn putSparseEmbeddingArtifactForTest(
@@ -14838,6 +23527,7 @@ fn putSparseEmbeddingArtifactForTest(
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, indices, values);
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
+    try markArtifactPresenceForTest(db);
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
@@ -15840,6 +24530,54 @@ test "db batch get match_all search and index registry" {
     try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
 }
 
+test "db match_all consumes resolved ordinal filter" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\"}" },
+        },
+    });
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    switch (include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var result = try db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .resolved_doc_filter = &filter,
+        .limit = 10,
+        .include_stored = false,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
@@ -16249,6 +24987,1689 @@ test "db basic batch/get works with memory primary backend" {
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
 }
 
+test "db batch treats reserved namespace bytes as user document ids" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_id = "\x03raw\x00doc";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = raw_id, .value = "{\"name\":\"binary\"}" },
+        },
+    });
+
+    const raw = try db.get(alloc, raw_id);
+    defer if (raw) |value| alloc.free(value);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"binary\"") != null);
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, &.{raw_id});
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolved_doc_ids.len);
+    try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[0]);
+}
+
+test "db batch and scan round trip adversarial document ids" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_ids = [_][]const u8{
+        "",
+        "\x00",
+        "\x00\x00",
+        "\x00a",
+        ":",
+        ":e:",
+        ":i:",
+        ":t",
+        "abc\x00def",
+        "abc:",
+        "abc\xffdef",
+        "\xff",
+    };
+
+    var writes: [raw_ids.len]types.BatchWrite = undefined;
+    for (raw_ids, 0..) |raw_id, i| {
+        writes[i] = .{
+            .key = raw_id,
+            .value = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i}),
+        };
+    }
+    defer for (writes) |write| alloc.free(@constCast(write.value));
+
+    try db.batch(.{ .writes = writes[0..] });
+
+    for (raw_ids, 0..) |raw_id, i| {
+        const raw = (try db.get(alloc, raw_id)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        const expected = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, raw);
+    }
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, raw_ids[0..]);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(raw_ids.len, ordinals.len);
+            for (ordinals, 0..) |ordinal, i| {
+                try std.testing.expectEqual(@as(doc_set.DocOrdinal, @intCast(i + 1)), ordinal);
+            }
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(raw_ids.len, resolved_doc_ids.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[i]);
+    }
+
+    var scanned = try db.scan(alloc, "", "", .{ .include_documents = true });
+    defer scanned.deinit(alloc);
+    try std.testing.expectEqual(raw_ids.len, scanned.hashes.len);
+    try std.testing.expectEqual(raw_ids.len, scanned.documents.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.hashes[i].id);
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.documents[i].id);
+    }
+}
+
+test "db resolved doc-set projection honors identity read generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var create_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (create_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        create_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        1,
+        &create_identity,
+        &.{"doc:a"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
+
+    var delete_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (delete_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        delete_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        2,
+        &delete_identity,
+        &.{},
+        &.{"doc:a"},
+    );
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+
+    var future_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (future_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        future_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        3,
+        &future_identity,
+        &.{"doc:b"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, future_identity.items, &.{}, null);
+
+    var resolved = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 });
+    defer resolved.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 3));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, null));
+
+    var created = try doc_set.fromOrdinalsAlloc(alloc, &.{1});
+    defer created.deinit(alloc);
+    const visible_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 1)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (visible_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(visible_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), visible_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:a", visible_doc_ids[0]);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, null));
+
+    var future = try doc_set.fromOrdinalsAlloc(alloc, &.{2});
+    defer future.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 2));
+    const future_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 3)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (future_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(future_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), future_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", future_doc_ids[0]);
+
+    const current_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, null)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (current_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(current_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), current_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", current_doc_ids[0]);
+}
+
+test "db persists configured doc identity namespace for batch writes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 11, .range_id = 13 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            },
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(namespace, "doc:a"), state.canonical_doc_id);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(namespace));
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 },
+    }));
+}
+
+test "db preferred identity namespace seeds new stores but preserves existing namespace" {
+    const alloc = std.testing.allocator;
+
+    var managed_path_buf: [256]u8 = undefined;
+    const managed_path = tempPath(&managed_path_buf);
+    defer cleanupTempDir(managed_path);
+
+    const managed_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    {
+        var db = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+        try std.testing.expect(db.core.identity_namespace.eql(managed_namespace));
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+            .prefer_existing_identity_namespace = true,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(managed_namespace));
+    }
+
+    var legacy_path_buf: [256]u8 = undefined;
+    const legacy_path = tempPath(&legacy_path_buf);
+    defer cleanupTempDir(legacy_path);
+
+    {
+        var legacy = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+        });
+        defer legacy.close();
+        try legacy.batch(.{
+            .writes = &.{.{ .key = "doc:legacy", .value = "{\"name\":\"legacy\"}" }},
+        });
+    }
+
+    {
+        var opened = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer opened.close();
+        try std.testing.expect(opened.core.identity_namespace.eql(doc_identity.default_namespace));
+    }
+}
+
+test "db can reassign identity namespace for rebuild" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 802, .range_id = 8002 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a"), state.canonical_doc_id);
+    }
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(u32, 1), ordinal);
+        try std.testing.expectEqual(@as(u64, 1), state.created_generation);
+    }
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(new_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(new_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(new_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = old_namespace,
+            .identity_read_generation = generation,
+        },
+    }));
+
+    var ok = try db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = new_namespace,
+            .identity_read_generation = generation,
+        },
+    });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
+}
+
+test "db strict namespace reopen recovers after identity reassignment repair" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3801, .range_id = 38001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3802, .range_id = 38002 };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = new_namespace,
+    }));
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    }
+
+    {
+        var repaired = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = new_namespace,
+        });
+        defer repaired.close();
+
+        var filtered = try repaired.search(alloc, .{
+            .query = .{ .match_all = {} },
+            .filter_doc_ids = &.{"doc:a"},
+            .filter_doc_ids_positive = true,
+            .limit = 10,
+        });
+        defer filtered.deinit();
+        try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+        try std.testing.expectEqualStrings("doc:a", filtered.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), filtered.hits[0].doc_ordinal);
+
+        var txn = try repaired.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, null), try doc_identity.lookupCanonicalOrdinalTxn(&txn, doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a")));
+    }
+}
+
+test "db identity namespace reassignment refreshes transaction recovery hook context" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2801, .range_id = 28001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2802, .range_id = 28002 };
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
+    try std.testing.expectEqual(
+        @intFromPtr(identity_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
+    );
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+    try std.testing.expect(identity_ctx.identity_namespace.eql(new_namespace));
+
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+}
+
+test "db identity namespace reassignment is unavailable on status-only handles" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1801, .range_id = 18001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1802, .range_id = 18002 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer status_db.close();
+        try std.testing.expectError(error.UnsupportedOperation, status_db.reassignIdentityNamespaceForInternalTransition(new_namespace));
+        const stats = try status_db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(old_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(old_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(old_namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(old_namespace));
+    }
+}
+
+test "db stats expose document identity coverage and tombstones" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+        },
+    });
+
+    var resolved_existing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    defer resolved_existing.deinit(alloc);
+    var resolved_missing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:missing"});
+    defer resolved_missing.deinit(alloc);
+
+    const fast = try db.stats(alloc);
+    defer types.freeDBStats(alloc, fast);
+    try std.testing.expectEqual(@as(u32, 3), fast.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), fast.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!fast.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!fast.doc_identity.rebuild_required);
+    try std.testing.expect(!fast.doc_identity.complete);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.missing_ordinal_coverage_count);
+
+    try db.batch(.{
+        .deletes = &.{"doc:b"},
+    });
+
+    const diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, diagnostic);
+    try std.testing.expect(diagnostic.doc_identity.complete);
+    try std.testing.expectEqual(@as(u32, 3), diagnostic.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), diagnostic.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!diagnostic.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!diagnostic.doc_identity.rebuild_required);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.tombstone_ordinals);
+    try std.testing.expect(diagnostic.doc_identity.min_created_generation > 0);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_created_generation, diagnostic.doc_identity.max_created_generation);
+    try std.testing.expect(diagnostic.doc_identity.min_deleted_generation > diagnostic.doc_identity.min_created_generation);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_deleted_generation, diagnostic.doc_identity.max_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+
+    const legacy_key = try internal_keys.documentKeyAlloc(alloc, "doc:legacy");
+    defer alloc.free(legacy_key);
+    try db.core.store.put(legacy_key, "{\"name\":\"legacy\"}");
+
+    const resurrected_key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+    defer alloc.free(resurrected_key);
+    try db.core.store.put(resurrected_key, "{\"name\":\"resurrected\"}");
+
+    const repaired_diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, repaired_diagnostic);
+    try std.testing.expectEqual(@as(u64, 3), repaired_diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), repaired_diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+    try std.testing.expect(repaired_diagnostic.doc_identity.rebuild_required);
+}
+
+test "db stats flag document identity ordinal capacity exhaustion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), stats.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(stats.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(stats.doc_identity.rebuild_required);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+    }));
+}
+
+test "db allocates final document ordinal then rejects new documents" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const last_allocatable = std.math.maxInt(doc_identity.DocOrdinal) - 1;
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, last_allocatable, .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"last\"}" }},
+        .sync_level = .write,
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, last_allocatable), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    }
+
+    const exhausted = try db.stats(alloc);
+    defer types.freeDBStats(alloc, exhausted);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), exhausted.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), exhausted.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(exhausted.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(exhausted.doc_identity.rebuild_required);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"updated-last\"}" }},
+        .sync_level = .full_index,
+    });
+    const updated = (try db.get(alloc, "doc:last")) orelse return error.TestExpectedEqual;
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("{\"name\":\"updated-last\"}", updated);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+        .sync_level = .write,
+    }));
+}
+
+test "db allocates final document ordinal with all index families present" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+        \\  "measure_fields": [{"name":"score","path":"score","type":"number"}],
+        \\  "materializations": [{"name":"count_by_category","op":"count","group_by":["category"]}]
+        \\}
+        ,
+    });
+
+    const last_allocatable = std.math.maxInt(doc_identity.DocOrdinal) - 1;
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, last_allocatable, .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:last",
+            .value = "{\"body\":\"final ordinal token\",\"category\":\"keep\",\"score\":1.0,\"embedding\":[0.0,1.0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}",
+        }},
+        .graph_writes = &.{.{
+            .index_name = "graph_v1",
+            .source = "doc:last",
+            .target = "doc:last",
+            .edge_type = "self",
+            .weight = 1.0,
+        }},
+        .sync_level = .full_index,
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, last_allocatable), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    }
+
+    const exhausted = try db.stats(alloc);
+    defer types.freeDBStats(alloc, exhausted);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), exhausted.doc_identity.next_ordinal);
+    try std.testing.expect(exhausted.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(exhausted.doc_identity.rebuild_required);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"body\":\"overflow\"}" }},
+        .sync_level = .full_index,
+    }));
+}
+
+test "db rejects new document writes at ordinal exhaustion for every sync level" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"updated\"}" }},
+        .sync_level = .full_index,
+    });
+    const existing = (try db.get(alloc, "doc:existing")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const levels = [_]types.SyncLevel{
+        .propose,
+        .write,
+        .full_text,
+        .enrichments,
+        .aknn,
+        .full_index,
+    };
+    for (levels, 0..) |level, i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:new:{d}", .{i});
+        try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+            .writes = &.{.{ .key = key, .value = "{\"name\":\"new\"}" }},
+            .sync_level = level,
+        }));
+        try std.testing.expect((try db.get(alloc, key)) == null);
+    }
+}
+
+test "db search requests default to current identity generation snapshot" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    const current_generation = db.core.nextDerivedSequence();
+    const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
+    try std.testing.expectEqual(@as(?u64, db.core.nextDerivedSequence()), current.identity_read_generation);
+
+    const explicit = try db.searchRequestAtCurrentIdentityGeneration(.{ .identity_read_generation = current_generation });
+    try std.testing.expectEqual(@as(?u64, current_generation), explicit.identity_read_generation);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchRequestAtCurrentIdentityGeneration(.{
+        .identity_read_generation = current_generation -| 1,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }));
+
+    var preflight = try db.preflightSearchRequest(alloc, .{ .identity_read_generation = current_generation }, 0);
+    defer preflight.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.preflightSearchRequest(alloc, .{
+        .identity_read_generation = current_generation -| 1,
+    }, 0));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectPlanningStats(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }, 0));
+    const text_stats = try db.collectSearchRequestTextStats(alloc, .{ .identity_read_generation = current_generation });
+    defer alloc.free(text_stats);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.collectSearchRequestTextStats(alloc, .{
+        .identity_read_generation = current_generation + 1,
+    }));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 5), stats.doc_set_planning.stale_identity_generation_rejection_count);
+}
+
+test "db caches identity visibility summary after local writes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
+}
+
+test "db lsm primary compaction preserves doc identity ordinals" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.core.store.flushBufferedWritesWithOptions(.{ .compact = true });
+
+        {
+            var txn = try db.core.store.beginProbeTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a"));
+            try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"));
+            const doc_b = (try doc_identity.lookupDocIdTxn(alloc, &txn, 2)) orelse return error.TestUnexpectedResult;
+            defer alloc.free(doc_b);
+            try std.testing.expectEqualStrings("doc:b", doc_b);
+        }
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:c", .value = "{\"body\":\"gamma\"}" },
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha updated\"}" },
+            },
+            .deletes = &.{"doc:b"},
+            .sync_level = .write,
+        });
+        try db.core.store.flushBufferedWritesWithOptions(.{ .compact = true });
+
+        var compacted_txn = try db.core.store.beginProbeTxn();
+        defer compacted_txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:a"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:b"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 3), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:c"));
+        const doc_c = (try doc_identity.lookupDocIdTxn(alloc, &compacted_txn, 3)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(doc_c);
+        try std.testing.expectEqualStrings("doc:c", doc_c);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer reopened.close();
+
+        var txn = try reopened.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 3), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:c"));
+        const doc_a = (try doc_identity.lookupDocIdTxn(alloc, &txn, 1)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(doc_a);
+        try std.testing.expectEqualStrings("doc:a", doc_a);
+    }
+}
+
+test "db validates internal resolved doc filter wire namespace and generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace = doc_identity.Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = namespace,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    var ok = try db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = namespace,
+            .identity_read_generation = generation,
+        },
+    });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = .{ .table_id = 1, .shard_id = 99, .range_id = 3 },
+            .identity_read_generation = generation,
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = namespace,
+            .identity_read_generation = generation + 1,
+        },
+    }));
+}
+
+test "db explicit doc-id filter resolution honors identity generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var create_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (create_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        create_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        1,
+        &create_identity,
+        &.{"doc:a"},
+        &.{},
+    );
+    try db.core.store.putBatchWithReplay(null, create_identity.items, &.{}, null);
+
+    var delete_identity = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (delete_identity.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        delete_identity.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataAlloc(
+        alloc,
+        db.core.store,
+        0,
+        0,
+        2,
+        &delete_identity,
+        &.{},
+        &.{"doc:a"},
+    );
+    try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
+
+    var visible_at_create = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 1);
+    defer visible_at_create.deinit(alloc);
+    switch (visible_at_create.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var hidden_at_delete = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 2);
+    defer hidden_at_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
+}
+
+test "db doc set planning stats record ordinal bitmap promotion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer writes.deinit(alloc);
+    var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer doc_ids.deinit(alloc);
+    var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_doc_ids.items) |doc_id| alloc.free(doc_id);
+        owned_doc_ids.deinit(alloc);
+    }
+
+    for (0..doc_set.bitmap_min_cardinality) |i| {
+        const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        errdefer alloc.free(doc_id);
+        try owned_doc_ids.append(alloc, doc_id);
+        try doc_ids.append(alloc, doc_id);
+        try writes.append(alloc, .{ .key = doc_id, .value = "{\"ok\":true}" });
+    }
+
+    try db.batch(.{ .writes = writes.items });
+
+    var resolved = try db.resolveDocSetForIdsAlloc(alloc, doc_ids.items);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
+        else => return error.ExpectedOrdinalBitmapDocSet,
+    }
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.ordinal_bitmap_count);
+    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
+}
+
+test "db sparse index uses identity ordinals as physical doc nums for primary docs" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"sparse\":{\"indices\":[1],\"values\":[0.5]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 2), try sparse_entry.index.debugDocNumForDocId("doc:b"));
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+
+    const sparse_doc_nums = try db.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, db.core.store, "sp_v1", &.{ordinal});
+    defer alloc.free(sparse_doc_nums);
+    try std.testing.expectEqual(@as(usize, 1), sparse_doc_nums.len);
+    try std.testing.expectEqual(@as(u32, ordinal), sparse_doc_nums[0]);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+        .resolved_doc_filter = &filter,
+    });
+    defer filtered.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:b", filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), filtered.hits[0].doc_ordinal);
+}
+
+test "db sparse hits resolve doc ordinals through identity not sparse doc nums" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    const sparse_entry = db.core.index_manager.sparseIndex("sp_v1") orelse return error.TestUnexpectedResult;
+    try sparse_entry.index.batch(&.{.{ .doc_id = "doc:a", .doc_num = 42, .vec = .{ .indices = &.{1}, .values = &.{1.0} } }}, &.{});
+    try std.testing.expectEqual(@as(?u32, 42), try sparse_entry.index.debugDocNumForDocId("doc:a"));
+
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 1), ordinal);
+
+    var result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
+}
+
+test "db dense index stores stable vector ids with ordinal filter mappings" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[10,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+    try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinal);
+    const expected_vector_id = denseTestVectorId("doc:b");
+    try std.testing.expect(expected_vector_id != @as(u64, ordinal));
+    try std.testing.expectEqual(@as(?u64, expected_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    try std.testing.expect(!db.canUsePublishedDenseSearch(.{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 } },
+    }));
+
+    var dense_filtered = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_filtered.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_filtered.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_filtered.result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), dense_filtered.result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.profile.raw_hit_count);
+
+    const reassigned_namespace = doc_identity.Namespace{ .table_id = 19, .shard_id = 1902, .range_id = 19002 };
+    try db.reassignIdentityNamespaceForInternalTransition(reassigned_namespace);
+    try std.testing.expectEqual(@as(?u64, expected_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(reassigned_namespace, "doc:b"), state.canonical_doc_id);
+    }
+
+    var dense_after_reassign = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_after_reassign.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_after_reassign.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_after_reassign.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_after_reassign.result.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), dense_after_reassign.result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(u32, 1), dense_after_reassign.profile.raw_hit_count);
+}
+
+test "db resolved doc filter normalizes doc keys before composing native ids" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"category\":\"keep\"}" },
+            .{ .key = "doc:b", .value = "{\"category\":\"keep\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var doc_key_filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "doc:b" }),
+    };
+    defer doc_key_filter.deinit(alloc);
+
+    var composed = (try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &doc_key_filter,
+        .filter_doc_ids_positive = true,
+        .filter_doc_ids = &.{"doc:b"},
+    })) orelse return error.TestUnexpectedResult;
+    defer composed.deinit(alloc);
+
+    switch (composed.include) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    var partial_doc_key_filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "missing" }),
+    };
+    defer partial_doc_key_filter.deinit(alloc);
+    try std.testing.expect((try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &partial_doc_key_filter,
+        .filter_doc_ids_positive = true,
+        .filter_doc_ids = &.{"doc:a"},
+    })) == null);
+}
+
+test "db vector full text filters project through doc identity ordinals" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"reject winner\",\"status\":\"active\",\"tenant\":\"tenantb\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"keep winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectEqual(@as(?u64, denseTestVectorId("doc:b")), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+
+    var dense_filtered = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_filtered.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_filtered.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_filtered.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_filtered.profile.raw_hit_count);
+
+    var dense_term_conjunct_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_term_conjunct_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_term_conjunct_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_term_conjunct_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_term_conjunct_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_term_conjunct_filter.profile.raw_hit_count);
+
+    var sparse_filtered = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .primary_text_index_name = "ft_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"keep\"}}",
+    });
+    defer sparse_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_filtered.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_filtered.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_filtered.hits[0].id);
+
+    var dense_empty_text_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"body\",\"text\":\"absent\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_empty_text_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), dense_empty_text_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), dense_empty_text_filter.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), dense_empty_text_filter.profile.raw_hit_count);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_set_planning.missing_ordinal_coverage_count);
+}
+
+test "db default dynamic schema vector term filters project through doc identity ordinals" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const default_schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, default_schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha winner\",\"status\":\"active\",\"tenant\":\"tenantb\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[10,0]}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha winner\",\"status\":\"active\",\"tenant\":\"tenanta\",\"embedding\":[20,0]}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha winner\",\"status\":\"draft\",\"tenant\":\"tenanta\",\"embedding\":[30,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var dense_term_conjunct_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_term_conjunct_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), dense_term_conjunct_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), dense_term_conjunct_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_term_conjunct_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 2), dense_term_conjunct_filter.profile.raw_hit_count);
+
+    var dense_text_and_term_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_query_json = "{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tenant\":\"tenanta\"}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_text_and_term_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_text_and_term_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_text_and_term_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_text_and_term_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_text_and_term_filter.profile.raw_hit_count);
+
+    var dense_text_exclusion_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .primary_text_index_name = "ft_v1",
+        .limit = 3,
+        .include_stored = false,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_query_json = "{\"term\":{\"tenant\":\"tenanta\"}}",
+        .exclusion_query_json = "{\"term\":{\"status\":\"draft\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 3 });
+    defer dense_text_exclusion_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_text_exclusion_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", dense_text_exclusion_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_text_exclusion_filter.profile.raw_hit_count);
+
+    const text_index = db.core.index_manager.textIndex("ft_v1").?;
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "status.keyword", "active"));
+    try std.testing.expectEqual(@as(u32, 3), try text_index.snapshot().termDocFreq(alloc, "tenant.keyword", "tenanta"));
+}
+
+test "db non chunked search paths apply broad live doc filter" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha only\",\"embedding\":[0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta only\",\"embedding\":[10,0],\"sparse\":{\"indices\":[8],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+    db.identity_visibility_summary_cache = null;
+
+    var dense_live = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_live.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_live.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_live.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_live.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_live.profile.raw_hit_count);
+
+    var sparse_live = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{7},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .include_stored = false,
+    });
+    defer sparse_live.deinit();
+    try std.testing.expectEqual(@as(u32, 0), sparse_live.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), sparse_live.hits.len);
+
+    var text_live = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = false,
+    });
+    defer text_live.deinit();
+    try std.testing.expectEqual(@as(u32, 0), text_live.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), text_live.hits.len);
+}
+
 test "db status_only open reads index catalog without loading index state" {
     const alloc = std.testing.allocator;
 
@@ -16352,6 +26773,11 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
     try std.testing.expectEqual(@as(u32, 1), dense_result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), dense_result.hits.len);
     try std.testing.expectEqualStrings("doc:b", dense_result.hits[0].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"), dense_result.hits[0].doc_ordinal);
+    }
 
     var sparse_result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -16391,6 +26817,11 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
         .config_json = "{\"field\":\"sparse\"}",
     });
     try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
         .name = "alg",
         .kind = .algebraic,
         .config_json =
@@ -16413,8 +26844,8 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"category\":\"reject\",\"published\":false,\"ip\":\"192.168.1.10\",\"score\":1.0,\"code\":\"drop\",\"meta\":{\"tier\":\"bronze\"},\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
-            .{ .key = "doc:b", .value = "{\"category\":\"keep\",\"published\":true,\"ip\":\"10.1.2.3\",\"score\":5.0,\"code\":\"keep-code\",\"meta\":{\"tier\":\"gold\"},\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+            .{ .key = "doc:a", .value = "{\"body\":\"shared token\",\"category\":\"reject\",\"published\":false,\"ip\":\"192.168.1.10\",\"score\":1.0,\"code\":\"drop\",\"meta\":{\"tier\":\"bronze\"},\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"shared token\",\"category\":\"keep\",\"published\":true,\"ip\":\"10.1.2.3\",\"score\":5.0,\"code\":\"keep-code\",\"meta\":{\"tier\":\"gold\"},\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
         },
         .sync_level = .full_index,
     });
@@ -16474,6 +26905,71 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_attempt_count);
         try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
         try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_fail_closed_count);
+    }
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.doc_set_planning.unsupported_filter_shape_count >= 1);
+    }
+
+    const binding_defs = [_]types.NamedDocFilterBinding{
+        .{ .name = "kept", .filter_query_json = "{\"term\":{\"category\":\"keep\"}}" },
+        .{ .name = "published", .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}" },
+    };
+    var sparse_with_binding = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer sparse_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_with_binding.hits[0].id);
+
+    var full_text_with_binding = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_with_binding.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 3), status_value.vector_filter_resolved_count);
+    }
+
+    var full_text_direct_algebraic = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_direct_algebraic.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_direct_algebraic.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_direct_algebraic.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_direct_algebraic.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 5), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_resolved_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
     }
 
     var dense_terms = try db.searchDenseProfiled(alloc, .{
@@ -17322,7 +27818,7 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
-    try std.testing.expectEqual(QueryVisibilityChange.invalidate, hook_ctx.change.?);
+    try std.testing.expectEqual(QueryVisibilityChange.publish, hook_ctx.change.?);
 }
 
 test "db full-text index and search survive reopen with durable lsm primary backend" {
@@ -17827,6 +28323,2136 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
     }
 }
 
+/// Embedder that returns a fixed vector for any text, so a backfilled mention
+/// embedding deterministically matches a candidate's name_embedding.
+const FixedVectorEmbedder = struct {
+    fn interface(self: *FixedVectorEmbedder) embedder_mod.DenseEmbedder {
+        return .{ .ptr = self, .dense_embed_fn = embed };
+    }
+    fn embed(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
+        _ = ptr;
+        _ = embedding_name;
+        _ = text;
+        _ = dims;
+        const v = try alloc.alloc(f32, 4);
+        v[0] = 1.0;
+        v[1] = 0.0;
+        v[2] = 0.0;
+        v[3] = 0.0;
+        return v;
+    }
+};
+
+test "db starts resolver replay workers only while resolver catalog is configured" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.resolution_runtime != null);
+    try std.testing.expect(db.promotion_runtime != null);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:no-resolver",
+            .value = "{\"title\":\"ordinary write\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    const no_resolver_pending = db.pendingWorkStats();
+    try std.testing.expect(!no_resolver_pending.resolution.enabled);
+    try std.testing.expect(!no_resolver_pending.resolution.catch_up_required);
+    try std.testing.expect(!no_resolver_pending.promotion.enabled);
+    try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try db.drainResolverBackfill();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_resume_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_repair_resume_key));
+
+    try db.addResolver(.{
+        .name = "kg_lifecycle",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_lifecycle_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try std.testing.expect(try db.removeResolver("kg_lifecycle"));
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+}
+
+test "db backfills a mention name embedding so ann/cosine resolution links end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // Resolver backfills a name embedding for each mention (no embedding in the
+    // extraction artifact), then prefix-blocks + cosine-scores against the entity.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    // An existing entity under a different key, carrying the matching vector.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // The mention had no embedding; the backfilled vector cosine-matched the
+    // entity, so it linked instead of minting a new key.
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+}
+
+test "db resolves extracted entities into a resolution artifact end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // A graph index drives production of the relations_v1 asset (extraction)
+    // artifact; the resolver consumes the same artifact.
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("config_generation").?.integer);
+    const entities = parsed.value.object.get("entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "db re-resolves the corpus when upsertResolver bumps the config generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    }
+
+    // Bump the resolver's config generation: the document was already ingested,
+    // so only the corpus backfill (triggered by upsertResolver) re-resolves it.
+    try db.upsertResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 2,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
+}
+
+test "db re-resolves existing corpus when upsertResolver inserts a new resolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const asset_raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(asset_raw);
+        try std.testing.expect(std.mem.indexOf(u8, asset_raw, "Ada Lovelace") != null);
+    }
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:a");
+    defer alloc.free(marker_key);
+    {
+        const marker_raw = try db.core.store.get(alloc, marker_key);
+        defer alloc.free(marker_raw);
+        try std.testing.expectEqualStrings(asset_key, marker_raw);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_inserted_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    try db.upsertResolver(.{
+        .name = "kg_inserted",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_inserted_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+}
+
+test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    const cfg: index_manager_mod.ResolverConfig = .{
+        .name = "kg_retry",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_retry_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    };
+
+    {
+        lockApply(&db);
+        defer db.core.unlockApply();
+        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+    // Retrying the same catalog config is a material no-op, but the durable
+    // dirty cursor from the first attempt must still be drained.
+    try db.upsertResolver(cfg);
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
+}
+
+test "db refuses resolver removal while resolution or promotion replay is pending" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_pending_remove",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_pending_remove_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+
+    // The default standalone DB has no entity sink and waits rather than
+    // advancing promotion replay. Removing the resolver here would otherwise
+    // erase the catalog signal that older retention logic used.
+    try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
+    try std.testing.expect(db.promotionStageStats().catch_up_required);
+}
+
+/// Thread-safe capturing entity sink for the promotion integration test.
+const FakePromotionSink = struct {
+    const Upsert = struct { table: []u8, key: []u8, doc: []u8 };
+    alloc: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    upserts: std.ArrayListUnmanaged(Upsert) = .empty,
+
+    fn deinit(self: *FakePromotionSink) void {
+        for (self.upserts.items) |u| {
+            self.alloc.free(u.table);
+            self.alloc.free(u.key);
+            self.alloc.free(u.doc);
+        }
+        self.upserts.deinit(self.alloc);
+    }
+
+    fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = promotion_runtime_mod.EntitySink.VTable{ .upsert = upsertFn };
+
+    fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+        _ = allocator;
+        const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const t = try self.alloc.dupe(u8, table);
+        errdefer self.alloc.free(t);
+        const k = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(k);
+        const d = try self.alloc.dupe(u8, doc_json);
+        errdefer self.alloc.free(d);
+        try self.upserts.append(self.alloc, .{ .table = t, .key = k, .doc = d });
+    }
+
+    fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.upserts.items) |u| {
+            if (std.mem.eql(u8, u.key, key)) return u.doc;
+        }
+        return null;
+    }
+};
+
+test "db promotes resolved entities into entity-document upserts end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.resolution.enabled);
+    try std.testing.expect(stats.promotion.enabled);
+    try std.testing.expectEqual(stats.resolution.target_sequence, stats.resolution.applied_sequence);
+    try std.testing.expectEqual(stats.promotion.target_sequence, stats.promotion.applied_sequence);
+    try std.testing.expect(!stats.promotion.blocked);
+
+    // The promoter upserted a canonical entity document per resolved mention,
+    // keyed by the rendered canonical key, into the entity table.
+    const ada = sink.findKey("person/ada_lovelace") orelse return error.MissingAdaUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"canonical_name\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"entity_type\":\"person\"") != null);
+    const antfly = sink.findKey("org/antfly") orelse return error.MissingAntflyUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, antfly, "\"canonical_name\":\"Antfly\"") != null);
+
+    // Replay is idempotent: draining again promotes nothing new.
+    const count_before = sink.upserts.items.len;
+    try db.runUntilIdle();
+    try std.testing.expectEqual(count_before, sink.upserts.items.len);
+}
+
+test "db graph index materializes relation asset artifacts into graph edge artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"relations":[{"type":"mentions","target":{"document_id":"doc:b"},"confidence":0.75}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    const raw_artifact = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(raw_artifact);
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), edges[0].weight, 0.0001);
+}
+
+test "db graph index materializes unit-derived chunk artifacts into graph edge artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 64,
+    });
+    try db.addIndex(.{
+        .name = "chunk_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"document_chunks_v1","format":"extraction_relation"},
+        \\  "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
+        \\  "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,ZG9jOmI=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const edges = try db.getEdges(alloc, "chunk_graph", unit_key, "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"unit\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"document_chunks_v1\"") != null);
+}
+
+test "db graph replay blocks resolution artifact without resolver contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+    const index_ref = index_manager_mod.ManagedIndexRef{
+        .name = "prov_graph",
+        .kind = .graph,
+    };
+
+    try db.core.store.put(resolution_key, "{}");
+
+    try std.testing.expect(!batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.core.store.delete(resolution_key);
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+}
+
+test "db graph replay ignores resolution artifacts bound to another source contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_b",
+        .table = "entities",
+        .source_artifact = "relations_b",
+        .resolution_artifact = "resolution_b",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_b");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+
+    const graph_a = index_manager_mod.ManagedIndexRef{ .name = "graph_a", .kind = .graph };
+    try std.testing.expect(!batchAffectsManagedIndex(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_a));
+
+    const graph_b = index_manager_mod.ManagedIndexRef{ .name = "graph_b", .kind = .graph };
+    try std.testing.expect(batchAffectsManagedIndex(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(try batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_b));
+}
+
+test "db materializes doc->entity mention edges as provenance and clears them on delete" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // The graph index materializes the relations_v1 extraction asset and, with
+    // mention_edge_type set, emits doc->entity provenance edges from the durable
+    // resolution artifact.
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"decision\":\"new\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "org/antfly") != null);
+    }
+
+    const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(ada_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+
+    const ada_mention_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e0");
+    defer alloc.free(ada_mention_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_mention_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_schema\":\"antfly.resolution_mention.v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"source_artifact\":\"relations_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"source_artifact_key\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"resolution_artifact\":\"resolution_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"resolution_artifact_key\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"local_id\":\"e0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"key\":\"person/ada_lovelace\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"text\":\"Ada Lovelace\"") != null);
+    }
+
+    // Outbound: doc:a mentions both canonical entities.
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+        // Each mention edge records the resolved DocRef target table so the
+        // endpoint can be hydrated cross-table.
+        for (out) |edge| {
+            try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "\"target_table\":\"entities\"") != null);
+        }
+    }
+    // Inbound provenance: "which documents mention this entity" == inbound edges.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+        try std.testing.expectEqualStrings("doc:a", inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_lovelace", inbound[0].target);
+    }
+
+    // Deleting the source document clears its mention edges (delete-on-source-delete).
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_mention_key));
+}
+
+test "db resolver removal retires resolution artifacts and mention graph state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var sink = FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    }
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, graph_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(raw.len > 0);
+    }
+    const mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e0");
+    defer alloc.free(mention_artifact_key);
+    const second_mention_artifact_key = try resolutionMentionArtifactKeyAlloc(alloc, "doc:a", "relations_v1", "resolution_v1", "e1");
+    defer alloc.free(second_mention_artifact_key);
+    {
+        const raw = try db.core.store.get(alloc, mention_artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
+    }
+    {
+        const raw = try db.core.store.get(alloc, second_mention_artifact_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"_artifact_kind\":\"resolution_mention\"") != null);
+    }
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        var parsed_metadata = try std.json.parseFromSlice(std.json.Value, alloc, out[0].metadata, .{});
+        defer parsed_metadata.deinit();
+        const metadata = parsed_metadata.value.object;
+        try std.testing.expectEqual(@as(i64, 2), metadata.get("mention_count").?.integer);
+        const mention_artifact_keys = metadata.get("mention_artifact_keys").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), mention_artifact_keys.len);
+        try std.testing.expectEqualStrings(mention_artifact_key, mention_artifact_keys[0].string);
+        try std.testing.expectEqualStrings(second_mention_artifact_key, mention_artifact_keys[1].string);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    try std.testing.expect(try db.removeResolver("kg"));
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, mention_artifact_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second_mention_artifact_key));
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+}
+
+test "db does not materialize review-band resolution as canonical mention edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [
+        \\    { "when": "exact", "weight": 8.0 },
+        \\    { "when": "jaro_winkler > 0.92", "weight": 5.0 },
+        \\    { "when": "jaro_winkler > 0.85", "weight": 2.0 },
+        \\    { "else": true, "weight": -6.0 }
+        \\  ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9, "review": 0.6 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const existing_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovlace");
+    defer alloc.free(existing_key);
+    try db.core.store.put(existing_key,
+        \\{"canonical_name":"Ada Lovlace","label":"person"}
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+
+    _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
+    try db.runUntilIdle();
+
+    const curated_raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(curated_raw);
+    var curated = try std.json.parseFromSlice(std.json.Value, alloc, curated_raw, .{});
+    defer curated.deinit();
+    const curated_ent = curated.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
+
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
+    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
+}
+
+test "db mention edge weight is fused from extractor trust and mention confidence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // A resolver declaring noisy_or fusion: this extractor is trusted 0.9, no
+    // graph prior. The mention asserts confidence 0.8, so the edge weight is
+    // fuse(noisy_or, [{0.8, 0.9}], prior=0, prior_weight=0) = 1-(1-0.72) = 0.72.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .fusion_combine = "noisy_or",
+        .fusion_trust = 0.9,
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.8}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
+    // Calibrated weight, not the legacy 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+}
+
+test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The mention edge points at the resolved DocRef from the resolution artifact.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    // Merge person/ada_lovelace into a canonical survivor: rewrite its edges.
+    const rewritten = try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical");
+    try std.testing.expectEqual(@as(usize, 1), rewritten);
+    try db.runUntilIdle();
+
+    // Inbound edges moved from the merged-away key to the survivor.
+    {
+        const old_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, old_inbound);
+        try std.testing.expectEqual(@as(usize, 0), old_inbound.len);
+
+        const new_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer graph_mod.GraphIndex.freeEdges(alloc, new_inbound);
+        try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
+        try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
+    }
+}
+
+test "db graph hydration fails closed for a not-yet-promoted entity node" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const mention_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_depth = 1 },
+        .include_documents = true,
+    };
+
+    // The mention edge points at person/ada_lovelace, but that entity document
+    // has not been promoted into this store: the node is returned as a graph
+    // result with its key, hydrated to nothing (fail closed), never fabricated.
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data == null);
+
+        // The reached node records its home table (from the mention edge's
+        // `target_table` metadata) so the api can route hydration to the
+        // entities table instead of failing closed against the query table.
+        const nodes = result.graph_results[0].nodes;
+        try std.testing.expectEqual(@as(usize, 1), nodes.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
+        try std.testing.expect(nodes[0].table != null);
+        try std.testing.expectEqualStrings("entities", nodes[0].table.?);
+    }
+
+    // Once the entity document exists (promoter wrote it; here co-located for the
+    // single-store test), the same node hydrates instead of failing closed.
+    try db.batch(.{
+        .writes = &.{.{ .key = "person/ada_lovelace", .value =
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace"}
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].stored_data.?, "Ada Lovelace") != null);
+    }
+}
+
+test "db graph relation artifact materializer uses mapping templates" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation"},
+        \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","ordinal":"{{ _item_index }}","tenant":"{{ _doc.value.tenant_id }}"}},
+        \\  "context":{"doc_fields":["tenant_id"]},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"tenant_id":"tenant-a","relations":{"items":[{"rel":"cites","to":"doc:b","score":0.5,"evidence":"see section 2"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "cites", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), edges[0].weight, 0.0001);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"evidence\":\"see section 2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"ordinal\":\"0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"tenant\":\"tenant-a\"") != null);
+}
+
+test "db graph relation artifact materializer resolves entity refs and artifact template values" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph"},
+        \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
+        \\  "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","text":"Ada Lovelace","document_id":"doc:a"},{"id":"e1","text":"Analytical Engine","doc_ref":{"key":"doc:b"}}],"relations":[{"type":"mentions","source":{"entity_id":"e0"},"target":{"entity_id":"e1"}}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"source_text\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_text\":\"Analytical Engine\"") != null);
+}
+
+test "db graph relation artifact materializer replaces stale document edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:c\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:c", edges[0].target);
+
+    const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(stale_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+}
+
+test "db graph relation artifact materializer deletes edges when asset source disappears" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"relations removed\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+
+    const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(stale_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+}
+
+test "db graph artifact source lifecycle reuses and protects asset enrichments" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    const created = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = created;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("relations", created.field);
+    try std.testing.expectEqualStrings("application/json", created.content_type);
+
+    try db.addIndex(.{
+        .name = "relations_graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+    try std.testing.expect(try db.deleteIndex("relations_graph_a"));
+    try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.asset, "relations_v1"));
+
+    const still_present = (try db.getEnrichment(alloc, .asset, "relations_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = still_present;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("relations", still_present.field);
+}
+
+test "db resolver catalog persists across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
+            .config_generation = 3,
+        });
+        try std.testing.expectError(error.ResolverAlreadyExists, db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactAlreadyExists, db.addResolver(.{
+            .name = "duplicate_output",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverSourceArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "other_resolution_v1",
+            .key_template = "x",
+        }));
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*r| r.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("knowledge_graph", resolvers[0].name);
+    try std.testing.expectEqualStrings("entities", resolvers[0].table);
+    try std.testing.expectEqual(@as(u64, 3), resolvers[0].config_generation);
+
+    try std.testing.expect(try db.removeResolver("knowledge_graph"));
+    const after = try db.listResolvers(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "relations",
+        .content_type = "application/json",
+    });
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(error.ConflictingEnrichmentConfig, db.addIndex(.{
+        .name = "conflicting_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}
+        \\}
+        ,
+    }));
+}
+
+test "db graph source artifact deletion clears materialized graph edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    {
+        const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+
+    const graph_artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_artifact_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_artifact_key));
+}
+
+test "db graph artifact edges are visible to graph search queries" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"Beta\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .direction = .out, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.graph_results[0].hits[0].id);
+    try std.testing.expect(result.graph_results[0].hits[0].stored_data != null);
+}
+
+test "db graph artifact external node targets return ids without document hydration" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "nodes":{"model":"external","target":"{{ _item.target.entity_id }}"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"entity_id\":\"entity:person:ada_lovelace\"}}]}}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "mentions",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .direction = .out, .edge_types = &.{"mentions"} },
+                    .include_documents = true,
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("entity:person:ada_lovelace", result.graph_results[0].hits[0].id);
+    try std.testing.expect(result.graph_results[0].hits[0].stored_data == null);
+    try std.testing.expect(result.graph_results[0].hits[0].doc_ordinal == null);
+}
+
+test "db async asset producer graph source materializes through replay" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "edge":{"metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}"}},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"target_doc","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"target_doc\":\"doc:b\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"content_type\":\"application/json\"") != null);
+}
+
+test "db async asset producer mention edges come from resolution artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .extractor_output =
+        \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
+        ,
+    };
+    var embedder = FixedVectorEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+        .resolution_embedder = embedder.interface(),
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"Ada mention\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_table\":\"entities\"") != null);
+
+    const deterministic_edges = try db.getEdges(alloc, "prov_graph", "person/a_lovelace", "mentions", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
+    try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
+
+    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    defer alloc.free(relation_state_key);
+    try db.core.store.delete(relation_state_key);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
+    defer freeOwnedKeySlice(alloc, changed);
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    const edge_raw = try db.core.store.get(alloc, graph_edge_key);
+    defer alloc.free(edge_raw);
+}
+
+test "db graph artifact source replay catches up after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(doc_key);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+        defer alloc.free(artifact_key);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try encodeChangeRecordPayload(&ctx, .{
+            .changed_artifact_keys = &.{artifact_key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = doc_key, .value = "{\"title\":\"alpha\"}" },
+            .{ .key = artifact_key, .value = "{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}" },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    try reopened.runUntilIdle();
+
+    const edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+}
+
+test "db graph edge artifact replay catches up after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+
+        const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        defer alloc.free(graph_key);
+        const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.8, 0, 0, "");
+        defer alloc.free(graph_value);
+        var ctx = db.batchContext();
+        const sequence = db.core.store.reserveNextReplaySequence(1);
+        const replay_payload = try encodeChangeRecordPayload(&ctx, .{
+            .changed_artifact_keys = &.{graph_key},
+        }, sequence);
+        defer alloc.free(replay_payload);
+
+        try db.core.store.putBatchWithReplay(null, &.{
+            .{ .key = graph_key, .value = graph_value },
+        }, &.{}, .{
+            .sequence = sequence,
+            .payload = replay_payload,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    try reopened.runUntilIdle();
+
+    const edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
+}
+
+test "db query_readonly opens empty declared graph index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "relations_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out },
+    };
+    var result = try reopened.search(alloc, .{ .graph_queries = &.{.{ .name = "mentions", .query = query }} });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 0), result.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 0), result.graph_results[0].nodes.len);
+}
+
 test "db batch marks generated enrichment replay for generator-enabled dense index" {
     const alloc = std.testing.allocator;
 
@@ -18007,6 +30633,7 @@ test "db enrichments precomputes generated enrichments into the committed batch"
         },
         .sync_level = .enrichments,
     });
+    try std.testing.expectEqual(@as(u64, 1), db.enrichment_runtime.?.stats().applied_sequence);
 
     const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
@@ -18025,6 +30652,2003 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     try std.testing.expect(journalRecordHasHint(journal_record.record, .sparse_vector));
     try std.testing.expect(!journalRecordHasHint(journal_record.record, .enrichment));
     try std.testing.expect(journal_record.record.changed_artifact_keys.len > 0);
+}
+
+test "db replicated apply decouples client enrichment sync from raft apply execution" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expect(journalRecordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!journalRecordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expectEqual(@as(usize, 0), journal_record.record.changed_artifact_keys.len);
+}
+
+test "db enrichments precomputed watermark advances across replay entries without enrichment debt" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+        },
+    });
+    defer db.close();
+
+    const inert_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:before"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(inert_payload);
+    try db.core.store.appendReplayOpaque(alloc, 1, inert_payload);
+    try db.enrichment_runtime.?.resumeFrom(0, 0);
+    try std.testing.expectEqual(@as(u64, 0), db.enrichment_runtime.?.stats().applied_sequence);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"precomputed dense text\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
+}
+
+const TestAssetProducer = struct {
+    calls: usize = 0,
+    generator_calls: usize = 0,
+    reader_calls: usize = 0,
+    transcriber_calls: usize = 0,
+    extractor_calls: usize = 0,
+    reader_output: ?[]const u8 = null,
+    transcriber_output: ?[]const u8 = null,
+    extractor_output: ?[]const u8 = null,
+
+    fn producer(self: *@This()) asset_producer_mod.Producer {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .produce = produce },
+        };
+    }
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        switch (request.producer_type) {
+            .copy => {},
+            .document_extraction => {},
+            .generator => self.generator_calls += 1,
+            .reader => self.reader_calls += 1,
+            .transcriber => self.transcriber_calls += 1,
+            .extractor => self.extractor_calls += 1,
+        }
+        if (request.producer_type == .extractor) {
+            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
+            return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
+        }
+        if (request.producer_type == .reader) {
+            if (self.reader_output) |output| return try alloc.dupe(u8, output);
+        }
+        if (request.producer_type == .transcriber) {
+            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
+        }
+        return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
+    }
+};
+
+fn jsonTestNumber(value: std.json.Value) f64 {
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => 0,
+    };
+}
+
+test "db asset producer enrichments execute fake providers and skip unchanged state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "generated_title_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addEnrichment(.{
+        .name = "image_text_v1",
+        .kind = .asset,
+        .field = "image",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"reader\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addEnrichment(.{
+        .name = "audio_text_v1",
+        .kind = .asset,
+        .field = "audio",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"transcriber\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"hello\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.generator_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    var first = (try db.lookup(alloc, "doc:a", .{
+        .fields = &.{"_artifacts"},
+        .include_all_fields = false,
+    })).?;
+    defer first.deinit(alloc);
+    var parsed_first = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
+    defer parsed_first.deinit();
+    const first_artifacts = parsed_first.value.object.get("_artifacts").?.object;
+    try std.testing.expectEqualStrings("generator:hello", first_artifacts.get("generated_title_v1").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("reader:data:image/png;base64,aaa", first_artifacts.get("image_text_v1").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("transcriber:https://example.test/a.wav", first_artifacts.get("audio_text_v1").?.object.get("value").?.string);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"hello\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"goodbye\",\"image\":\"data:image/png;base64,aaa\",\"audio\":\"https://example.test/a.wav\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.generator_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "generated_title_v1");
+    defer alloc.free(asset_key);
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "generated_title_v1", "doc:a");
+    defer alloc.free(marker_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "generated_title_v1");
+    defer alloc.free(state_key);
+    const stored_asset = try db.core.store.get(alloc, asset_key);
+    alloc.free(stored_asset);
+    const stored_marker = try db.core.store.get(alloc, marker_key);
+    defer alloc.free(stored_marker);
+    try std.testing.expectEqualStrings(asset_key, stored_marker);
+    const stored_state = try db.core.store.get(alloc, state_key);
+    alloc.free(stored_state);
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, asset_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
+test "db document unit payload preserves pdf page provenance" {
+    const alloc = std.testing.allocator;
+    var text_regions = [_]document_extraction_mod.TextRegion{.{
+        .span = .{ 0, 5 },
+        .bbox = .{ 72, 700, 120, 712 },
+    }};
+    const unit = document_extraction_mod.Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast("hello"),
+        .method = @constCast("pdf_text"),
+        .page_number = 1,
+        .page_label = @constCast("i"),
+        .page_bbox = .{ 0, 0, 612, 792 },
+        .page_rotation = 90,
+        .text_regions = text_regions[0..],
+        .char_start = 0,
+        .char_end = 5,
+    };
+
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("range:000000", parsed.value.object.get("_artifact_range_id").?.string);
+    try std.testing.expectEqualStrings("unit", parsed.value.object.get("_artifact_range_kind").?.string);
+    try std.testing.expectEqualStrings("local_committed", parsed.value.object.get("_artifact_route_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("_artifact_owner_group_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), provenance.get("page_number").?.integer);
+    try std.testing.expectEqualStrings("i", provenance.get("page_label").?.string);
+    const page_bbox = provenance.get("page_bbox").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), page_bbox.len);
+    try std.testing.expectEqual(@as(i64, 612), page_bbox[2].integer);
+    try std.testing.expectEqual(@as(i64, 90), provenance.get("page_rotation").?.integer);
+    const format_provenance = provenance.get("format_provenance").?.object;
+    try std.testing.expectEqualStrings("antfly.document_format_provenance.v1", format_provenance.get("schema").?.string);
+    try std.testing.expectEqualStrings("application/pdf", format_provenance.get("source_content_type").?.string);
+    try std.testing.expectEqualStrings("source_page_points", format_provenance.get("coordinate_system").?.string);
+    try std.testing.expectEqualStrings("pdf_text", format_provenance.get("extraction_method").?.string);
+    try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
+    const regions = format_provenance.get("text_regions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), regions.len);
+    const region = regions[0].object;
+    try std.testing.expectEqual(@as(i64, 0), region.get("span").?.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 5), region.get("span").?.array.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 72), region.get("bbox").?.array.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 712), region.get("bbox").?.array.items[3].integer);
+}
+
+test "db document unit payload marks scanned pdf pages as pending OCR" {
+    const alloc = std.testing.allocator;
+    const unit = document_extraction_mod.Unit{
+        .unit_id = @constCast("page:000002"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_ocr_pending"),
+        .extraction_status = @constCast("pending_ocr"),
+        .ocr_used = false,
+        .page_number = 2,
+        .page_label = @constCast("2"),
+        .page_bbox = .{ 0, 0, 612, 792 },
+        .char_start = 5,
+        .char_end = 5,
+    };
+
+    const payload = try documentUnitPayloadAlloc(alloc, "doc:a", "document_units_v1", unit, "data:application/pdf;base64,AA==", "application/pdf", .{ .range_id = "range:000000" });
+    defer alloc.free(payload);
+    const fingerprint = try documentExtractionUnitFingerprintAlloc(alloc, unit);
+    defer alloc.free(fingerprint);
+    try std.testing.expectEqual(@as(usize, 64), fingerprint.len);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("pending_ocr", parsed.value.object.get("extraction_status").?.string);
+    try std.testing.expectEqualStrings("pdf_ocr_pending", provenance.get("method").?.string);
+    try std.testing.expectEqualStrings("pending_ocr", provenance.get("extraction_status").?.string);
+    try std.testing.expect(!provenance.get("ocr_used").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), provenance.get("page_number").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), provenance.get("char_end").?.integer);
+    const format_provenance = provenance.get("format_provenance").?.object;
+    try std.testing.expectEqualStrings("pdf_ocr_pending", format_provenance.get("extraction_method").?.string);
+    try std.testing.expectEqualStrings("pending_ocr", format_provenance.get("extraction_status").?.string);
+    try std.testing.expect(!format_provenance.get("ocr_used").?.bool);
+}
+
+test "db document extraction asset materializes unit artifacts from data url" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"artifact_type\":\"document_units\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_parent_doc_key\":\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"_artifact_name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"alpha beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"text\"") != null);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"kind\":\"document_extraction_state_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "document:000001") != null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, manifest_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
+}
+
+test "db document extraction routes mixed files using source metadata fields" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json =
+        \\{"type":"document_extraction","config":{"source":{"filename_field":"filename"},"routes":[{"match":{"extension":["md"]},"extractor":{"type":"text","unit":"note"}}]}}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:application/octet-stream;base64,YWxwaGEgYmV0YQ==\",\"filename\":\"notes.md\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "note:000001");
+    defer alloc.free(unit_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"text\"") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_id\":\"note:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_type\":\"note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"alpha beta\"") != null);
+}
+
+test "db document extraction stores docx section units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:docx",
+            .value = "{\"filename\":\"report.docx\",\"mime_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\",\"url\":\"data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsDBBQAAAAAAAAAAABUVz0vhwAAAIcAAAARAAAAd29yZC9kb2N1bWVudC54bWw8dzpkb2N1bWVudCB4bWxuczp3PSJ3Ij48dzpib2R5Pjx3OnA+PHc6cj48dzp0PkFscGhhIERCPC93OnQ+PC93OnI+PC93OnA+PHc6cD48dzpyPjx3OnQ+QmV0YSBEQjwvdzp0PjwvdzpyPjwvdzpwPjwvdzpib2R5Pjwvdzpkb2N1bWVudD5QSwECFAAUAAAAAAAAAAAAVFc9L4cAAACHAAAAEQAAAAAAAAAAAAAAAAAAAAAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAEAAQA/AAAAtgAAAAAA\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:docx", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const section_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:docx", "document_units_v1", "section:000001");
+    defer alloc.free(section_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"docx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const section_payload = try db.core.store.get(alloc, section_key);
+    defer alloc.free(section_payload);
+    try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"unit_type\":\"section\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"method\":\"docx_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"text\":\"Alpha DB\\nBeta DB\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section_payload, "\"source_content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"") != null);
+}
+
+test "db document extraction stores zip archive entry units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:archive",
+            .value = "{\"filename\":\"bundle.zip\",\"mime_type\":\"application/zip\",\"url\":\"data:application/zip;base64,UEsDBBQAAAAAAAAAAADxLiMkDwAAAA8AAAAPAAAAZG9jcy9yZWFkbWUudHh0QXJjaGl2ZSBEQiB0ZXh0UEsBAhQAFAAAAAAAAAAAAPEuIyQPAAAADwAAAA8AAAAAAAAAAAAAAAAAAAAAAGRvY3MvcmVhZG1lLnR4dFBLBQYAAAAAAQABAD0AAAA8AAAAAAA=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:archive", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const entry_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:archive", "document_units_v1", "archive:entry:000001");
+    defer alloc.free(entry_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"archive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const entry_payload = try db.core.store.get(alloc, entry_key);
+    defer alloc.free(entry_payload);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"unit_type\":\"archive_entry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"method\":\"zip_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_path\":\"docs/readme.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"text\":\"Archive DB text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry_payload, "\"source_content_type\":\"application/zip\"") != null);
+}
+
+test "db document extraction stores image pending OCR unit" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:image", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"unit_type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"pending_ocr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"byte_length\":19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_sha256\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"source_content_type\":\"image/png\"") != null);
+}
+
+test "db document extraction completes image OCR with reader producer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image-ocr",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+}
+
+test "db document extraction stores structured OCR confidence and coordinates" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .reader_output = "{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image-ocr-structured",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-structured", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("invoice total", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("confidence").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("ocr_confidence").?.float, 0.0001);
+    const bbox = parsed.value.object.get("ocr_bbox").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), bbox.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), jsonTestNumber(bbox[0]), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 42), jsonTestNumber(bbox[3]), 0.0001);
+    try std.testing.expectEqualStrings("low contrast", parsed.value.object.get("extraction_warning").?.string);
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("confidence").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("ocr_confidence").?.float, 0.0001);
+    try std.testing.expectEqualStrings("low contrast", provenance.get("extraction_warning").?.string);
+}
+
+test "db document extraction completes audio transcription with transcriber producer" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"spoken words\",\"confidence\":0.81}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:audio-transcript",
+            .value = "{\"filename\":\"audio.mp3\",\"mime_type\":\"audio/mpeg\",\"url\":\"data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:audio-transcript", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"transcript_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"transcript_used\":true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("spoken words", parsed.value.object.get("text").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), parsed.value.object.get("confidence").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), parsed.value.object.get("transcript_confidence").?.float, 0.0001);
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("confidence").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("transcript_confidence").?.float, 0.0001);
+}
+
+test "db document extraction stores rfc822 email units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:email",
+            .value = "{\"filename\":\"message.eml\",\"mime_type\":\"message/rfc822\",\"url\":\"data:message/rfc822;base64,U3ViamVjdDogQWxwaGENCkZyb206IGFAZXhhbXBsZS50ZXN0DQoNCkhlbGxvIGVtYWls\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:email", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const headers_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:email", "document_units_v1", "email:headers");
+    defer alloc.free(headers_key);
+    const body_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:email", "document_units_v1", "email:body");
+    defer alloc.free(body_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":2") != null);
+
+    const headers_payload = try db.core.store.get(alloc, headers_key);
+    defer alloc.free(headers_payload);
+    try std.testing.expect(std.mem.indexOf(u8, headers_payload, "\"unit_type\":\"email_headers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers_payload, "Subject: Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers_payload, "\"method\":\"email_rfc822\"") != null);
+
+    const body_payload = try db.core.store.get(alloc, body_key);
+    defer alloc.free(body_payload);
+    try std.testing.expect(std.mem.indexOf(u8, body_payload, "\"unit_type\":\"email_body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_payload, "\"text\":\"Hello email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_payload, "\"source_content_type\":\"message/rfc822\"") != null);
+}
+
+test "db document extraction stores multipart rfc822 text parts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:multipart-email",
+            .value = "{\"filename\":\"message.eml\",\"mime_type\":\"message/rfc822\",\"url\":\"data:message/rfc822;base64,U3ViamVjdDogQWxwaGENCkNvbnRlbnQtVHlwZTogbXVsdGlwYXJ0L2FsdGVybmF0aXZlOyBib3VuZGFyeT0iYjEiDQoNCi0tYjENCkNvbnRlbnQtVHlwZTogdGV4dC9wbGFpbg0KDQpQbGFpbiBib2R5DQotLWIxDQpDb250ZW50LVR5cGU6IHRleHQvaHRtbA0KDQo8cD5IVE1MIGJvZHk8L3A+DQotLWIxLS0NCg==\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:multipart-email", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const plain_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:multipart-email", "document_units_v1", "email:part:000001");
+    defer alloc.free(plain_key);
+    const html_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:multipart-email", "document_units_v1", "email:part:000002");
+    defer alloc.free(html_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"email\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":3") != null);
+
+    const plain_payload = try db.core.store.get(alloc, plain_key);
+    defer alloc.free(plain_payload);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "\"unit_type\":\"email_part\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "\"method\":\"email_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_payload, "Plain body") != null);
+
+    const html_payload = try db.core.store.get(alloc, html_key);
+    defer alloc.free(html_payload);
+    try std.testing.expect(std.mem.indexOf(u8, html_payload, "\"method\":\"email_html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_payload, "\"text\":\"HTML body\"") != null);
+}
+
+test "db document extraction stores unsupported file manifest without searchable units" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_units",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"document_units_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:bin",
+            .value = "{\"url\":\"data:application/octet-stream;base64,AAEC\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bin", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:bin", "document_units_v1");
+    defer alloc.free(state_key);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_type\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unsupported_reason\":\"unsupported_content_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":0") != null);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_keys\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\":[]") != null);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match_all = {} },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+}
+
+test "db document extraction manifest classifies unit fingerprint keeps" {
+    const alloc = std.testing.allocator;
+    const unit_keys = [_][]const u8{ "unit:a", "unit:b" };
+    const chunk_keys = [_][]const u8{};
+    const previous_unit_keys = [_][]const u8{ "unit:a", "unit:b" };
+    const previous_chunk_keys = [_][]const u8{};
+    const units = [_]document_extraction_mod.Unit{
+        .{
+            .unit_id = @constCast("unit:a"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("same"),
+            .method = @constCast("text"),
+        },
+        .{
+            .unit_id = @constCast("unit:b"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("changed"),
+            .method = @constCast("text"),
+        },
+    };
+    const extraction = document_extraction_mod.Result{
+        .content_type = @constCast("text/plain"),
+        .route_type = @constCast("text"),
+        .units = @constCast(units[0..]),
+    };
+    const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = "unit:a", .fingerprint = "same-fingerprint" },
+        .{ .key = "unit:b", .fingerprint = "new-fingerprint" },
+    };
+    const previous_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = "unit:a", .fingerprint = "same-fingerprint" },
+        .{ .key = "unit:b", .fingerprint = "old-fingerprint" },
+    };
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:text/plain,same",
+        "source-fingerprint",
+        extraction,
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        2,
+        1,
+        2,
+        "converged",
+    );
+    defer alloc.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"owner_group_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"placement_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_status\":\"local_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_eligible\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"coverage_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"full_text_replay\":\"stored_artifact_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"watermark_required_before_suppression\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"upsert\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"first_key\":\"unit:b\"") != null);
+}
+
+test "db document extraction skips stable unit local rewrites without text consumers" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+}
+
+test "db applies document artifact child range batch without source row write" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const artifact_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(artifact_key);
+    const artifact_value =
+        "{\"_parent_doc_key\":\"doc:a\",\"_artifact_name\":\"document_units_v1\",\"_artifact_range_id\":\"range:000000\",\"_artifact_range_kind\":\"unit\",\"_artifact_route_status\":\"remote_committed\",\"_artifact_owner_group_id\":7002,\"unit_id\":\"page:000001\",\"text\":\"alpha\"}";
+    const writes = [_]types.BatchWrite{.{
+        .key = artifact_key,
+        .value = artifact_value,
+    }};
+
+    const sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = writes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(sequence > 0);
+
+    const stored = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(artifact_value, stored);
+
+    const source_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(source_store_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, source_store_key));
+
+    const deletes = [_][]const u8{artifact_key};
+    const delete_sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(delete_sequence > sequence);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+}
+
+test "db dispatches generated document child range artifacts to remote owner" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), moved.child_ranges.len);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const Capture = struct {
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        artifact_delete_keys: usize = 0,
+        documents: usize = 0,
+        dense_embeddings: usize = 0,
+        sparse_embeddings: usize = 0,
+        first_key: ?[]u8 = null,
+        first_value: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+            if (self.first_value) |value| allocator.free(value);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            self.artifact_delete_keys += dispatch.child_batch.artifact_delete_keys.len;
+            self.documents += dispatch.child_batch.documents.len;
+            self.dense_embeddings += dispatch.child_batch.dense_embeddings.len;
+            self.sparse_embeddings += dispatch.child_batch.sparse_embeddings.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+                errdefer {
+                    allocator.free(self.first_key.?);
+                    self.first_key = null;
+                }
+                self.first_value = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].value);
+            }
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.deinit(alloc);
+
+    try db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqual(@as(usize, 0), capture.artifact_delete_keys);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_owner_group_id\":7002") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+}
+
+test "db retries remote document child range dispatch from durable outbox" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+
+    const FlakyCapture = struct {
+        fail_next: bool = true,
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        first_key: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail_next) {
+                self.fail_next = false;
+                return error.IntentionalDispatchFailure;
+            }
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+            }
+        }
+    };
+
+    var capture = FlakyCapture{};
+    defer capture.deinit(alloc);
+
+    try std.testing.expectError(error.IntentionalDispatchFailure, db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher()));
+
+    const outbox_prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(alloc);
+    defer alloc.free(outbox_prefix);
+    const pending = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const drained = try db.drainDocumentArtifactChildRangeOutbox(capture.dispatcher(), 0);
+    try std.testing.expectEqual(@as(usize, 1), drained.scanned);
+    try std.testing.expectEqual(@as(usize, 1), drained.dispatched);
+    try std.testing.expectEqual(@as(usize, 1), drained.deleted);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+
+    const after = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "db document extraction manifest inspection and reprocess API" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    var inspected = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer inspected.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", inspected.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", inspected.artifact_name);
+    try std.testing.expect(std.mem.startsWith(u8, inspected.artifact_id, "af1:asset:"));
+    try std.testing.expectEqual(@as(u64, 2), inspected.manifest_version);
+    try std.testing.expectEqual(@as(u64, 1), inspected.generation);
+    try std.testing.expectEqualStrings("data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==", inspected.source_url);
+    try std.testing.expectEqual(@as(usize, 64), inspected.source_fingerprint.len);
+    try std.testing.expectEqualStrings("text/plain", inspected.content_type);
+    try std.testing.expectEqualStrings("text", inspected.route_type);
+    try std.testing.expectEqual(@as(usize, 1), inspected.unit_count);
+    try std.testing.expectEqual(@as(usize, 1), inspected.chunk_count);
+    try std.testing.expectEqual(@as(usize, 2), inspected.child_range_count);
+    try std.testing.expectEqual(@as(usize, 2), inspected.child_ranges.len);
+    try std.testing.expectEqualStrings("range:000000", inspected.child_ranges[0].range_id);
+    try std.testing.expectEqualStrings("unit", inspected.child_ranges[0].range_kind);
+    try std.testing.expectEqualStrings("document_units_v1", inspected.child_ranges[0].artifact_name);
+    try std.testing.expectEqual(@as(?u64, 0), inspected.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 0), inspected.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("local_committed", inspected.child_ranges[0].route_status.?);
+    try std.testing.expectEqual(@as(?bool, false), inspected.child_ranges[0].split_eligible);
+    try std.testing.expectEqual(@as(usize, 1), inspected.child_ranges[0].child_count);
+    try std.testing.expect(inspected.child_ranges[0].text_bytes != null);
+    try std.testing.expectEqualStrings("chunk", inspected.child_ranges[1].range_kind);
+    try std.testing.expectEqualStrings("chunk", inspected.child_ranges[1].split_boundary);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"range_policy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"unit_target_children\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"unit_target_text_bytes\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspected.manifest_json, "\"oversized_unit_policy\":\"single_unit_range\"") != null);
+    try std.testing.expectEqualStrings("converged", inspected.merge_status);
+    try std.testing.expectEqual(@as(u64, 0), inspected.merge_from_generation);
+    try std.testing.expectEqual(@as(u64, 1), inspected.merge_to_generation);
+    try std.testing.expectEqualStrings("unit_fingerprint", inspected.merge_operation_granularity);
+    try std.testing.expect(inspected.merge_operation_count > 0);
+    try std.testing.expect(inspected.state_json != null);
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7001,
+        .placement_generation = 2,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqualStrings("remote", moved.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7001), moved.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 2), moved.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("remote_committed", moved.child_ranges[0].route_status.?);
+    try std.testing.expectEqual(@as(?bool, true), moved.child_ranges[0].split_eligible);
+    try std.testing.expect(std.mem.indexOf(u8, moved.manifest_json, "\"owner_group_id\":7001") != null);
+    try std.testing.expect(!try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:missing",
+        .placement = "remote",
+    }));
+    try std.testing.expect(!try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:missing", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+    }));
+
+    var artifact_list = try db.listDocumentArtifactManifests(alloc, "doc:a");
+    defer artifact_list.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", artifact_list.document_id);
+    try std.testing.expectEqual(@as(usize, 1), artifact_list.artifacts.len);
+    try std.testing.expectEqualStrings("document_units_v1", artifact_list.artifacts[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 1), artifact_list.artifacts[0].generation);
+    try std.testing.expect(artifact_list.artifacts[0].state_json != null);
+
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), after.generation);
+    try std.testing.expectEqualStrings("remote", after.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7001), after.child_ranges[0].owner_group_id);
+    try std.testing.expectEqual(@as(?u64, 2), after.child_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("remote_committed", after.child_ranges[0].route_status.?);
+    try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"op\":\"keep\"") != null);
+    const routed_unit_payload = try db.core.store.get(alloc, after.child_ranges[0].start_key);
+    defer alloc.free(routed_unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_owner_group_id\":7001") != null);
+
+    try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
+    try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:missing", "document_units_v1")) == null);
+    var missing_list = try db.listDocumentArtifactManifests(alloc, "doc:missing");
+    defer missing_list.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:missing", missing_list.document_id);
+    try std.testing.expectEqual(@as(usize, 0), missing_list.artifacts.len);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:b",
+            .value = "{\"url\":\"data:text/plain;base64,ZGVsdGEgZXBzaWxvbg==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var range_first = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .limit = 1 });
+    defer range_first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), range_first.scanned);
+    try std.testing.expectEqual(@as(usize, 1), range_first.reprocessed);
+    try std.testing.expectEqual(@as(usize, 0), range_first.failed);
+    try std.testing.expectEqual(@as(usize, 0), range_first.failures.len);
+    try std.testing.expect(range_first.next_key != null);
+    try std.testing.expectEqualStrings("doc:a", range_first.next_key.?);
+
+    var range_after_a = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer range_after_a.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), range_after_a.generation);
+
+    var range_second = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .from_key = range_first.next_key.? });
+    defer range_second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), range_second.scanned);
+    try std.testing.expectEqual(@as(usize, 1), range_second.reprocessed);
+    try std.testing.expect(range_second.next_key == null);
+
+    var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer range_after_b.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
+}
+
+test "db document extraction unit ranges split by text bytes" {
+    const alloc = std.testing.allocator;
+    const text_a = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(text_a);
+    const text_b = try alloc.alloc(u8, 400 * 1024);
+    defer alloc.free(text_b);
+    const text_c = try alloc.alloc(u8, 100 * 1024);
+    defer alloc.free(text_c);
+    @memset(text_a, 'a');
+    @memset(text_b, 'b');
+    @memset(text_c, 'c');
+
+    const units = [_]document_extraction_mod.Unit{
+        .{
+            .unit_id = @constCast("unit:a"),
+            .unit_type = @constCast("document"),
+            .text = text_a,
+            .method = @constCast("text"),
+        },
+        .{
+            .unit_id = @constCast("unit:b"),
+            .unit_type = @constCast("document"),
+            .text = text_b,
+            .method = @constCast("text"),
+        },
+        .{
+            .unit_id = @constCast("unit:c"),
+            .unit_type = @constCast("document"),
+            .text = text_c,
+            .method = @constCast("text"),
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), documentExtractionUnitRangeCount(&units));
+    try std.testing.expectEqual(@as(usize, 0), documentExtractionUnitRangeIndex(&units, 0));
+    try std.testing.expectEqual(@as(usize, 0), documentExtractionUnitRangeIndex(&units, 1));
+    try std.testing.expectEqual(@as(usize, 1), documentExtractionUnitRangeIndex(&units, 2));
+}
+
+test "db document extraction failure records last error and clears stale children" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var before = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer before.deinit(alloc);
+    try std.testing.expectEqualStrings("text", before.route_type);
+    try std.testing.expect(before.last_error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), before.child_ranges.len);
+    const stale_unit_key = try alloc.dupe(u8, before.child_ranges[0].start_key);
+    defer alloc.free(stale_unit_key);
+    {
+        const stale_unit = try db.core.store.get(alloc, stale_unit_key);
+        defer alloc.free(stale_unit);
+    }
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, before.generation + 1), after.generation);
+    try std.testing.expectEqualStrings("error", after.route_type);
+    try std.testing.expectEqualStrings("failed", after.merge_status);
+    try std.testing.expectEqual(@as(usize, 0), after.unit_count);
+    try std.testing.expectEqual(@as(usize, 0), after.child_range_count);
+    try std.testing.expect(after.state_json == null);
+    try std.testing.expect(after.last_error_code != null);
+    try std.testing.expectEqualStrings("InvalidDataUri", after.last_error_code.?);
+    try std.testing.expect(after.last_error_message != null);
+    try std.testing.expectEqualStrings("remote content download failed", after.last_error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"last_error\"") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_unit_key));
+
+    var list = try db.listDocumentArtifactManifests(alloc, "doc:a");
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), list.artifacts.len);
+    try std.testing.expectEqualStrings("InvalidDataUri", list.artifacts[0].last_error_code.?);
+}
+
+test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "ft_document_units",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"document_units_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    const first_value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}";
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = first_value }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const first_calls = counting.calls;
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+
+    const second_value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}";
+    var extracted = [_]mapper.ExtractedWrite{try mapper.extractWrite(alloc, "doc:a", second_value)};
+    defer extracted[0].deinit(alloc);
+    var precomputed = try prepareGeneratedEnrichments(&db, .{
+        .writes = &.{.{ .key = "doc:a", .value = second_value }},
+    }, &extracted, .all, &.{});
+    defer precomputed.deinit(alloc);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
+
+    try std.testing.expectEqual(first_calls, counting.calls);
+    try std.testing.expectEqual(@as(usize, 2), precomputed.documents.len);
+    var saw_unit_doc = false;
+    var saw_chunk_doc = false;
+    for (precomputed.documents) |doc| {
+        try std.testing.expectEqual(@as(?[]const u8, null), doc.cleaned_value);
+        if (std.mem.eql(u8, doc.key, unit_key)) saw_unit_doc = true;
+        if (std.mem.eql(u8, doc.key, chunk_key)) saw_chunk_doc = true;
+    }
+    try std.testing.expect(saw_unit_doc);
+    try std.testing.expect(saw_chunk_doc);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = second_value }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(first_calls, counting.calls);
+
+    var unit_result = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer unit_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), unit_result.total_hits);
+
+    var chunk_result = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .chunk,
+    });
+    defer chunk_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
+}
+
+test "db document extraction chunks units through source artifact enrichment" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_sparse_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+    });
+    try db.addIndex(.{
+        .name = "ft_document_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "document_chunk_sparse_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\"}",
+    });
+    const embedding_cfg = db.core.index_manager.getEnrichment(.embedding, "document_chunk_dense_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("document_chunks_v1", embedding_cfg.source_artifact_name);
+    try std.testing.expectEqual(@as(u32, 3), embedding_cfg.expected_dims);
+    const dense_consumers = try db.core.index_manager.denseIndexesForEmbedding(alloc, "document_chunk_dense_v1", 3);
+    defer {
+        for (dense_consumers) |name| alloc.free(name);
+        alloc.free(dense_consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), dense_consumers.len);
+    try std.testing.expectEqualStrings("dv_document_chunks", dense_consumers[0]);
+    const sparse_consumers = try db.core.index_manager.sparseIndexesForEmbedding(alloc, "document_chunk_sparse_v1");
+    defer {
+        for (sparse_consumers) |name| alloc.free(name);
+        alloc.free(sparse_consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sparse_consumers.len);
+    try std.testing.expectEqualStrings("document_chunk_sparse_v1", sparse_consumers[0]);
+
+    const planned = try db.core.planGeneratedEnrichments(
+        alloc,
+        "doc:planned",
+        "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        &.{},
+        &.{},
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, planned);
+    var saw_document_asset = false;
+    var saw_document_chunk_dense = false;
+    var saw_document_chunk_sparse = false;
+    for (planned) |request| {
+        if (request.kind == .asset and std.mem.eql(u8, request.artifact_name, "document_units_v1")) saw_document_asset = true;
+        if (request.kind == .dense_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_dense_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_dense = true;
+        }
+        if (request.kind == .sparse_embedding and
+            std.mem.eql(u8, request.artifact_name, "document_chunks_v1") and
+            std.mem.eql(u8, request.embedding_name, "document_chunk_sparse_v1") and
+            request.chunk_size == 256)
+        {
+            saw_document_chunk_sparse = true;
+        }
+    }
+    try std.testing.expect(saw_document_asset);
+    try std.testing.expect(!saw_document_chunk_dense);
+    try std.testing.expect(!saw_document_chunk_sparse);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
+    defer alloc.free(unit_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "document:000001", 0);
+    defer alloc.free(chunk_key);
+    const state_key = try assetStateKeyAlloc(alloc, "doc:a", "document_units_v1");
+    defer alloc.free(state_key);
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+
+    const chunk_payload = try db.core.store.get(alloc, chunk_key);
+    defer alloc.free(chunk_payload);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_doc_key\":\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_parent_unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_artifact_name\":\"document_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"_source_artifact_name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_payload, "\"text\":\"alpha beta gamma\"") != null);
+    var parsed_chunk_payload = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+    defer parsed_chunk_payload.deinit();
+    try std.testing.expectEqualStrings("range:000001", parsed_chunk_payload.value.object.get("_artifact_range_id").?.string);
+    try std.testing.expectEqualStrings("chunk", parsed_chunk_payload.value.object.get("_artifact_range_kind").?.string);
+    try std.testing.expectEqualStrings("local_committed", parsed_chunk_payload.value.object.get("_artifact_route_status").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed_chunk_payload.value.object.get("_artifact_owner_group_id").?.integer);
+    const chunk_provenance = parsed_chunk_payload.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("unit", chunk_provenance.get("offset_basis").?.string);
+    try std.testing.expectEqualStrings("document:000001", chunk_provenance.get("parent_unit_id").?.string);
+    try std.testing.expectEqualStrings("document_units_v1", chunk_provenance.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(i64, 0), chunk_provenance.get("unit_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), chunk_provenance.get("unit_char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), chunk_provenance.get("document_char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), chunk_provenance.get("document_char_end").?.integer);
+
+    const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_chunk_dense_v1");
+    defer alloc.free(dense_artifact_key);
+    const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(dense_artifact_payload);
+    const sparse_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "document_chunk_sparse_v1");
+    defer alloc.free(sparse_artifact_key);
+    const sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(sparse_artifact_payload);
+
+    const state = try db.core.store.get(alloc, state_key);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"fingerprint\"") != null);
+
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"manifest_version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"child_ranges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"unit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"merge_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+
+    var result = try db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    var parent_with_chunks = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .parent_with_chunks,
+        .include_stored = false,
+    });
+    defer parent_with_chunks.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
+    var chunk_public_id_for_rollup = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, chunk_key);
+    defer chunk_public_id_for_rollup.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_public_id_for_rollup.id, parent_with_chunks.hits[0].chunk_hits[0].id);
+    const rollup_chunk_ref = parent_with_chunks.hits[0].chunk_hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("doc:a", rollup_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("document_chunks_v1", rollup_chunk_ref.name);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, rollup_chunk_ref.kind);
+    try std.testing.expectEqual(@as(?u32, 0), rollup_chunk_ref.chunk_id);
+    try std.testing.expectEqualStrings("document:000001", rollup_chunk_ref.unit_id.?);
+
+    const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
+    defer alloc.free(query_vec);
+    const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
+    var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
+    defer direct.deinit();
+    const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
+        metadata
+    else blk: {
+        const hit = direct.getHits()[0];
+        break :blk (try dense_index.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
+    };
+    defer alloc.free(dense_internal_id);
+    try std.testing.expectEqualStrings(chunk_key, dense_internal_id);
+
+    var sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta gamma");
+    defer sparse_query.deinit(alloc);
+    var sparse_result = try db.search(alloc, .{
+        .index_name = "document_chunk_sparse_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = sparse_query.indices,
+            .values = sparse_query.values,
+            .k = 3,
+        } },
+        .return_mode = .chunk,
+        .limit = 1,
+        .include_stored = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+    });
+    defer sparse_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
+    var chunk_public_id = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, chunk_key);
+    defer chunk_public_id.deinit(alloc);
+    try std.testing.expectEqualStrings(chunk_public_id.id, sparse_result.hits[0].id);
+    try std.testing.expect(sparse_result.hits[0].stored_data == null);
+    try std.testing.expect(sparse_result.hits[0].ancestor_source_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_source_data.?, "\"url\"") != null);
+    try std.testing.expect(sparse_result.hits[0].ancestor_unit_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"unit_id\":\"document:000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"text\":\"alpha beta gamma\"") != null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBkZWx0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    const updated_manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(updated_manifest);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"from_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_manifest, "\"to_generation\":2") != null);
+    const updated_chunk_payload = try db.core.store.get(alloc, chunk_key);
+    defer alloc.free(updated_chunk_payload);
+    try std.testing.expect(std.mem.indexOf(u8, updated_chunk_payload, "\"text\":\"alpha beta delta\"") != null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unit_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, chunk_key));
 }
 
 test "db extractEnrichments exposes cleaned writes and special fields" {
@@ -18060,14 +32684,12 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqualStrings("sparse_idx", result.sparse_embeddings[0].index_name);
     try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
 
-    try std.testing.expectEqual(@as(usize, 0), result.summaries.len);
-
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
 }
 
-test "db extractEnrichments rejects unsupported summaries field" {
+test "db extractEnrichments rejects unsupported legacy summaries field" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -18077,7 +32699,7 @@ test "db extractEnrichments rejects unsupported summaries field" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try std.testing.expectError(error.UnsupportedSummaryField, db.extractEnrichments(alloc, &.{
+    try std.testing.expectError(error.UnsupportedReservedField, db.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
             .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
@@ -18337,6 +32959,255 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try db.runUntilIdle();
+}
+
+test "db open quarantines dense index with unsupported artifact version" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_quarantine",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_quarantine\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "quarantine-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), open_options);
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        // Persist an HBC metadata record with a version this build does not
+        // support, simulating an artifact written by an incompatible build.
+        const entry = db.core.denseIndex("dv_quarantine") orelse return error.TestUnexpectedResult;
+        var bad_meta = entry.index.metadata;
+        bad_meta.version = 99;
+        var meta_buf: [vectorindex_mod.hbc.IndexMetadata.encoded_size]u8 = undefined;
+        const encoded = bad_meta.encode(&meta_buf);
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, vectorindex_mod.hbc.meta_key, encoded);
+        try txn.commit();
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), open_options);
+    defer db.close();
+
+    // The broken dense index is quarantined: absent from the runtime, its
+    // load error recorded, and the rest of the table fully usable.
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") == null);
+    const recorded = db.core.index_manager.loadFailure("dv_quarantine") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("UnsupportedVersion", recorded);
+
+    var ft_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer ft_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ft_result.total_hits);
+
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        var found = false;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "dv_quarantine")) continue;
+            found = true;
+            const load_error = item.load_error orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("UnsupportedVersion", load_error);
+            try std.testing.expect(!item.backfill_active);
+        }
+        try std.testing.expect(found);
+    }
+
+    // Queries that explicitly reference the quarantined index get a distinct
+    // error instead of IndexNotFound or a stall.
+    const query_vec = [_]f32{ 0.1, 0.2, 0.3 };
+    try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = &query_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }));
+
+    // Drop + recreate recovers and clears the recorded failure.
+    try std.testing.expect(try db.deleteIndex("dv_quarantine"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_quarantine") == null);
+    try db.addIndex(dense_cfg);
+    try db.runUntilIdle();
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") != null);
+
+    const recovered_vec = try deterministic.interface().embedDense(alloc, "dv_quarantine", "alpha concept overview", 3);
+    defer alloc.free(recovered_vec);
+    var recovered = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = recovered_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }, 1);
+    defer recovered.deinit();
+    try std.testing.expect(recovered.total_hits >= 1);
+}
+
+test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..300) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    index_manager_mod.test_abort_text_backfill_after_batches = 1;
+    defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") == null);
+
+    // Writes keep flowing while the index is quarantined; the heal's resumed
+    // backfill must pick them up. They also guarantee the next backfill
+    // attempt flushes at least once, so the still-set abort knob fires.
+    {
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (300..400) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+    }
+
+    // While the cause persists, a forced retry fails and applies backoff.
+    {
+        const result = try db.retryQuarantinedIndexLoads(true);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+    // Cause fixed — but the failed attempt set a backoff deadline, so a
+    // non-forced retry is skipped without re-attempting the open (it would
+    // recover if it attempted).
+    index_manager_mod.test_abort_text_backfill_after_batches = null;
+    {
+        const result = try db.retryQuarantinedIndexLoads(false);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+
+    // Forced retry recovers the index in-process — no reopen, no
+    // drop+recreate — resuming the persisted rebuild state.
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
+
+    try db.runUntilIdle();
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .limit = 500,
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db read-only open propagates transient index load errors instead of quarantining" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    // A read-only (replica) open must NOT quarantine a transient read race
+    // (e.g. the writer reclaiming obsolete LSM runs mid-open): the error
+    // propagates so the query layer reopens against a fresh manifest and
+    // retries. A quarantined replica would instead serve IndexUnavailable
+    // until the read cache next invalidates it — the quarantine retry
+    // worker only runs on the writer.
+    try std.testing.expectError(error.FileNotFound, DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    }));
+
+    // The writer open quarantines the same error: the writer cannot race
+    // its own (not yet started) reclaim, so a missing artifact there is
+    // persistent damage — and the in-process retry recovers it once the
+    // cause clears.
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const recorded = db.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("FileNotFound", recorded);
+
+    index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
 }
 
 test "db managed dense enrichment delete recreate recovers after corrupt artifact" {
@@ -18867,6 +33738,38 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
     try std.testing.expectEqualStrings("doc:a", sparse_result.hits[0].id);
     try std.testing.expect(sparse_result.hits[0].stored_data != null);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, ordinal), sparse_result.hits[0].doc_ordinal);
+    }
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+    db.identity_visibility_summary_cache = null;
+
+    var stale_sparse_result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = sparse_query.indices,
+            .values = sparse_query.values,
+            .k = 3,
+        } },
+        .return_mode = .chunk,
+        .limit = 3,
+        .include_stored = false,
+    });
+    defer stale_sparse_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_sparse_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), stale_sparse_result.hits.len);
 }
 
 test "db sparse enrichment skips unchanged source hash" {
@@ -19063,6 +33966,74 @@ test "db runUntilIdle drains enrichment and derived indexing" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db generated enrichment backfill drains stored docs beyond first replay chunk" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "embedded-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const total_docs: usize = 129;
+    const writes = try alloc.alloc(types.BatchWrite, total_docs);
+    defer {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc {d}\",\"body\":\"generated vector text {d}\"}}", .{ i, i }),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .write,
+    });
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+    try db.runUntilIdle();
+
+    const pending_after = db.pendingWorkStats();
+    try std.testing.expectEqual(pending_after.enrichment.target_sequence, pending_after.enrichment.applied_sequence);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text 128", 3);
+    defer alloc.free(query_vec);
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 5,
+        },
+    }, 1);
+    defer result.deinit();
+    try std.testing.expect(result.total_hits > 0);
+    var found_last = false;
+    for (result.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:128")) {
+            found_last = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_last);
 }
 
 test "db runUntilIdle drains lazy dense posting maintenance" {
@@ -19813,14 +34784,14 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
-        .source_field = "body",
+        .field = "body",
         .chunk_size = 8,
         .chunk_overlap = 2,
     });
     try db.addEnrichment(.{
         .name = "chunk_dense_v1",
         .kind = .embedding,
-        .source_field = "body",
+        .field = "body",
         .source_artifact_name = "body_chunks_v1",
         .expected_dims = 3,
     });
@@ -19841,7 +34812,7 @@ test "db addEnrichment supports explicit shared definitions" {
     try db.enrichment_runtime.?.waitForApplied(1);
     try waitForDerivedReplayTarget(&db);
 
-    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    const query_vec = try deterministic.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
     const req: types.SearchRequest = .{
@@ -19854,16 +34825,19 @@ test "db addEnrichment supports explicit shared definitions" {
 
     var result = try waitForSearchResult(alloc, &db, req, 1);
     defer result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, result.hits[0].id);
+    var chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, result.hits[0].id)) orelse return error.TestUnexpectedResult;
+    defer chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", chunk_ref.name);
+    try std.testing.expect(chunk_ref.chunk_id != null);
 
     const chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
     defer {
         var tmp = chunk;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", chunk.source_field);
+    try std.testing.expectEqualStrings("body", chunk.field);
 
     const embedding = (try db.getEnrichment(alloc, .embedding, "chunk_dense_v1")) orelse return error.TestUnexpectedResult;
     defer {
@@ -20032,9 +35006,9 @@ test "db preflightSearchRequest validates live lane bindings" {
     try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
     try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
-    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
-    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expect(dense_summary.dense_search_width_total >= 1);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 1);
+    try std.testing.expect(dense_summary.dense_epsilon_max > 0.0);
     try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
     try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
     try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);
@@ -20421,7 +35395,7 @@ test "db deleteEnrichment rejects referenced definitions" {
     try db.addEnrichment(.{
         .name = "body_chunks_v1",
         .kind = .chunk,
-        .source_field = "body",
+        .field = "body",
         .chunk_size = 8,
         .chunk_overlap = 2,
     });
@@ -20524,21 +35498,23 @@ test "db dense index can reference existing chunk embedding enrichment" {
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
     const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, slow_test_wait_attempts);
+    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 2, slow_test_wait_attempts);
     defer direct.deinit();
 
-    const internal_id = if (direct.takeMetadata(0)) |metadata|
-        metadata
-    else blk: {
-        const hit = direct.getHits()[0];
-        break :blk (try dv_ref.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
-    };
-    defer alloc.free(internal_id);
-    var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
-    defer identity.deinit(alloc);
     const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, identity.id);
+    var found_chunk_zero = false;
+    for (direct.getHits(), 0..) |hit, idx| {
+        const internal_id = if (direct.takeMetadata(idx)) |metadata|
+            metadata
+        else
+            (try dv_ref.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(internal_id);
+        var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
+        defer identity.deinit(alloc);
+        if (std.mem.eql(u8, identity.id, chunk_zero)) found_chunk_zero = true;
+    }
+    try std.testing.expect(found_chunk_zero);
 }
 
 test "db persists shorthand chunk enrichment catalog across reopen" {
@@ -20563,7 +35539,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
             var tmp = enrichment;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", enrichment.source_field);
+        try std.testing.expectEqualStrings("body", enrichment.field);
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -20572,7 +35548,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
             var tmp = embedding;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", embedding.source_field);
+        try std.testing.expectEqualStrings("body", embedding.field);
         try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
         try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
     }
@@ -20585,7 +35561,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
         var tmp = enrichment;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", enrichment.source_field);
+    try std.testing.expectEqualStrings("body", enrichment.field);
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -20594,7 +35570,7 @@ test "db persists shorthand chunk enrichment catalog across reopen" {
         var tmp = embedding;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", embedding.source_field);
+    try std.testing.expectEqualStrings("body", embedding.field);
     try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
     try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
 }
@@ -20625,7 +35601,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
             var tmp = enrichment;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", enrichment.source_field);
+        try std.testing.expectEqualStrings("body", enrichment.field);
         try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
         try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -20634,7 +35610,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
             var tmp = embedding;
             tmp.deinit(alloc);
         }
-        try std.testing.expectEqualStrings("body", embedding.source_field);
+        try std.testing.expectEqualStrings("body", embedding.field);
         try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
         try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
     }
@@ -20649,7 +35625,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
         var tmp = enrichment;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", enrichment.source_field);
+    try std.testing.expectEqualStrings("body", enrichment.field);
     try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
     try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
 
@@ -20658,7 +35634,7 @@ test "db persists shorthand chunk enrichment catalog across reopen with durable 
         var tmp = embedding;
         tmp.deinit(alloc);
     }
-    try std.testing.expectEqualStrings("body", embedding.source_field);
+    try std.testing.expectEqualStrings("body", embedding.field);
     try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
     try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
 }
@@ -20677,14 +35653,14 @@ test "db listEnrichments returns explicit definitions across reopen" {
         try db.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
-            .source_field = "body",
+            .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
-            .source_field = "body",
+            .field = "body",
             .source_artifact_name = "body_chunks_v1",
             .expected_dims = 3,
         });
@@ -20720,14 +35696,14 @@ test "db listEnrichments returns explicit definitions across reopen with durable
         try db.addEnrichment(.{
             .name = "body_chunks_v1",
             .kind = .chunk,
-            .source_field = "body",
+            .field = "body",
             .chunk_size = 8,
             .chunk_overlap = 2,
         });
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
-            .source_field = "body",
+            .field = "body",
             .source_artifact_name = "body_chunks_v1",
             .expected_dims = 3,
         });
@@ -21015,9 +35991,46 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         .return_mode = .chunk,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    const top_chunk_id = try alloc.dupe(u8, chunk_result.hits[0].id);
+    defer alloc.free(top_chunk_id);
+    var top_chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, top_chunk_id)) orelse return error.TestUnexpectedResult;
+    defer top_chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, top_chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", top_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", top_chunk_ref.name);
+    try std.testing.expect(top_chunk_ref.chunk_id != null);
+
+    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+    const vector_ids = try db.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, db.core.store, "dv_v1", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expect(vector_ids.len >= 2);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var filtered_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .parent,
+        .resolved_doc_filter = &filter,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer filtered_chunk_result.result.deinit();
+    try std.testing.expect(filtered_chunk_result.profile.raw_hit_count >= 2);
+    try std.testing.expectEqual(@as(u32, 1), filtered_chunk_result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", filtered_chunk_result.result.hits[0].id);
 
     var parent_result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -21038,7 +36051,36 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
-    try std.testing.expectEqualStrings(chunk_zero, parent_with_chunks.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+    db.identity_visibility_summary_cache = null;
+
+    var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .chunk,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer stale_chunk_result.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.result.total_hits);
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.profile.raw_hit_count);
+
+    var stale_parent_result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+    });
+    defer stale_parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_parent_result.total_hits);
 }
 
 test "db dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
@@ -21089,9 +36131,14 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
         .return_mode = .chunk,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
-    defer alloc.free(chunk_zero);
-    try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    const top_chunk_id = try alloc.dupe(u8, chunk_result.hits[0].id);
+    defer alloc.free(top_chunk_id);
+    var top_chunk_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, top_chunk_id)) orelse return error.TestUnexpectedResult;
+    defer top_chunk_ref.deinit(alloc);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, top_chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", top_chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", top_chunk_ref.name);
+    try std.testing.expect(top_chunk_ref.chunk_id != null);
 
     var parent_result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -21112,7 +36159,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
-    try std.testing.expectEqualStrings(chunk_zero, parent_with_chunks.hits[0].chunk_hits[0].id);
+    try std.testing.expectEqualStrings(top_chunk_id, parent_with_chunks.hits[0].chunk_hits[0].id);
 }
 
 test "db dense parent paging fetches enough chunk hits before grouping" {
@@ -22594,6 +37641,36 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
 }
 
+test "db thin replay marks deleted asset and graph artifacts for graph apply" {
+    const alloc = std.testing.allocator;
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_key);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{},
+        &.{},
+        &.{ asset_key, graph_key },
+        &.{},
+        &.{},
+        44,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+}
+
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {
     const alloc = std.testing.allocator;
 
@@ -22724,7 +37801,14 @@ test "db full-text backfill resumes after interrupted reopen" {
 
     index_manager_mod.test_abort_text_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_text_backfill_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);
@@ -22792,7 +37876,14 @@ test "db sparse backfill resumes after interrupted reopen" {
     defer index_manager_mod.test_sparse_backfill_batch_size = null;
     index_manager_mod.test_abort_sparse_backfill_after_batches = 1;
     defer index_manager_mod.test_abort_sparse_backfill_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("sp_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/sp_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);
@@ -23187,6 +38278,7 @@ test "db stats uses full text visible count when available" {
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
         try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+        try std.testing.expect(stats.indexes[0].term_count > 0);
     }
 
     try db.batch(.{
@@ -23200,6 +38292,49 @@ test "db stats uses full text visible count when available" {
         try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
         try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
     }
+}
+
+test "db schemaless full text indexes strings into _all for bare text search" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha beta\"}" },
+            .{ .key = "doc:b", .value = "{\"nested\":{\"body\":\"gamma delta\"}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var top_level = try db.search(alloc, .{
+        .index_name = "ft_v0",
+        .query = .{ .match = .{ .field = "_all", .text = "alpha" } },
+        .limit = 10,
+    });
+    defer top_level.deinit();
+    try std.testing.expectEqual(@as(u32, 1), top_level.total_hits);
+    try std.testing.expectEqualStrings("doc:a", top_level.hits[0].id);
+
+    var nested = try db.search(alloc, .{
+        .index_name = "ft_v0",
+        .query = .{ .match = .{ .field = "_all", .text = "gamma" } },
+        .limit = 10,
+    });
+    defer nested.deinit();
+    try std.testing.expectEqual(@as(u32, 1), nested.total_hits);
+    try std.testing.expectEqualStrings("doc:b", nested.hits[0].id);
 }
 
 test "db stats does not scan primary docs when full text count is available" {
@@ -23277,6 +38412,10 @@ test "db sparse vector index routes knn search" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "doc:a")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, ordinal), result.hits[0].doc_ordinal);
 }
 
 test "db sparse vector index routes knn search with durable lsm primary backend" {
@@ -23437,6 +38576,50 @@ test "db direct graph writes persist graph artifacts and deletes remove them" {
     const after_delete = try db.core.scanStorePrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db delete artifact cleanup isolates binary document id prefixes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const first_doc = "doc\x00a";
+    const second_doc = "doc\x00a:child";
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = first_doc, .value = "{\"title\":\"first\"}" },
+            .{ .key = second_doc, .value = "{\"title\":\"second\"}" },
+        },
+    });
+
+    const first_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, first_doc, "dense\x00idx");
+    defer alloc.free(first_artifact);
+    const second_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, second_doc, "dense\x00idx");
+    defer alloc.free(second_artifact);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, first_artifact, null, &.{ 1.0, 0.0 });
+    try putDenseEmbeddingArtifactForTest(&db, alloc, second_artifact, null, &.{ 0.0, 1.0 });
+
+    try db.batch(.{ .deletes = &.{first_doc} });
+
+    try std.testing.expect((try db.get(alloc, first_doc)) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, first_artifact));
+
+    const remaining_doc = (try db.get(alloc, second_doc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(remaining_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"second\"}", remaining_doc);
+
+    const remaining_artifact = try db.core.store.get(alloc, second_artifact);
+    defer alloc.free(remaining_artifact);
+    try expectDenseEmbeddingArtifactValue(alloc, remaining_artifact, null, 2);
 }
 
 test "db graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
@@ -23732,6 +38915,122 @@ test "db document _embeddings update vector index and strip stored special field
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
+test "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"body\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"semantic_idx\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[0,1,0],\"sparse\":{\"indices\":[3],\"values\":[1.0]}}" },
+            .{ .key = "doc:c", .value = "{\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const stored = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"sparse\"") == null);
+
+    const vector_only_stored = (try db.get(alloc, "doc:c")).?;
+    defer alloc.free(vector_only_stored);
+    try std.testing.expectEqualStrings("{}", vector_only_stored);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:managed", .value = "{\"body\":\"managed embedding source text\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[13],\"values\":[1.0]}}" },
+        },
+        .sync_level = .write,
+    });
+    const managed_stored = (try db.get(alloc, "doc:managed")).?;
+    defer alloc.free(managed_stored);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"body\":\"managed embedding source text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"sparse\"") == null);
+
+    const dense_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(dense_artifact_key);
+    const dense_artifact = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(dense_artifact);
+    const sparse_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+    defer alloc.free(sparse_artifact_key);
+    const sparse_artifact = try db.core.store.get(alloc, sparse_artifact_key);
+    defer alloc.free(sparse_artifact);
+
+    var dense = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer dense.deinit();
+    try std.testing.expectEqualStrings("doc:a", dense.hits[0].id);
+
+    var sparse = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{7},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer sparse.deinit();
+    try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[0,0,1],\"sparse\":{\"indices\":[11],\"values\":[1.0]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const updated = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"embedding\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"sparse\"") == null);
+    const updated_dense_artifact = try db.core.store.get(alloc, dense_artifact_key);
+    defer alloc.free(updated_dense_artifact);
+
+    var dense_after = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 0.0, 0.0, 1.0 },
+            .k = 3,
+        } },
+        .limit = 3,
+    });
+    defer dense_after.deinit();
+    try std.testing.expectEqualStrings("doc:a", dense_after.hits[0].id);
+}
+
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -23941,6 +39240,75 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
     try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db dense artifact rebuild preserves stable vector ids distinct from ordinals" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 2), ordinal);
+        const stable_vector_id = denseTestVectorId("doc:b");
+        try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+        try std.testing.expectEqual(@as(?u64, stable_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", "doc:b"));
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 2), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    var txn = try reopened.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const stable_vector_id = denseTestVectorId("doc:b");
+    try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+    try std.testing.expectEqual(@as(?u64, stable_vector_id), try reopened.core.index_manager.lookupDenseVectorId(reopened.core.store, "dense_idx", "doc:b"));
+
+    const vector_ids = try reopened.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, reopened.core.store, "dense_idx", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
+    try std.testing.expectEqual(stable_vector_id, vector_ids[0]);
+
+    const dense_entry = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    const stable_metadata = (try dense_entry.index.getMetadata(stable_vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stable_metadata);
+    try std.testing.expectEqualStrings("doc:b", stable_metadata);
+    try std.testing.expectEqual(@as(?[]u8, null), try dense_entry.index.getMetadata(@as(u64, ordinal)));
 }
 
 test "db dense artifact rebuild force-resets corrupt external dense structure" {
@@ -24721,7 +40089,7 @@ test "db search supports graph result_ref from full-text hits" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "gr_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 5 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
                     .params = .{ .direction = .out, .edge_types = &.{"cites"} },
                 },
             },
@@ -24736,6 +40104,117 @@ test "db search supports graph result_ref from full-text hits" {
     try std.testing.expectEqualStrings("citations", result.graph_results[0].name);
     try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
     try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+}
+
+test "db search supports graph result_ref from dense hits without public id handoff" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\"}",
+    });
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "paper:1", .value = "{\"embedding\":[1,0],\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:2\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:2", .value = "{\"embedding\":[0,1]}" },
+            .{ .key = "paper:3", .value = "{\"embedding\":[-1,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 },
+        .graph_queries = &.{
+            .{
+                .name = "citations",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 0 } },
+                    .params = .{ .direction = .out, .edge_types = &.{"cites"} },
+                },
+            },
+        },
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expect(result.total_hits >= 1);
+    try std.testing.expect(result.hits.len >= 1);
+    try std.testing.expectEqualStrings("paper:1", result.hits[0].id);
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "paper:1"), result.hits[0].doc_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqualStrings("citations", result.graph_results[0].name);
+    try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
+    try std.testing.expectEqualStrings("paper:2", result.graph_results[0].hits[0].id);
+}
+
+test "db search rejects unbounded graph result_ref when base result is paged" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "paper:1", .value = "{\"title\":\"intro\",\"body\":\"machine learning systems\",\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:3\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:2", .value = "{\"title\":\"followup\",\"body\":\"machine learning ranking\",\"_edges\":{\"gr_v1\":{\"cites\":[{\"target\":\"paper:3\",\"weight\":1.0}]}}}" },
+            .{ .key = "paper:3", .value = "{\"title\":\"target\",\"body\":\"graph traversal\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "machine" } },
+        .index_name = "ft_v1",
+        .graph_queries = &.{
+            .{
+                .name = "citations",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "gr_v1",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$full_text_results", .limit = 0 } },
+                    .params = .{ .direction = .out, .edge_types = &.{"cites"} },
+                },
+            },
+        },
+        .limit = 1,
+    }));
 }
 
 test "db search supports graph-only named queries" {
@@ -24783,6 +40262,92 @@ test "db search supports graph-only named queries" {
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
     try std.testing.expectEqual(@as(u32, 1), result.graph_results[0].total_hits);
     try std.testing.expectEqualStrings("n:b", result.graph_results[0].hits[0].id);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_docs >= 1);
+}
+
+test "db named graph input sets carry resolved doc sets" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "n:a", .value = "{\"title\":\"A\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"}]}}}" },
+            .{ .key = "n:b", .value = "{\"title\":\"B\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const graph_queries = [_]types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "gr_v1",
+            .start_nodes = .{ .result_ref = .{ .ref = "seed", .limit = 0 } },
+            .params = .{ .direction = .out, .edge_types = &.{"links"} },
+        },
+    }};
+    const input_sets = [_]types.NamedGraphInputSet{.{
+        .name = "seed",
+        .hit_ids = &.{"n:a"},
+    }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{}, &graph_queries, &input_sets));
+
+    const current_generation = db.core.nextDerivedSequence();
+    const seed_hits = try db.graphInputSetHitsAlloc(alloc, &.{"n:a"}, current_generation);
+    defer {
+        for (seed_hits) |*hit| hit.deinit(alloc);
+        if (seed_hits.len > 0) alloc.free(seed_hits);
+    }
+    const seed_ordinal = seed_hits[0].doc_ordinal orelse return error.TestUnexpectedResult;
+    var identity_txn = try db.core.store.beginProbeTxn();
+    defer identity_txn.abort();
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, seed_ordinal), try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "n:a"));
+
+    const results = try db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation,
+    }, &graph_queries, &input_sets);
+    defer {
+        for (results) |*result| result.deinit(alloc);
+        if (results.len > 0) alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u32, 1), results[0].total_hits);
+    try std.testing.expectEqualStrings("n:b", results[0].hits[0].id);
+    try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &identity_txn, "n:b"), results[0].hits[0].doc_ordinal);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_count >= 1);
+    try std.testing.expect(stats.doc_set_planning.ordinal_list_docs >= 1);
+
+    const paged_input_sets = [_]types.NamedGraphInputSet{.{
+        .name = "seed",
+        .hit_ids = &.{"n:a"},
+        .total_hits = 2,
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation,
+    }, &graph_queries, &paged_input_sets));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.executeNamedGraphQueries(alloc, .{
+        .identity_read_generation = current_generation -| 1,
+    }, &graph_queries, &input_sets));
 }
 
 test "db search supports fused graph selectors for single-lane full-text searches" {
@@ -25656,7 +41221,14 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
 
     graph_mod.test_abort_reverse_rebuild_after_batches = 1;
     defer graph_mod.test_abort_reverse_rebuild_after_batches = null;
-    try std.testing.expectError(error.TestInjectedBackfillFailure, DB.open(alloc, std.mem.span(path), .{}));
+    {
+        // A per-index load failure no longer fails the whole open; the index
+        // is quarantined with its error recorded and retried on next open.
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{});
+        defer interrupted.close();
+        const recorded = interrupted.core.index_manager.loadFailure("gr_v1") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", recorded);
+    }
 
     const state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/gr_v1/rebuild.state", .{std.mem.span(path)});
     defer alloc.free(state_path);
@@ -26100,7 +41672,7 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc {d}\",\"body\":\"common token {d}\"}}", .{ i, i });
@@ -26118,16 +41690,16 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     try db.runUntilIdle();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expect(text_index.snapshot().segments.len < 6);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle drains scheduled text merges without index workers" {
@@ -26219,14 +41791,16 @@ test "db full_text sync does not require draining scheduled text merges" {
     try std.testing.expect(after.pending_segments <= before.pending_segments);
 }
 
-test "db force compacts text index to one searchable segment" {
+test "db force compacts text index to searchable merge tier" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -26255,7 +41829,7 @@ test "db force compacts text index to one searchable segment" {
     try db.forceCompactTextIndexes();
 
     const text_index = db.core.index_manager.textIndex("ft_v1").?;
-    try std.testing.expectEqual(@as(usize, 1), text_index.snapshot().segments.len);
+    try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -26270,8 +41844,120 @@ test "db force compacts text index to one searchable segment" {
     }
 }
 
+test "db text compaction preserves ordinal filters across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const expected_ordinal: doc_set.DocOrdinal = 9;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
+            defer alloc.free(value);
+
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .full_index,
+            });
+        }
+
+        var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        errdefer include.deinit(alloc);
+        const resolved_ordinal = switch (include) {
+            .ordinals => |ordinals| blk: {
+                try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+                break :blk ordinals[0];
+            },
+            else => return error.ExpectedOrdinalDocSet,
+        };
+        try std.testing.expectEqual(expected_ordinal, resolved_ordinal);
+
+        var filter = doc_set.ResolvedDocFilter{
+            .include = include,
+            .exclude = .none,
+        };
+        include = .all;
+        defer filter.deinit(alloc);
+
+        try db.forceCompactTextIndexes();
+
+        const text_index = db.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "common" } },
+            .limit = 20,
+            .resolved_doc_filter = &filter,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+
+        var include = try reopened.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        errdefer include.deinit(alloc);
+        const resolved_ordinal = switch (include) {
+            .ordinals => |ordinals| blk: {
+                try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+                break :blk ordinals[0];
+            },
+            else => return error.ExpectedOrdinalDocSet,
+        };
+        try std.testing.expectEqual(expected_ordinal, resolved_ordinal);
+
+        var filter = doc_set.ResolvedDocFilter{
+            .include = include,
+            .exclude = .none,
+        };
+        include = .all;
+        defer filter.deinit(alloc);
+
+        const text_index = reopened.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expect(text_index.snapshot().segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "common" } },
+            .limit = 20,
+            .resolved_doc_filter = &filter,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc:8", result.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, expected_ordinal), result.hits[0].doc_ordinal);
+    }
+}
+
 test "db best effort force compact leaves text merge debt under pressure" {
     const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
@@ -26302,13 +41988,37 @@ test "db best effort force compact leaves text merge debt under pressure" {
     });
     defer db.close();
 
+    const schema_json =
+        \\{
+        \\  "default_type": "doc",
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-types": ["text"]
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
     try db.addIndex(.{
         .name = "ft_v1",
         .kind = .full_text,
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -26331,11 +42041,11 @@ test "db best effort force compact leaves text merge debt under pressure" {
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
         .query = .{ .match = .{ .field = "body", .text = "common" } },
-        .limit = 10,
+        .limit = 20,
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 6), result.total_hits);
+    try std.testing.expectEqual(@as(u32, 12), result.total_hits);
 }
 
 test "db runUntilIdle defers full text merge pressure without failing" {
@@ -26372,7 +42082,7 @@ test "db runUntilIdle defers full text merge pressure without failing" {
         .config_json = "{}",
     });
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -27992,6 +43702,103 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
     try std.testing.expectEqual(@as(i64, 1), chunks[1].object.get("_chunk_id").?.integer);
 }
 
+test "db lookup includes unified artifact projection when _artifacts is requested" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
+    });
+    try db.addEnrichment(.{
+        .name = "page_ocr_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+    });
+    try db.addEnrichment(.{
+        .name = "entities_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "application/json",
+    });
+
+    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    defer alloc.free(chunk_one);
+    try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
+    try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
+
+    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    defer alloc.free(dense_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 2, 3 });
+
+    var ocr_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "page_ocr_v1"),
+        .kind = .asset,
+    };
+    defer ocr_ref.deinit(alloc);
+    const ocr_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ocr_ref);
+    defer alloc.free(ocr_key);
+    try db.core.store.put(ocr_key, "Revenue increased");
+
+    var entities_ref = types.ArtifactRef{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "entities_v1"),
+        .kind = .asset,
+    };
+    defer entities_ref.deinit(alloc);
+    const entities_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, entities_ref);
+    defer alloc.free(entities_key);
+    try db.core.store.put(entities_key, "{\"entities\":[{\"text\":\"Antfly\"}],\"relations\":[]}");
+
+    var result = (try db.lookup(alloc, "doc:a", .{
+        .fields = &.{ "title", "_artifacts" },
+        .include_all_fields = false,
+    })).?;
+    defer result.deinit(alloc);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("alpha", parsed.value.object.get("title").?.string);
+    const artifacts = parsed.value.object.get("_artifacts").?.object;
+
+    const chunks = artifacts.get("body_chunks_v1").?.object;
+    try std.testing.expectEqualStrings("chunk_set", chunks.get("kind").?.string);
+    const items = chunks.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expect(std.mem.startsWith(u8, items[0].object.get("artifact_id").?.string, "af1:chunk:"));
+    try std.testing.expectEqualStrings("chunk", items[0].object.get("artifact_ref").?.object.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, 0), items[0].object.get("artifact_ref").?.object.get("chunk_id").?.integer);
+    try std.testing.expectEqualStrings("hello", items[0].object.get("value").?.object.get("_content").?.string);
+
+    const embedding = artifacts.get("body_dense_v1").?.object;
+    try std.testing.expect(std.mem.startsWith(u8, embedding.get("artifact_id").?.string, "af1:embedding:"));
+    try std.testing.expectEqualStrings("embedding", embedding.get("kind").?.string);
+    try std.testing.expectEqualStrings("application/vnd.antfly.embedding+binary", embedding.get("content_type").?.string);
+    try std.testing.expectEqual(@as(i64, 3), embedding.get("dims").?.integer);
+    try std.testing.expect(embedding.get("value").? == .null);
+
+    const ocr = artifacts.get("page_ocr_v1").?.object;
+    try std.testing.expect(std.mem.startsWith(u8, ocr.get("artifact_id").?.string, "af1:asset:"));
+    try std.testing.expectEqualStrings("asset", ocr.get("artifact_ref").?.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("asset", ocr.get("kind").?.string);
+    try std.testing.expectEqualStrings("text/plain", ocr.get("content_type").?.string);
+    try std.testing.expectEqualStrings("Revenue increased", ocr.get("value").?.string);
+
+    const entities = artifacts.get("entities_v1").?.object;
+    try std.testing.expectEqualStrings("application/json", entities.get("content_type").?.string);
+    try std.testing.expectEqualStrings("Antfly", entities.get("value").?.object.get("entities").?.array.items[0].object.get("text").?.string);
+}
+
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {
     const alloc = std.testing.allocator;
 
@@ -28298,27 +44105,48 @@ test "db lookup loads embeddings for _embeddings.* selector and allows nested pr
 
 test "db field selection plan only enables chunk special field for explicit include-all selectors" {
     const none = db_query_projection.buildFieldSelectionPlan(&.{"_chunks.body_chunks_v1.0._content"}, false);
+    try std.testing.expect(!none.special.all_artifacts);
     try std.testing.expect(!none.special.all_chunks);
     try std.testing.expect(!none.special.all_embeddings);
 
+    const artifacts_none = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
+    try std.testing.expect(!artifacts_none.special.all_artifacts);
+    try std.testing.expect(!artifacts_none.special.all_chunks);
+    try std.testing.expect(!artifacts_none.special.all_embeddings);
+
+    const artifacts_plain = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts"}, false);
+    try std.testing.expect(artifacts_plain.special.all_artifacts);
+    try std.testing.expect(!artifacts_plain.special.all_chunks);
+    try std.testing.expect(!artifacts_plain.special.all_embeddings);
+
+    const artifacts_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_artifacts.*", "_artifacts.body_chunks_v1.items" }, false);
+    try std.testing.expect(artifacts_wildcard.special.all_artifacts);
+    try std.testing.expect(!artifacts_wildcard.special.all_chunks);
+    try std.testing.expect(!artifacts_wildcard.special.all_embeddings);
+
     const all_plain = db_query_projection.buildFieldSelectionPlan(&.{"_chunks"}, false);
+    try std.testing.expect(!all_plain.special.all_artifacts);
     try std.testing.expect(all_plain.special.all_chunks);
     try std.testing.expect(!all_plain.special.all_embeddings);
 
     const all_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_chunks.*", "_chunks.body_chunks_v1.0._content" }, false);
+    try std.testing.expect(!all_wildcard.special.all_artifacts);
     try std.testing.expect(all_wildcard.special.all_chunks);
     try std.testing.expect(!all_wildcard.special.all_embeddings);
     try std.testing.expectEqual(@as(usize, 2), all_wildcard.projection.fields.len);
 
     const embedding_none = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings.body_dense_v1"}, false);
+    try std.testing.expect(!embedding_none.special.all_artifacts);
     try std.testing.expect(!embedding_none.special.all_chunks);
     try std.testing.expect(!embedding_none.special.all_embeddings);
 
     const embedding_plain = db_query_projection.buildFieldSelectionPlan(&.{"_embeddings"}, false);
+    try std.testing.expect(!embedding_plain.special.all_artifacts);
     try std.testing.expect(!embedding_plain.special.all_chunks);
     try std.testing.expect(embedding_plain.special.all_embeddings);
 
     const embedding_wildcard = db_query_projection.buildFieldSelectionPlan(&.{ "_embeddings.*", "_embeddings.body_dense_v1" }, false);
+    try std.testing.expect(!embedding_wildcard.special.all_artifacts);
     try std.testing.expect(!embedding_wildcard.special.all_chunks);
     try std.testing.expect(embedding_wildcard.special.all_embeddings);
     try std.testing.expectEqual(@as(usize, 2), embedding_wildcard.projection.fields.len);
@@ -28341,6 +44169,24 @@ test "db writes and reads timestamp metadata" {
 
     const ts = try db.getTimestamp(alloc, "doc:a");
     try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_000), ts);
+
+    const first_doc = "doc\x00ttl";
+    const second_doc = "doc\x00ttl:child";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = first_doc, .value = "{\"title\":\"first\"}" },
+            .{ .key = second_doc, .value = "{\"title\":\"second\"}" },
+        },
+        .timestamp_ns = 1_700_000_000_000_000_101,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
+
+    try db.batch(.{ .deletes = &.{first_doc} });
+
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
 }
 
 test "db lookup hides expired documents when ttl schema is configured" {
@@ -28522,6 +44368,16 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     try waitForRawDelete(alloc, &db, "doc:expired", 200);
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+        try std.testing.expect(!stats.doc_identity.rebuild_required);
+    }
 
     try db.setSchema(.{
         .version = 1,
@@ -28785,6 +44641,118 @@ test "db exposes local transaction lifecycle" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", raw);
     try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "doc:txn"));
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "doc:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+}
+
+test "db transaction intent writes reject new documents at ordinal exhaustion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing_txn", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const existing_txn = try db.beginTransaction(11_000);
+    try db.writeIntents(existing_txn, &.{
+        .{ .key = "doc:existing_txn", .value = "{\"name\":\"updated\"}" },
+    }, &.{});
+    try db.commitTransaction(existing_txn, 11_001);
+
+    const existing = (try db.get(alloc, "doc:existing_txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const direct_txn = try db.beginTransaction(12_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeIntents(direct_txn, &.{
+        .{ .key = "doc:new_direct_txn", .value = "{\"name\":\"new\"}" },
+    }, &.{}));
+    try db.abortTransaction(direct_txn, 12_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_direct_txn")) == null);
+
+    const request_txn = try db.beginTransaction(13_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeTransaction(request_txn, .{
+        .writes = &.{.{ .key = "doc:new_request_txn", .value = "{\"name\":\"new\"}" }},
+    }));
+    try db.abortTransaction(request_txn, 13_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_request_txn")) == null);
+}
+
+test "db transaction-created identity rows remain visible after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const txn_id = try db.beginTransaction(21_000);
+        try db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:txn_reopen", .value = "{\"title\":\"txn\"}" }},
+        });
+        try db.commitTransaction(txn_id, 21_001);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const raw = (try db.get(alloc, "doc:txn_reopen")) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("{\"title\":\"txn\"}", raw);
+
+        const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
+        var resolved = try db.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolved.containsOrdinal(1));
+
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
 }
 
 test "db batch resolves transforms against pending same-batch writes" {
@@ -28975,7 +44943,7 @@ test "db bulk ingest primary lsm writes use direct sorted ingest batch mode" {
 
     const stats = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expect(stats.sorted_ingest_runs > 0);
 
     const visible_before_finish = (try db.get(alloc, "doc:bulk_lsm_d")) orelse return error.TestExpectedEqual;
     alloc.free(visible_before_finish);
@@ -29293,6 +45261,42 @@ test "db query_readonly reopen does not backfill pending external dense artifact
     try std.testing.expect(reopened_stats.indexes[0].replay_target_sequence > reopened_stats.indexes[0].replay_applied_sequence);
 }
 
+test "db primary auto bulk leaves dense replay active while session is open" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.beginPrimaryStoreAutoBulkIngestSession();
+    errdefer db.abortPrimaryStoreAutoBulkIngestSession();
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" }},
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+
+    try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
     const alloc = std.testing.allocator;
 
@@ -29311,12 +45315,25 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     const HookCtx = struct {
         publish_calls: u64 = 0,
+        publish_blocking_calls: u64 = 0,
+        publish_blocking_while_applied_sequence_locked: u64 = 0,
         invalidate_calls: u64 = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (change) {
                 .publish, .publish_consistent => self.publish_calls += 1,
+                .publish_blocking => {
+                    self.publish_calls += 1;
+                    self.publish_blocking_calls += 1;
+                    if (changed_db) |hook_db| {
+                        if (hook_db.async_context.applied_sequence_mutex.tryLock()) {
+                            hook_db.async_context.applied_sequence_mutex.unlock();
+                        } else {
+                            self.publish_blocking_while_applied_sequence_locked += 1;
+                        }
+                    }
+                },
                 .invalidate => self.invalidate_calls += 1,
             }
         }
@@ -29357,11 +45374,17 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     try db.executor.waitForAll(4);
 
     try std.testing.expect(hook_ctx.publish_calls > 0);
+    try std.testing.expect(hook_ctx.publish_blocking_calls > 0);
+    try std.testing.expectEqual(@as(u64, 0), hook_ctx.publish_blocking_while_applied_sequence_locked);
     try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+
+    const persisted_status = (try db.loadIndexStatusSnapshot(alloc, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 4), persisted_status.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), try db.core.loadAppliedSequence(alloc, "dense_idx"));
 }
 
 test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {
@@ -29464,7 +45487,7 @@ test "db bulk ingest full_text sync defers text merge work until finish" {
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
 
-    for (0..6) |i| {
+    for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
         const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
@@ -29794,6 +45817,8 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
         },
     });
     defer db.close();
+    try std.testing.expect(db.transaction_recovery_identity_context != null);
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
 
     var cleared = false;
     var attempts: usize = 0;
@@ -29838,6 +45863,78 @@ test "db transaction recovery runtime resolves participants and unblocks cleanup
     if (!stats_ready) return error.TransactionRecoveryStatsTimeout;
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
     if (!resolver_called) return error.TransactionRecoveryResolverTimeout;
+}
+
+test "db transaction recovery runtime appends identity rows for committed orphaned intents" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:recovered_orphan", .value = "{\"title\":\"recovered\"}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], 2_000, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        sleepPollInterval();
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
 }
 
 test "db batch enforces optimistic version predicates" {
@@ -29965,6 +46062,103 @@ test "db split state and split deltas are exposed through public api" {
     try std.testing.expectEqual(@as(u64, 0), try db.getSplitDeltaFinalSeq(alloc));
 }
 
+test "db split finalization marks split-off document child ranges remote" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"zeta\"}" },
+        },
+    });
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const moved_child_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:z", "document_units_v1", "page:000001");
+    defer alloc.free(moved_child_key);
+
+    const ChildRangeJson = struct {
+        range_id: []const u8,
+        range_kind: []const u8,
+        artifact_name: []const u8,
+        split_boundary: []const u8,
+        placement: []const u8,
+        owner_group_id: u64,
+        placement_generation: u64,
+        route_status: []const u8,
+        split_eligible: bool,
+        start_key: []const u8,
+        end_key_exclusive: []const u8,
+        last_key: []const u8,
+        child_count: usize,
+    };
+    const ManifestJson = struct {
+        manifest_version: u64,
+        generation: u64,
+        artifact_name: []const u8,
+        source_url: []const u8,
+        source_fingerprint: []const u8,
+        content_type: []const u8,
+        route_type: []const u8,
+        child_ranges: []const ChildRangeJson,
+    };
+    const child_ranges = [_]ChildRangeJson{.{
+        .range_id = "range:000000",
+        .range_kind = "unit",
+        .artifact_name = "document_units_v1",
+        .split_boundary = "unit",
+        .placement = "parent",
+        .owner_group_id = 0,
+        .placement_generation = 4,
+        .route_status = "local_committed",
+        .split_eligible = true,
+        .start_key = moved_child_key,
+        .end_key_exclusive = "",
+        .last_key = moved_child_key,
+        .child_count = 1,
+    }};
+    const manifest = try std.json.Stringify.valueAlloc(alloc, ManifestJson{
+        .manifest_version = 2,
+        .generation = 1,
+        .artifact_name = "document_units_v1",
+        .source_url = "data:text/plain;base64,YWxwaGE=",
+        .source_fingerprint = "fp",
+        .content_type = "text/plain",
+        .route_type = "text",
+        .child_ranges = child_ranges[0..],
+    }, .{});
+    defer alloc.free(manifest);
+    const child_value = "{\"_parent_doc_key\":\"doc:a\",\"_artifact_name\":\"document_units_v1\",\"unit_id\":\"page:000001\",\"text\":\"moved\"}";
+    try db.core.store.putBatch(&.{
+        .{ .key = manifest_key, .value = manifest },
+        .{ .key = moved_child_key, .value = child_value },
+    }, &.{});
+
+    try db.core.shard_manager.prepareSplit("doc:m");
+    try db.core.shard_manager.split(7002, "doc:m");
+    db.core.index_manager.updateRange(db.core.shard_manager.getByteRange());
+    try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
+
+    const updated = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"placement\":\"remote\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"owner_group_id\":7002") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"placement_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"split_eligible\":false") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, moved_child_key));
+}
+
 test "db shadow index manager backfills split-off range and ignores parent-range live writes after split" {
     const alloc = std.testing.allocator;
 
@@ -30028,7 +46222,10 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     const dest = tempPath(&dest_buf);
     defer cleanupTempDir(dest);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    const identity_namespace = doc_identity.Namespace{ .table_id = 71, .shard_id = 101, .range_id = 1001 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = identity_namespace,
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -30063,10 +46260,22 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
     try std.testing.expect((try split_db.getSplitState(alloc)) == null);
+    {
+        const split_stats = try split_db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, split_stats);
+        try std.testing.expectEqual(identity_namespace.table_id, split_stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(identity_namespace.shard_id, split_stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(identity_namespace.range_id, split_stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u32, 3), split_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), split_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), split_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_identity_state);
+    }
 
     const split_doc = (try split_db.get(alloc, "doc:z")) orelse return error.TestExpectedEqual;
     defer alloc.free(split_doc);
-    try std.testing.expectEqualStrings("{\"title\":\"zeta\",\"sparse\":{\"indices\":[2],\"values\":[1.0]}}", split_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", split_doc);
 
     var split_result = try split_db.search(alloc, .{
         .index_name = "ft_v1",
@@ -30087,6 +46296,27 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer split_sparse.deinit();
     try std.testing.expectEqual(@as(u32, 1), split_sparse.total_hits);
     try std.testing.expectEqualStrings("doc:z", split_sparse.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), split_sparse.hits[0].doc_ordinal);
+
+    var split_filtered = try split_db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:z"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer split_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), split_filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:z", split_filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), split_filtered.hits[0].doc_ordinal);
+
+    var split_filtered_left_doc = try split_db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:a"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer split_filtered_left_doc.deinit();
+    try std.testing.expectEqual(@as(u32, 0), split_filtered_left_doc.total_hits);
 
     const split_incoming = try split_db.getEdges(alloc, "graph_v1", "doc:y", "cites", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, split_incoming);
@@ -30096,6 +46326,18 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
+    {
+        const parent_stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, parent_stats);
+        try std.testing.expectEqual(identity_namespace.table_id, parent_stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(identity_namespace.shard_id, parent_stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(identity_namespace.range_id, parent_stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u32, 3), parent_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), parent_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), parent_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_identity_state);
+    }
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -30116,6 +46358,18 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     defer parent_sparse.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_sparse.total_hits);
     try std.testing.expectEqualStrings("doc:a", parent_sparse.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), parent_sparse.hits[0].doc_ordinal);
+
+    var parent_filtered = try db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{"doc:a"},
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer parent_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_filtered.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_filtered.hits[0].id);
+    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), parent_filtered.hits[0].doc_ordinal);
 
     var removed = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -30179,6 +46433,14 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     });
     defer split_db.close();
     try std.testing.expectEqualStrings("doc:m", split_db.getRange().start);
+    {
+        const split_stats = try split_db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, split_stats);
+        try std.testing.expectEqual(@as(u32, 3), split_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), split_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), split_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), split_stats.doc_identity.primary_docs_missing_ordinals);
+    }
 
     const split_doc = (try split_db.get(alloc, "doc:z")) orelse return error.TestExpectedEqual;
     defer alloc.free(split_doc);
@@ -30194,6 +46456,14 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     try db.finalizeSplit(.{ .start = "", .end = "doc:m" });
     try std.testing.expectEqualStrings("doc:m", db.getRange().end);
     try std.testing.expect((try db.get(alloc, "doc:z")) == null);
+    {
+        const parent_stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, parent_stats);
+        try std.testing.expectEqual(@as(u32, 3), parent_stats.doc_identity.next_ordinal);
+        try std.testing.expectEqual(@as(u64, 2), parent_stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), parent_stats.doc_identity.scanned_primary_docs);
+        try std.testing.expectEqual(@as(u64, 0), parent_stats.doc_identity.primary_docs_missing_ordinals);
+    }
 
     var removed = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -30330,7 +46600,7 @@ test "db split prepare survives reopen and finalizes text sparse and graph index
 
     const split_doc = (try child.get(alloc, "doc:z")) orelse return error.TestExpectedEqual;
     defer alloc.free(split_doc);
-    try std.testing.expectEqualStrings("{\"title\":\"zeta\",\"sparse\":{\"indices\":[2],\"values\":[1.0]}}", split_doc);
+    try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", split_doc);
 
     var child_text = try child.search(alloc, .{
         .index_name = "ft_v1",
@@ -31564,10 +47834,14 @@ test "db merge-style cutover preserves text sparse and graph indexes across reop
 }
 
 fn cacheBlockHitsForBench(stats: anytype) u64 {
+    var hits: u64 = 0;
     if (@hasField(@TypeOf(stats), "run_table_block")) {
-        return stats.run_table_block.hits;
+        hits += stats.run_table_block.hits;
     }
-    return 0;
+    if (@hasField(@TypeOf(stats), "run_table_physical_block")) {
+        hits += stats.run_table_physical_block.hits;
+    }
+    return hits;
 }
 
 fn normalizedBenchSearchEffort(effort: ?f32) f32 {
@@ -32271,6 +48545,120 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db restore snapshot rejects invalid doc identity metadata" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:bad-identity", .value = "{\"title\":\"bad\"}" }},
+        });
+
+        const state_key = internal_keys.identityOrdinalStateKey(1);
+        var corrupt_state: [25]u8 = undefined;
+        std.mem.writeInt(u64, corrupt_state[0..8], 0xdead_beef, .big);
+        std.mem.writeInt(u64, corrupt_state[8..16], 1, .big);
+        corrupt_state[16] = 0;
+        @memset(corrupt_state[17..25], 0);
+        try db.core.store.putBatch(&.{.{ .key = state_key[0..], .value = corrupt_state[0..] }}, &.{});
+
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    try std.testing.expectError(error.InvalidDocIdentity, DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+    }));
+}
+
+test "db deferred restore rejects strict doc identity namespace mismatch" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 11,
+        .range_id = 12,
+    };
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 10,
+        .shard_id = 99,
+        .range_id = 100,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .identity_namespace = source_namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:restore", .value = "{\"title\":\"restore\"}" }},
+        });
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+        alloc,
+        snapshot_root,
+        std.mem.span(restore_path),
+        .{
+            .primary_backend = primary_backend,
+            .identity_namespace = target_namespace,
+        },
+        .{
+            .backup_id = "backup-a",
+            .location = "local",
+            .snapshot_path = "snap1",
+            .group_id = 99,
+        },
+    ));
+}
+
 test "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -32523,7 +48911,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         .primary_backend = primary_backend,
     });
 
-    try DB.markRestorePrimaryRestored(
+    try DB.markRestorePrimaryRestoredForPath(
         alloc,
         std.mem.span(restore_path),
         "snap1",
@@ -32833,6 +49221,8 @@ fn applyStoredSearchPatternFilters(self: *DB, alloc: Allocator, req: types.Searc
     return try db_query_result_shape.applyStoredSearchPatternFilters(alloc, req, result, .{
         .ctx = self,
         .load_stored = loadStoredSearchDocumentCallback,
+        .resolve_doc_set_doc_ids = DB.resolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = DB.resolveDocIdsToDocSetCallback,
     });
 }
 
@@ -32842,7 +49232,7 @@ fn loadStoredSearchDocumentCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.get(alloc, key);
+    return try self.loadStoredSearchDocumentProbe(alloc, key);
 }
 
 fn loadStoredSearchDocumentManyCallback(

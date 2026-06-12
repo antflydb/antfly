@@ -26,8 +26,10 @@ const schema_openapi = @import("antfly_schema_openapi");
 const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
+const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
+const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
@@ -41,10 +43,298 @@ pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
 }
 
 pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const LsmStorageStatus = struct {
+    // Table status intentionally exposes a compact operational snapshot. Full
+    // low-level WAL and scheduler counters remain available through metrics.
+    run_count: u64 = 0,
+    run_bytes: u64 = 0,
+    l0_run_count: u64 = 0,
+    l0_bytes: u64 = 0,
+    lower_level_run_count: u64 = 0,
+    lower_level_bytes: u64 = 0,
+    max_level: u64 = 0,
+    compactable_l0_run_count: u64 = 0,
+    overlapping_l0_run_count: u64 = 0,
+    soft_limit_l0_run_count: u64 = 0,
+    hard_limit_l0_run_count: u64 = 0,
+    write_stall_l0_run_debt: u64 = 0,
+    soft_limit_l0_bytes: u64 = 0,
+    hard_limit_l0_bytes: u64 = 0,
+    write_stall_l0_byte_debt: u64 = 0,
+    level_overflow_run_count: u64 = 0,
+    level_overflow_bytes: u64 = 0,
+    obsolete_path_count: u64 = 0,
+    obsolete_paths_pinned_by_readers: u64 = 0,
+    obsolete_paths_pinned_by_versions: u64 = 0,
+    obsolete_paths_waiting_for_retry: u64 = 0,
+    obsolete_paths_reclaimable: u64 = 0,
+    obsolete_delete_failures: u64 = 0,
+    obsolete_delete_retries: u64 = 0,
+    current_manifest_bytes: u64 = 0,
+    mutable_entry_count: u64 = 0,
+    mutable_bytes: u64 = 0,
+    immutable_memtable_count: u64 = 0,
+    immutable_entry_count: u64 = 0,
+    immutable_bytes: u64 = 0,
+    mutable_snapshot_clone_count: u64 = 0,
+    mutable_snapshot_clone_bytes: u64 = 0,
+    mutable_snapshot_clone_peak_bytes: u64 = 0,
+    read_snapshot_mutable_rotation_count: u64 = 0,
+    read_snapshot_mutable_rotation_bytes: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    compaction_backlog_bytes: u64 = 0,
+    active_readers: u64 = 0,
+    active_readers_bound_read_txn: u64 = 0,
+    active_readers_namespace_read_txn: u64 = 0,
+    active_readers_probe_txn: u64 = 0,
+    active_readers_current_scan: u64 = 0,
+    active_readers_write_txn: u64 = 0,
+    active_readers_compaction: u64 = 0,
+    active_readers_other: u64 = 0,
+    obsolete_paths_pinned_by_reader_bound_read_txn: u64 = 0,
+    obsolete_paths_pinned_by_reader_namespace_read_txn: u64 = 0,
+    obsolete_paths_pinned_by_reader_probe_txn: u64 = 0,
+    obsolete_paths_pinned_by_reader_current_scan: u64 = 0,
+    obsolete_paths_pinned_by_reader_write_txn: u64 = 0,
+    obsolete_paths_pinned_by_reader_compaction: u64 = 0,
+    obsolete_paths_pinned_by_reader_other: u64 = 0,
+    active_bulk_ingest_batches: u64 = 0,
+    manifest_dirty: bool = false,
+    obsolete_manifest_dirty: bool = false,
+    maintenance_score: u64 = 0,
+    maintenance_debt_hint: u64 = 0,
+    flush_count: u64 = 0,
+    flush_output_run_count: u64 = 0,
+    flush_output_bytes: u64 = 0,
+    sorted_ingest_run_count: u64 = 0,
+    sorted_ingest_bytes: u64 = 0,
+    manifest_write_count: u64 = 0,
+    manifest_bytes: u64 = 0,
+    write_pressure_event_count: u64 = 0,
+    write_pressure_compaction_count: u64 = 0,
+    write_pressure_compaction_step_count: u64 = 0,
+    write_pressure_overload_count: u64 = 0,
+    write_pressure_overload_l0_run_debt: u64 = 0,
+    immutable_rotation_count: u64 = 0,
+    immutable_flush_count: u64 = 0,
+    direct_bulk_ingest_attempt_count: u64 = 0,
+    direct_bulk_ingest_success_count: u64 = 0,
+    direct_bulk_ingest_entry_count: u64 = 0,
+    bulk_append_attempt_count: u64 = 0,
+    bulk_append_entry_count: u64 = 0,
+    bulk_append_direct_success_count: u64 = 0,
+    bulk_append_direct_entry_count: u64 = 0,
+    bulk_append_fallback_backend_pending_count: u64 = 0,
+    bulk_append_fallback_below_threshold_count: u64 = 0,
+    bulk_append_fallback_duplicate_key_count: u64 = 0,
+    bulk_append_fallback_to_mutable_entry_count: u64 = 0,
+    direct_bulk_ingest_direct_entry_count: u64 = 0,
+    direct_bulk_ingest_fallback_unsupported_count: u64 = 0,
+    direct_bulk_ingest_fallback_backend_mutable_count: u64 = 0,
+    direct_bulk_ingest_fallback_below_threshold_count: u64 = 0,
+};
+
 pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
+    lsm: ?LsmStorageStatus = null,
 };
+
+fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
+    return counts[@intFromEnum(kind)];
+}
+
+pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
+    const maintenance = stats.maintenance;
+    const write = stats.write;
+    return .{
+        .run_count = maintenance.total_runs,
+        .run_bytes = maintenance.total_run_bytes,
+        .l0_run_count = maintenance.l0_runs,
+        .l0_bytes = maintenance.l0_bytes,
+        .lower_level_run_count = maintenance.lower_level_runs,
+        .lower_level_bytes = maintenance.lower_level_bytes,
+        .max_level = maintenance.max_level,
+        .compactable_l0_run_count = maintenance.compactable_l0_runs,
+        .overlapping_l0_run_count = maintenance.overlapping_l0_runs,
+        .soft_limit_l0_run_count = maintenance.soft_limit_l0_runs,
+        .hard_limit_l0_run_count = maintenance.hard_limit_l0_runs,
+        .write_stall_l0_run_debt = maintenance.write_stall_l0_run_debt,
+        .soft_limit_l0_bytes = maintenance.soft_limit_l0_bytes,
+        .hard_limit_l0_bytes = maintenance.hard_limit_l0_bytes,
+        .write_stall_l0_byte_debt = maintenance.write_stall_l0_byte_debt,
+        .level_overflow_run_count = maintenance.level_overflow_runs,
+        .level_overflow_bytes = maintenance.level_overflow_bytes,
+        .obsolete_path_count = maintenance.obsolete_paths,
+        .obsolete_paths_pinned_by_readers = maintenance.obsolete_paths_pinned_by_readers,
+        .obsolete_paths_pinned_by_versions = maintenance.obsolete_paths_pinned_by_versions,
+        .obsolete_paths_waiting_for_retry = maintenance.obsolete_paths_waiting_for_retry,
+        .obsolete_paths_reclaimable = maintenance.obsolete_paths_reclaimable,
+        .obsolete_delete_failures = maintenance.obsolete_delete_failures,
+        .obsolete_delete_retries = maintenance.obsolete_delete_retries,
+        .current_manifest_bytes = maintenance.current_manifest_bytes,
+        .mutable_entry_count = maintenance.mutable_entries,
+        .mutable_bytes = maintenance.mutable_bytes,
+        .immutable_memtable_count = maintenance.immutable_memtables,
+        .immutable_entry_count = maintenance.immutable_entries,
+        .immutable_bytes = maintenance.immutable_bytes,
+        .mutable_snapshot_clone_count = maintenance.mutable_snapshot_clone_calls,
+        .mutable_snapshot_clone_bytes = maintenance.mutable_snapshot_clone_bytes_total,
+        .mutable_snapshot_clone_peak_bytes = maintenance.mutable_snapshot_clone_peak_bytes,
+        .read_snapshot_mutable_rotation_count = maintenance.read_snapshot_mutable_rotations,
+        .read_snapshot_mutable_rotation_bytes = maintenance.read_snapshot_mutable_rotation_bytes_total,
+        .wal_retained_bytes = maintenance.wal_retained_bytes,
+        .compaction_backlog_bytes = maintenance.compaction_scheduler_remembered_pending_bytes,
+        .active_readers = maintenance.active_readers,
+        .active_readers_bound_read_txn = readerPinCount(maintenance.active_readers_by_kind, .bound_read_txn),
+        .active_readers_namespace_read_txn = readerPinCount(maintenance.active_readers_by_kind, .namespace_read_txn),
+        .active_readers_probe_txn = readerPinCount(maintenance.active_readers_by_kind, .probe_txn),
+        .active_readers_current_scan = readerPinCount(maintenance.active_readers_by_kind, .current_scan),
+        .active_readers_write_txn = readerPinCount(maintenance.active_readers_by_kind, .write_txn),
+        .active_readers_compaction = readerPinCount(maintenance.active_readers_by_kind, .compaction),
+        .active_readers_other = readerPinCount(maintenance.active_readers_by_kind, .other),
+        .obsolete_paths_pinned_by_reader_bound_read_txn = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .bound_read_txn),
+        .obsolete_paths_pinned_by_reader_namespace_read_txn = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .namespace_read_txn),
+        .obsolete_paths_pinned_by_reader_probe_txn = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .probe_txn),
+        .obsolete_paths_pinned_by_reader_current_scan = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .current_scan),
+        .obsolete_paths_pinned_by_reader_write_txn = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .write_txn),
+        .obsolete_paths_pinned_by_reader_compaction = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .compaction),
+        .obsolete_paths_pinned_by_reader_other = readerPinCount(maintenance.obsolete_paths_pinned_by_reader_kind, .other),
+        .active_bulk_ingest_batches = maintenance.active_bulk_ingest_batches,
+        .manifest_dirty = maintenance.manifest_dirty,
+        .obsolete_manifest_dirty = maintenance.obsolete_manifest_dirty,
+        .maintenance_score = stats.maintenance_score,
+        .maintenance_debt_hint = stats.maintenance_debt_hint,
+        .flush_count = write.flushes,
+        .flush_output_run_count = write.flush_output_runs,
+        .flush_output_bytes = write.flush_output_bytes,
+        .sorted_ingest_run_count = write.sorted_ingest_runs,
+        .sorted_ingest_bytes = write.sorted_ingest_bytes,
+        .manifest_write_count = write.manifest_writes,
+        .manifest_bytes = write.manifest_bytes,
+        .write_pressure_event_count = write.write_pressure_events,
+        .write_pressure_compaction_count = write.write_pressure_compactions,
+        .write_pressure_compaction_step_count = write.write_pressure_compaction_steps,
+        .write_pressure_overload_count = write.write_pressure_overloads,
+        .write_pressure_overload_l0_run_debt = write.write_pressure_overload_l0_run_debt,
+        .immutable_rotation_count = write.immutable_rotations,
+        .immutable_flush_count = write.immutable_flushes,
+        .bulk_append_attempt_count = write.bulk_append_attempts,
+        .bulk_append_entry_count = write.bulk_append_entries,
+        .bulk_append_direct_success_count = write.bulk_append_direct_successes,
+        .bulk_append_direct_entry_count = write.bulk_append_direct_entries,
+        .bulk_append_fallback_backend_pending_count = write.bulk_append_fallback_backend_pending,
+        .bulk_append_fallback_below_threshold_count = write.bulk_append_fallback_below_threshold,
+        .bulk_append_fallback_duplicate_key_count = write.bulk_append_fallback_duplicate_keys,
+        .bulk_append_fallback_to_mutable_entry_count = write.bulk_append_fallback_to_mutable_entries,
+        .direct_bulk_ingest_attempt_count = write.direct_bulk_ingest_attempts,
+        .direct_bulk_ingest_success_count = write.direct_bulk_ingest_successes,
+        .direct_bulk_ingest_entry_count = write.direct_bulk_ingest_entries,
+        .direct_bulk_ingest_direct_entry_count = write.direct_bulk_ingest_entries_direct,
+        .direct_bulk_ingest_fallback_unsupported_count = write.direct_bulk_ingest_fallback_unsupported,
+        .direct_bulk_ingest_fallback_backend_mutable_count = write.direct_bulk_ingest_fallback_backend_mutable,
+        .direct_bulk_ingest_fallback_below_threshold_count = write.direct_bulk_ingest_fallback_below_threshold,
+    };
+}
+
+pub fn lsmStorageStatusFromMaintenanceStats(maintenance: lsm_backend.Backend.MaintenanceStats) LsmStorageStatus {
+    return lsmStorageStatusFromStats(.{ .maintenance = maintenance, .write = .{} });
+}
+
+fn generatedLsmStorageStatus(status: LsmStorageStatus) metadata_openapi.LsmStorageStatus {
+    return .{
+        .run_count = u64ToI64(status.run_count),
+        .run_bytes = u64ToI64(status.run_bytes),
+        .l0_run_count = u64ToI64(status.l0_run_count),
+        .l0_bytes = u64ToI64(status.l0_bytes),
+        .lower_level_run_count = u64ToI64(status.lower_level_run_count),
+        .lower_level_bytes = u64ToI64(status.lower_level_bytes),
+        .max_level = u64ToI64(status.max_level),
+        .compactable_l0_run_count = u64ToI64(status.compactable_l0_run_count),
+        .overlapping_l0_run_count = u64ToI64(status.overlapping_l0_run_count),
+        .soft_limit_l0_run_count = u64ToI64(status.soft_limit_l0_run_count),
+        .hard_limit_l0_run_count = u64ToI64(status.hard_limit_l0_run_count),
+        .write_stall_l0_run_debt = u64ToI64(status.write_stall_l0_run_debt),
+        .soft_limit_l0_bytes = u64ToI64(status.soft_limit_l0_bytes),
+        .hard_limit_l0_bytes = u64ToI64(status.hard_limit_l0_bytes),
+        .write_stall_l0_byte_debt = u64ToI64(status.write_stall_l0_byte_debt),
+        .level_overflow_run_count = u64ToI64(status.level_overflow_run_count),
+        .level_overflow_bytes = u64ToI64(status.level_overflow_bytes),
+        .obsolete_path_count = u64ToI64(status.obsolete_path_count),
+        .obsolete_paths_pinned_by_readers = u64ToI64(status.obsolete_paths_pinned_by_readers),
+        .obsolete_paths_pinned_by_versions = u64ToI64(status.obsolete_paths_pinned_by_versions),
+        .obsolete_paths_waiting_for_retry = u64ToI64(status.obsolete_paths_waiting_for_retry),
+        .obsolete_paths_reclaimable = u64ToI64(status.obsolete_paths_reclaimable),
+        .obsolete_delete_failures = u64ToI64(status.obsolete_delete_failures),
+        .obsolete_delete_retries = u64ToI64(status.obsolete_delete_retries),
+        .current_manifest_bytes = u64ToI64(status.current_manifest_bytes),
+        .mutable_entry_count = u64ToI64(status.mutable_entry_count),
+        .mutable_bytes = u64ToI64(status.mutable_bytes),
+        .immutable_memtable_count = u64ToI64(status.immutable_memtable_count),
+        .immutable_entry_count = u64ToI64(status.immutable_entry_count),
+        .immutable_bytes = u64ToI64(status.immutable_bytes),
+        .mutable_snapshot_clone_count = u64ToI64(status.mutable_snapshot_clone_count),
+        .mutable_snapshot_clone_bytes = u64ToI64(status.mutable_snapshot_clone_bytes),
+        .mutable_snapshot_clone_peak_bytes = u64ToI64(status.mutable_snapshot_clone_peak_bytes),
+        .read_snapshot_mutable_rotation_count = u64ToI64(status.read_snapshot_mutable_rotation_count),
+        .read_snapshot_mutable_rotation_bytes = u64ToI64(status.read_snapshot_mutable_rotation_bytes),
+        .wal_retained_bytes = u64ToI64(status.wal_retained_bytes),
+        .compaction_backlog_bytes = u64ToI64(status.compaction_backlog_bytes),
+        .active_readers = u64ToI64(status.active_readers),
+        .active_readers_bound_read_txn = u64ToI64(status.active_readers_bound_read_txn),
+        .active_readers_namespace_read_txn = u64ToI64(status.active_readers_namespace_read_txn),
+        .active_readers_probe_txn = u64ToI64(status.active_readers_probe_txn),
+        .active_readers_current_scan = u64ToI64(status.active_readers_current_scan),
+        .active_readers_write_txn = u64ToI64(status.active_readers_write_txn),
+        .active_readers_compaction = u64ToI64(status.active_readers_compaction),
+        .active_readers_other = u64ToI64(status.active_readers_other),
+        .obsolete_paths_pinned_by_reader_bound_read_txn = u64ToI64(status.obsolete_paths_pinned_by_reader_bound_read_txn),
+        .obsolete_paths_pinned_by_reader_namespace_read_txn = u64ToI64(status.obsolete_paths_pinned_by_reader_namespace_read_txn),
+        .obsolete_paths_pinned_by_reader_probe_txn = u64ToI64(status.obsolete_paths_pinned_by_reader_probe_txn),
+        .obsolete_paths_pinned_by_reader_current_scan = u64ToI64(status.obsolete_paths_pinned_by_reader_current_scan),
+        .obsolete_paths_pinned_by_reader_write_txn = u64ToI64(status.obsolete_paths_pinned_by_reader_write_txn),
+        .obsolete_paths_pinned_by_reader_compaction = u64ToI64(status.obsolete_paths_pinned_by_reader_compaction),
+        .obsolete_paths_pinned_by_reader_other = u64ToI64(status.obsolete_paths_pinned_by_reader_other),
+        .active_bulk_ingest_batches = u64ToI64(status.active_bulk_ingest_batches),
+        .manifest_dirty = status.manifest_dirty,
+        .obsolete_manifest_dirty = status.obsolete_manifest_dirty,
+        .maintenance_score = u64ToI64(status.maintenance_score),
+        .maintenance_debt_hint = u64ToI64(status.maintenance_debt_hint),
+        .flush_count = u64ToI64(status.flush_count),
+        .flush_output_run_count = u64ToI64(status.flush_output_run_count),
+        .flush_output_bytes = u64ToI64(status.flush_output_bytes),
+        .sorted_ingest_run_count = u64ToI64(status.sorted_ingest_run_count),
+        .sorted_ingest_bytes = u64ToI64(status.sorted_ingest_bytes),
+        .manifest_write_count = u64ToI64(status.manifest_write_count),
+        .manifest_bytes = u64ToI64(status.manifest_bytes),
+        .write_pressure_event_count = u64ToI64(status.write_pressure_event_count),
+        .write_pressure_compaction_count = u64ToI64(status.write_pressure_compaction_count),
+        .write_pressure_compaction_step_count = u64ToI64(status.write_pressure_compaction_step_count),
+        .write_pressure_overload_count = u64ToI64(status.write_pressure_overload_count),
+        .write_pressure_overload_l0_run_debt = u64ToI64(status.write_pressure_overload_l0_run_debt),
+        .immutable_rotation_count = u64ToI64(status.immutable_rotation_count),
+        .immutable_flush_count = u64ToI64(status.immutable_flush_count),
+        .bulk_append_attempt_count = u64ToI64(status.bulk_append_attempt_count),
+        .bulk_append_entry_count = u64ToI64(status.bulk_append_entry_count),
+        .bulk_append_direct_success_count = u64ToI64(status.bulk_append_direct_success_count),
+        .bulk_append_direct_entry_count = u64ToI64(status.bulk_append_direct_entry_count),
+        .bulk_append_fallback_backend_pending_count = u64ToI64(status.bulk_append_fallback_backend_pending_count),
+        .bulk_append_fallback_below_threshold_count = u64ToI64(status.bulk_append_fallback_below_threshold_count),
+        .bulk_append_fallback_duplicate_key_count = u64ToI64(status.bulk_append_fallback_duplicate_key_count),
+        .bulk_append_fallback_to_mutable_entry_count = u64ToI64(status.bulk_append_fallback_to_mutable_entry_count),
+        .direct_bulk_ingest_attempt_count = u64ToI64(status.direct_bulk_ingest_attempt_count),
+        .direct_bulk_ingest_success_count = u64ToI64(status.direct_bulk_ingest_success_count),
+        .direct_bulk_ingest_entry_count = u64ToI64(status.direct_bulk_ingest_entry_count),
+        .direct_bulk_ingest_direct_entry_count = u64ToI64(status.direct_bulk_ingest_direct_entry_count),
+        .direct_bulk_ingest_fallback_unsupported_count = u64ToI64(status.direct_bulk_ingest_fallback_unsupported_count),
+        .direct_bulk_ingest_fallback_backend_mutable_count = u64ToI64(status.direct_bulk_ingest_fallback_backend_mutable_count),
+        .direct_bulk_ingest_fallback_below_threshold_count = u64ToI64(status.direct_bulk_ingest_fallback_below_threshold_count),
+    };
+}
+
+fn u64ToI64(value: u64) i64 {
+    return if (value > std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(value);
+}
 
 const RuntimeSchemaDebugBinding = struct {
     index_name: []const u8,
@@ -462,8 +752,10 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupId(table.name, 0x47525031);
     return .{
-        .group_id = deriveDataGroupId(table.name, 0x47525031),
+        .group_id = group_id,
+        .range_id = group_id,
         .table_id = table.table_id,
         .start_key = "",
         .end_key = null,
@@ -475,9 +767,11 @@ pub fn deriveInitialRanges(
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
     if (table.min_ranges <= 1) {
+        const initial_range = deriveInitialRange(table);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
-            .group_id = deriveInitialRange(table).group_id,
+            .group_id = initial_range.group_id,
+            .range_id = initial_range.range_id,
             .table_id = table.table_id,
             .start_key = try alloc.dupe(u8, ""),
             .end_key = null,
@@ -509,8 +803,10 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
+        const group_id = deriveShardGroupId(table.name, i);
         out[i] = .{
-            .group_id = deriveShardGroupId(table.name, i),
+            .group_id = group_id,
+            .range_id = group_id,
             .table_id = table.table_id,
             .start_key = start_key,
             .end_key = end_key,
@@ -621,6 +917,10 @@ fn buildTableStatus(
     }
 
     const empty = if (storage_status) |status| status.empty else ranges.len == 0;
+    const lsm_status = if (storage_status) |status|
+        if (status.lsm) |lsm| generatedLsmStorageStatus(lsm) else null
+    else
+        null;
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
@@ -635,6 +935,7 @@ fn buildTableStatus(
         .storage_status = .{
             .disk_usage = 0,
             .empty = empty,
+            .lsm = lsm_status,
         },
     };
 }
@@ -835,6 +1136,10 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
+        // `resolvers` is a reserved entity-resolution section, not an index
+        // config; the provisioner reads it from the stored indexes_json. Skip it
+        // here so the typed IndexConfig validation/projection ignores it.
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -1507,6 +1812,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
 
 fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
+    if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     if (req.full_text_queries.len > 0) return false;
 
     return switch (req.query) {
@@ -1575,7 +1881,7 @@ fn extractCanonicalObjectField(alloc: std.mem.Allocator, schema_json: []const u8
     return try stringifyJsonValue(alloc, value);
 }
 
-fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
+pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
     defer parsed.deinit();
@@ -1843,11 +2149,143 @@ test "metadata.table status encoder honors storage status overrides" {
         .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
-    const storage_statuses = [_]TableStorageStatus{.{ .table_name = "docs", .empty = true }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = true,
+        .lsm = .{
+            .run_count = 3,
+            .run_bytes = 44,
+            .l0_run_count = 1,
+            .l0_bytes = 33,
+            .lower_level_run_count = 2,
+            .lower_level_bytes = 11,
+            .max_level = 3,
+            .compactable_l0_run_count = 4,
+            .overlapping_l0_run_count = 5,
+            .soft_limit_l0_run_count = 6,
+            .hard_limit_l0_run_count = 7,
+            .write_stall_l0_run_debt = 8,
+            .soft_limit_l0_bytes = 9,
+            .hard_limit_l0_bytes = 10,
+            .write_stall_l0_byte_debt = 12,
+            .level_overflow_run_count = 13,
+            .level_overflow_bytes = 14,
+            .obsolete_path_count = 15,
+            .obsolete_paths_pinned_by_readers = 130,
+            .obsolete_paths_pinned_by_versions = 131,
+            .obsolete_paths_waiting_for_retry = 132,
+            .obsolete_paths_reclaimable = 133,
+            .obsolete_delete_failures = 134,
+            .obsolete_delete_retries = 135,
+            .current_manifest_bytes = 16,
+            .mutable_entry_count = 17,
+            .mutable_bytes = 18,
+            .immutable_memtable_count = 19,
+            .immutable_entry_count = 20,
+            .immutable_bytes = 21,
+            .mutable_snapshot_clone_count = 22,
+            .mutable_snapshot_clone_bytes = 23,
+            .mutable_snapshot_clone_peak_bytes = 24,
+            .read_snapshot_mutable_rotation_count = 25,
+            .read_snapshot_mutable_rotation_bytes = 26,
+            .wal_retained_bytes = 55,
+            .compaction_backlog_bytes = 10,
+            .active_readers = 2,
+            .active_bulk_ingest_batches = 1,
+            .manifest_dirty = true,
+            .obsolete_manifest_dirty = true,
+            .maintenance_score = 99,
+            .maintenance_debt_hint = 88,
+            .flush_count = 101,
+            .flush_output_run_count = 102,
+            .flush_output_bytes = 103,
+            .sorted_ingest_run_count = 104,
+            .sorted_ingest_bytes = 105,
+            .manifest_write_count = 106,
+            .manifest_bytes = 107,
+            .write_pressure_event_count = 108,
+            .write_pressure_compaction_count = 109,
+            .write_pressure_compaction_step_count = 110,
+            .write_pressure_overload_count = 111,
+            .write_pressure_overload_l0_run_debt = 112,
+            .immutable_rotation_count = 113,
+            .immutable_flush_count = 114,
+            .bulk_append_attempt_count = 119,
+            .bulk_append_entry_count = 120,
+            .bulk_append_direct_success_count = 121,
+            .bulk_append_direct_entry_count = 122,
+            .bulk_append_fallback_backend_pending_count = 123,
+            .bulk_append_fallback_below_threshold_count = 124,
+            .bulk_append_fallback_duplicate_key_count = 125,
+            .bulk_append_fallback_to_mutable_entry_count = 126,
+            .direct_bulk_ingest_attempt_count = 115,
+            .direct_bulk_ingest_success_count = 116,
+            .direct_bulk_ingest_entry_count = 117,
+            .direct_bulk_ingest_direct_entry_count = 118,
+            .direct_bulk_ingest_fallback_unsupported_count = 127,
+            .direct_bulk_ingest_fallback_backend_mutable_count = 128,
+            .direct_bulk_ingest_fallback_below_threshold_count = 129,
+        },
+    }};
 
     const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"storage_status\":{\"disk_usage\":0,\"empty\":true,\"lsm\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"run_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"l0_bytes\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lower_level_run_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"max_level\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compactable_l0_run_count\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"overlapping_l0_run_count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"hard_limit_l0_run_count\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_stall_l0_run_debt\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"level_overflow_run_count\":13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_path_count\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_paths_pinned_by_readers\":130") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_paths_pinned_by_versions\":131") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_paths_waiting_for_retry\":132") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_paths_reclaimable\":133") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_delete_failures\":134") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_delete_retries\":135") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_manifest_bytes\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_entry_count\":17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_bytes\":18") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_memtable_count\":19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_bytes\":21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"mutable_snapshot_clone_count\":22") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"read_snapshot_mutable_rotation_count\":25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_retained_bytes\":55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"compaction_backlog_bytes\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_readers\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_bulk_ingest_batches\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_dirty\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"obsolete_manifest_dirty\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_score\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"maintenance_debt_hint\":88") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_count\":101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_output_run_count\":102") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"flush_output_bytes\":103") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sorted_ingest_run_count\":104") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sorted_ingest_bytes\":105") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_write_count\":106") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"manifest_bytes\":107") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_event_count\":108") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_compaction_count\":109") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_compaction_step_count\":110") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overload_count\":111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"write_pressure_overload_l0_run_debt\":112") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_rotation_count\":113") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"immutable_flush_count\":114") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_attempt_count\":119") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_direct_success_count\":121") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_fallback_backend_pending_count\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"bulk_append_fallback_below_threshold_count\":124") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_attempt_count\":115") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_success_count\":116") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_entry_count\":117") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_direct_entry_count\":118") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_backend_mutable_count\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_below_threshold_count\":129") != null);
 }
 
 test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {
@@ -2250,6 +2688,37 @@ test "metadata.query routing preserves vector index and records read schema text
     defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
     defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
     defer std.testing.allocator.free(req.filter_query_json);
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing selects read schema text index for vector-only structured filters" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":3}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v3\":{\"type\":\"full_text\"}}",
+        .placement_role = "data",
+    };
+    var req: db_mod.types.SearchRequest = .{
+        .query = .{ .dense_knn = .{
+            .vector = try std.testing.allocator.dupe(f32, &.{ 1, 2, 3 }),
+            .k = 10,
+        } },
+        .index_name = try std.testing.allocator.dupe(u8, "dense_idx"),
+        .filter_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
+        .exclusion_query_json = try std.testing.allocator.dupe(u8, "{\"term\":{\"archived\":true}}"),
+    };
+    defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
+    defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
+    defer {
+        std.testing.allocator.free(req.query.dense_knn.vector);
+        std.testing.allocator.free(req.filter_query_json);
+        std.testing.allocator.free(req.exclusion_query_json);
+    }
 
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);

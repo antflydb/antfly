@@ -209,7 +209,7 @@ const QueryResultsList: React.FC<QueryResultsListProps> = ({ result, className }
 
         {/* Table View */}
         {viewMode === "table" && (
-          <div className="border rounded-lg overflow-auto max-h-[600px]">
+          <div className="border rounded-none overflow-auto max-h-[600px]">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -228,9 +228,7 @@ const QueryResultsList: React.FC<QueryResultsListProps> = ({ result, className }
                     </TableCell>
                     <TableCell>
                       {hit._score !== undefined ? (
-                        <Badge variant="outline" className="font-mono text-xs">
-                          {hit._score.toFixed(4)}
-                        </Badge>
+                        <Badge className="font-mono text-xs">{hit._score.toFixed(4)}</Badge>
                       ) : (
                         <span className="text-muted-foreground text-xs">-</span>
                       )}

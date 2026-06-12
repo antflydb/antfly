@@ -38,9 +38,9 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
 
-	// Start a single-node swarm without Termite (only full-text indexing needed).
-	t.Log("Starting Antfly swarm (no Termite)...")
-	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableTermite: true})
+	// Start a single-node swarm without Antfly inference (only full-text indexing needed).
+	t.Log("Starting Antfly swarm (no Antfly inference)...")
+	swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{DisableInference: true})
 	defer swarm.Cleanup()
 
 	tableName := "schema_migration_test"

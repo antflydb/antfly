@@ -1,7 +1,7 @@
 # Image Corpus
 
 This directory holds the curated image conformance corpus for the shared
-`antfly-zig` / `termite-zig` image stack.
+`antfly-zig` / `antfly-inference-zig` image stack.
 
 The goal is to keep a small checked-in core corpus that exercises the behavior
 we claim to support, plus enough invalid inputs to lock down parser and decoder

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.lsm_storage_status import LsmStorageStatus
+
 
 T = TypeVar("T", bound="StorageStatus")
 
@@ -17,16 +21,23 @@ class StorageStatus:
     Attributes:
         disk_usage (int | Unset): Disk usage in bytes.
         empty (bool | Unset): Whether the table has received data.
+        lsm (LsmStorageStatus | Unset): Compact LSM backend operational status. Detailed low-level counters are
+            available through metrics.
     """
 
     disk_usage: int | Unset = UNSET
     empty: bool | Unset = UNSET
+    lsm: LsmStorageStatus | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         disk_usage = self.disk_usage
 
         empty = self.empty
+
+        lsm: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lsm, Unset):
+            lsm = self.lsm.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -35,19 +46,31 @@ class StorageStatus:
             field_dict["disk_usage"] = disk_usage
         if empty is not UNSET:
             field_dict["empty"] = empty
+        if lsm is not UNSET:
+            field_dict["lsm"] = lsm
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.lsm_storage_status import LsmStorageStatus
+
         d = dict(src_dict)
         disk_usage = d.pop("disk_usage", UNSET)
 
         empty = d.pop("empty", UNSET)
 
+        _lsm = d.pop("lsm", UNSET)
+        lsm: LsmStorageStatus | Unset
+        if isinstance(_lsm, Unset):
+            lsm = UNSET
+        else:
+            lsm = LsmStorageStatus.from_dict(_lsm)
+
         storage_status = cls(
             disk_usage=disk_usage,
             empty=empty,
+            lsm=lsm,
         )
 
         storage_status.additional_properties = d

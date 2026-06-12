@@ -195,8 +195,7 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 
 		scannedTimestampKeys++
 
-		// Extract the base key (remove :t suffix)
-		baseKey := bytes.TrimSuffix(key, storeutils.TransactionSuffix)
+		baseKey := documentKeyFromTimestampKey(key)
 
 		// Read the timestamp value (uint64 encoded with EncodeUint64Ascending)
 		timestampBytes := iter.Value()
@@ -218,7 +217,7 @@ func (tc *TTLCleaner) cleanupExpiredDocuments(
 
 		// Check if document is expired
 		if timestamp < expirationThreshold {
-			expiredKeys = append(expiredKeys, bytes.Clone(baseKey))
+			expiredKeys = append(expiredKeys, baseKey)
 
 			// Process batch if we've hit the limit
 			if len(expiredKeys) >= TTLBatchSize {
@@ -337,6 +336,23 @@ func (tc *TTLCleaner) Stats() map[string]any {
 	}
 }
 
+func documentKeyFromTimestampKey(key []byte) []byte {
+	baseKey := bytes.TrimSuffix(key, storeutils.TransactionSuffix)
+	if bytes.HasSuffix(baseKey, storeutils.DBRangeStart) {
+		return bytes.Clone(baseKey[:len(baseKey)-len(storeutils.DBRangeStart)])
+	}
+	return bytes.Clone(baseKey)
+}
+
+func documentTimestampKey(key []byte) []byte {
+	if bytes.HasSuffix(key, storeutils.DBRangeStart) {
+		return append(bytes.Clone(key), storeutils.TransactionSuffix...)
+	}
+
+	normalizedKey := storeutils.KeyRangeStart(key)
+	return append(normalizedKey, storeutils.TransactionSuffix...)
+}
+
 // isDocumentExpiredByTimestamp checks if a document is expired by reading its HLC timestamp.
 // This is used for query filtering. Returns true if expired, false otherwise.
 func (db *DBImpl) isDocumentExpiredByTimestamp(ctx context.Context, key []byte) (bool, error) {
@@ -354,11 +370,16 @@ func (db *DBImpl) isDocumentExpiredByTimestamp(ctx context.Context, key []byte) 
 		return false, fmt.Errorf("database is closed or not initialized")
 	}
 
-	// Build timestamp key: <baseKey>:t
-	timestampKey := append(bytes.Clone(key), storeutils.TransactionSuffix...)
+	timestampKey := documentTimestampKey(key)
 
 	// Read the timestamp value
 	timestampBytes, closer, err := pdb.Get(timestampKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		legacyTimestampKey := append(bytes.Clone(key), storeutils.TransactionSuffix...)
+		if !bytes.Equal(legacyTimestampKey, timestampKey) {
+			timestampBytes, closer, err = pdb.Get(legacyTimestampKey)
+		}
+	}
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			// No timestamp key means document was inserted before timestamps were enabled

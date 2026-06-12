@@ -257,17 +257,111 @@ pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.js
     return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Lookup a key in a table
+/// Retrieve a document by key
 pub const LookupKeyPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Key of the record to lookup
+    /// Key of the document to retrieve
     key: []const u8,
 };
 
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+};
+
+/// List derived document artifact manifests
+pub const ListDocumentArtifactManifestsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+};
+
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+/// Reprocess a derived document artifact across a table range
+pub const ReprocessDocumentArtifactRangePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for reprocessDocumentArtifactRange.
+pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Create a derived document artifact reprocess job
+pub const StartDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for startDocumentArtifactReprocessJob.
+pub fn parseStartDocumentArtifactReprocessJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactReprocessJobStartRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactReprocessJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get derived document artifact reprocess job status
+pub const GetDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a derived document artifact reprocess job
+pub const AdvanceDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Cancel a derived document artifact reprocess job
+pub const CancelDocumentArtifactReprocessJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+    /// Reprocess job identifier.
+    job_id: []const u8,
+};
+
+/// Inspect a derived document artifact manifest
+pub const GetDocumentArtifactManifestPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+pub const GetDocumentArtifactManifestParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
+};
+
+/// Reprocess a derived document artifact
+pub const ReprocessDocumentArtifactPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
 };
 
 /// List all indexes for a table
@@ -501,6 +595,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
+    .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -536,7 +631,15 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/lookup/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
@@ -570,6 +673,7 @@ pub const routes = [_]Route{
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
@@ -606,6 +710,14 @@ pub const routes = [_]Route{
 //   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
+//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
+//   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

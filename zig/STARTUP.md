@@ -8,8 +8,8 @@ Startup, health, and public status paths must stay cheap even when a node holds 
 
 The request path for:
 
-- `GET /api/v1/tables/{name}`
-- `GET /api/v1/tables/{name}/indexes/{index}`
+- `GET /db/v1/tables/{name}`
+- `GET /db/v1/tables/{name}/indexes/{index}`
 - health/status endpoints
 - metadata store-status heartbeats
 

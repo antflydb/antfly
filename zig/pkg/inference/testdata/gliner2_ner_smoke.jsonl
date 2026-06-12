@@ -1,0 +1,3 @@
+{"text":"John works at Acme in Paris","entities":[{"text":"John","label":"person","start":0,"end":4},{"text":"Acme","label":"organization","start":14,"end":18},{"text":"Paris","label":"location","start":22,"end":27}]}
+{"text":"Mary joined Globex in London","entities":[{"text":"Mary","label":"person","start":0,"end":4},{"text":"Globex","label":"organization","start":12,"end":18},{"text":"London","label":"location","start":22,"end":28}]}
+{"text":"Acme hired John in Seattle","entities":[{"text":"Acme","label":"organization","start":0,"end":4},{"text":"John","label":"person","start":11,"end":15},{"text":"Seattle","label":"location","start":20,"end":27}]}

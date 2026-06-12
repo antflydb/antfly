@@ -21,6 +21,8 @@ import {
   type ExpressionName,
   type EyeStyle,
 } from "./animation/types";
+import { LOGO_BRACKET_BR, LOGO_BRACKET_TL, LOGO_VIEWBOX } from "./pixelate/logo-mark";
+import type { PixelateCycleOptions, PixelateOptions } from "./pixelate/pixelate-system";
 import { useAnimationController } from "./use-animation-controller";
 
 export type AntyPreset = "default" | "hero" | "assistant" | "icon" | "logo";
@@ -123,6 +125,13 @@ export interface AntyProps {
   floatDuration?: number;
   /** Float easing curve (default: 'sine.inOut'). Any GSAP ease string. */
   floatEase?: string;
+  /**
+   * Declarative pixelation. When it flips to `true`, Anty ripples into its
+   * pixel form; back to `false` ripples to the smooth vector. Composes with
+   * idle/emotions (the pixel form still floats and can play emotions). For
+   * finer control (cycle, origin), use the imperative handle.
+   */
+  pixelated?: boolean;
   /** Callback when an emotion animation completes */
   onEmotionComplete?: (emotion: string) => void;
   /** Callback when animation sequence changes (for debugging) */
@@ -150,6 +159,18 @@ export interface AntyHandle {
   powerOff?: () => void;
   /** Transition to IDLE state */
   wakeUp?: () => void;
+  /** Ripple into the pixel form and hold. */
+  pixelate?: (opts?: PixelateOptions) => void;
+  /** Ripple back to the smooth vector. */
+  depixelate?: (opts?: PixelateOptions) => void;
+  /** Toggle between pixel and vector forms. */
+  togglePixelate?: (opts?: PixelateOptions) => void;
+  /** Start a looping pixelation/depixelation "waiting" animation. */
+  startPixelateCycle?: (opts?: PixelateCycleOptions) => void;
+  /** Stop the cycle and settle back to the vector. */
+  stopPixelateCycle?: () => void;
+  /** Whether Anty is currently in (or transitioning to) pixel form. */
+  isPixelated?: () => boolean;
 }
 
 // ============================================================================
@@ -188,20 +209,32 @@ const styles = {
     overflow: "visible" as const,
   },
 
+  vectorLayer: {
+    position: "absolute" as const,
+    inset: 0,
+  },
+
+  pixelCanvas: {
+    position: "absolute" as const,
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    display: "none",
+    imageRendering: "pixelated" as const,
+    pointerEvents: "none" as const,
+  },
+
+  // Both brackets fill the whole (square) character box and render their slice
+  // of the canonical af-logo viewBox at 1:1 — so the live mark is the logo, and
+  // the pixelate texture (also the logo) cross-fades without shifting.
   rightBody: {
     position: "absolute" as const,
-    top: "13.46%",
-    right: "0",
-    bottom: "0",
-    left: "13.46%",
+    inset: 0,
   },
 
   leftBody: {
     position: "absolute" as const,
-    top: "0",
-    right: "13.15%",
-    bottom: "13.15%",
-    left: "0",
+    inset: 0,
   },
 
   bodyImage: {
@@ -212,15 +245,18 @@ const styles = {
     overflow: "visible",
   },
 
+  // Eye-container centers match the canonical af-logo eye positions (37.375% /
+  // 60.375% horizontal, 49.375% vertical) so the vector eyes sit exactly where
+  // the pixelate texture (the logo) draws them.
   leftEyeContainer: {
     position: "absolute" as const,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    top: "33.44%",
-    right: "56.93%",
-    bottom: "38.44%",
-    left: "30.57%",
+    top: "35.32%",
+    right: "56.38%",
+    bottom: "36.56%",
+    left: "31.13%",
   },
 
   rightEyeContainer: {
@@ -228,10 +264,10 @@ const styles = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    top: "33.44%",
-    right: "31.21%",
-    bottom: "38.44%",
-    left: "56.29%",
+    top: "35.32%",
+    right: "33.38%",
+    bottom: "36.56%",
+    left: "54.13%",
   },
 
   eyeWrapper: (width: number, height: number, scale: number = 1): React.CSSProperties => ({
@@ -322,6 +358,7 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
     floatAmplitude,
     floatDuration,
     floatEase,
+    pixelated = false,
     onEmotionComplete,
     onAnimationSequenceChange,
     className = "",
@@ -342,6 +379,8 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
   const rightEyeSvgRef = useRef<SVGSVGElement>(null);
   const leftBodyRef = useRef<HTMLDivElement>(null);
   const rightBodyRef = useRef<HTMLDivElement>(null);
+  const vectorLayerRef = useRef<HTMLDivElement>(null);
+  const pixelCanvasRef = useRef<HTMLCanvasElement>(null);
   const shadowRef = useRef<HTMLDivElement>(null);
   const innerGlowRef = useRef<HTMLDivElement>(null);
   const outerGlowRef = useRef<HTMLDivElement>(null);
@@ -394,6 +433,8 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
       eyeRightSvg: rightEyeSvgRef.current,
       leftBody: leftBodyRef.current,
       rightBody: rightBodyRef.current,
+      vectorLayer: vectorLayerRef.current,
+      pixelCanvas: pixelCanvasRef.current,
       innerGlow: innerGlowRef.current,
       outerGlow: outerGlowRef.current,
     }),
@@ -434,6 +475,7 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
     floatAmplitude,
     floatDuration,
     floatEase,
+    reducedMotion,
     onStateChange: handleControllerStateChange,
     onAnimationSequenceChange,
     callbacks: animationCallbacks,
@@ -539,6 +581,12 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
         setIsOffInternal(false);
         animationController.transitionTo(AnimationState.IDLE);
       },
+      pixelate: (opts) => animationController.pixelate(opts),
+      depixelate: (opts) => animationController.depixelate(opts),
+      togglePixelate: (opts) => animationController.togglePixelate(opts),
+      startPixelateCycle: (opts) => animationController.startPixelateCycle(opts),
+      stopPixelateCycle: () => animationController.stopPixelateCycle(),
+      isPixelated: () => animationController.isPixelated(),
     }),
     [animationController, useOriginalEyes]
   );
@@ -566,6 +614,17 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expression, isOff, animationController.playEmotion, animationController.isReady]);
+
+  // Declarative pixelation: ripple in/out when the `pixelated` prop flips.
+  // No isReady gate: isReady is a ref snapshotted into the memoized controller
+  // object, so it reads as a stale `false` on mount and never re-fires the
+  // effect (refs don't re-render). Callback refs create the pixelate system
+  // before effects run, and pixelate/depixelate are idempotent no-ops until it
+  // exists, so calling directly is safe — and makes `pixelated` work at mount.
+  useEffect(() => {
+    if (pixelated) animationController.pixelate();
+    else animationController.depixelate();
+  }, [pixelated, animationController.pixelate, animationController.depixelate]);
 
   // Shadow/glow elements are always rendered so the tracker/glow system can
   // attach once. When neither is visible, the outer container collapses to a
@@ -613,34 +672,27 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
         />
 
         <div ref={characterRef} style={styles.character}>
+          <div ref={vectorLayerRef} style={styles.vectorLayer}>
           <div ref={rightBodyRef} style={styles.rightBody}>
             <svg
               aria-hidden="true"
-              preserveAspectRatio="none"
-              viewBox="0 0 173.082 173.082"
+              viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
               fill="none"
               xmlns="http://www.w3.org/2000/svg"
               style={styles.bodyImage}
             >
-              <path
-                d="M173.082 115.977C173.082 147.515 147.515 173.082 115.976 173.082H4.18192C0.463682 173.082 -1.39842 168.586 1.23077 165.957L29.5407 137.647H115.976C127.945 137.647 137.647 127.945 137.647 115.977V29.5407L165.957 1.23077C168.586 -1.39842 173.082 0.463679 173.082 4.18192V115.977Z"
-                fill="currentColor"
-              />
+              <path d={LOGO_BRACKET_BR} fill="currentColor" />
             </svg>
           </div>
           <div ref={leftBodyRef} style={styles.leftBody}>
             <svg
               aria-hidden="true"
-              preserveAspectRatio="none"
-              viewBox="0 0 173.694 173.694"
+              viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
               fill="none"
               xmlns="http://www.w3.org/2000/svg"
               style={styles.bodyImage}
             >
-              <path
-                d="M144.153 35.4344H57.1051C45.1368 35.4345 35.4344 45.1368 35.4344 57.1051V144.153L7.12469 172.463C4.4955 175.092 0 173.23 0 169.512V57.1051C2.28235e-05 25.5668 25.5668 4.78163e-05 57.1051 0H169.512C173.23 0 175.092 4.49551 172.463 7.1247L144.153 35.4344Z"
-                fill="currentColor"
-              />
+              <path d={LOGO_BRACKET_TL} fill="currentColor" />
             </svg>
           </div>
 
@@ -699,6 +751,8 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
               </svg>
             </div>
           </div>
+          </div>
+          <canvas ref={pixelCanvasRef} style={styles.pixelCanvas} />
         </div>
       </div>
 

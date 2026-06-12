@@ -72,9 +72,12 @@ pub const TableIndexCatalog = struct {
 
 pub const RangeRecord = struct {
     group_id: u64,
+    range_id: u64 = 0,
     table_id: u64,
     start_key: []const u8,
     end_key: ?[]const u8 = null,
+    doc_identity_shard_id: u64 = 0,
+    doc_identity_range_id: u64 = 0,
     restore_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
@@ -172,7 +175,48 @@ pub const RuntimeGroupStatusReport = struct {
     async_startup_active: bool = false,
     async_dense_catch_up_active: bool = false,
     async_bulk_coalescing_active: bool = false,
+    doc_identity: RuntimeDocIdentityStatusReport = .{},
+    doc_set_planning: RuntimeDocSetPlanningStatusReport = .{},
     indexes: []RuntimeIndexStatusReport = &.{},
+};
+
+pub const RuntimeDocIdentityStatusReport = struct {
+    namespace_table_id: u64 = 0,
+    namespace_shard_id: u64 = 0,
+    namespace_range_id: u64 = 0,
+    next_ordinal: u32 = 1,
+    allocated_ordinals: u64 = 0,
+    ordinal_capacity_remaining: u64 = 0,
+    ordinal_capacity_exhausted: bool = false,
+    rebuild_required: bool = false,
+    state_rows: u64 = 0,
+    live_ordinals: u64 = 0,
+    tombstone_ordinals: u64 = 0,
+    min_created_generation: u64 = 0,
+    max_created_generation: u64 = 0,
+    min_deleted_generation: u64 = 0,
+    max_deleted_generation: u64 = 0,
+    scanned_primary_docs: u64 = 0,
+    primary_docs_missing_ordinals: u64 = 0,
+    primary_docs_missing_identity_state: u64 = 0,
+    primary_docs_with_tombstone_ordinals: u64 = 0,
+    complete: bool = false,
+};
+
+pub const RuntimeDocSetPlanningStatusReport = struct {
+    resolved_set_count: u64 = 0,
+    all_set_count: u64 = 0,
+    none_set_count: u64 = 0,
+    doc_key_list_count: u64 = 0,
+    ordinal_list_count: u64 = 0,
+    ordinal_bitmap_count: u64 = 0,
+    doc_key_list_docs: u64 = 0,
+    ordinal_list_docs: u64 = 0,
+    ordinal_bitmap_docs: u64 = 0,
+    missing_ordinal_coverage_count: u64 = 0,
+    bitmap_promotion_count: u64 = 0,
+    unsupported_filter_shape_count: u64 = 0,
+    stale_identity_generation_rejection_count: u64 = 0,
 };
 
 pub const RuntimeIndexStatusReport = struct {
@@ -256,6 +300,7 @@ pub const MergeIntent = struct {
     receiver_group_id: u64,
     rollback_reason: ?[]const u8 = null,
     automatic: bool = false,
+    allow_doc_identity_reassignment: bool = false,
 };
 
 pub const TableManager = struct {
@@ -305,7 +350,9 @@ pub const TableManager = struct {
         const table = self.tables.get(record.table_id) orelse return error.UnknownTable;
         _ = table;
 
-        const owned = try cloneRange(self.alloc, record);
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
             freeRange(self.alloc, existing.*);
@@ -472,18 +519,26 @@ pub const TableManager = struct {
     pub fn applyFinalizedSplit(self: *TableManager, record: transition_state.SplitTransitionRecord) !void {
         const split_key = record.split_key orelse return error.MissingSplitKey;
         const source = self.ranges.get(record.source_group_id) orelse return error.UnknownSourceRange;
+        const identity_shard_id = rangeDocIdentityShardId(source);
+        const identity_range_id = rangeDocIdentityRangeId(source);
 
         try self.upsertRange(.{
             .group_id = source.group_id,
+            .range_id = source.range_id,
             .table_id = source.table_id,
             .start_key = source.start_key,
             .end_key = split_key,
+            .doc_identity_shard_id = source.doc_identity_shard_id,
+            .doc_identity_range_id = source.doc_identity_range_id,
         });
         try self.upsertRange(.{
             .group_id = record.destination_group_id,
+            .range_id = record.destination_group_id,
             .table_id = source.table_id,
             .start_key = split_key,
             .end_key = record.source_range_end,
+            .doc_identity_shard_id = identity_shard_id,
+            .doc_identity_range_id = identity_range_id,
         });
         _ = self.removeSplitIntent(record.transition_id);
     }
@@ -504,9 +559,12 @@ pub const TableManager = struct {
 
         try self.upsertRange(.{
             .group_id = receiver.group_id,
+            .range_id = receiver.range_id,
             .table_id = receiver.table_id,
             .start_key = merged_start,
             .end_key = merged_end,
+            .doc_identity_shard_id = receiver.doc_identity_shard_id,
+            .doc_identity_range_id = receiver.doc_identity_range_id,
         });
         _ = self.removeRange(donor.group_id);
         _ = self.removeMergeIntent(record.transition_id);
@@ -545,6 +603,7 @@ pub const TableManager = struct {
                 .receiver_group_id = intent.receiver_group_id,
                 .phase = .prepare,
                 .rollback_reason = intent.rollback_reason,
+                .allow_doc_identity_reassignment = intent.allow_doc_identity_reassignment,
             }));
         }
         return try out.toOwnedSlice(alloc);
@@ -680,13 +739,25 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     errdefer alloc.free(restore_snapshot_path);
     return .{
         .group_id = record.group_id,
+        .range_id = if (record.range_id == 0) record.group_id else record.range_id,
         .table_id = record.table_id,
         .start_key = start_key,
         .end_key = end_key,
+        .doc_identity_shard_id = record.doc_identity_shard_id,
+        .doc_identity_range_id = record.doc_identity_range_id,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .restore_snapshot_path = restore_snapshot_path,
     };
+}
+
+pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
+    return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
+}
+
+pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
+    if (record.doc_identity_range_id != 0) return record.doc_identity_range_id;
+    return if (record.range_id == 0) record.group_id else record.range_id;
 }
 
 pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
@@ -936,6 +1007,8 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .async_startup_active = record.async_startup_active,
         .async_dense_catch_up_active = record.async_dense_catch_up_active,
         .async_bulk_coalescing_active = record.async_bulk_coalescing_active,
+        .doc_identity = record.doc_identity,
+        .doc_set_planning = record.doc_set_planning,
         .indexes = indexes,
     };
 }
@@ -1036,6 +1109,7 @@ fn cloneMergeIntent(alloc: std.mem.Allocator, intent: MergeIntent) !MergeIntent 
         .receiver_group_id = intent.receiver_group_id,
         .rollback_reason = try cloneOwnedOptional(alloc, intent.rollback_reason),
         .automatic = intent.automatic,
+        .allow_doc_identity_reassignment = intent.allow_doc_identity_reassignment,
     };
 }
 
@@ -1076,6 +1150,7 @@ fn cloneMergeTransitionRecord(alloc: std.mem.Allocator, record: transition_state
         .receiver_group_id = record.receiver_group_id,
         .phase = record.phase,
         .rollback_reason = rollback_reason,
+        .allow_doc_identity_reassignment = record.allow_doc_identity_reassignment,
     };
 }
 
@@ -1123,6 +1198,7 @@ test "table manager validates split and merge intents" {
         .table_id = 10,
         .donor_group_id = 102,
         .receiver_group_id = 101,
+        .allow_doc_identity_reassignment = true,
     });
 
     const merges = try manager.listDesiredMergeTransitions(std.testing.allocator);
@@ -1130,6 +1206,7 @@ test "table manager validates split and merge intents" {
     try std.testing.expectEqual(@as(usize, 1), merges.len);
     try std.testing.expectEqual(@as(u64, 102), merges[0].donor_group_id);
     try std.testing.expectEqual(@as(u64, 101), merges[0].receiver_group_id);
+    try std.testing.expect(merges[0].allow_doc_identity_reassignment);
 }
 
 test "table manager applies finalized split to desired topology" {
@@ -1166,7 +1243,63 @@ test "table manager applies finalized split to desired topology" {
     const ranges = try manager.listRanges(std.testing.allocator);
     defer manager.freeRanges(std.testing.allocator, ranges);
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
+    for (ranges) |range| {
+        if (range.group_id == 101) try std.testing.expectEqual(@as(u64, 101), range.range_id);
+        if (range.group_id == 102) {
+            try std.testing.expectEqual(@as(u64, 102), range.range_id);
+            try std.testing.expectEqual(@as(u64, 101), range.doc_identity_shard_id);
+            try std.testing.expectEqual(@as(u64, 101), range.doc_identity_range_id);
+        }
+    }
     try std.testing.expect(manager.split_intents.count() == 0);
+}
+
+test "table manager applies finalized merge preserving receiver range id" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{
+        .table_id = 10,
+        .name = "docs",
+    });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .range_id = 1001,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 102,
+        .range_id = 1002,
+        .table_id = 10,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 6003,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+    });
+
+    try manager.applyFinalizedMerge(.{
+        .transition_id = 6003,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+        .phase = .finalized,
+    });
+
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(u64, 101), ranges[0].group_id);
+    try std.testing.expectEqual(@as(u64, 1001), ranges[0].range_id);
+    try std.testing.expectEqual(@as(u64, 0), ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 0), ranges[0].doc_identity_range_id);
+    try std.testing.expectEqualStrings("doc:a", ranges[0].start_key);
+    try std.testing.expectEqualStrings("doc:z", ranges[0].end_key.?);
+    try std.testing.expect(manager.merge_intents.count() == 0);
 }
 
 test "table manager rejects invalid split key" {

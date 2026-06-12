@@ -25,17 +25,22 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
-USERMGR_SPEC = ROOT / "specs/openapi/antfly/usermgr.yaml"
+USERMGR_SPEC = ROOT / "specs/openapi/auth/api.yaml"
 ROOT_SPEC = ROOT / "openapi.yaml"
-GO_SCHEMA_SPEC = (ROOT / "go/pkg/antfly/lib/schema/openapi.yaml").resolve()
-GO_INDEX_SPEC = (ROOT / "go/pkg/antfly/src/store/db/indexes/openapi.yaml").resolve()
+GO_SCHEMA_SPEC = (ROOT / "specs/openapi/antfly/schema.yaml").resolve()
+GO_INDEX_SPEC = (ROOT / "specs/openapi/antfly/indexes.yaml").resolve()
 GO_INDEX_REF_PATHS = {
-    "../../antfly/src/store/db/indexes/openapi.yaml",
-    "../antfly/src/store/db/indexes/openapi.yaml",
-    "../../../go/pkg/antfly/src/store/db/indexes/openapi.yaml",
+    "indexes.yaml",
+    "specs/openapi/antfly/indexes.yaml",
 }
 PATH_REWRITES = {
-    "usermgr.yaml": "specs/openapi/antfly/usermgr.yaml",
+    "../auth/api.yaml": "specs/openapi/auth/api.yaml",
+    "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
+    "schema.yaml": "specs/openapi/antfly/schema.yaml",
+    "indexes.yaml": "specs/openapi/antfly/indexes.yaml",
+    "generating.yaml": "specs/openapi/antfly/generating.yaml",
+    "eval.yaml": "specs/openapi/antfly/eval.yaml",
+    "reranking.yaml": "specs/openapi/antfly/reranking.yaml",
     "query.yaml": "specs/openapi/antfly/query.yaml",
     "../../../src/": "go/pkg/antfly/src/",
     "../../../lib/": "go/pkg/antfly/lib/",

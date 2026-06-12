@@ -52,16 +52,19 @@ pub const TransitionAction = union(enum) {
         transition_id: u64,
         donor_group_id: u64,
         receiver_group_id: u64,
+        allow_doc_identity_reassignment: bool = false,
     },
     catch_up_merge_receiver: struct {
         transition_id: u64,
         donor_group_id: u64,
         receiver_group_id: u64,
+        allow_doc_identity_reassignment: bool = false,
     },
     finalize_merge: struct {
         transition_id: u64,
         donor_group_id: u64,
         receiver_group_id: u64,
+        allow_doc_identity_reassignment: bool = false,
     },
     rollback_merge: struct {
         transition_id: u64,

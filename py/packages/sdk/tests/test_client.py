@@ -17,9 +17,9 @@ class TestAntflyClient:
         """Test client initialization with and without auth."""
         # Without auth
         client = AntflyClient(base_url="http://localhost:8080")
-        assert client.base_url == "http://localhost:8080/api/v1"
+        assert client.base_url == "http://localhost:8080"
         mock_client.assert_called_once_with(
-            base_url="http://localhost:8080/api/v1",
+            base_url="http://localhost:8080",
             timeout=Timeout(30.0),
             httpx_args={},
         )
@@ -27,31 +27,33 @@ class TestAntflyClient:
         # With auth
         mock_client.reset_mock()
         client = AntflyClient(base_url="http://localhost:8080/", username="admin", password="password")
-        assert client.base_url == "http://localhost:8080/api/v1"
+        assert client.base_url == "http://localhost:8080"
         mock_client.assert_called_once_with(
-            base_url="http://localhost:8080/api/v1",
+            base_url="http://localhost:8080",
             timeout=Timeout(30.0),
             httpx_args={"auth": ("admin", "password")},
         )
 
     def test_normalize_base_url(self) -> None:
-        assert normalize_base_url("http://localhost:8080") == "http://localhost:8080/api/v1"
-        assert normalize_base_url("http://localhost:8080/") == "http://localhost:8080/api/v1"
-        assert normalize_base_url("http://localhost:8080/api/v1") == "http://localhost:8080/api/v1"
+        assert normalize_base_url("http://localhost:8080") == "http://localhost:8080"
+        assert normalize_base_url("http://localhost:8080/") == "http://localhost:8080"
+        assert normalize_base_url("http://localhost:8080/db/v1") == "http://localhost:8080"
+        assert normalize_base_url("http://localhost:8080/auth/v1") == "http://localhost:8080"
+        assert normalize_base_url("http://localhost:8080/ai/v1") == "http://localhost:8080"
         assert (
             normalize_base_url("https://platform.antfly.io/cloud/v1/instance")
-            == "https://platform.antfly.io/cloud/v1/instance/api/v1"
+            == "https://platform.antfly.io/cloud/v1/instance"
         )
         assert (
-            normalize_base_url("https://platform.antfly.io/cloud/v1/instance/api/v1")
-            == "https://platform.antfly.io/cloud/v1/instance/api/v1"
+            normalize_base_url("https://platform.antfly.io/cloud/v1/instance/db/v1")
+            == "https://platform.antfly.io/cloud/v1/instance"
         )
 
     @patch("antfly.client.AuthenticatedClient")
     def test_token_auth(self, mock_client: MagicMock) -> None:
         AntflyClient(base_url="https://platform.antfly.io/cloud/v1/instance", token="antflydb_test")
         mock_client.assert_called_once_with(
-            base_url="https://platform.antfly.io/cloud/v1/instance/api/v1",
+            base_url="https://platform.antfly.io/cloud/v1/instance",
             token="antflydb_test",
             prefix="Bearer",
             timeout=Timeout(30.0),
@@ -76,7 +78,7 @@ class TestAntflyClient:
         tables = client.list_tables()
 
         assert tables == []
-        mock_httpx.request.assert_called_once_with("GET", "/tables")
+        mock_httpx.request.assert_called_once_with("GET", "/db/v1/tables")
 
     @patch("antfly.client.Client")
     def test_create_table(self, mock_client_class: MagicMock) -> None:
@@ -93,7 +95,7 @@ class TestAntflyClient:
         result = client.create_table(name="test_table", num_shards=2)
 
         assert result["name"] == "test_table"
-        mock_httpx.request.assert_called_once_with("POST", "/tables/test_table", json={"num_shards": 2})
+        mock_httpx.request.assert_called_once_with("POST", "/db/v1/tables/test_table", json={"num_shards": 2})
 
     @patch("antfly.client.Client")
     def test_create_table_failure(self, mock_client_class: MagicMock) -> None:

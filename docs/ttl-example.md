@@ -80,7 +80,7 @@ When documents are inserted:
 
 ```bash
 # Insert document (using default _timestamp)
-curl -X POST http://localhost:8080/api/v1/my_table/batch \
+curl -X POST http://localhost:8080/db/v1/my_table/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {

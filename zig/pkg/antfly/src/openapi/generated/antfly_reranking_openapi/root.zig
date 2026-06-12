@@ -5,8 +5,7 @@ pub const types = @import("types.zig");
 
 pub const RerankerProvider = types.RerankerProvider;
 pub const OllamaRerankerConfig = types.OllamaRerankerConfig;
-pub const TermiteRerankerConfig = types.TermiteRerankerConfig;
+pub const AntflyRerankerConfig = types.AntflyRerankerConfig;
 pub const CohereRerankerConfig = types.CohereRerankerConfig;
 pub const VertexRerankerConfig = types.VertexRerankerConfig;
-pub const AntflyRerankerConfig = types.AntflyRerankerConfig;
 pub const RerankerConfig = types.RerankerConfig;

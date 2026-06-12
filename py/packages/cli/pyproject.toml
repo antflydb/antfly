@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antfly-cli"
+version = "0.0.0"
+description = "Native Antfly CLI installer package"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Elastic-2.0"}
+authors = [
+    {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
+]
+keywords = ["antfly", "cli", "database", "search", "vector"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+antfly = "antfly_cli:main"
+
+[project.urls]
+Homepage = "https://antfly.io"
+Documentation = "https://docs.antfly.io"
+Repository = "https://github.com/antflydb/antfly"
+Issues = "https://github.com/antflydb/antfly/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/antfly_cli"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/src/antfly_cli/bin",
+    "/src/antfly_cli/share",
+]

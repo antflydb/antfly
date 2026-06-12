@@ -20,7 +20,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "put",
-        "url": "/api/v1/tables/{table_name}/schema".format(
+        "url": "/db/v1/tables/{table_name}/schema".format(
             table_name=quote(str(table_name), safe=""),
         ),
     }

@@ -141,6 +141,9 @@ pub const SearchRequest = struct {
     graph_searches: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
 };
 
 pub const SearchQuery = union(enum) {
@@ -154,6 +157,7 @@ pub const SearchQuery = union(enum) {
     numeric_range: NumericRangeQuery,
     date_range: DateRangeQuery,
     doc_id: DocIdQuery,
+    doc_num: DocNumQuery,
     bool_field: BoolFieldQuery,
     geo_distance: GeoDistanceQuery,
     geo_bbox: GeoBBoxQuery,
@@ -270,6 +274,11 @@ pub const DocIdQuery = struct {
     boost: f32 = 1.0,
 };
 
+pub const DocNumQuery = struct {
+    ids: []const u32,
+    boost: f32 = 1.0,
+};
+
 pub const BoolFieldQuery = struct {
     field: []const u8,
     value: bool,
@@ -372,6 +381,7 @@ pub const SearchResult = struct {
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| {
             if (hit.stored_data) |d| self.alloc.free(d);
+            freeIndexScores(self.alloc, hit.index_scores);
         }
         self.alloc.free(self.hits);
         freeAggResults(self.alloc, self.aggregations);
@@ -382,6 +392,29 @@ pub const SearchResult = struct {
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
     }
 };
+
+fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
+    for (scores) |score| alloc.free(score.index_name);
+    if (scores.len > 0) alloc.free(scores);
+}
+
+fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
+    if (scores.len == 0) return &.{};
+    const cloned = try alloc.alloc(fusion_mod.IndexScore, scores.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(cloned);
+    }
+    for (scores, 0..) |score, i| {
+        cloned[i] = .{
+            .index_name = try alloc.dupe(u8, score.index_name),
+            .score = score.score,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
 
 fn freeAggResults(alloc: Allocator, aggs: []const NamedAggResult) void {
     for (aggs) |agg| {
@@ -415,6 +448,7 @@ pub const ScoredHit = struct {
     score: f32,
     id: ?[]const u8,
     stored_data: ?[]u8,
+    index_scores: []fusion_mod.IndexScore = &.{},
 };
 
 // ============================================================================
@@ -450,6 +484,7 @@ pub fn execute(
         .numeric_range => |rq| try executeNumericRange(alloc, snap, rq, request),
         .date_range => |rq| try executeDateRange(alloc, snap, rq, request),
         .doc_id => |dq| try executeDocID(alloc, snap, dq, request),
+        .doc_num => |dq| try executeDocNum(alloc, snap, dq, request),
         .bool_field => |bq| try executeBoolField(alloc, snap, bq, request),
         .geo_distance => |gq| try executeGeoDistance(alloc, snap, gq, request),
         .geo_bbox => |gq| try executeGeoBBox(alloc, snap, gq, request),
@@ -880,6 +915,15 @@ fn executeDocID(
     return executeFilterQuery(alloc, snap, .{ .doc_id = .{ .doc_ids = dq.ids } }, request, dq.boost);
 }
 
+fn executeDocNum(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    dq: DocNumQuery,
+    request: SearchRequest,
+) !SearchResult {
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids } }, request, dq.boost);
+}
+
 fn executeBoolField(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -1221,6 +1265,9 @@ const FastTermState = struct {
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
+    filter_doc_nums: []const u32 = &.{},
+    filter_doc_nums_positive: bool = false,
+    exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
 
@@ -1229,8 +1276,15 @@ const FastTopK = struct {
     }
 
     fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
+        if (!self.allows(doc_id)) return;
         self.total_count += 1;
         try scorer_mod.insertTopK(self.alloc, &self.hits, self.k, .{ .doc_id = doc_id, .score = score });
+    }
+
+    fn allows(self: *const FastTopK, doc_id: u32) bool {
+        if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
+        if (containsSortedU32(self.exclude_doc_nums, doc_id)) return false;
+        return true;
     }
 
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
@@ -1238,6 +1292,14 @@ const FastTopK = struct {
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
 };
+
+fn containsSortedU32(items: []const u32, value: u32) bool {
+    return std.sort.binarySearch(u32, items, value, compareU32) != null;
+}
+
+fn compareU32(expected: u32, item: u32) std.math.Order {
+    return std.math.order(expected, item);
+}
 
 fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTextTerm), query: SearchQuery) !bool {
     switch (query) {
@@ -1343,7 +1405,7 @@ fn scoreFastTerm(state: FastTermState, hit: inverted.PostingsIterator.Hit, globa
 }
 
 fn isSegmentDocDeleted(seg: *const index_mod.SegmentEntry, doc_id: u32) bool {
-    if (seg.deleted) |deleted| return deleted.contains(doc_id);
+    if (seg.shared.deleted) |deleted| return deleted.contains(doc_id);
     return false;
 }
 
@@ -1511,7 +1573,13 @@ fn executeSimpleTextBool(
         return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
     }
 
-    var collector = FastTopK{ .alloc = alloc, .k = effectiveK(request, snap) };
+    var collector = FastTopK{
+        .alloc = alloc,
+        .k = effectiveK(request, snap),
+        .filter_doc_nums = request.filter_doc_nums,
+        .filter_doc_nums_positive = request.filter_doc_nums_positive,
+        .exclude_doc_nums = request.exclude_doc_nums,
+    };
     defer collector.deinit();
 
     const avg_dl = snap.textAvgDocLen(text_field);
@@ -1700,6 +1768,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -1845,6 +1914,11 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
         },
         .doc_id => |dq| .{
             .filter = .{ .doc_id = .{ .doc_ids = dq.ids } },
+            .duped_terms = &.{},
+            .filter_slice = &.{},
+        },
+        .doc_num => |dq| .{
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -2144,7 +2218,14 @@ fn executeHybrid(
     // Convert fused results back to ScoredHits
     const result_count = @min(fused.len, request.k);
     var hits = try alloc.alloc(ScoredHit, result_count);
-    errdefer alloc.free(hits);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| {
+            if (hit.stored_data) |data| alloc.free(data);
+            freeIndexScores(alloc, hit.index_scores);
+        }
+        alloc.free(hits);
+    }
 
     for (fused[0..result_count], 0..) |fh, i| {
         const doc_id = std.fmt.parseInt(u32, fh.doc_id, 10) catch 0;
@@ -2153,7 +2234,9 @@ fn executeHybrid(
             .score = @floatCast(fh.score),
             .id = null,
             .stored_data = null,
+            .index_scores = try cloneIndexScores(alloc, fh.index_scores),
         };
+        errdefer freeIndexScores(alloc, hit.index_scores);
         if (request.include_stored) {
             if (try snap.storedDocDecompressed(doc_id)) |stored| {
                 hit.id = stored.id;
@@ -2161,6 +2244,7 @@ fn executeHybrid(
             }
         }
         hits[i] = hit;
+        initialized += 1;
     }
 
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(result_count) };

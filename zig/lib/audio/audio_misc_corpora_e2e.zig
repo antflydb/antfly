@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const termite_audio = @import("src/mod.zig");
+const inference_audio = @import("src/mod.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -277,20 +277,20 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), full_path, alloc, .limited(max_fixture_bytes));
     defer alloc.free(bytes);
 
-    const format = termite_audio.detectFormatFromFilename(relative_path) orelse
-        termite_audio.detectFormat(bytes) orelse
+    const format = inference_audio.detectFormatFromFilename(relative_path) orelse
+        inference_audio.detectFormat(bytes) orelse
         return classifyUnsupported(relative_path);
     switch (format) {
         .mp3, .aac, .mp4 => {},
         else => return classifyUnsupported(relative_path),
     }
 
-    var interleaved = termite_audio.decodeInterleaved(alloc, bytes, .{
+    var interleaved = inference_audio.decodeInterleaved(alloc, bytes, .{
         .file_name_hint = relative_path,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => {
             if (format == .mp4) {
-                const demuxed = termite_audio.mp4.demux(alloc, bytes) catch |demux_err| {
+                const demuxed = inference_audio.mp4.demux(alloc, bytes) catch |demux_err| {
                     std.debug.print("MP4_DEMUX_FAILED\t{s}\terr={s}\n", .{ relative_path, @errorName(demux_err) });
                     std.debug.print("UNSUPPORTED\t{s}\terr={s}\n", .{ relative_path, @errorName(err) });
                     return classifyUnsupported(relative_path);
@@ -311,7 +311,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                     },
                 );
                 if (demuxed.codec == .aac) {
-                    if (termite_audio.aac.parseAudioSpecificConfig(demuxed.decoder_config)) |config| {
+                    if (inference_audio.aac.parseAudioSpecificConfig(demuxed.decoder_config)) |config| {
                         const config_channels = config.explicit_channel_count orelse config.channel_config;
                         std.debug.print(
                             "AAC_CONFIG\t{s}\tobject_type={d}\tsample_rate={d}\tchannel_config={d}\tframe_length_960={any}\tsbr={any}\tps={any}\n",
@@ -326,7 +326,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                             },
                         );
                         if (demuxed.access_units.len > 0) {
-                            if (termite_audio.aac.summarizeAccessUnit(demuxed.access_units[0])) |summary| {
+                            if (inference_audio.aac.summarizeAccessUnit(demuxed.access_units[0])) |summary| {
                                 std.debug.print(
                                     "AAC_FIRST_AU\t{s}\tfirst_element={s}\ttag={d}\tcommon_window={any}\n",
                                     .{
@@ -339,14 +339,14 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                             } else |summary_err| {
                                 std.debug.print("AAC_FIRST_AU_FAILED\t{s}\terr={s}\n", .{ relative_path, @errorName(summary_err) });
                             }
-                            _ = termite_audio.aac.dequantizeFirstChannelSpectralCoefficientsAlloc(
+                            _ = inference_audio.aac.dequantizeFirstChannelSpectralCoefficientsAlloc(
                                 alloc,
                                 demuxed.sample_rate,
                                 demuxed.access_units[0],
                             ) catch |dequant_err| {
                                 std.debug.print("AAC_FIRST_AU_DEQUANT_FAILED\t{s}\terr={s}\n", .{ relative_path, @errorName(dequant_err) });
                             };
-                            _ = termite_audio.aac.decodeFirstChannelPcmBlockAlloc(
+                            _ = inference_audio.aac.decodeFirstChannelPcmBlockAlloc(
                                 alloc,
                                 demuxed.sample_rate,
                                 null,
@@ -360,7 +360,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                             var tail: ?[]f32 = null;
                             defer if (tail) |owned_tail| alloc.free(owned_tail);
                             for (demuxed.access_units, 0..) |unit, index| {
-                                const block = termite_audio.aac.decodeFirstChannelPcmBlockAlloc(
+                                const block = inference_audio.aac.decodeFirstChannelPcmBlockAlloc(
                                     alloc,
                                     demuxed.sample_rate,
                                     tail,
@@ -373,7 +373,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                                 tail = block.tail;
                                 alloc.free(block.pcm);
                             }
-                            _ = termite_audio.aac.decodeFirstChannelPcmSequenceAlloc(
+                            _ = inference_audio.aac.decodeFirstChannelPcmSequenceAlloc(
                                 alloc,
                                 demuxed.sample_rate,
                                 demuxed.access_units,
@@ -381,7 +381,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                                 std.debug.print("AAC_RAW_MONO_SEQUENCE_FAILED\t{s}\terr={s}\n", .{ relative_path, @errorName(seq_err) });
                             };
                         }
-                        _ = termite_audio.aac.decodeInterleavedMonoAccessUnitsAlloc(
+                        _ = inference_audio.aac.decodeInterleavedMonoAccessUnitsAlloc(
                             alloc,
                             demuxed.sample_rate,
                             effective_channels,
@@ -390,7 +390,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
                         ) catch |mono_err| {
                             std.debug.print("AAC_MONO_UNSUPPORTED\t{s}\terr={s}\n", .{ relative_path, @errorName(mono_err) });
                         };
-                        _ = termite_audio.aac.decodeInterleavedStereoAccessUnitsAlloc(
+                        _ = inference_audio.aac.decodeInterleavedStereoAccessUnitsAlloc(
                             alloc,
                             demuxed.sample_rate,
                             effective_channels,
@@ -416,7 +416,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
     if (interleaved.sample_rate == 0 or interleaved.channels == 0 or interleaved.samples.len == 0) return .decode_failed;
     if (!allFinite(interleaved.samples)) return .decode_failed;
 
-    var mono = termite_audio.decode(alloc, bytes, .{
+    var mono = inference_audio.decode(alloc, bytes, .{
         .file_name_hint = relative_path,
     }) catch |err| switch (err) {
         error.UnsupportedAudioFormat => {
@@ -465,7 +465,7 @@ fn probeOneMinimp3Vector(alloc: Allocator, root_dir: []const u8, relative_path: 
 
     const expected_case = minimp3ExpectedCase(relative_path) orelse return .decode_failed;
 
-    const decoded = termite_audio.mp3.decodeInterleaved(alloc, bitstream) catch |err| switch (err) {
+    const decoded = inference_audio.mp3.decodeInterleaved(alloc, bitstream) catch |err| switch (err) {
         error.Mp3PureZigUnimplemented => return .unsupported,
         else => {
             std.debug.print("DECODE_FAILED\t{s}\terr={s}\n", .{ relative_path, @errorName(err) });
@@ -500,7 +500,7 @@ fn probeOneMinimp3Vector(alloc: Allocator, root_dir: []const u8, relative_path: 
     const decoded_for_compare = try collapseMp3DecodedAlloc(alloc, decoded.samples, frame_shapes, decoded.channels);
     defer alloc.free(decoded_for_compare);
 
-    const metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, decoded_for_compare, 8192);
+    const metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, decoded_for_compare, 8192);
     if (metrics.compared < 8000) {
         std.debug.print(
             "DECODE_FAILED\t{s}\terr=ComparedTooShort\tref_samples={d}\tdecoded_samples={d}\tcompared={d}\n",
@@ -532,24 +532,24 @@ fn probeOneMinimp3Vector(alloc: Allocator, root_dir: []const u8, relative_path: 
         else
             decoded_for_compare[0..0];
 
-        const neg_metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, negated, 8192);
-        const alternating_metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, alternating, 8192);
-        const block32_metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, block32, 8192);
-        const block64_metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, block64, 8192);
-        const swapped_metrics = termite_audio.conformance.bestAlignmentMetrics(raw_reference, swapped, 8192);
+        const neg_metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, negated, 8192);
+        const alternating_metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, alternating, 8192);
+        const block32_metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, block32, 8192);
+        const block64_metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, block64, 8192);
+        const swapped_metrics = inference_audio.conformance.bestAlignmentMetrics(raw_reference, swapped, 8192);
         const trimmed_front_metrics = if (trimmed_front.len >= 8000)
-            termite_audio.conformance.bestAlignmentMetrics(raw_reference, trimmed_front, 8192)
+            inference_audio.conformance.bestAlignmentMetrics(raw_reference, trimmed_front, 8192)
         else
-            termite_audio.conformance.AlignmentMetrics{
+            inference_audio.conformance.AlignmentMetrics{
                 .offset = 0,
                 .compared = 0,
                 .correlation = -1.0,
                 .mean_abs_error = std.math.inf(f32),
             };
         const trimmed_back_metrics = if (trimmed_back.len >= 8000)
-            termite_audio.conformance.bestAlignmentMetrics(raw_reference, trimmed_back, 8192)
+            inference_audio.conformance.bestAlignmentMetrics(raw_reference, trimmed_back, 8192)
         else
-            termite_audio.conformance.AlignmentMetrics{
+            inference_audio.conformance.AlignmentMetrics{
                 .offset = 0,
                 .compared = 0,
                 .correlation = -1.0,
@@ -623,7 +623,7 @@ fn pcm16LeToFloatAlloc(alloc: Allocator, pcm_bytes: []const u8) ![]f32 {
 }
 
 fn collectMp3FrameShapesAlloc(alloc: Allocator, mp3_bytes: []const u8) ![]Mp3FrameShape {
-    var it = termite_audio.mp3.bitstream.FrameIterator.init(mp3_bytes);
+    var it = inference_audio.mp3.bitstream.FrameIterator.init(mp3_bytes);
     var shapes = std.ArrayList(Mp3FrameShape).empty;
     errdefer shapes.deinit(alloc);
 
@@ -937,7 +937,7 @@ fn outcomeName(outcome: Outcome) []const u8 {
     };
 }
 
-fn formatName(format: termite_audio.EncodedFormat) []const u8 {
+fn formatName(format: inference_audio.EncodedFormat) []const u8 {
     return switch (format) {
         .ogg => "ogg",
         .opus => "opus",

@@ -14,7 +14,7 @@ def _get_kwargs() -> dict[str, Any]:
 
     _kwargs: dict[str, Any] = {
         "method": "get",
-        "url": "/api/v1/status",
+        "url": "/db/v1/status",
     }
 
     return _kwargs
@@ -59,7 +59,7 @@ def sync_detailed(
 ) -> Response[ClusterStatus | Error]:
     """Get cluster status
 
-     Returns the current health and status of all stores and shards in the cluster
+     Returns minimal cluster health and runtime status.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -84,7 +84,7 @@ def sync(
 ) -> ClusterStatus | Error | None:
     """Get cluster status
 
-     Returns the current health and status of all stores and shards in the cluster
+     Returns minimal cluster health and runtime status.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -105,7 +105,7 @@ async def asyncio_detailed(
 ) -> Response[ClusterStatus | Error]:
     """Get cluster status
 
-     Returns the current health and status of all stores and shards in the cluster
+     Returns minimal cluster health and runtime status.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -128,7 +128,7 @@ async def asyncio(
 ) -> ClusterStatus | Error | None:
     """Get cluster status
 
-     Returns the current health and status of all stores and shards in the cluster
+     Returns minimal cluster health and runtime status.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

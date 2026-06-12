@@ -39,6 +39,7 @@ export interface SharedState {
   url?: string;
   table: string; // Required default table for all widgets
   listenerEffect?: (() => void) | null;
+  configVersion?: number;
   widgets: Map<string, Widget>;
   headers?: Record<string, string>;
 }
@@ -80,6 +81,7 @@ export type SharedAction =
   | {
       type: "setListenerEffect";
       value: (() => void) | null;
+      contextVersion?: number;
     }
   | {
       type: "setSharedConfig";

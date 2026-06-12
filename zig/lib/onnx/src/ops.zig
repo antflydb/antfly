@@ -1562,7 +1562,11 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     // Apply specified axes
     for (0..starts_data.len) |i| {
-        const ax: u8 = if (axes_data) |ad| @intCast(@as(i64, @intFromFloat(ad[i]))) else @intCast(i);
+        // Normalize negative axes
+        var ax_val: i64 = if (axes_data) |ad| @intFromFloat(ad[i]) else @intCast(i);
+        if (ax_val < 0) ax_val += in_shape.rank();
+        if (ax_val < 0 or ax_val >= in_shape.rank()) return error.InvalidAttribute;
+        const ax: u8 = @intCast(ax_val);
         // Clamp to i64 range — ONNX uses INT64_MAX as "to the end" sentinel,
         // which overflows when round-tripped through f32.
         var start: i64 = clampF32ToI64(starts_data[i]);
@@ -3242,7 +3246,7 @@ fn convertCumSum(builder: *Builder, node: *const NodeProto, inputs: []const Node
 
     // CumSum can't be efficiently decomposed without scan primitive.
     // Return input as-is for now — models that need cumsum will need
-    // a scan primitive added to termite.
+    // a scan primitive added to inference.
     return inputs[0];
 }
 

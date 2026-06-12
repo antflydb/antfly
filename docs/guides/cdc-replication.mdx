@@ -72,7 +72,7 @@ CREATE TABLE users (
 ### 3. Create an Antfly table with a replication source
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/table \
+curl -X POST http://localhost:8080/db/v1/table \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{
@@ -99,7 +99,7 @@ INSERT INTO users (id, name, email, score) VALUES ('user-1', 'Alice', 'alice@exa
 
 ```bash
 # Check it appears in Antfly
-curl -s http://localhost:8080/api/v1/table/users/key/user-1 -u admin:admin | jq .
+curl -s http://localhost:8080/db/v1/table/users/key/user-1 -u admin:admin | jq .
 ```
 
 ## Configuration Reference
@@ -180,7 +180,7 @@ Never put credentials directly in the DSN. Use the Antfly keystore:
 
 ```bash
 # Store the DSN as a secret
-curl -X PUT http://localhost:8080/api/v1/secrets/pg_dsn \
+curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://user:pass@pg-host:5432/mydb?sslmode=require"}'

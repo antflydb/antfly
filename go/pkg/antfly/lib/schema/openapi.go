@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//go:generate go tool oapi-codegen --config=cfg.yaml ./openapi.yaml
+//go:generate go tool oapi-codegen --config=cfg.yaml ../../../../../specs/openapi/antfly/schema.yaml
 package schema
 
 import (

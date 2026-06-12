@@ -20,12 +20,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Provider = if (build_options.bench_minimal_deps) enum {
     mock,
-    termite,
     antfly,
 
     pub fn fromSlice(raw: []const u8) !Provider {
         if (std.mem.eql(u8, raw, "mock")) return .mock;
-        if (std.mem.eql(u8, raw, "termite")) return .termite;
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
         return error.InvalidChunkerConfig;
     }
@@ -173,7 +171,7 @@ pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
         }
     }
 
-    if (cfg.provider == .termite and cfg.model.len == 0) return error.InvalidChunkerConfig;
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0) return error.InvalidChunkerConfig;
     return cfg;
 }
 
@@ -203,7 +201,6 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
     try appendJsonFieldName(alloc, &out, &wrote, "provider");
     try appendJsonString(alloc, &out, switch (cfg.provider) {
         .mock => "mock",
-        .termite => "termite",
         .antfly => "antfly",
     });
     if (cfg.api_url.len > 0) {

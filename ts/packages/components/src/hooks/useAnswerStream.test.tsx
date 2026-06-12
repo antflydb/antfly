@@ -78,7 +78,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request,
         headers: { "X-API-Key": "test" },
       });
@@ -131,7 +131,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -166,7 +166,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -203,7 +203,7 @@ describe("useAnswerStream", () => {
     // First stream
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "first",
           queries: [{ table: "docs" }],
@@ -229,7 +229,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "second",
           queries: [{ table: "docs" }],
@@ -259,7 +259,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -298,7 +298,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -343,7 +343,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -380,7 +380,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "test",
           queries: [{ table: "docs" }],
@@ -410,7 +410,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "first",
           queries: [{ table: "docs" }],
@@ -424,7 +424,7 @@ describe("useAnswerStream", () => {
 
     await act(async () => {
       await result.current.startStream({
-        url: "http://localhost:8080/api/v1",
+        url: "http://localhost:8080/db/v1",
         request: {
           query: "second",
           queries: [{ table: "docs" }],

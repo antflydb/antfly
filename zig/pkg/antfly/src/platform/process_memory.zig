@@ -18,29 +18,94 @@ const builtin = @import("builtin");
 pub const Stats = struct {
     available: bool = false,
     resident_bytes: u64 = 0,
+    anonymous_bytes: u64 = 0,
+    private_dirty_bytes: u64 = 0,
     footprint_bytes: u64 = 0,
     wired_bytes: u64 = 0,
     pageins: u64 = 0,
+    malloc_available: bool = false,
+    malloc_allocated_bytes: u64 = 0,
+    malloc_zone_bytes: u64 = 0,
 };
 
 pub fn snapshot() Stats {
+    if (builtin.os.tag == .linux) return linuxSnapshot();
     if (builtin.os.tag != .macos) return .{};
 
     var info: darwin.rusage_info_current = std.mem.zeroes(darwin.rusage_info_current);
     const rc = darwin.proc_pid_rusage(darwin.getpid(), darwin.RUSAGE_INFO_CURRENT, @ptrCast(&info));
     if (rc != 0) return .{};
 
-    return .{
+    var stats = Stats{
         .available = true,
         .resident_bytes = info.ri_resident_size,
         .footprint_bytes = info.ri_phys_footprint,
         .wired_bytes = info.ri_wired_size,
         .pageins = info.ri_pageins,
     };
+    const malloc_stats = darwin.mallocStats();
+    stats.malloc_available = malloc_stats.available;
+    stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
+    stats.malloc_zone_bytes = malloc_stats.zone_bytes;
+    return stats;
+}
+
+fn linuxSnapshot() Stats {
+    var out = linuxStatusSnapshot() orelse return .{};
+    out.private_dirty_bytes = linuxStatusValueBytes("/proc/self/smaps_rollup", "Private_Dirty:") orelse 0;
+    return out;
+}
+
+fn linuxStatusSnapshot() ?Stats {
+    var buf: [16 * 1024]u8 = undefined;
+    const contents = readProcFile("/proc/self/status", &buf) orelse return null;
+    const resident_bytes = parseProcStatusBytes(contents, "VmRSS:") orelse return null;
+    const anonymous_bytes = parseProcStatusBytes(contents, "RssAnon:") orelse 0;
+    return .{
+        .available = true,
+        .resident_bytes = resident_bytes,
+        .anonymous_bytes = anonymous_bytes,
+        .footprint_bytes = resident_bytes,
+    };
+}
+
+fn linuxStatusValueBytes(path: []const u8, key: []const u8) ?u64 {
+    var buf: [64 * 1024]u8 = undefined;
+    const contents = readProcFile(path, &buf) orelse return null;
+    return parseProcStatusBytes(contents, key);
+}
+
+fn readProcFile(path: []const u8, buf: []u8) ?[]const u8 {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
+    defer file.close(io_impl.io());
+    var reader = file.reader(io_impl.io(), &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
+}
+
+fn parseProcStatusBytes(contents: []const u8, key: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        var fields = std.mem.tokenizeAny(u8, line[key.len..], " \t");
+        const raw_value = fields.next() orelse return null;
+        const value = std.fmt.parseInt(u64, raw_value, 10) catch return null;
+        const unit = fields.next() orelse return value;
+        if (std.mem.eql(u8, unit, "kB")) return value * 1024;
+        return value;
+    }
+    return null;
 }
 
 const darwin = if (builtin.os.tag == .macos) struct {
     const darwin_c_int = i32;
+    const mach_port_t = u32;
+    const kern_return_t = i32;
+    const vm_address_t = usize;
+    const vm_size_t = usize;
+    const memory_reader_t = ?*const fn (mach_port_t, vm_address_t, vm_size_t, *?*anyopaque) callconv(.c) kern_return_t;
 
     pub const RUSAGE_INFO_CURRENT: darwin_c_int = 6;
 
@@ -93,6 +158,52 @@ const darwin = if (builtin.os.tag == .macos) struct {
         ri_reserved: [12]u64,
     };
 
+    const malloc_statistics_t = extern struct {
+        blocks_in_use: c_uint,
+        size_in_use: usize,
+        max_size_in_use: usize,
+        size_allocated: usize,
+    };
+
+    const MallocStats = struct {
+        available: bool = false,
+        allocated_bytes: u64 = 0,
+        zone_bytes: u64 = 0,
+    };
+
+    fn mallocStats() MallocStats {
+        var zones: [*]vm_address_t = undefined;
+        var zone_count: c_uint = 0;
+        if (malloc_get_all_zones(mach_task_self_, null, &zones, &zone_count) != 0) {
+            return mallocStatsForDefaultZone();
+        }
+
+        var out: MallocStats = .{ .available = true };
+        for (zones[0..zone_count]) |zone_addr| {
+            var zone_stats: malloc_statistics_t = std.mem.zeroes(malloc_statistics_t);
+            const zone: *anyopaque = @ptrFromInt(zone_addr);
+            malloc_zone_statistics(zone, &zone_stats);
+            out.allocated_bytes +|= @intCast(zone_stats.size_in_use);
+            out.zone_bytes +|= @intCast(zone_stats.size_allocated);
+        }
+        return out;
+    }
+
+    fn mallocStatsForDefaultZone() MallocStats {
+        const zone = malloc_default_zone() orelse return .{};
+        var zone_stats: malloc_statistics_t = std.mem.zeroes(malloc_statistics_t);
+        malloc_zone_statistics(zone, &zone_stats);
+        return .{
+            .available = true,
+            .allocated_bytes = @intCast(zone_stats.size_in_use),
+            .zone_bytes = @intCast(zone_stats.size_allocated),
+        };
+    }
+
     extern "c" fn proc_pid_rusage(pid: darwin_c_int, flavor: darwin_c_int, buffer: *rusage_info_current) darwin_c_int;
     extern "c" fn getpid() darwin_c_int;
+    extern "c" var mach_task_self_: mach_port_t;
+    extern "c" fn malloc_get_all_zones(task: mach_port_t, reader: memory_reader_t, addresses: *[*]vm_address_t, count: *c_uint) kern_return_t;
+    extern "c" fn malloc_default_zone() ?*anyopaque;
+    extern "c" fn malloc_zone_statistics(zone: *anyopaque, stats: *malloc_statistics_t) void;
 } else struct {};

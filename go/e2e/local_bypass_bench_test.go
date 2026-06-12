@@ -89,8 +89,8 @@ func TestE2E_LocalBypassLatency(t *testing.T) {
 		defer cancel()
 
 		swarm := startAntflySwarmWithOptions(t, ctx, SwarmOptions{
-			DisableTermite: true,
-			LocalBypass:    localBypass,
+			DisableInference: true,
+			LocalBypass:      localBypass,
 		})
 		defer swarm.Cleanup()
 

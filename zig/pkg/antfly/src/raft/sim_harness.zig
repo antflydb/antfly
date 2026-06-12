@@ -26,6 +26,7 @@ const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const db_enrichment_runtime_factory = @import("db_enrichment_runtime_factory.zig");
 const enrichment_runtime = @import("enrichment_runtime.zig");
 const db_types = @import("../storage/db/types.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
 const feature_reads = @import("feature_reads.zig");
 const transport = @import("transport/mod.zig");
 const transition_checker = @import("transition_checker.zig");
@@ -33,6 +34,7 @@ const transition_runtime_mod = @import("transition_runtime.zig");
 const raft_state_machine = @import("state_machine/mod.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
 pub const ManagedHostSimulationConfig = struct {
     host: managed_host.ManagedHostConfig,
@@ -49,6 +51,7 @@ pub const ManagedHttpHostSimulationConfig = struct {
     host: managed_host.ManagedHttpHostConfig,
     service: service.ManagedServiceConfig = .{},
     runtime: runtime_loop.RuntimeLoopConfig = .{},
+    async_transport: bool = true,
 };
 
 pub const ManagedHttpHostSimulationDeps = struct {
@@ -907,6 +910,7 @@ pub const ManagedHttpHostSimulation = struct {
     alloc: std.mem.Allocator,
     updates: *runtime_loop.MemoryUpdateSource,
     applier: metadata_apply.MetadataApplier,
+    backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     runtime: runtime_loop.ManagedHttpHostRuntime,
     virtual_base_uri: ?[]u8 = null,
 
@@ -920,14 +924,23 @@ pub const ManagedHttpHostSimulation = struct {
         updates.* = runtime_loop.MemoryUpdateSource.init(alloc);
         errdefer updates.deinit();
 
+        var host_deps = deps.host;
+        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (cfg.async_transport)
+            try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{})
+        else
+            null;
+        errdefer if (backend_runtime) |*runtime| runtime.deinit();
+        if (backend_runtime) |*runtime| host_deps.http.backend_runtime = runtime.ptr();
+
         return .{
             .alloc = alloc,
             .updates = updates,
             .applier = metadata_apply.MetadataApplier.init(updates.sink()),
+            .backend_runtime = backend_runtime,
             .runtime = try runtime_loop.ManagedHttpHostRuntime.init(
                 alloc,
                 cfg.host,
-                deps.host,
+                host_deps,
                 cfg.service,
                 deps.service,
                 updates.source(),
@@ -939,6 +952,7 @@ pub const ManagedHttpHostSimulation = struct {
     pub fn deinit(self: *ManagedHttpHostSimulation) void {
         if (self.virtual_base_uri) |uri| self.alloc.free(uri);
         self.runtime.deinit();
+        if (self.backend_runtime) |*runtime| runtime.deinit();
         self.updates.deinit();
         self.alloc.destroy(self.updates);
         self.* = undefined;
@@ -1139,6 +1153,7 @@ pub const ManagedHttpClusterSimulation = struct {
 
         const owned_configs = try alloc.dupe(ManagedHttpHostSimulationConfig, configs);
         errdefer alloc.free(owned_configs);
+        for (owned_configs) |*cfg| cfg.async_transport = false;
         const owned_deps = try alloc.dupe(ManagedHttpHostSimulationDeps, deps);
         errdefer alloc.free(owned_deps);
         for (owned_deps) |*dep| dep.host.http.request_executor = network.executor();
@@ -1281,7 +1296,9 @@ pub const ManagedHttpClusterSimulation = struct {
     pub fn restartNode(self: *ManagedHttpClusterSimulation, index: usize) !void {
         if (self.started) self.nodes[index].stop();
         self.nodes[index].deinit();
-        self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, self.configs[index], self.deps[index]);
+        var cfg = self.configs[index];
+        cfg.async_transport = false;
+        self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
         const node_id = self.configs[index].host.http.host.local_node_id;
         try self.nodes[index].useVirtualBaseUri(node_id);
         try self.network.registerNode(node_id, self.nodes[index].serverExecutor());
@@ -1565,6 +1582,7 @@ fn waitForLeader(
     var i: usize = 0;
     while (i < max_rounds) : (i += 1) {
         try stepHttpPair(a, b);
+        try sleepForNanos(std.time.ns_per_ms);
         if (a.raftStatus(group_id)) |status| {
             if (status.soft.role == .leader) return status.id;
         }
@@ -1586,6 +1604,7 @@ fn waitForLastIndex(
     while (i < max_rounds) : (i += 1) {
         if (try store.storage().lastIndex() >= target_index) return true;
         try stepHttpPair(a, b);
+        try sleepForNanos(std.time.ns_per_ms);
     }
     return (try store.storage().lastIndex()) >= target_index;
 }
@@ -2592,6 +2611,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     };
 
     var sim_a = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 1 },
@@ -2615,6 +2635,7 @@ test "managed http host simulations elect and replicate over real HTTP" {
     defer sim_a.deinit();
 
     var sim_b = try ManagedHttpHostSimulation.init(std.testing.allocator, .{
+        .async_transport = false,
         .host = .{
             .http = .{
                 .host = .{ .local_node_id = 2 },
@@ -2702,11 +2723,13 @@ test "managed http host simulations elect and replicate over real HTTP" {
     _ = try sim_b.stepOnce();
 
     try sim_a.campaignGroup(2001);
-    const leader = try waitForLeader(&sim_a, &sim_b, 2001, 64);
+    try sleepForNanos(20 * std.time.ns_per_ms);
+    const leader = try waitForLeader(&sim_a, &sim_b, 2001, 256);
     try std.testing.expectEqual(@as(?u64, 1), leader);
 
     try sim_a.propose(2001, "hello-http");
-    try std.testing.expect(try waitForLastIndex(&sim_a, &sim_b, &store_b, 2, 64));
+    try sleepForNanos(20 * std.time.ns_per_ms);
+    try std.testing.expect(try waitForLastIndex(&sim_a, &sim_b, &store_b, 2, 256));
 
     const entries = try store_b.storage().entries(std.testing.allocator, 1, 3, 0);
     defer raft_engine.core.types.freeEntries(std.testing.allocator, entries);
@@ -4700,6 +4723,7 @@ test "cluster simulation drives merge transition actions deterministically" {
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = observeStatus,
+                    .record_doc_identity_reassignment = recordDocIdentityReassignment,
                     .accept_receiver = acceptReceiver,
                     .catch_up_receiver = catchUpReceiver,
                     .finalize_merge = finalizeMerge,
@@ -4711,6 +4735,12 @@ test "cluster simulation drives merge transition actions deterministically" {
         fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.MergeTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
+        }
+
+        fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.calls.append(std.testing.allocator, "record_identity");
+            self.status.allow_doc_identity_reassignment = true;
         }
 
         fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -5970,6 +6000,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
                 .ptr = self,
                 .vtable = &.{
                     .observe_status = observeStatus,
+                    .record_doc_identity_reassignment = recordDocIdentityReassignment,
                     .accept_receiver = acceptReceiver,
                     .catch_up_receiver = catchUpReceiver,
                     .finalize_merge = finalizeMerge,
@@ -5981,6 +6012,12 @@ test "cluster simulation drives queued merge transitions through service-owned m
         fn observeStatus(ptr: *anyopaque, _: u64, _: u64) !data_mod.MergeTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
+        }
+
+        fn recordDocIdentityReassignment(ptr: *anyopaque, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.calls.append(std.testing.allocator, "record_identity");
+            self.status.allow_doc_identity_reassignment = true;
         }
 
         fn acceptReceiver(ptr: *anyopaque, _: u64, _: u64) !void {
@@ -6063,6 +6100,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
             .transition_id = 9202,
             .donor_group_id = 501,
             .receiver_group_id = 502,
+            .allow_doc_identity_reassignment = true,
         },
     });
 
@@ -6074,10 +6112,14 @@ test "cluster simulation drives queued merge transitions through service-owned m
     const metrics = cluster.node(0).serviceMetrics();
     try std.testing.expectEqual(@as(usize, 0), metrics.queued_merge_transitions);
     try std.testing.expectEqual(@as(usize, 1), metrics.completed_merge_transitions);
-    try std.testing.expectEqual(@as(usize, 3), merge.calls.items.len);
-    try std.testing.expectEqualStrings("accept", merge.calls.items[0]);
-    try std.testing.expectEqualStrings("catchup", merge.calls.items[1]);
-    try std.testing.expectEqualStrings("finalize", merge.calls.items[2]);
+    try std.testing.expectEqual(@as(usize, 6), merge.calls.items.len);
+    try std.testing.expectEqualStrings("record_identity", merge.calls.items[0]);
+    try std.testing.expectEqualStrings("accept", merge.calls.items[1]);
+    try std.testing.expectEqualStrings("record_identity", merge.calls.items[2]);
+    try std.testing.expectEqualStrings("catchup", merge.calls.items[3]);
+    try std.testing.expectEqualStrings("record_identity", merge.calls.items[4]);
+    try std.testing.expectEqualStrings("finalize", merge.calls.items[5]);
+    try std.testing.expect(merge.status.allow_doc_identity_reassignment);
 }
 
 test "http host simulation drives queued merge transitions through the service lane with real merge coordinator" {
@@ -6090,6 +6132,8 @@ test "http host simulation drives queued merge transitions through the service l
     defer std.testing.allocator.free(donor_root);
     const receiver_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-real-merge-receiver", .{tmp.sub_path});
     defer std.testing.allocator.free(receiver_root);
+    const old_receiver_namespace = doc_identity.Namespace{ .table_id = 9, .shard_id = 202, .range_id = 9202 };
+    const target_receiver_namespace = doc_identity.Namespace{ .table_id = 9, .shard_id = 202, .range_id = 9302 };
 
     {
         var donor = try data_mod.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = donor_root });
@@ -6108,7 +6152,10 @@ test "http host simulation drives queued merge transitions through the service l
     }
 
     {
-        var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+        var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{
+            .root_dir = receiver_root,
+            .db = .{ .identity_namespace = old_receiver_namespace },
+        });
         defer receiver.deinit();
         try receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
         try receiver.db.batch(.{
@@ -6123,6 +6170,14 @@ test "http host simulation drives queued merge transitions through the service l
         .receiver_root_dir = receiver_root,
         .donor_group_id = 201,
         .receiver_group_id = 202,
+        .receiver = .{
+            .root_dir = "",
+            .db = .{
+                .identity_namespace = old_receiver_namespace,
+                .prefer_existing_identity_namespace = true,
+            },
+        },
+        .receiver_identity_reassignment_namespace = target_receiver_namespace,
     });
     defer merge.deinit();
 
@@ -6147,6 +6202,7 @@ test "http host simulation drives queued merge transitions through the service l
             .transition_id = 9302,
             .donor_group_id = 201,
             .receiver_group_id = 202,
+            .allow_doc_identity_reassignment = true,
         },
     });
 
@@ -6168,7 +6224,13 @@ test "http host simulation drives queued merge transitions through the service l
     try std.testing.expectEqual(@as(usize, 0), metrics.merge_replay_blocked);
     try std.testing.expectEqual(@as(usize, 1), metrics.merge_ready_to_finalize);
 
-    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{ .root_dir = receiver_root });
+    var receiver = try data_mod.SplitDestination.init(std.testing.allocator, .{
+        .root_dir = receiver_root,
+        .db = .{
+            .identity_namespace = target_receiver_namespace,
+            .prefer_existing_identity_namespace = true,
+        },
+    });
     defer receiver.deinit();
     const range = receiver.getRange();
     try std.testing.expectEqualStrings("doc:a", range.start);
@@ -6176,6 +6238,12 @@ test "http host simulation drives queued merge transitions through the service l
     const donor_doc = (try receiver.get(std.testing.allocator, "doc:t")) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(donor_doc);
     try std.testing.expectEqualStrings("{\"v\":\"donor\"}", donor_doc);
+    const stats = try receiver.db.diagnosticStats(std.testing.allocator);
+    defer db_types.freeDBStats(std.testing.allocator, stats);
+    try std.testing.expectEqual(target_receiver_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(target_receiver_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(target_receiver_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expectEqual(@as(u64, 2), stats.doc_identity.live_ordinals);
 }
 
 test "http host simulation rolls back and retries queued merge transitions through the service lane" {

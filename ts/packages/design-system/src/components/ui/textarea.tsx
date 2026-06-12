@@ -7,7 +7,18 @@ function Textarea({ className, ...props }: React.ComponentProps<"textarea">) {
     <textarea
       data-slot="textarea"
       className={cn(
-        "text-foreground border-input placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive dark:bg-input/30 flex field-sizing-content min-h-20 w-full rounded-[calc(var(--radius)-2px)] border bg-transparent px-3 py-2 text-base shadow-xs transition-[color,box-shadow] outline-none focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
+        // body voice — what the user types is a phrase, not an instrument
+        // readout. Code-like fields can opt back in with font-mono.
+        "font-sans text-sm text-foreground placeholder:text-muted-foreground",
+        // structure: square, token-width border, no shadow
+        "field-sizing-content flex min-h-20 w-full rounded-none border-(length:--border-width) border-input bg-transparent",
+        "px-3 py-2",
+        // focus
+        "outline-none transition-[border-color,box-shadow]",
+        "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
+        // invalid + disabled
+        "aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40",
+        "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
         className
       )}
       {...props}

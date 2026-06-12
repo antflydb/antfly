@@ -19,7 +19,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 )
 
 var (
@@ -57,7 +57,7 @@ var _ = BeforeSuite(func() {
 
 	err = antflyv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
-	err = termitev1alpha1.AddToScheme(scheme.Scheme)
+	err = inferencev1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
@@ -75,9 +75,9 @@ var _ = BeforeSuite(func() {
 
 	// Setup the reconciler with the manager
 	err = (&AntflyClusterReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		ManageTermitePools: true,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		ManageInferencePools: true,
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 

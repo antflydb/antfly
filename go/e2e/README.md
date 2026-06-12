@@ -7,17 +7,17 @@ This directory contains end-to-end (e2e) tests for Antfly that test the full sys
 ### `TestE2E_RetrievalAgent_DocsEval`
 
 A comprehensive e2e test that:
-1. Starts Antfly in swarm mode programmatically (metadata + store + termite servers)
+1. Starts Antfly in swarm mode programmatically (metadata + store + antfly inference servers)
 2. Indexes real Antfly documentation using docsaf library (~2,500 document sections)
 3. Creates table with hybrid search (BM25 + embeddings) and waits for enrichment
 4. Executes 8 retrieval agent queries with semantic search and reasoning
 5. Validates answer quality using LLM-as-judge evaluation (faithfulness, relevance, completeness)
 
 **What it tests:**
-- Swarm mode startup and initialization (metadata + store + termite servers)
+- Swarm mode startup and initialization (metadata + store + antfly inference servers)
 - Document indexing pipeline (docsaf → LinearMerge)
 - Hybrid search (BM25 full-text + vector embeddings)
-- Embedding enrichment with Termite chunking service
+- Embedding enrichment with Antfly inference chunking service
 - Retrieval agent query execution with reasoning
 - Answer quality evaluation using LLM-as-judge (evalaf framework)
 
@@ -262,7 +262,7 @@ Expected keywords are provided for reference but not used for automated validati
 - [x] Add embedding indexes (aknn_v0)
 - [x] Implement proper embedding enrichment status polling
 - [x] Use LLM-as-judge for answer quality validation (evalaf framework)
-- [x] Integrate Termite chunking service
+- [x] Integrate Antfly inference chunking service
 
 ## Troubleshooting
 

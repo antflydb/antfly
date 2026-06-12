@@ -39,16 +39,16 @@ export const PipelineEdge: React.FC<PipelineEdgeProps> = ({
         markerEnd="url(#arrowhead)"
         className={cn(
           edgeState === "pending" && "stroke-muted-foreground/30",
-          edgeState === "active" && "stroke-blue-500 pipeline-edge-active",
-          edgeState === "complete" && "stroke-green-500/60",
-          edgeState === "error" && "stroke-red-500/60"
+          edgeState === "active" && "stroke-primary pipeline-edge-active",
+          edgeState === "complete" && "stroke-muted-foreground/60",
+          edgeState === "error" && "stroke-destructive/60"
         )}
         strokeDasharray={edgeState === "pending" ? "4 4" : undefined}
       />
       {edgeState === "active" && (
         <circle
           r={3}
-          className="fill-blue-500 pipeline-edge-pulse-dot"
+          className="fill-primary pipeline-edge-pulse-dot"
           style={{ offsetPath: `path('${d}')` }}
         />
       )}

@@ -109,7 +109,10 @@ pub const MetadataServer = struct {
             owned_admin_http_server = admin_http_server;
 
             const listener = try alloc.create(raft_transport.StdHttpListener);
-            listener.* = raft_transport.StdHttpListener.init(alloc, listener_cfg, admin_http_server.executor());
+            listener.* = if (svc.apiIoImpl()) |io_impl|
+                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, admin_http_server.executor(), io_impl)
+            else
+                raft_transport.StdHttpListener.init(alloc, listener_cfg, admin_http_server.executor());
             owned_admin_listener = listener;
         }
 

@@ -19,7 +19,7 @@ import generating "github.com/antflydb/antfly/go/pkg/generating"
 type GoogleGeneratorConfig = generating.GoogleGeneratorConfig
 type VertexGeneratorConfig = generating.VertexGeneratorConfig
 type OllamaGeneratorConfig = generating.OllamaGeneratorConfig
-type TermiteGeneratorConfig = generating.TermiteGeneratorConfig
+type AntflyGeneratorConfig = generating.AntflyGeneratorConfig
 type OpenAIGeneratorConfig = generating.OpenAIGeneratorConfig
 type OpenRouterGeneratorConfig = generating.OpenRouterGeneratorConfig
 type BedrockGeneratorConfig = generating.BedrockGeneratorConfig
@@ -40,6 +40,5 @@ const (
 	GeneratorProviderOllama     = generating.GeneratorProviderOllama
 	GeneratorProviderOpenai     = generating.GeneratorProviderOpenai
 	GeneratorProviderOpenrouter = generating.GeneratorProviderOpenrouter
-	GeneratorProviderTermite    = generating.GeneratorProviderTermite
 	GeneratorProviderVertex     = generating.GeneratorProviderVertex
 )

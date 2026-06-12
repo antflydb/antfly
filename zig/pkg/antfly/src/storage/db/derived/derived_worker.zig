@@ -37,6 +37,8 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
     applied_entries: usize = 0,
+    replay_scan_batches: usize = 0,
+    replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
@@ -46,6 +48,8 @@ pub const CatchUpProgress = struct {
     sequence: u64 = 0,
     scanned_entries: u64 = 0,
     applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
 };
 
 pub const CatchUpOptions = struct {
@@ -201,13 +205,17 @@ pub fn catchUpIndexFromMatchingCursor(
         if (chunk_stats.last_sequence == 0) {
             break;
         }
-        stats.scanned_entries += chunk_stats.matched_entries;
+        stats.scanned_entries += if (chunk_stats.scanned_entries != 0) chunk_stats.scanned_entries else chunk_stats.matched_entries;
+        stats.replay_scan_batches += chunk_stats.scan_batches;
+        stats.replay_hint_filter_skips += chunk_stats.hint_filter_skips;
         stats.last_sequence = chunk_stats.last_sequence;
         if (options.progress_fn) |progress| {
             try progress(options.progress_ctx.?, index_ref.name, .{
                 .sequence = chunk_stats.last_sequence,
                 .scanned_entries = @intCast(stats.scanned_entries),
                 .applied_entries = @intCast(stats.applied_entries),
+                .replay_scan_batches = @intCast(stats.replay_scan_batches),
+                .replay_hint_filter_skips = @intCast(stats.replay_hint_filter_skips),
             });
         }
 
@@ -244,6 +252,8 @@ pub fn catchUpIndexFromMatchingCursor(
                 .sequence = chunk_stats.last_sequence,
                 .scanned_entries = @intCast(stats.scanned_entries),
                 .applied_entries = @intCast(stats.applied_entries),
+                .replay_scan_batches = @intCast(stats.replay_scan_batches),
+                .replay_hint_filter_skips = @intCast(stats.replay_hint_filter_skips),
             });
         }
         if (options.finish_window_fn) |finish_window| {
@@ -276,6 +286,7 @@ const ReplayChunkBuilder = struct {
     alloc: Allocator,
     index_ref: index_manager_mod.ManagedIndexRef,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    decode_scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{},
     max_chunk_bytes: u64,
     changed_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     deleted_doc_keys: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -306,6 +317,7 @@ const ReplayChunkBuilder = struct {
     }
 
     fn deinit(self: *@This()) void {
+        self.decode_scratch.deinit(self.alloc);
         for (self.changed_doc_keys.items) |key| self.alloc.free(key);
         self.changed_doc_keys.deinit(self.alloc);
         for (self.deleted_doc_keys.items) |key| self.alloc.free(key);
@@ -364,7 +376,13 @@ const ReplayChunkBuilder = struct {
             .graph => {
                 for (record.deleted_doc_keys) |key| try self.appendUniqueKey(&self.deleted_doc_keys, &self.seen_deleted_docs, key);
                 for (record.changed_artifact_keys) |key| {
-                    if (!internal_keys.isGraphEdgeArtifactKey(key)) continue;
+                    if (!internal_keys.isGraphEdgeArtifactKey(key) and
+                        !internal_keys.isAssetArtifactKey(key) and
+                        !internal_keys.isChunkArtifactRecordKey(key) and
+                        !internal_keys.isResolutionArtifactKey(key))
+                    {
+                        continue;
+                    }
                     try self.appendUniqueKey(&self.changed_artifact_keys, &self.seen_changed_artifacts, key);
                 }
             },
@@ -469,10 +487,9 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     const builder: *ReplayChunkBuilder = @ptrCast(@alignCast(ctx));
     if (builder.target_sequence != 0 and sequence > builder.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
-        var record = try change_journal_mod.decodeBinaryRecordBorrowed(builder.alloc, payload);
-        defer record.deinit();
-        if (builder.wouldOverflowWithRecord(record.record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
-        try builder.appendRecord(record.record);
+        const record = try change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.alloc, payload, &builder.decode_scratch);
+        if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+        try builder.appendRecord(record);
         return;
     }
 
@@ -512,7 +529,13 @@ fn countEmbeddingArtifactKeys(keys: []const []const u8) usize {
 fn countGraphArtifactKeys(keys: []const []const u8) usize {
     var count: usize = 0;
     for (keys) |key| {
-        if (internal_keys.isGraphEdgeArtifactKey(key)) count += 1;
+        if (internal_keys.isGraphEdgeArtifactKey(key) or
+            internal_keys.isAssetArtifactKey(key) or
+            internal_keys.isChunkArtifactRecordKey(key) or
+            internal_keys.isResolutionArtifactKey(key))
+        {
+            count += 1;
+        }
     }
     return count;
 }
@@ -1065,8 +1088,9 @@ test "catchUpIndex chunks large replay windows" {
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
     defer journal.close();
 
+    const record_count = 4;
     var i: usize = 0;
-    while (i < catch_up_max_records_per_window_default + 1) : (i += 1) {
+    while (i < record_count) : (i += 1) {
         const doc_key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(doc_key);
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "dv_v1");
@@ -1082,23 +1106,21 @@ test "catchUpIndex chunks large replay windows" {
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
 
-    const stats = try catchUpIndex(
+    const stats = try catchUpIndexWithOptions(
         alloc,
         replay_source_mod.Source.fromJournal(&journal),
         .{ .name = "dv_v1", .kind = .dense_vector },
         0,
-        null,
         &capture,
         testApplyCapture,
-        null,
-        null,
+        .{ .max_records_per_window = 3 },
     );
 
-    try std.testing.expectEqual(catch_up_max_records_per_window_default + 1, stats.scanned_entries);
+    try std.testing.expectEqual(record_count, stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, 2), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 2), capture.call_count);
-    try std.testing.expectEqual(catch_up_max_records_per_window_default + 1, capture.applied_documents);
-    try std.testing.expectEqual(catch_up_max_records_per_window_default + 1, capture.applied_changed_artifact_keys);
+    try std.testing.expectEqual(record_count, capture.applied_documents);
+    try std.testing.expectEqual(record_count, capture.applied_changed_artifact_keys);
 }
 
 test "catchUpIndex chunks replay by byte budget" {
@@ -1417,5 +1439,47 @@ test "catchUpIndex batches graph artifact journal records before applying" {
     try std.testing.expectEqual(@as(usize, 1), capture.call_count);
     try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
     try std.testing.expectEqual(@as(usize, 0), capture.applied_graph_writes);
+    try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
+}
+
+test "catchUpIndex batches resolution artifact graph journal records before applying" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-resolution-graph-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    const artifact_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(artifact_key);
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 7,
+        .changed_artifact_keys = &.{artifact_key},
+        .target_hints = &.{.graph},
+    });
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+
+    const stats = try catchUpIndex(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "graph_v1", .kind = .graph },
+        0,
+        null,
+        &capture,
+        testApplyCapture,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
+    try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
     try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
 }

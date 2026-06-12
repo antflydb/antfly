@@ -64,6 +64,17 @@ pub const Storage = struct {
 };
 
 pub const MemoryStorage = struct {
+    pub const Diagnostics = struct {
+        entries: usize = 0,
+        entry_capacity: usize = 0,
+        first_index: types.Index = 0,
+        last_index: types.Index = 0,
+        snapshot_index: types.Index = 0,
+        snapshot_bytes: usize = 0,
+        entry_payload_bytes: usize = 0,
+        estimated_bytes: usize = 0,
+    };
+
     alloc: std.mem.Allocator,
     hard_state: types.HardState = .{},
     conf_state: types.ConfState = .{},
@@ -94,6 +105,26 @@ pub const MemoryStorage = struct {
                 .snapshot = snapshotImpl,
             },
         };
+    }
+
+    pub fn diagnostics(self: *const MemoryStorage) Diagnostics {
+        var out = Diagnostics{
+            .entries = self.entries_state.items.len,
+            .entry_capacity = self.entries_state.capacity,
+            .first_index = if (self.entries_state.items.len > 0) self.entries_state.items[0].index else self.snapshot_state.metadata.index + 1,
+            .last_index = if (self.entries_state.items.len > 0) self.entries_state.items[self.entries_state.items.len - 1].index else self.snapshot_state.metadata.index,
+            .snapshot_index = self.snapshot_state.metadata.index,
+            .snapshot_bytes = self.snapshot_state.data.len,
+            .estimated_bytes = @sizeOf(types.Entry) * self.entries_state.capacity +
+                self.snapshot_state.data.len +
+                confStateEstimatedBytes(self.conf_state) +
+                confStateEstimatedBytes(self.snapshot_state.metadata.conf_state),
+        };
+        for (self.entries_state.items) |entry| {
+            out.entry_payload_bytes += entry.data.len;
+            out.estimated_bytes += entry.data.len;
+        }
+        return out;
     }
 
     pub fn setHardState(self: *MemoryStorage, hard_state: types.HardState) void {
@@ -237,6 +268,13 @@ pub const MemoryStorage = struct {
         return try self.snapshot_state.clone(alloc);
     }
 };
+
+fn confStateEstimatedBytes(conf_state: types.ConfState) usize {
+    return @sizeOf(types.NodeId) * (conf_state.voters.len +
+        conf_state.voters_outgoing.len +
+        conf_state.learners.len +
+        conf_state.learners_next.len);
+}
 
 test "memory storage appends and serves entries" {
     var storage = MemoryStorage.init(std.testing.allocator);

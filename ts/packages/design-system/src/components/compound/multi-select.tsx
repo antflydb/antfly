@@ -100,7 +100,7 @@ function MultiSelectTrigger({
           {children || (
             value.length > 0 ? (
               value.map((v) => (
-                <Badge key={v} variant="secondary" className="text-xs">
+                <Badge key={v} className="text-xs">
                   {v}
                 </Badge>
               ))
@@ -171,7 +171,7 @@ function MultiSelectItem({
       <span
         aria-hidden
         className={cn(
-          "size-1.5 shrink-0 rounded-full",
+          "size-1.5 shrink-0",
           isSelected ? "bg-primary" : "bg-transparent",
         )}
       />

@@ -49,6 +49,35 @@ pub const IndexType = enum {
     }
 };
 
+/// Managed generated artifact kind.
+pub const EnrichmentKind = enum {
+    chunk,
+    asset,
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chunk => "chunk",
+            .asset => "asset",
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chunk", .chunk },
+            .{ "asset", .asset },
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const FullTextIndexConfig = struct {
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
@@ -558,6 +587,31 @@ pub const NodeFilter = struct {
     filter_prefix: ?[]const u8 = null,
 };
 
+/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
+pub const EnrichmentConfig = struct {
+    /// Stable generated artifact name.
+    name: []const u8,
+    kind: EnrichmentKind,
+    /// Source field to read from the source document or source artifact payload.
+    field: ?[]const u8 = null,
+    /// Optional template for generated text input.
+    template: ?[]const u8 = null,
+    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
+    source_artifact_name: ?[]const u8 = null,
+    /// Expected embedding dimension for embedding enrichments.
+    expected_dims: ?i64 = null,
+    /// Chunk size for chunk enrichments.
+    chunk_size: ?i64 = null,
+    /// Chunk overlap for chunk enrichments.
+    chunk_overlap: ?i64 = null,
+    /// Serialized chunker configuration for chunk enrichments.
+    chunker_json: ?[]const u8 = null,
+    /// Produced asset content type for asset enrichments.
+    content_type: ?[]const u8 = null,
+    /// Serialized asset producer configuration.
+    producer_json: ?[]const u8 = null,
+};
+
 /// Configuration for result fusion when combining multiple search indexes.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
@@ -579,6 +633,10 @@ pub const EmbeddingsIndexConfig = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -738,6 +796,8 @@ pub const GraphResultNode = struct {
     path_edges: ?[]const PathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
+    /// Parsed evidence envelope for provenance labels and edge metadata
+    evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
 };
@@ -791,8 +851,8 @@ pub const IndexConfig = struct {
     type: IndexType,
     /// Version of the index implementation. Defaults to 0.
     version: ?i64 = null,
-    /// List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level.
-    enrichments: ?[]const []const u8 = null,
+    /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+    enrichments: ?[]const EnrichmentConfig = null,
 };
 
 /// A step in a graph pattern query

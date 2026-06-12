@@ -102,6 +102,13 @@ pub const ServerConfig = struct {
     tls_key_path: ?[]const u8 = null,
 };
 
+fn routeErrorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        else => 500,
+    };
+}
+
 /// Request context passed to handlers.
 pub const Context = struct {
     allocator: Allocator,
@@ -1035,7 +1042,7 @@ pub const Server = struct {
             if (route_result) |r| {
                 response = self.executeMiddleware(&ctx, r.handler) catch |err| {
                     std.debug.print("Route handler error: {}\n", .{err});
-                    return self.sendError(&sock, 500);
+                    return self.sendError(&sock, routeErrorStatus(err));
                 };
             } else {
                 var allow_methods: [16]types.Method = undefined;
@@ -1637,8 +1644,8 @@ pub const Server = struct {
 
         var response: Response = undefined;
         if (route_result) |r| {
-            response = self.executeMiddleware(&ctx, r.handler) catch {
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, 500);
+            response = self.executeMiddleware(&ctx, r.handler) catch |err| {
+                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, routeErrorStatus(err));
                 return;
             };
         } else {
@@ -2078,6 +2085,13 @@ test "ServerConfig defaults" {
     try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.max_body_size);
     try std.testing.expectEqual(@as(usize, 100), config.max_headers);
     try std.testing.expectEqual(@as(usize, 100 * 1024 * 1024), config.max_file_size);
+}
+
+test "routeErrorStatus maps oversized route errors to payload too large" {
+    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.ValueTooLong));
+    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.StreamTooLong));
+    try std.testing.expectEqual(@as(u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
 }
 
 test "Context max_file_size default and override" {

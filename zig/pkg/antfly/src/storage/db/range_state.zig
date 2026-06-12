@@ -29,7 +29,7 @@ pub fn loadRange(alloc: Allocator, store: anytype) !docstore_mod.ByteRange {
 pub fn loadRangeAtKey(alloc: Allocator, store: anytype, key: []const u8) !docstore_mod.ByteRange {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const borrowed = txn.get(key) catch |err| switch (err) {
         error.NotFound => return .{ .start = "", .end = "" },
@@ -100,7 +100,7 @@ pub fn encodeRange(byte_range: docstore_mod.ByteRange, stack_buf: []u8) ![]const
 pub fn loadSplitDeltaFinalSeq(alloc: Allocator, store: anytype) !u64 {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginRead();
+    var txn = try runtime.store.beginProbe();
     defer txn.abort();
     const borrowed = txn.get(split_delta_final_seq_key) catch |err| switch (err) {
         error.NotFound => return 0,
@@ -263,4 +263,27 @@ test "range state saves and loads via lsm backend store" {
     try std.testing.expectEqual(@as(u64, 21), try loadSplitDeltaFinalSeq(std.testing.allocator, runtime));
     try clearSplitDeltaFinalSeq(runtime);
     try std.testing.expectEqual(@as(u64, 0), try loadSplitDeltaFinalSeq(std.testing.allocator, runtime));
+}
+
+test "range state lsm point loads do not clone mutable snapshot" {
+    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    try saveRangeAtKey(runtime, "group-range:11", .{
+        .start = "doc:e",
+        .end = "doc:s",
+    });
+    try saveSplitDeltaFinalSeq(runtime, 34);
+
+    const before = backend.snapshotMaintenanceStats();
+    const loaded = try loadRangeAtKey(std.testing.allocator, runtime, "group-range:11");
+    defer freeRange(std.testing.allocator, loaded);
+    try std.testing.expectEqualStrings("doc:e", loaded.start);
+    try std.testing.expectEqualStrings("doc:s", loaded.end);
+    try std.testing.expectEqual(@as(u64, 34), try loadSplitDeltaFinalSeq(std.testing.allocator, runtime));
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

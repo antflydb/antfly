@@ -2,6 +2,15 @@
  * Aeonik typeface — bundled with the package.
  * URLs resolve relative to the emitted CSS (dist/index.css).
  * The Vite build copies src/fonts/ → dist/fonts/.
+ *
+ * Body (--font-sans) defaults to "Inter" for cross-platform stability
+ * (the OS system stack looks great on macOS but renders inconsistently
+ * across Windows/Linux). Consumers load Inter + Roboto Mono + Silkscreen
+ * themselves (e.g. via next/font or a <link> in their HTML); if absent
+ * the stacks fall back to system fonts.
+ *
+ * Pixel display (--font-pixel) is a DELIBERATE EMPHASIS tool — reserved
+ * for brand-moment overlines, tags, 404/splash. Don't make it ambient.
  */
 
 @font-face {
@@ -20,9 +29,21 @@
   font-display: swap;
 }
 
+/*
+ * These tokens are unlayered :root rules, so they BEAT any consumer override
+ * made inside a Tailwind `@theme` block (@theme emits into `@layer theme`,
+ * and unlayered CSS wins over layered). The stacks therefore list the
+ * variable-font family names (@fontsource-variable registers e.g. "Inter
+ * Variable") ahead of the static names, so consumers that bundle variable
+ * fonts resolve correctly with no override. To override a font token, use a
+ * plain `:root { ... }` rule after importing this file — not `@theme`.
+ */
 :root {
   --font-sans:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-display: "Aeonik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-mono: "Roboto Mono", "Menlo", "Monaco", "Courier New", monospace;
+    "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-display:
+    "Aeonik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Roboto Mono Variable", "Roboto Mono", "Menlo", "Monaco", "Courier New", monospace;
+  --font-pixel: "Silkscreen", "Roboto Mono Variable", "Roboto Mono", monospace;
 }

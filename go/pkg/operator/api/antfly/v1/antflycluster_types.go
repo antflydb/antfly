@@ -1,7 +1,7 @@
 package v1
 
 import (
-	termitev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/termite/v1alpha1"
+	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -65,8 +65,8 @@ const (
 	// TypeScaling indicates whether replica scaling can proceed safely
 	TypeScaling = "Scaling"
 
-	// TypeTermitePoolReady indicates whether the operator-managed TermitePool is reconciled
-	TypeTermitePoolReady = "TermitePoolReady"
+	// TypeInferencePoolReady indicates whether the operator-managed InferencePool is reconciled
+	TypeInferencePoolReady = "InferencePoolReady"
 
 	// TypeMetadataReady indicates whether metadata pods are ready.
 	TypeMetadataReady = "MetadataReady"
@@ -77,20 +77,20 @@ const (
 	// TypeSwarmReady indicates whether swarm pods are ready.
 	TypeSwarmReady = "SwarmReady"
 
-	// TypeTermiteReady indicates whether termite is ready when managed in swarm mode.
-	TypeTermiteReady = "TermiteReady"
+	// TypeInferenceReady indicates whether inference is ready when managed in swarm mode.
+	TypeInferenceReady = "InferenceReady"
 
 	// TypeAvailable indicates whether the cluster is serving.
 	TypeAvailable = "Available"
 
-	// ReasonTermitePoolReady indicates the managed TermitePool reconcile completed
-	ReasonTermitePoolReady = "TermitePoolReady"
+	// ReasonInferencePoolReady indicates the managed InferencePool reconcile completed
+	ReasonInferencePoolReady = "InferencePoolReady"
 
-	// ReasonTermitePoolNameConflict indicates a same-name TermitePool is not owned by the cluster
-	ReasonTermitePoolNameConflict = "TermitePoolNameConflict"
+	// ReasonInferencePoolNameConflict indicates a same-name InferencePool is not owned by the cluster
+	ReasonInferencePoolNameConflict = "InferencePoolNameConflict"
 
-	// ReasonTermitePoolManagementDisabled indicates termite pool management is disabled by operator flag
-	ReasonTermitePoolManagementDisabled = "TermitePoolManagementDisabled"
+	// ReasonInferencePoolManagementDisabled indicates inference pool management is disabled by operator flag
+	ReasonInferencePoolManagementDisabled = "InferencePoolManagementDisabled"
 
 	// ReasonPVCAZMismatch indicates PVCs are bound to a different AZ than available nodes
 	ReasonPVCAZMismatch = "PVCAZMismatch"
@@ -218,11 +218,11 @@ type AntflyClusterSpec struct {
 	// +optional
 	Swarm *SwarmSpec `json:"swarm,omitempty"`
 
-	// Termite configures inference pools used by this cluster.
+	// Inference configures inference pools used by this cluster.
 	// Pools may be owned by this cluster, referenced as customer-managed shared
 	// pools, or referenced as platform-managed shared pools.
 	// +optional
-	Termite *AntflyTermiteSpec `json:"termite,omitempty"`
+	Inference *AntflyInferenceSpec `json:"inference,omitempty"`
 
 	// ProductTier records the CloudAF/product tier intent that was expanded
 	// into the explicit operator fields below. The operator does not resolve
@@ -319,67 +319,67 @@ type ProductTierSpec struct {
 	// +optional
 	DataTier string `json:"dataTier,omitempty"`
 
-	// TermiteTier optionally records the TermitePool sub-tier name when
-	// spec.termite is set.
+	// InferenceTier optionally records the InferencePool sub-tier name when
+	// spec.inference is set.
 	// +optional
-	TermiteTier string `json:"termiteTier,omitempty"`
+	InferenceTier string `json:"inferenceTier,omitempty"`
 }
 
-// AntflyTermiteMode selects how an AntflyCluster uses Termite inference pools.
-type AntflyTermiteMode string
+// AntflyInferenceMode selects how an AntflyCluster uses Inference inference pools.
+type AntflyInferenceMode string
 
 const (
-	// AntflyTermiteModeDisabled disables cluster-level inference integration.
-	AntflyTermiteModeDisabled AntflyTermiteMode = "Disabled"
+	// AntflyInferenceModeDisabled disables cluster-level inference integration.
+	AntflyInferenceModeDisabled AntflyInferenceMode = "Disabled"
 
-	// AntflyTermiteModePlatformShared uses platform-operated shared inference pools.
-	AntflyTermiteModePlatformShared AntflyTermiteMode = "PlatformShared"
+	// AntflyInferenceModePlatformShared uses platform-operated shared inference pools.
+	AntflyInferenceModePlatformShared AntflyInferenceMode = "PlatformShared"
 
-	// AntflyTermiteModeManaged creates TermitePools owned by this AntflyCluster.
-	AntflyTermiteModeManaged AntflyTermiteMode = "Managed"
+	// AntflyInferenceModeManaged creates InferencePools owned by this AntflyCluster.
+	AntflyInferenceModeManaged AntflyInferenceMode = "Managed"
 
-	// AntflyTermiteModeSharedRef uses existing customer-managed TermitePools.
-	AntflyTermiteModeSharedRef AntflyTermiteMode = "SharedRef"
+	// AntflyInferenceModeSharedRef uses existing customer-managed InferencePools.
+	AntflyInferenceModeSharedRef AntflyInferenceMode = "SharedRef"
 )
 
-// AntflyTermiteSpec configures Termite inference pools for an AntflyCluster.
-type AntflyTermiteSpec struct {
-	// Mode selects how Termite pools are provided.
+// AntflyInferenceSpec configures Inference inference pools for an AntflyCluster.
+type AntflyInferenceSpec struct {
+	// Mode selects how Inference pools are provided.
 	// +kubebuilder:validation:Enum=Disabled;PlatformShared;Managed;SharedRef
 	// +kubebuilder:default=Managed
 	// +optional
-	Mode AntflyTermiteMode `json:"mode,omitempty"`
+	Mode AntflyInferenceMode `json:"mode,omitempty"`
 
-	// ManagedPools are TermitePools created and owned by this AntflyCluster.
+	// ManagedPools are InferencePools created and owned by this AntflyCluster.
 	// Valid when mode is Managed.
 	// +optional
-	ManagedPools []ManagedTermitePoolSpec `json:"managedPools,omitempty"`
+	ManagedPools []ManagedInferencePoolSpec `json:"managedPools,omitempty"`
 
-	// SharedPools references existing customer-managed TermitePools.
+	// SharedPools references existing customer-managed InferencePools.
 	// Valid when mode is SharedRef.
 	// +optional
-	SharedPools []TermitePoolReference `json:"sharedPools,omitempty"`
+	SharedPools []InferencePoolReference `json:"sharedPools,omitempty"`
 
-	// PlatformPools references platform-operated shared TermitePools.
+	// PlatformPools references platform-operated shared InferencePools.
 	// Valid when mode is PlatformShared.
 	// +optional
-	PlatformPools []TermitePoolReference `json:"platformPools,omitempty"`
+	PlatformPools []InferencePoolReference `json:"platformPools,omitempty"`
 }
 
-// ManagedTermitePoolSpec describes one TermitePool owned by an AntflyCluster.
-type ManagedTermitePoolSpec struct {
-	// Name is the child TermitePool name. If omitted for a single managed pool,
-	// the operator uses "<antflycluster-name>-termite".
+// ManagedInferencePoolSpec describes one InferencePool owned by an AntflyCluster.
+type ManagedInferencePoolSpec struct {
+	// Name is the child InferencePool name. If omitted for a single managed pool,
+	// the operator uses "<antflycluster-name>-inference".
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// Spec is the TermitePool spec to apply to the child pool.
-	Spec termitev1alpha1.TermitePoolSpec `json:"spec"`
+	// Spec is the InferencePool spec to apply to the child pool.
+	Spec inferencev1alpha1.InferencePoolSpec `json:"spec"`
 }
 
-// TermitePoolReference points at an existing shared TermitePool or service.
-type TermitePoolReference struct {
-	// Name is the referenced TermitePool or logical platform pool name.
+// InferencePoolReference points at an existing shared InferencePool or service.
+type InferencePoolReference struct {
+	// Name is the referenced InferencePool or logical platform pool name.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
@@ -388,7 +388,7 @@ type TermitePoolReference struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// APIURL optionally pins the Termite API URL for this reference. When omitted,
+	// APIURL optionally pins the Inference API URL for this reference. When omitted,
 	// higher-level platform wiring may resolve the URL from the referenced pool.
 	// +optional
 	APIURL string `json:"apiURL,omitempty"`
@@ -547,9 +547,9 @@ type SwarmSpec struct {
 	// Health defines the health endpoint configuration.
 	Health APISpec `json:"health,omitempty"`
 
-	// Termite controls the optional termite sidecar runtime integrated into swarm mode.
+	// Inference controls the optional inference sidecar runtime integrated into swarm mode.
 	// +optional
-	Termite *SwarmTermiteSpec `json:"termite,omitempty"`
+	Inference *SwarmInferenceSpec `json:"inference,omitempty"`
 
 	// EnvFrom is a list of sources to populate environment variables in the container.
 	// +optional
@@ -572,12 +572,12 @@ type SwarmSpec struct {
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
-// SwarmTermiteSpec defines termite configuration for swarm mode.
-type SwarmTermiteSpec struct {
-	// Enabled controls whether termite runs alongside the swarm node.
+// SwarmInferenceSpec defines inference configuration for swarm mode.
+type SwarmInferenceSpec struct {
+	// Enabled controls whether inference runs alongside the swarm node.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// APIURL is the termite API URL.
+	// APIURL is the inference API URL.
 	APIURL string `json:"apiURL,omitempty"`
 }
 
@@ -1039,8 +1039,8 @@ type ProductTierStatus struct {
 	// DataTier records the observed data sub-tier name.
 	DataTier string `json:"dataTier,omitempty"`
 
-	// TermiteTier records the observed termite sub-tier name.
-	TermiteTier string `json:"termiteTier,omitempty"`
+	// InferenceTier records the observed inference sub-tier name.
+	InferenceTier string `json:"inferenceTier,omitempty"`
 
 	// SwarmResources summarizes swarm CPU/memory requests and limits.
 	SwarmResources string `json:"swarmResources,omitempty"`
@@ -1069,11 +1069,11 @@ type ProductTierStatus struct {
 	// DataAutoscaling reports the observed data autoscaling bounds.
 	DataAutoscaling string `json:"dataAutoscaling,omitempty"`
 
-	// TermiteEnabled reports whether this tier has an operator-managed TermitePool.
-	TermiteEnabled bool `json:"termiteEnabled,omitempty"`
+	// InferenceEnabled reports whether this tier has an operator-managed InferencePool.
+	InferenceEnabled bool `json:"inferenceEnabled,omitempty"`
 
-	// TermiteReplicas reports the observed TermitePool replica bounds.
-	TermiteReplicas string `json:"termiteReplicas,omitempty"`
+	// InferenceReplicas reports the observed InferencePool replica bounds.
+	InferenceReplicas string `json:"inferenceReplicas,omitempty"`
 
 	// ObservedGeneration is the AntflyCluster generation used for this status.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -1109,8 +1109,8 @@ type SwarmStatus struct {
 	// StoreReady indicates that the store API is ready.
 	StoreReady bool `json:"storeReady,omitempty"`
 
-	// TermiteReady indicates that termite is ready when enabled.
-	TermiteReady bool `json:"termiteReady,omitempty"`
+	// InferenceReady indicates that inference is ready when enabled.
+	InferenceReady bool `json:"inferenceReady,omitempty"`
 
 	// NodeID is the configured swarm node ID.
 	NodeID int32 `json:"nodeID,omitempty"`

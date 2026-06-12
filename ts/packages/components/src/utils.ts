@@ -175,7 +175,7 @@ export interface AnswerCallbacks {
 
 /**
  * Stream Retrieval Agent results from the Antfly /agents/retrieval endpoint using Server-Sent Events or JSON
- * @param url - Base URL of the Antfly server (e.g., http://localhost:8080/api/v1)
+ * @param url - Base URL of the Antfly server (e.g., http://localhost:8080/db/v1)
  * @param request - Retrieval agent request with query, mode, and optional step configs
  * @param headers - Optional HTTP headers for authentication
  * @param callbacks - Structured callbacks for retrieval events (classification, hits, reasoning, answer, follow-up, complete, error)

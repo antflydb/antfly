@@ -31,6 +31,8 @@ const enrichment_worker = @import("enrichment_worker.zig");
 const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
+const asset_producer_mod = @import("asset_producer.zig");
+const document_extraction_mod = @import("document_extraction.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
@@ -65,6 +67,8 @@ pub const Config = struct {
     lease_ttl_ms: u64 = 30_000,
     dense_embedder: ?embedder_mod.DenseEmbedder = null,
     sparse_embedder: ?embedder_mod.SparseEmbedder = null,
+    asset_producer: ?asset_producer_mod.Producer = null,
+    enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
@@ -98,12 +102,14 @@ const GeneratedReplayWindow = struct {
     alloc: Allocator,
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
     deleted_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
 
     fn isEmpty(self: *const @This()) bool {
         return self.documents.items.len == 0 and
             self.deleted_keys.items.len == 0 and
+            self.changed_artifact_keys.items.len == 0 and
             self.dense_embeddings.items.len == 0 and
             self.sparse_embeddings.items.len == 0;
     }
@@ -111,6 +117,7 @@ const GeneratedReplayWindow = struct {
     fn itemCount(self: *const @This()) usize {
         return self.documents.items.len +
             self.deleted_keys.items.len +
+            self.changed_artifact_keys.items.len +
             self.dense_embeddings.items.len +
             self.sparse_embeddings.items.len;
     }
@@ -121,6 +128,7 @@ const GeneratedReplayWindow = struct {
         };
         errdefer derived_types.deinitDerivedBatch(self.alloc, &batch);
         batch.deleted_keys = try self.deleted_keys.toOwnedSlice(self.alloc);
+        batch.changed_artifact_keys = try self.changed_artifact_keys.toOwnedSlice(self.alloc);
         batch.dense_embeddings = try self.dense_embeddings.toOwnedSlice(self.alloc);
         batch.sparse_embeddings = try self.sparse_embeddings.toOwnedSlice(self.alloc);
         return batch;
@@ -137,6 +145,9 @@ const GeneratedReplayWindow = struct {
 
         for (self.deleted_keys.items) |key| self.alloc.free(key);
         self.deleted_keys.deinit(self.alloc);
+
+        for (self.changed_artifact_keys.items) |key| self.alloc.free(key);
+        self.changed_artifact_keys.deinit(self.alloc);
 
         for (self.dense_embeddings.items) |embedding| freeDerivedDenseEmbedding(self.alloc, embedding);
         self.dense_embeddings.deinit(self.alloc);
@@ -195,6 +206,25 @@ fn sleepRetryBackoff(sleep_ns: u64) void {
 fn transientEmbedRetrySleepNs(attempt: u32) u64 {
     const shift = @min(attempt, 5);
     return @min(transient_embed_retry_base_sleep_ns << @intCast(shift), transient_embed_retry_max_sleep_ns);
+}
+
+const query_yield_poll_ns: u64 = 25 * std.time.ns_per_ms;
+const query_yield_max_ns: u64 = 5 * std.time.ns_per_s;
+
+// yieldToInteractiveEmbeds briefly defers the next embed batch while a
+// query-time embed is in flight, so interactive embeds aren't starved by
+// backfill. The flag covers only the embed call itself (milliseconds), so
+// the wait normally clears on the first poll; the 5s cap is a safety bound —
+// backfill must always make progress.
+fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    if (enrichment_types.interactive_embed_inflight.load(.monotonic) == 0) return;
+    const start_ns = runtime.config.clock.nowRealtimeNs();
+    while (enrichment_types.interactive_embed_inflight.load(.monotonic) > 0) {
+        if (elapsedNsSince(runtime, start_ns) >= query_yield_max_ns) return;
+        if (runtimeShuttingDown(runtime)) return;
+        sleepRetryBackoff(query_yield_poll_ns);
+    }
 }
 
 fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
@@ -297,6 +327,20 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
     }
 }
 
+const TextBatchByteStats = struct {
+    total_bytes: usize = 0,
+    max_bytes: usize = 0,
+};
+
+fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
+    var stats = TextBatchByteStats{};
+    for (texts) |text| {
+        stats.total_bytes += text.len;
+        stats.max_bytes = @max(stats.max_bytes, text.len);
+    }
+    return stats;
+}
+
 const TransientEmbedRetryDecision = enum {
     retry_inline,
     yield_to_worker,
@@ -315,6 +359,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
     return switch (err) {
         error.EmbedRateLimited,
         error.EmbedTransientFailure,
+        error.ModelNotFound,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
@@ -329,6 +374,10 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "enrichment treats missing local model as retryable" {
+    try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
@@ -361,10 +410,83 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
     };
 }
 
+fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
+    runtime.error_count = persisted_status.error_count;
+    runtime.retryable_error_count = persisted_status.retryable_error_count;
+    runtime.fatal_error_count = persisted_status.fatal_error_count;
+    runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
+    runtime.worker_failed = persisted_status.worker_failed;
+    runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
+}
+
+test "enrichment runtime restore preserves retry target across restart" {
+    var runtime = struct {
+        applied_sequence: u64 = 3,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 9,
+        .error_count = 2,
+        .retryable_error_count = 2,
+        .fatal_error_count = 0,
+        .retrying = true,
+        .worker_failed = false,
+    });
+
+    try std.testing.expectEqual(@as(u64, 9), runtime.target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), runtime.error_count);
+    try std.testing.expectEqual(@as(u64, 2), runtime.retryable_error_count);
+    try std.testing.expect(runtime.retrying);
+    try std.testing.expect(!runtime.worker_failed);
+}
+
+test "enrichment runtime restore does not resume persisted fatal failure" {
+    var runtime = struct {
+        applied_sequence: u64 = 7,
+        target_sequence: u64 = 0,
+        error_count: u64 = 0,
+        retryable_error_count: u64 = 0,
+        fatal_error_count: u64 = 0,
+        retrying: bool = false,
+        worker_failed: bool = false,
+    }{};
+
+    restorePersistedRuntimeStatus(&runtime, .{
+        .target_sequence = 4,
+        .error_count = 1,
+        .fatal_error_count = 1,
+        .retrying = true,
+        .worker_failed = true,
+    });
+
+    try std.testing.expectEqual(@as(u64, 7), runtime.target_sequence);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expect(runtime.worker_failed);
+}
+
 fn clearPublishedGeneratedArtifacts(runtime: *EnrichmentRuntime) void {
     var it = runtime.published_generated_artifacts.iterator();
     while (it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
     runtime.published_generated_artifacts.clearAndFree(runtime.alloc);
+}
+
+fn clearIsolatedFailedIndexes(runtime: *EnrichmentRuntime) void {
+    var it = runtime.isolated_failed_indexes.iterator();
+    while (it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
+    runtime.isolated_failed_indexes.clearAndFree(runtime.alloc);
+}
+
+fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) void {
+    if (runtime.isolated_failed_indexes.contains(index_name)) return;
+    const owned_key = runtime.alloc.dupe(u8, index_name) catch return;
+    errdefer runtime.alloc.free(owned_key);
+    runtime.isolated_failed_indexes.put(runtime.alloc, owned_key, {}) catch return;
 }
 
 fn generatedArtifactAlreadyPublished(runtime: *EnrichmentRuntime, artifact_key: []const u8) bool {
@@ -535,6 +657,19 @@ const ChunkedDenseWindowItem = struct {
     source_hash: u64,
 };
 
+const ChunkEmbeddingSource = struct {
+    key: []u8,
+    text: []u8,
+};
+
+fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
+    for (sources) |source| {
+        alloc.free(source.key);
+        alloc.free(source.text);
+    }
+    if (sources.len > 0) alloc.free(sources);
+}
+
 const PlainDenseBatchItem = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
     source_text: []const u8,
@@ -587,18 +722,67 @@ fn workerChunkCacheKey(
     alloc: Allocator,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "{s}\x1f{s}\x1f{s}\x1f{d}\x1f{d}\x1f{s}",
-        .{
-            request.doc_key,
-            request.source_field,
-            request.source_template,
-            request.chunk_size,
-            request.chunk_overlap,
-            request.chunker_json,
-        },
-    );
+    var chunk_size: [@sizeOf(u32)]u8 = undefined;
+    var chunk_overlap: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &chunk_size, request.chunk_size, .big);
+    std.mem.writeInt(u32, &chunk_overlap, request.chunk_overlap, .big);
+    return try workerChunkCacheTupleKeyAlloc(alloc, &.{
+        request.doc_key,
+        request.source_field,
+        request.source_template,
+        &chunk_size,
+        &chunk_overlap,
+        request.chunker_json,
+    });
+}
+
+fn workerChunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    for (components) |component| {
+        if (component.len > std.math.maxInt(u32)) return error.KeyComponentTooLarge;
+        var len_buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(component.len), .big);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, component);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+test "enrichment worker chunk cache keys preserve embedded separators" {
+    const alloc = std.testing.allocator;
+
+    const left = try workerChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .embedding_name = "embedding",
+        .doc_key = "doc\x1ffield",
+        .source_field = "field",
+        .source_template = "{{body}}",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(left);
+
+    const right = try workerChunkCacheKey(alloc, .{
+        .kind = .chunk_text,
+        .index_name = "idx",
+        .artifact_name = "artifact",
+        .embedding_name = "embedding",
+        .doc_key = "doc",
+        .source_field = "field\x1ffield",
+        .source_template = "{{body}}",
+        .chunk_size = 64,
+        .chunk_overlap = 8,
+        .chunker_json = "{\"mode\":\"a\"}",
+    });
+    defer alloc.free(right);
+
+    try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
 fn getOrCreateRequestChunks(
@@ -695,6 +879,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(
         alloc: Allocator,
@@ -725,21 +910,26 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
+                .asset_producer = config.asset_producer,
+                .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .clock = config.clock,
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
     pub fn deinit(self: *@This()) void {
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
+        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -753,6 +943,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
+        if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
     }
 
@@ -763,11 +954,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.applied_sequence = next_applied;
         }
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, @max(target_sequence, next_applied));
     }
 
     pub fn waitForApplied(self: *@This(), sequence: u64) !void {
-        if (self.config.dense_embedder == null and self.config.sparse_embedder == null) return;
+        if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null and !self.config.enable_without_producers) return;
 
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
@@ -805,6 +997,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retrying = false;
             self.worker_failed = false;
             clearPublishedGeneratedArtifacts(self);
+            clearIsolatedFailedIndexes(self);
         }
     }
 
@@ -817,11 +1010,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.applied_sequence = sequence;
         self.target_sequence = @max(self.target_sequence, sequence);
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = true,
             .has_lease = true,
             .acquisition_count = 0,
@@ -856,6 +1050,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
+        return self.isolated_failed_indexes.contains(index_name);
     }
 } else struct {
     alloc: Allocator,
@@ -902,6 +1100,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     chunk_artifact_bytes_written: u64 = 0,
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     future: ?Io.Future(void) = null,
 
@@ -919,7 +1118,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         config: Config,
     ) !EnrichmentRuntime {
         const io_impl = backend_runtime.io_impl;
-        if ((config.dense_embedder != null or config.sparse_embedder != null) and io_impl == null) return error.MissingBackendRuntimeIo;
+        if ((config.dense_embedder != null or config.sparse_embedder != null or config.asset_producer != null or config.enable_without_producers) and io_impl == null) return error.MissingBackendRuntimeIo;
         var runtime_store = try initRuntimeStore(alloc, store);
         errdefer runtime_store.deinit();
         var runtime = EnrichmentRuntime{
@@ -938,6 +1137,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
                 .sparse_embedder = config.sparse_embedder,
+                .asset_producer = config.asset_producer,
+                .enable_without_producers = config.enable_without_producers,
+                .secret_store = config.secret_store,
+                .remote_content = config.remote_content,
                 .clock = config.clock,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
@@ -947,7 +1150,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             }),
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
-        runtime.target_sequence = runtime.applied_sequence;
+        const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
+        restorePersistedRuntimeStatus(&runtime, persisted_status);
         return runtime;
     }
 
@@ -963,10 +1167,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         self.future = null;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         if (self.config.dense_embedder) |dense_embedder| dense_embedder.deinit(self.alloc);
         if (self.config.sparse_embedder) |sparse_embedder| sparse_embedder.deinit(self.alloc);
+        if (self.config.asset_producer) |producer| producer.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1003,6 +1209,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             if (sequence > self.target_sequence) self.last_error_name = null;
             self.retrying = false;
             self.worker_failed = false;
+            if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
             self.target_sequence = @max(self.target_sequence, sequence);
             return;
         };
@@ -1011,6 +1218,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (sequence > self.target_sequence) self.last_error_name = null;
         self.retrying = false;
         self.worker_failed = false;
+        if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
@@ -1028,6 +1236,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retrying = false;
         self.worker_failed = false;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
 
@@ -1064,6 +1273,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retrying = false;
         self.worker_failed = false;
         clearPublishedGeneratedArtifacts(self);
+        clearIsolatedFailedIndexes(self);
         status = runtimeStatusSnapshot(self);
         self.cond.broadcast(io);
         self.mutex.unlock(io);
@@ -1082,7 +1292,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
         const ownership_stats = self.ownership.stats();
         return .{
-            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null,
+            .enabled = self.config.dense_embedder != null or self.config.sparse_embedder != null or self.config.asset_producer != null or self.config.enable_without_producers,
             .lease_owned = ownership_stats.lease_owned,
             .has_lease = ownership_stats.has_lease,
             .acquisition_count = ownership_stats.acquisition_count,
@@ -1117,6 +1327,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    pub fn indexHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8) bool {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        return self.isolated_failed_indexes.contains(index_name);
     }
 
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
@@ -1162,6 +1379,63 @@ fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) voi
         return;
     }
     runtime.recordError(io, err);
+}
+
+fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) void {
+    std.log.warn("enrichment request failed index={s} artifact={s}: {s}", .{ request.index_name, requestEmbeddingName(request), @errorName(err) });
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        runtime.error_count += 1;
+        runtime.fatal_error_count += 1;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        markIsolatedFailedIndex(runtime, request.index_name);
+        runtime.mutex.unlock(io);
+    } else {
+        runtime.error_count += 1;
+        runtime.fatal_error_count += 1;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        markIsolatedFailedIndex(runtime, request.index_name);
+    }
+    runtime.notifyStatusHook();
+}
+
+test "isolated enrichment request error does not mark worker failed" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    runtime.retrying = true;
+    runtime.worker_failed = true;
+
+    recordIsolatedRequestError(&runtime, .{
+        .kind = .dense_embedding,
+        .index_name = "bad_visual",
+        .embedding_name = "clipclap",
+        .doc_key = "doc:1",
+        .source_field = "image_url",
+    }, error.UnsupportedEmbeddingProvider);
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.error_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.fatal_error_count);
+    try std.testing.expect(!runtime.retrying);
+    try std.testing.expect(!runtime.worker_failed);
+    try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
+    try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    clearIsolatedFailedIndexes(&runtime);
 }
 
 fn workerMain(runtime: *EnrichmentRuntime) void {
@@ -1319,11 +1593,1331 @@ fn processPendingDocumentGroup(
             continue;
         }
         switch (request.kind) {
-            .chunk_text => try processChunkText(runtime, request, chunk_cache, window),
-            .dense_embedding => try processDenseEmbedding(runtime, request, chunk_cache, window),
-            .sparse_embedding => try processSparseEmbedding(runtime, request, chunk_cache, window),
+            .asset => processAsset(runtime, request, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
+            .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
+                if (isRetryableEnrichmentError(err)) return err;
+                recordIsolatedRequestError(runtime, request, err);
+                continue;
+            },
         }
     }
+}
+
+fn processAsset(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
+) !void {
+    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    defer runtime.alloc.free(doc_store_key);
+    const raw = storeGetAlloc(runtime, doc_store_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return,
+    };
+    defer runtime.alloc.free(raw);
+
+    var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer producer_cfg.deinit(runtime.alloc);
+
+    const artifact_name = requestArtifactName(request);
+    const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
+    defer runtime.alloc.free(key);
+
+    const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
+        const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (producer_cfg.type == .document_extraction) {
+            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+        } else {
+            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        return;
+    };
+    defer runtime.alloc.free(@constCast(source_text));
+    if (source_text.len == 0) {
+        const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (producer_cfg.type == .document_extraction) {
+            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+        } else {
+            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        return;
+    }
+
+    if (producer_cfg.type == .document_extraction) {
+        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, window);
+        return;
+    }
+
+    const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+        try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
+    else
+        null;
+    defer if (source_parts_json) |value| runtime.alloc.free(value);
+
+    if (producer_cfg.type == .copy) {
+        if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
+            try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+            return;
+        }
+        try storePutWithRetry(runtime, key, source_text);
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+        recordArtifactBytes(runtime, .asset, source_text.len);
+        return;
+    }
+
+    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
+    defer runtime.alloc.free(state_value);
+    if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
+        const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
+            std.mem.Allocator.Error.OutOfMemory => return err,
+            else => null,
+        };
+        if (existing) |value| {
+            defer runtime.alloc.free(value);
+            try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+            return;
+        }
+    }
+
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const produced = try producer.produce(runtime.alloc, .{
+        .producer_type = producer_cfg.type,
+        .config_json = producer_cfg.config_json,
+        .source_text = source_text,
+        .source_parts_json = source_parts_json,
+        .content_type = request.content_type,
+    });
+    defer runtime.alloc.free(produced);
+
+    const writes = [_]KVPair{
+        .{ .key = key, .value = produced },
+        .{ .key = state_key, .value = state_value },
+    };
+    try storePutBatch(runtime, &writes, &.{});
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+    try materializeGraphAssetForRuntime(runtime, request, produced, raw, window);
+    recordArtifactBytes(runtime, .asset, produced.len);
+}
+
+fn processDocumentExtractionAsset(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    raw_doc: []const u8,
+    source_url: []const u8,
+    config_json: []const u8,
+    manifest_key: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    const artifact_name = requestArtifactName(request);
+    var config = try document_extraction_mod.parseConfig(runtime.alloc, config_json);
+    defer config.deinit(runtime.alloc);
+    try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
+
+    const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+    defer runtime.alloc.free(state_key);
+    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_state) |value| runtime.alloc.free(value);
+    const existing_manifest = storeGetAlloc(runtime, manifest_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_manifest) |value| runtime.alloc.free(value);
+    var previous_child_ranges: []types.DocumentArtifactChildRange = &.{};
+    defer freeDocumentArtifactChildRanges(runtime.alloc, previous_child_ranges);
+    if (existing_manifest) |value| {
+        previous_child_ranges = try documentArtifactChildRangesFromManifestJsonAlloc(runtime.alloc, value);
+    }
+    const from_generation = if (existing_manifest) |value| try documentExtractionManifestGeneration(runtime.alloc, value) else 0;
+    const to_generation = from_generation + 1;
+
+    const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(runtime.alloc, source_url, config_json, config);
+    defer if (metadata_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    if (metadata_fingerprint) |fingerprint| {
+        if (existing_state) |state| {
+            if (documentExtractionStateFingerprintMatches(runtime.alloc, state, fingerprint)) {
+                if (existing_manifest) |value| {
+                    if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                        runtime.skip_by_hash_count += 1;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    const fetched = try template_remote.downloadRemoteContentOutcomeAllocWithConfig(
+        runtime.alloc,
+        runtime.config.remote_content,
+        runtime.config.secret_store,
+        source_url,
+        if (config.credentials.len > 0) config.credentials else null,
+    );
+    const downloaded = switch (fetched) {
+        .ok => |content| content,
+        .http_error => return error.RemoteDocumentFetchFailed,
+    };
+    var downloaded_mut = downloaded;
+    defer downloaded_mut.deinit(runtime.alloc);
+
+    var extraction = try document_extraction_mod.extractDownloadedAlloc(runtime.alloc, downloaded_mut, source_url, config);
+    defer extraction.deinit(runtime.alloc);
+    try completeRuntimeDocumentExtractionGeneratedText(runtime, config, source_url, extraction.content_type, &extraction);
+
+    const byte_source_fingerprint = if (metadata_fingerprint == null)
+        try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+    else
+        null;
+    defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
+    const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+
+    var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_keys.items) |key| runtime.alloc.free(@constCast(key));
+        desired_unit_keys.deinit(runtime.alloc);
+    }
+    var desired_unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_unit_fingerprints.items) |fingerprint| runtime.alloc.free(@constCast(fingerprint));
+        desired_unit_fingerprints.deinit(runtime.alloc);
+    }
+    var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (desired_chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(runtime.alloc);
+    }
+    try collectRuntimeDocumentExtractionDesiredKeys(runtime, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
+
+    const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(runtime.alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
+    defer runtime.alloc.free(desired_unit_descriptors);
+
+    const new_state = try documentExtractionStateValueAlloc(runtime.alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
+    defer runtime.alloc.free(new_state);
+
+    if (existing_state) |state| {
+        if (std.mem.eql(u8, state, new_state)) {
+            if (existing_manifest) |value| {
+                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                    runtime.skip_by_hash_count += 1;
+                    return;
+                }
+            }
+        }
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            runtime.alloc.free(@constCast(write.key));
+            runtime.alloc.free(@constCast(write.value));
+        }
+        writes.deinit(runtime.alloc);
+    }
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+
+    var previous_unit_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
+    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
+    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
+    var previous_chunk_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    if (existing_state) |state| {
+        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
+        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+    }
+
+    if (existing_state != null) {
+        for (previous_unit_keys) |previous_key| {
+            if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+        for (previous_chunk_keys) |previous_key| {
+            if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+    }
+
+    const in_progress_manifest = try documentExtractionManifestPayloadAlloc(
+        runtime.alloc,
+        request.doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        extraction,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        previous_child_ranges,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        from_generation,
+        from_generation,
+        to_generation,
+        "in_progress",
+    );
+    defer runtime.alloc.free(in_progress_manifest);
+    const in_progress_key = try runtime.alloc.dupe(u8, manifest_key);
+    defer runtime.alloc.free(in_progress_key);
+    const in_progress_writes = [_]KVPair{.{ .key = in_progress_key, .value = in_progress_manifest }};
+    try storePutBatchWithRetry(runtime, in_progress_writes[0..], &.{});
+
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, false);
+    defer {
+        for (text_indexes) |name| runtime.alloc.free(name);
+        runtime.alloc.free(text_indexes);
+    }
+
+    const chunk_range_base_index = documentExtractionUnitRangeCount(extraction.units);
+    for (extraction.units, 0..) |unit, unit_index| {
+        const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, unit.unit_id);
+        defer runtime.alloc.free(unit_key);
+        const unit_range_id = try documentExtractionRangeIdAlloc(runtime.alloc, documentExtractionUnitRangeIndex(extraction.units, unit_index));
+        defer runtime.alloc.free(unit_range_id);
+        const unit_route = documentExtractionRangeRoute(previous_child_ranges, unit_range_id, "unit", artifact_name);
+        const payload = try documentUnitPayloadAlloc(runtime.alloc, request.doc_key, artifact_name, unit, source_url, extraction.content_type, unit_route);
+        errdefer runtime.alloc.free(payload);
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, unit_key),
+            .value = payload,
+        });
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, unit_key);
+
+        if (text_indexes.len > 0) {
+            var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+            errdefer {
+                for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+                runtime.alloc.free(targets);
+            }
+            for (text_indexes, 0..) |index_name, i| {
+                targets[i] = .{
+                    .kind = .full_text,
+                    .index_name = try runtime.alloc.dupe(u8, index_name),
+                };
+            }
+            try window.documents.append(runtime.alloc, .{
+                .key = try runtime.alloc.dupe(u8, unit_key),
+                .action = .upsert,
+                .cleaned_value = try runtime.alloc.dupe(u8, payload),
+                .targets = targets,
+            });
+        }
+
+        try appendRuntimeDocumentUnitChunkWrites(runtime, request.doc_key, artifact_name, unit_key, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, &writes, window);
+    }
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        runtime.alloc,
+        request.doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        extraction,
+        desired_unit_keys.items,
+        desired_unit_descriptors,
+        desired_chunk_keys.items,
+        previous_child_ranges,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        to_generation,
+        from_generation,
+        to_generation,
+        "converged",
+    );
+    errdefer runtime.alloc.free(manifest);
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, manifest_key),
+        .value = manifest,
+    });
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, state_key),
+        .value = try runtime.alloc.dupe(u8, new_state),
+    });
+
+    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    recordArtifactBytes(runtime, .asset, manifest.len);
+}
+
+fn deleteDocumentExtractionForRuntime(
+    runtime: *EnrichmentRuntime,
+    manifest_key: []const u8,
+    state_key: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+
+    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, manifest_key));
+    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+
+    const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (existing_state) |value| runtime.alloc.free(value);
+    if (existing_state) |state| {
+        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+        for (previous_keys) |previous_key| {
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+        for (previous_chunk_keys) |previous_key| {
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+        }
+    }
+
+    try storePutBatchWithRetry(runtime, &.{}, deletes.items);
+}
+
+fn completeRuntimeDocumentExtractionGeneratedText(
+    runtime: *EnrichmentRuntime,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    source_content_type: []const u8,
+    extraction: *document_extraction_mod.Result,
+) !void {
+    const producer = runtime.config.asset_producer orelse return;
+    for (extraction.units) |*unit| {
+        if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
+            const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, extraction.route_type, source_content_type, unit.*);
+            defer runtime.alloc.free(parts_json);
+            const produced = try producer.produce(runtime.alloc, .{
+                .producer_type = .reader,
+                .config_json = config.ocr_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer runtime.alloc.free(produced);
+            try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "ocr_text", "completed", .ocr);
+            continue;
+        }
+        if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
+            const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, extraction.route_type, source_content_type, unit.*);
+            defer runtime.alloc.free(parts_json);
+            const produced = try producer.produce(runtime.alloc, .{
+                .producer_type = .transcriber,
+                .config_json = config.transcription_config_json,
+                .source_text = source_url,
+                .source_parts_json = parts_json,
+                .content_type = "text/plain",
+            });
+            errdefer runtime.alloc.free(produced);
+            try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "transcript_text", "completed", .transcript);
+        }
+    }
+}
+
+const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };
+
+fn applyRuntimeGeneratedUnitText(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    produced: []u8,
+    method: []const u8,
+    status: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    if (produced.len == 0) {
+        alloc.free(produced);
+        return;
+    }
+    defer alloc.free(produced);
+    var parsed = try parseRuntimeGeneratedUnitTextOutputAlloc(alloc, produced);
+    errdefer parsed.deinit(alloc);
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    if (unit.extraction_warning) |value| alloc.free(value);
+    unit.text = parsed.text;
+    parsed.text = &.{};
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    switch (kind) {
+        .ocr => {
+            unit.ocr_used = true;
+            unit.ocr_confidence = parsed.confidence;
+            unit.ocr_bbox = parsed.bbox;
+        },
+        .transcript => {
+            unit.transcript_used = true;
+            unit.transcript_confidence = parsed.confidence;
+        },
+    }
+    unit.extraction_warning = parsed.warning;
+    parsed.warning = null;
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+const RuntimeParsedGeneratedUnitText = struct {
+    text: []u8,
+    confidence: ?f64 = null,
+    bbox: ?[4]f64 = null,
+    warning: ?[]u8 = null,
+
+    fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
+        if (self.text.len > 0) alloc.free(self.text);
+        if (self.warning) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !RuntimeParsedGeneratedUnitText {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, produced, .{}) catch {
+        return .{ .text = try alloc.dupe(u8, produced) };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, produced) };
+    const text_value = parsed.value.object.get("text") orelse return .{ .text = try alloc.dupe(u8, produced) };
+    if (text_value != .string) return .{ .text = try alloc.dupe(u8, produced) };
+
+    var out = RuntimeParsedGeneratedUnitText{ .text = try alloc.dupe(u8, text_value.string) };
+    errdefer out.deinit(alloc);
+    out.confidence = runtimeGeneratedTextJsonFloatField(parsed.value.object, "confidence");
+    out.bbox = runtimeGeneratedTextJsonBboxField(parsed.value.object, "ocr_bbox") orelse runtimeGeneratedTextJsonBboxField(parsed.value.object, "bbox") orelse runtimeGeneratedTextJsonBboxField(parsed.value.object, "coordinates");
+    if (runtimeGeneratedTextJsonStringField(parsed.value.object, "warning") orelse runtimeGeneratedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
+        out.warning = try alloc.dupe(u8, warning);
+    }
+    return out;
+}
+
+fn runtimeGeneratedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn runtimeGeneratedTextJsonFloatField(object: std.json.ObjectMap, field: []const u8) ?f64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .float => |v| v,
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    };
+}
+
+fn runtimeGeneratedTextJsonBboxField(object: std.json.ObjectMap, field: []const u8) ?[4]f64 {
+    const value = object.get(field) orelse return null;
+    if (value != .array or value.array.items.len != 4) return null;
+    var out: [4]f64 = undefined;
+    for (value.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .float => |v| v,
+            .integer => |v| @floatFromInt(v),
+            else => return null,
+        };
+    }
+    return out;
+}
+
+fn runtimeDocumentGeneratedTextPartsJsonAlloc(
+    alloc: Allocator,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    unit: document_extraction_mod.Unit,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .schema = "antfly.document_generated_text_request.v1",
+        .route_type = route_type,
+        .source_content_type = source_content_type,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .source_path = unit.source_path,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .text_regions = unit.text_regions,
+        .byte_length = unit.byte_length,
+        .source_sha256 = unit.source_sha256,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+    }, .{});
+}
+
+fn collectRuntimeDocumentExtractionDesiredKeys(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    units: []const document_extraction_mod.Unit,
+    desired_unit_keys: *std.ArrayListUnmanaged([]const u8),
+    desired_unit_fingerprints: *std.ArrayListUnmanaged([]const u8),
+    desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (units) |unit| {
+        try desired_unit_keys.append(runtime.alloc, try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, doc_key, artifact_name, unit.unit_id));
+        try desired_unit_fingerprints.append(runtime.alloc, try documentExtractionUnitFingerprintAlloc(runtime.alloc, unit));
+        for (runtime.index_manager.enrichments.items) |entry| {
+            if (entry.kind != .chunk) continue;
+            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+            const chunks = if (entry.chunker_json.len > 0)
+                try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            else
+                try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+            defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            for (chunks) |chunk| {
+                try desired_chunk_keys.append(runtime.alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            }
+        }
+    }
+}
+
+fn appendRuntimeDocumentUnitChunkWrites(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+    unit_key: []const u8,
+    unit: document_extraction_mod.Unit,
+    desired_chunk_keys: []const []const u8,
+    chunk_range_base_index: usize,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    window: *GeneratedReplayWindow,
+) !void {
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        const chunks = if (entry.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+        else
+            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+        if (chunks.len == 0) continue;
+
+        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, false);
+        defer {
+            for (text_indexes) |name| runtime.alloc.free(name);
+            runtime.alloc.free(text_indexes);
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(runtime.alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
+        for (chunks) |chunk| {
+            if (!chunk.isText()) continue;
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer runtime.alloc.free(chunk_key);
+            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            try writes.append(runtime.alloc, .{
+                .key = try runtime.alloc.dupe(u8, chunk_key),
+                .value = try runtime.alloc.dupe(u8, payload),
+            });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, chunk_key);
+
+            if (text_indexes.len > 0) {
+                var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+                errdefer {
+                    for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+                    runtime.alloc.free(targets);
+                }
+                for (text_indexes, 0..) |index_name, i| {
+                    targets[i] = .{
+                        .kind = .full_text,
+                        .index_name = try runtime.alloc.dupe(u8, index_name),
+                    };
+                }
+                try window.documents.append(runtime.alloc, .{
+                    .key = try runtime.alloc.dupe(u8, chunk_key),
+                    .action = .upsert,
+                    .cleaned_value = try runtime.alloc.dupe(u8, payload),
+                    .targets = targets,
+                });
+            }
+
+            _ = arena_state.reset(.retain_capacity);
+        }
+    }
+}
+
+fn buildDocumentUnitChunkPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    unit_key: []const u8,
+    artifact_name: []const u8,
+    source_artifact_name: []const u8,
+    source_field: []const u8,
+    unit: document_extraction_mod.Unit,
+    chunk: chunker_mod.Chunk,
+    include_payload: bool,
+    route: DocumentExtractionRangeRoute,
+) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_doc_key"), .{ .string = try alloc.dupe(u8, doc_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_key"), .{ .string = try alloc.dupe(u8, unit_key) });
+    try obj.put(alloc, try alloc.dupe(u8, "_parent_unit_id"), .{ .string = try alloc.dupe(u8, unit.unit_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_name"), .{ .string = try alloc.dupe(u8, artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_artifact_name"), .{ .string = try alloc.dupe(u8, source_artifact_name) });
+    try obj.put(alloc, try alloc.dupe(u8, "_source_field"), .{ .string = try alloc.dupe(u8, source_field) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_id"), .{ .string = try alloc.dupe(u8, route.range_id) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_range_kind"), .{ .string = try alloc.dupe(u8, "chunk") });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_route_status"), .{ .string = try alloc.dupe(u8, route.route_status) });
+    try obj.put(alloc, try alloc.dupe(u8, "_artifact_owner_group_id"), .{ .integer = owner_group_id });
+    try chunk_artifact_mod.appendArtifactFieldsWithProvenance(alloc, &obj, source_field, chunk, include_payload, .{
+        .scope = .unit,
+        .parent_doc_key = doc_key,
+        .parent_unit_key = unit_key,
+        .parent_unit_id = unit.unit_id,
+        .source_artifact_name = source_artifact_name,
+        .document_char_base = unit.char_start,
+        .page_number = unit.page_number,
+        .page_label = unit.page_label,
+        .page_bbox = unit.page_bbox,
+        .page_rotation = unit.page_rotation,
+        .extraction_method = unit.method,
+        .extraction_status = unit.extraction_status,
+        .confidence = documentUnitConfidence(unit),
+        .ocr_used = unit.ocr_used,
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_used = unit.transcript_used,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+    });
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
+}
+
+fn materializeGraphAssetForRuntime(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    value: []const u8,
+    raw_doc: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
+    if (!runtime.index_manager.hasGraphIndexes()) return;
+    const artifact_name = requestArtifactName(request);
+
+    for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+
+        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc);
+        defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
+
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                runtime.alloc.free(@constCast(write.key));
+                runtime.alloc.free(@constCast(write.value));
+            }
+            writes.deinit(runtime.alloc);
+        }
+        for (graph_writes) |write| {
+            const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
+            var key_owned = true;
+            errdefer if (key_owned) runtime.alloc.free(key);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            var payload_owned = true;
+            errdefer if (payload_owned) runtime.alloc.free(payload);
+            try writes.append(runtime.alloc, .{ .key = key, .value = payload });
+            key_owned = false;
+            payload_owned = false;
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+            deletes.deinit(runtime.alloc);
+        }
+
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (runtimeContainsKVKey(writes.items, previous_key)) continue;
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            }
+        } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
+            const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
+            defer runtime.alloc.free(prefix);
+            const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+            defer backend_scan.freeResults(runtime.alloc, existing);
+            for (existing) |entry| {
+                if (runtimeContainsKVKey(writes.items, entry.key)) continue;
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, writes.items);
+        var state_owned = true;
+        defer if (state_owned) runtime.alloc.free(state_value);
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, state_key),
+            .value = state_value,
+        });
+        state_owned = false;
+
+        if (writes.items.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+        }
+    }
+}
+
+fn materializeGraphAssetDeleteForRuntime(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    window: *GeneratedReplayWindow,
+) !void {
+    if (!runtime.index_manager.hasGraphIndexes()) return;
+    const artifact_name = requestArtifactName(request);
+
+    for (runtime.index_manager.graphIndexes()) |graph_entry| {
+        const source = graph_entry.artifact_source orelse continue;
+        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+            deletes.deinit(runtime.alloc);
+        }
+
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        defer runtime.alloc.free(state_key);
+        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
+            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            }
+        } else {
+            const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
+            const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
+            defer runtime.alloc.free(prefix);
+            const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+            defer backend_scan.freeResults(runtime.alloc, existing);
+            for (existing) |entry| {
+                if (runtimeContainsConstKey(protected_keys, entry.key)) continue;
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, entry.key);
+            }
+        }
+
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, &.{});
+        defer runtime.alloc.free(state_value);
+        const writes = [_]KVPair{.{ .key = state_key, .value = state_value }};
+        if (writes.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, &writes, deletes.items);
+        }
+    }
+}
+
+fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeContainsConstKey(items: []const []const u8, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, key)) return true;
+    }
+    return false;
+}
+
+fn runtimeGraphWritesFromArtifactValueAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
+    raw_doc: ?[]const u8,
+) ![]types.GraphEdgeWrite {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
+    defer if (parsed_doc) |*doc| doc.deinit();
+    const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer runtimeFreeGraphWrites(alloc, writes.items);
+
+    switch (source.format) {
+        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
+        .extraction_graph => {
+            if (source.path.len > 0) {
+                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+            } else if (parsed.value == .object) {
+                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+            }
+        },
+    }
+
+    return try writes.toOwnedSlice(alloc);
+}
+
+fn runtimeFreeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    }
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn runtimeAppendRelationItemsFromPath(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    root: std.json.Value,
+    path: []const u8,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
+    const selected = runtimeSelectGraphArtifactPath(root, path) orelse return;
+    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
+}
+
+fn runtimeSelectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var trimmed = path;
+    if (std.mem.startsWith(u8, trimmed, "$.")) trimmed = trimmed[2..];
+    if (std.mem.endsWith(u8, trimmed, "[*]")) trimmed = trimmed[0 .. trimmed.len - 3];
+    if (trimmed.len == 0) return root;
+
+    var current = root;
+    var parts = std.mem.splitScalar(u8, trimmed, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn runtimeAppendRelationValueItems(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    value: std.json.Value,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (value == .array) {
+        for (value.array.items, 0..) |item, i| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
+    } else {
+        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
+    }
+}
+
+fn runtimeAppendRelationItem(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
+    index_name: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    mapping: index_manager_mod.GraphArtifactMapping,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !void {
+    if (item != .object) return;
+    const mapped_edge_type = if (mapping.edge_type_template.len > 0)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_edge_type) |value| alloc.free(value);
+    const edge_type = if (mapped_edge_type) |value|
+        std.mem.trim(u8, value, &std.ascii.whitespace)
+    else
+        runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
+    if (edge_type.len == 0) return;
+
+    const mapped_source = if (mapping.source_template.len > 0)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_source) |value| alloc.free(value);
+    const source_doc = if (mapped_source) |value| blk: {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        break :blk if (trimmed.len > 0) trimmed else doc_key;
+    } else if (item.object.get("source")) |source_value|
+        runtimeJsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
+    else
+        doc_key;
+
+    const mapped_target = if (mapping.target_template.len > 0)
+        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        null;
+    defer if (mapped_target) |value| alloc.free(value);
+    const target_doc = if (mapped_target) |value| blk: {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len == 0) return;
+        break :blk trimmed;
+    } else blk: {
+        const target_value = item.object.get("target") orelse return;
+        break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
+    };
+
+    const weight = if (mapping.weight_template.len > 0) blk: {
+        const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        defer alloc.free(rendered);
+        const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
+        break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
+    } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
+    const metadata_json = if (mapping.metadata_template_json.len > 0)
+        try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else
+        try std.json.Stringify.valueAlloc(alloc, item, .{});
+    errdefer alloc.free(metadata_json);
+
+    try writes.append(alloc, .{
+        .index_name = try alloc.dupe(u8, index_name),
+        .source = try alloc.dupe(u8, source_doc),
+        .target = try alloc.dupe(u8, target_doc),
+        .edge_type = try alloc.dupe(u8, edge_type),
+        .weight = weight,
+        .metadata_json = metadata_json,
+    });
+}
+
+fn runtimeRenderGraphArtifactTemplateAlloc(
+    alloc: Allocator,
+    template_source: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var pos: usize = 0;
+    while (pos < template_source.len) {
+        const start = std.mem.indexOfPos(u8, template_source, pos, "{{") orelse {
+            try out.appendSlice(alloc, template_source[pos..]);
+            break;
+        };
+        try out.appendSlice(alloc, template_source[pos..start]);
+        const body_start = start + 2;
+        const end = std.mem.indexOfPos(u8, template_source, body_start, "}}") orelse {
+            try out.appendSlice(alloc, template_source[start..]);
+            break;
+        };
+        const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
+        const rendered = try runtimeRenderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        defer alloc.free(rendered);
+        try out.appendSlice(alloc, rendered);
+        pos = end + 2;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn runtimeRenderGraphArtifactExpressionAlloc(
+    alloc: Allocator,
+    expr: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    if (std.mem.startsWith(u8, expr, "default ")) {
+        var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
+        const path = parts.next() orelse return try alloc.dupe(u8, "");
+        const fallback = parts.next() orelse "";
+        const value = runtimeGraphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        const text = if (value) |found| try runtimeGraphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
+            alloc.free(text);
+            return try alloc.dupe(u8, fallback);
+        }
+        return text;
+    }
+    if (runtimeGraphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
+        return try runtimeGraphJsonValueTextAlloc(alloc, value);
+    }
+    return try alloc.dupe(u8, "");
+}
+
+fn runtimeGraphTemplateValue(
+    path: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ?std.json.Value {
+    if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
+    if (std.mem.startsWith(u8, path, "_doc.value.")) {
+        const doc = doc_value orelse return null;
+        return runtimeSelectJsonDotPath(doc, path["_doc.value.".len..]);
+    }
+    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
+    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
+    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
+    if (std.mem.startsWith(u8, path, "_artifact.value.")) return runtimeSelectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
+    if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
+    if (std.mem.eql(u8, path, "_item")) return item;
+    if (std.mem.startsWith(u8, path, "_item.")) return runtimeSelectGraphItemDotPath(item, path["_item.".len..], artifact_value);
+    return null;
+}
+
+fn runtimeSelectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
+    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("source") orelse return null;
+        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "source")) return selected;
+        return runtimeSelectJsonDotPath(selected, path["source.".len..]);
+    }
+    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
+        if (item != .object) return null;
+        const endpoint = item.object.get("target") orelse return null;
+        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
+        if (std.mem.eql(u8, path, "target")) return selected;
+        return runtimeSelectJsonDotPath(selected, path["target.".len..]);
+    }
+    return runtimeSelectJsonDotPath(item, path);
+}
+
+fn runtimeSelectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var parts = std.mem.splitScalar(u8, path, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn runtimeGraphJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, ""),
+        .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
+        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
+        .float => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
+        .number_string => |s| try alloc.dupe(u8, s),
+        .string => |s| try alloc.dupe(u8, s),
+        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+    };
+}
+
+fn runtimeRenderGraphArtifactMetadataTemplateAlloc(
+    alloc: Allocator,
+    metadata_template_json: []const u8,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{});
+    defer parsed.deinit();
+    var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+    defer runtimeFreeGraphRenderedJsonValue(alloc, &rendered);
+    return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
+}
+
+fn runtimeRenderGraphArtifactMetadataValueAlloc(
+    alloc: Allocator,
+    value: std.json.Value,
+    doc_key: []const u8,
+    doc_value: ?std.json.Value,
+    item: std.json.Value,
+    item_index: usize,
+    artifact_name: []const u8,
+    artifact_content_type: []const u8,
+    artifact_value: std.json.Value,
+) !std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try runtimeRenderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
+        .array => |array| blk: {
+            var out = std.json.Array.init(alloc);
+            errdefer out.deinit();
+            for (array.items) |child| try out.append(try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
+            break :blk .{ .array = out };
+        },
+        .object => |object| blk: {
+            var out = std.json.ObjectMap.empty;
+            errdefer out.deinit(alloc);
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
+            }
+            break :blk .{ .object = out };
+        },
+        else => value,
+    };
+}
+
+fn runtimeFreeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .string => |text| alloc.free(@constCast(text)),
+        .array => |*array| {
+            for (array.items) |*item| runtimeFreeGraphRenderedJsonValue(alloc, item);
+            array.deinit();
+        },
+        .object => |*object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                runtimeFreeGraphRenderedJsonValue(alloc, entry.value_ptr);
+            }
+            object.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+
+fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => value.string,
+        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
+        else => null,
+    };
+}
+
+fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
+    return runtimeJsonEndpointDocumentId(value) orelse if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| runtimeJsonEndpointDocumentId(entity) else null;
+}
+
+fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
+    if (value != .object) return null;
+    if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
+    const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
+    return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
+}
+
+fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
+    if (artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    return switch (entities) {
+        .array => |array| blk: {
+            for (array.items) |entity| {
+                const id = runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse continue;
+                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
+            }
+            break :blk null;
+        },
+        .object => entities.object.get(entity_id),
+        else => null,
+    };
+}
+
+fn runtimeGraphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
+    if (entity_index < 0 or artifact_value != .object) return null;
+    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    if (entities != .array) return null;
+    const index: usize = @intCast(entity_index);
+    if (index >= entities.array.items.len) return null;
+    return entities.array.items[index];
+}
+
+fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return if (found == .string) found.string else null;
+}
+
+fn runtimeJsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .integer => found.integer,
+        else => null,
+    };
+}
+
+fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
+    if (value != .object) return null;
+    const found = value.object.get(field) orelse return null;
+    return switch (found) {
+        .float => found.float,
+        .integer => @floatFromInt(found.integer),
+        else => null,
+    };
 }
 
 fn sameChunkedDenseBatchKey(
@@ -1391,6 +2985,7 @@ fn flushPlainDenseItems(
         max_source_bytes = @max(max_source_bytes, item.source_text.len);
     }
 
+    yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStarted(runtime, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
@@ -1476,7 +3071,11 @@ fn processPlainDenseWindow(
             }
         }
 
-        try flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window);
+        flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            for (items.items) |item| recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
     }
 }
 
@@ -1538,35 +3137,32 @@ fn processChunkedDenseWindow(
                 try appendUniqueOwnedKey(runtime.alloc, &stale_vector_keys, key);
             }
 
-            const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-            for (chunks) |chunk| {
-                const source = chunk.text orelse continue;
-                const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, chunk_artifact_name, @intCast(chunk.chunk_id));
-                errdefer runtime.alloc.free(chunk_key);
-                const source_hash = enrichment_artifact_codec.hashSource(source);
-                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, embedding_artifact_name);
+            const sources = try chunkEmbeddingSourcesForRequest(runtime, request, chunk_artifact_name, chunk_cache);
+            defer freeChunkEmbeddingSources(runtime.alloc, sources);
+            for (sources) |source| {
+                const source_hash = enrichment_artifact_codec.hashSource(source.text);
+                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
                     if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
-                        runtime.alloc.free(chunk_key);
                         continue;
                     }
                     try cached_embeddings.append(runtime.alloc, .{
                         .index_name = try runtime.alloc.dupe(u8, seed.index_name),
                         .parent_doc_key = try runtime.alloc.dupe(u8, request.doc_key),
-                        .doc_key = chunk_key,
+                        .doc_key = try runtime.alloc.dupe(u8, source.key),
                         .artifact_key = try runtime.alloc.dupe(u8, embedding_key),
                         .vector = &.{},
                     });
                     continue;
                 }
-                try chunk_texts.append(runtime.alloc, source);
+                try chunk_texts.append(runtime.alloc, source.text);
                 try chunk_items.append(runtime.alloc, .{
                     .request = request,
                     .parent_doc_key = request.doc_key,
                     .source_field = request.source_field,
                     .artifact_name = embedding_artifact_name,
-                    .chunk_key = chunk_key,
+                    .chunk_key = try runtime.alloc.dupe(u8, source.key),
                     .source_hash = source_hash,
                 });
             }
@@ -1583,7 +3179,16 @@ fn processChunkedDenseWindow(
         }
         if (chunk_items.items.len == 0) continue;
 
-        const vectors = try embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, chunk_texts.items, seed.expected_dims);
+        const batch_stats = textBatchByteStats(chunk_texts.items);
+        noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, chunk_texts.items, seed.expected_dims) catch |err| {
+            noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            if (isRetryableEnrichmentError(err)) return err;
+            for (chunk_items.items) |item| recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
         if (vectors.len != chunk_items.items.len) return error.InvalidEmbeddingResponse;
 
@@ -2108,8 +3713,9 @@ fn buildChunkDenseEmbeddings(
     artifact_name: []const u8,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![]derived_types.DerivedDenseEmbeddingWrite {
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
+    const sources = try chunkEmbeddingSourcesForRequest(runtime, request, artifact_name, chunk_cache);
+    defer freeChunkEmbeddingSources(runtime.alloc, sources);
+    if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
 
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite).empty;
     errdefer {
@@ -2124,11 +3730,10 @@ fn buildChunkDenseEmbeddings(
         chunk_keys.deinit(runtime.alloc);
     }
 
-    for (chunks) |chunk| {
-        const source = chunk.text orelse continue;
-        const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-        const source_hash = enrichment_artifact_codec.hashSource(source);
-        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, requestEmbeddingName(request));
+    for (sources) |source| {
+        const chunk_key = try runtime.alloc.dupe(u8, source.key);
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
             if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
@@ -2144,13 +3749,20 @@ fn buildChunkDenseEmbeddings(
             });
             continue;
         }
-        try chunk_texts.append(runtime.alloc, source);
+        try chunk_texts.append(runtime.alloc, source.text);
         try chunk_keys.append(runtime.alloc, chunk_key);
     }
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const vectors = try embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), chunk_texts.items, request.expected_dims);
+    const batch_stats = textBatchByteStats(chunk_texts.items);
+    noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), chunk_texts.items, request.expected_dims) catch |err| {
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
 
@@ -2184,8 +3796,9 @@ fn buildChunkSparseEmbeddings(
     artifact_name: []const u8,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![]derived_types.DerivedSparseEmbeddingWrite {
-    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
+    const sources = try chunkEmbeddingSourcesForRequest(runtime, request, artifact_name, chunk_cache);
+    defer freeChunkEmbeddingSources(runtime.alloc, sources);
+    if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
 
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
@@ -2208,11 +3821,10 @@ fn buildChunkSparseEmbeddings(
         chunk_keys.deinit(runtime.alloc);
     }
 
-    for (chunks) |chunk| {
-        const source = chunk.text orelse continue;
-        const chunk_key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-        const source_hash = enrichment_artifact_codec.hashSource(source);
-        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, chunk_key, requestEmbeddingName(request));
+    for (sources) |source| {
+        const chunk_key = try runtime.alloc.dupe(u8, source.key);
+        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
             if (generatedArtifactAlreadyPublished(runtime, embedding_key)) {
@@ -2228,14 +3840,21 @@ fn buildChunkSparseEmbeddings(
             });
             continue;
         }
-        try chunk_texts.append(runtime.alloc, source);
+        try chunk_texts.append(runtime.alloc, source.text);
         try chunk_keys.append(runtime.alloc, chunk_key);
         try chunk_hashes.append(runtime.alloc, source_hash);
     }
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const sparse_batch = try embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), chunk_texts.items);
+    const batch_stats = textBatchByteStats(chunk_texts.items);
+    noteEmbedBatchStarted(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), chunk_texts.items) catch |err| {
+        noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, chunk_texts.items.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
     if (sparse_batch.len != chunk_keys.items.len) return error.InvalidEmbeddingResponse;
 
@@ -2460,12 +4079,984 @@ fn shouldSkipEmbeddingArtifact(runtime: *EnrichmentRuntime, artifact_key: []cons
     return false;
 }
 
+fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8, value: []const u8) !bool {
+    const raw = storeGetAlloc(runtime, artifact_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer runtime.alloc.free(raw);
+    if (std.mem.eql(u8, raw, value)) {
+        runtime.skip_by_hash_count += 1;
+        return true;
+    }
+    return false;
+}
+
+fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer runtime.alloc.free(raw);
+    if (std.mem.eql(u8, raw, expected_state)) {
+        runtime.skip_by_hash_count += 1;
+        return true;
+    }
+    return false;
+}
+
+fn assetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn assetStateValueAlloc(
+    alloc: Allocator,
+    source_text: []const u8,
+    source_parts_json: ?[]const u8,
+    producer_json: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_text);
+    if (source_parts_json) |parts| hasher.update(parts);
+    hasher.update(producer_json);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try alloc.dupe(u8, &digest);
+}
+
+fn documentExtractionFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(source_url);
+    hasher.update(config_json);
+    hasher.update(configured_content_type);
+    hasher.update(configured_filename);
+    hasher.update(downloaded_content_type);
+    hasher.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn hexBytesAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
+}
+
+const DocumentExtractionUnitDescriptor = struct {
+    key: []const u8,
+    fingerprint: []const u8,
+};
+
+const DocumentExtractionRangeRoute = struct {
+    range_id: []const u8,
+    route_status: []const u8 = "local_committed",
+    owner_group_id: u64 = 0,
+};
+
+fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(unit.unit_id);
+    hasher.update(unit.unit_type);
+    hasher.update(unit.text);
+    hasher.update(unit.method);
+    if (unit.source_path) |source_path| hasher.update(source_path);
+    if (unit.extraction_status) |extraction_status| hasher.update(extraction_status);
+    if (unit.source_sha256) |source_sha256| hasher.update(source_sha256);
+    if (unit.byte_length) |byte_length| {
+        var buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &buf, byte_length, .big);
+        hasher.update(&buf);
+    }
+    hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    if (unit.ocr_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.ocr_bbox) |bbox| {
+        for (bbox) |coord| {
+            var value = coord;
+            hasher.update(std.mem.asBytes(&value));
+        }
+    }
+    hasher.update(if (unit.transcript_used) "transcript:1" else "transcript:0");
+    if (unit.transcript_confidence) |confidence| {
+        var value = confidence;
+        hasher.update(std.mem.asBytes(&value));
+    }
+    if (unit.extraction_warning) |warning| hasher.update(warning);
+    if (unit.page_number) |page_number| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, page_number, .big);
+        hasher.update(&buf);
+    }
+    if (unit.page_label) |page_label| hasher.update(page_label);
+    if (unit.page_bbox) |bbox| {
+        for (bbox) |coord| {
+            const coord_value: u64 = @bitCast(coord);
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
+    if (unit.page_rotation) |rotation| {
+        var buf: [@sizeOf(i32)]u8 = undefined;
+        std.mem.writeInt(i32, &buf, rotation, .big);
+        hasher.update(&buf);
+    }
+    for (unit.text_regions) |region| {
+        for (region.span) |span| {
+            var buf: [@sizeOf(u32)]u8 = undefined;
+            std.mem.writeInt(u32, &buf, span, .big);
+            hasher.update(&buf);
+        }
+        for (region.bbox) |coord| {
+            const coord_value: u64 = @bitCast(coord);
+            hasher.update(std.mem.asBytes(&coord_value));
+        }
+    }
+    if (unit.char_start) |char_start| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_start, .big);
+        hasher.update(&buf);
+    }
+    if (unit.char_end) |char_end| {
+        var buf: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &buf, char_end, .big);
+        hasher.update(&buf);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
+fn documentExtractionUnitDescriptorsFromKeysAlloc(
+    alloc: Allocator,
+    unit_keys: []const []const u8,
+    fingerprints: []const []const u8,
+) ![]DocumentExtractionUnitDescriptor {
+    if (unit_keys.len != fingerprints.len) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, unit_keys.len);
+    for (unit_keys, fingerprints, 0..) |key, fingerprint, i| {
+        out[i] = .{
+            .key = key,
+            .fingerprint = fingerprint,
+        };
+    }
+    return out;
+}
+
+fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []DocumentExtractionUnitDescriptor) void {
+    for (descriptors) |descriptor| {
+        if (descriptor.key.len > 0) alloc.free(@constCast(descriptor.key));
+        if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+    }
+    if (descriptors.len > 0) alloc.free(descriptors);
+}
+
+fn documentExtractionStateValueAlloc(
+    alloc: Allocator,
+    fingerprint: []const u8,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .kind = "document_extraction_state_v1",
+        .fingerprint = fingerprint,
+        .unit_keys = unit_keys,
+        .unit_descriptors = unit_descriptors,
+        .chunk_keys = chunk_keys,
+    }, .{});
+}
+
+fn documentExtractionStateFingerprintMatches(alloc: Allocator, state: []const u8, fingerprint: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("fingerprint") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, fingerprint);
+}
+
+fn documentExtractionStateUnitKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "unit_keys");
+}
+
+fn documentExtractionStateChunkKeysAlloc(alloc: Allocator, state: []const u8) ![]const []const u8 {
+    return try documentExtractionStateKeysAlloc(alloc, state, "chunk_keys");
+}
+
+fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const u8) ![]DocumentExtractionUnitDescriptor {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const descriptors_value = parsed.value.object.get("unit_descriptors") orelse return documentExtractionStateUnitDescriptorFallbackAlloc(alloc, parsed.value.object);
+    if (descriptors_value != .array) return error.InvalidDocumentExtractionState;
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, descriptors_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (descriptors_value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionState;
+        const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
+        const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
+        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, key_value.string),
+            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]DocumentExtractionUnitDescriptor {
+    const keys_value = object.get("unit_keys") orelse return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    if (keys_value != .array) return try alloc.alloc(DocumentExtractionUnitDescriptor, 0);
+    const out = try alloc.alloc(DocumentExtractionUnitDescriptor, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |descriptor| {
+            alloc.free(@constCast(descriptor.key));
+            if (descriptor.fingerprint.len > 0) alloc.free(@constCast(descriptor.fingerprint));
+        }
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = .{
+            .key = try alloc.dupe(u8, item.string),
+            .fingerprint = "",
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_name: []const u8) ![]const []const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc([]const u8, 0);
+    const keys_value = parsed.value.object.get(field_name) orelse return try alloc.alloc([]const u8, 0);
+    if (keys_value != .array) return try alloc.alloc([]const u8, 0);
+    const out = try alloc.alloc([]const u8, keys_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(out);
+    }
+    for (keys_value.array.items, 0..) |item, i| {
+        if (item != .string) return error.InvalidDocumentExtractionState;
+        out[i] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn documentExtractionUnitKeyStillPresent(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    previous_key: []const u8,
+    units: []const document_extraction_mod.Unit,
+) !bool {
+    for (units) |unit| {
+        const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id);
+        defer alloc.free(key);
+        if (std.mem.eql(u8, previous_key, key)) return true;
+    }
+    return false;
+}
+
+fn documentUnitPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    unit: document_extraction_mod.Unit,
+    source_url: []const u8,
+    content_type: []const u8,
+    route: DocumentExtractionRangeRoute,
+) ![]u8 {
+    const owner_group_id = std.math.cast(i64, route.owner_group_id) orelse return error.InvalidDocumentExtractionManifest;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        ._parent_doc_key = doc_key,
+        ._artifact_name = artifact_name,
+        ._artifact_range_id = route.range_id,
+        ._artifact_range_kind = "unit",
+        ._artifact_route_status = route.route_status,
+        ._artifact_owner_group_id = owner_group_id,
+        .unit_id = unit.unit_id,
+        .unit_type = unit.unit_type,
+        .text = unit.text,
+        .content_type = "text/plain",
+        .language = "",
+        .source_path = unit.source_path,
+        .extraction_status = unit.extraction_status,
+        .source_sha256 = unit.source_sha256,
+        .byte_length = unit.byte_length,
+        .confidence = documentUnitConfidence(unit),
+        .ocr_confidence = unit.ocr_confidence,
+        .ocr_bbox = unit.ocr_bbox,
+        .transcript_confidence = unit.transcript_confidence,
+        .extraction_warning = unit.extraction_warning,
+        .provenance = .{
+            .source_url = source_url,
+            .source_path = unit.source_path,
+            .method = unit.method,
+            .extraction_status = unit.extraction_status,
+            .source_sha256 = unit.source_sha256,
+            .byte_length = unit.byte_length,
+            .confidence = documentUnitConfidence(unit),
+            .ocr_used = unit.ocr_used,
+            .ocr_confidence = unit.ocr_confidence,
+            .ocr_bbox = unit.ocr_bbox,
+            .transcript_used = unit.transcript_used,
+            .transcript_confidence = unit.transcript_confidence,
+            .extraction_warning = unit.extraction_warning,
+            .page_number = unit.page_number,
+            .page_label = unit.page_label,
+            .page_bbox = unit.page_bbox,
+            .page_rotation = unit.page_rotation,
+            .text_regions = unit.text_regions,
+            .char_start = unit.char_start,
+            .char_end = unit.char_end,
+            .source_content_type = content_type,
+            .format_provenance = .{
+                .schema = "antfly.document_format_provenance.v1",
+                .source_content_type = content_type,
+                .source_path = unit.source_path,
+                .coordinate_system = "source_page_points",
+                .extraction_method = unit.method,
+                .extraction_status = unit.extraction_status,
+                .source_sha256 = unit.source_sha256,
+                .byte_length = unit.byte_length,
+                .confidence = documentUnitConfidence(unit),
+                .ocr_used = unit.ocr_used,
+                .ocr_confidence = unit.ocr_confidence,
+                .ocr_bbox = unit.ocr_bbox,
+                .transcript_used = unit.transcript_used,
+                .transcript_confidence = unit.transcript_confidence,
+                .extraction_warning = unit.extraction_warning,
+                .page_number = unit.page_number,
+                .page_label = unit.page_label,
+                .page_bbox = unit.page_bbox,
+                .page_rotation = unit.page_rotation,
+                .text_regions = unit.text_regions,
+            },
+        },
+    }, .{});
+}
+
+fn documentUnitConfidence(unit: document_extraction_mod.Unit) ?f64 {
+    return unit.ocr_confidence orelse unit.transcript_confidence;
+}
+
+const document_extraction_range_target_children = 256;
+const document_extraction_range_target_text_bytes = 1024 * 1024;
+
+fn documentExtractionRangeCount(key_count: usize) usize {
+    if (key_count == 0) return 0;
+    return (key_count + document_extraction_range_target_children - 1) / document_extraction_range_target_children;
+}
+
+fn documentExtractionUnitRangeCount(units: []const document_extraction_mod.Unit) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) {
+        count += 1;
+        start = documentExtractionRangeEnd(units.len, units, start);
+    }
+    return count;
+}
+
+fn documentExtractionUnitRangeIndex(units: []const document_extraction_mod.Unit, unit_index: usize) usize {
+    var range_index: usize = 0;
+    var start: usize = 0;
+    while (start < units.len) : (range_index += 1) {
+        const end = documentExtractionRangeEnd(units.len, units, start);
+        if (unit_index < end) return range_index;
+        start = end;
+    }
+    return range_index;
+}
+
+fn documentExtractionRangeIdAlloc(alloc: Allocator, range_index: usize) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index});
+}
+
+fn documentExtractionKeyIndex(keys: []const []const u8, key: []const u8) ?usize {
+    for (keys, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, key)) return i;
+    }
+    return null;
+}
+
+fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) !u64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, manifest, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    const generation = parsed.value.object.get("generation") orelse return 0;
+    if (generation != .integer or generation.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("last_error") != null;
+}
+
+fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    const value = object.get(field_name) orelse return "";
+    if (value != .string) return "";
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .string) return null;
+    return try alloc.dupe(u8, value.string);
+}
+
+fn jsonObjectU64(object: std.json.ObjectMap, field_name: []const u8) !u64 {
+    const value = object.get(field_name) orelse return 0;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
+    return std.math.cast(usize, try jsonObjectU64(object, field_name)) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !?usize {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
+    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
+}
+
+fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?bool {
+    const value = object.get(field_name) orelse return null;
+    if (value != .bool) return error.InvalidDocumentExtractionManifest;
+    return value.bool;
+}
+
+fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    const value = parsed.value.object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+    if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
+
+    const out = try alloc.alloc(types.DocumentArtifactChildRange, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*range| range.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidDocumentExtractionManifest;
+        out[i] = .{
+            .range_id = try jsonObjectStringDup(alloc, item.object, "range_id"),
+            .range_kind = try jsonObjectStringDup(alloc, item.object, "range_kind"),
+            .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
+            .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
+            .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
+            .owner_group_id = try jsonObjectOptionalU64(item.object, "owner_group_id"),
+            .placement_generation = try jsonObjectOptionalU64(item.object, "placement_generation"),
+            .route_status = try jsonObjectOptionalStringDup(alloc, item.object, "route_status"),
+            .split_eligible = try jsonObjectOptionalBool(item.object, "split_eligible"),
+            .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
+            .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
+            .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
+            .child_count = try jsonObjectUsize(item.object, "child_count"),
+            .text_bytes = try jsonObjectOptionalUsize(item.object, "text_bytes"),
+        };
+        initialized += 1;
+    }
+
+    return out;
+}
+
+fn freeDocumentArtifactChildRanges(alloc: Allocator, child_ranges: []types.DocumentArtifactChildRange) void {
+    for (child_ranges) |*child_range| child_range.deinit(alloc);
+    if (child_ranges.len > 0) alloc.free(child_ranges);
+}
+
+fn appendJsonFieldName(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+    try appendJsonString(alloc, out, name);
+    try out.append(alloc, ':');
+}
+
+fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: []const u8) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try appendJsonString(alloc, out, value);
+}
+
+fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
+    try appendJsonFieldName(alloc, out, first, name);
+    try out.appendSlice(alloc, if (value) "true" else "false");
+}
+
+fn appendDocumentExtractionRangeDescriptors(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    artifact_name: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var first_range = true;
+    var range_index: usize = 0;
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "unit", artifact_name, unit_keys, units, previous_child_ranges);
+    try appendDocumentExtractionKeyRanges(alloc, out, &first_range, &range_index, "chunk", "derived_chunks", chunk_keys, &.{}, previous_child_ranges);
+}
+
+fn appendDocumentExtractionRangePolicy(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldU64(alloc, out, &first, "policy_version", 1);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_children", document_extraction_range_target_children);
+    try appendJsonFieldUsize(alloc, out, &first, "unit_target_text_bytes", document_extraction_range_target_text_bytes);
+    try appendJsonFieldUsize(alloc, out, &first, "chunk_target_children", document_extraction_range_target_children);
+    try appendJsonFieldString(alloc, out, &first, "oversized_unit_policy", "single_unit_range");
+    try out.append(alloc, '}');
+}
+
+fn appendDocumentExtractionKeyRanges(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_range: *bool,
+    range_index: *usize,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    units: []const document_extraction_mod.Unit,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+) !void {
+    var start: usize = 0;
+    while (start < keys.len) {
+        const end = documentExtractionRangeEnd(keys.len, units, start);
+        if (first_range.*) {
+            first_range.* = false;
+        } else {
+            try out.append(alloc, ',');
+        }
+        var first = true;
+        try out.append(alloc, '{');
+        const range_id = try std.fmt.allocPrint(alloc, "range:{d:0>6}", .{range_index.*});
+        defer alloc.free(range_id);
+        const previous_range = findDocumentArtifactChildRange(previous_child_ranges, range_id, range_kind, artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "range_id", range_id);
+        try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+        try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+        try appendJsonFieldString(alloc, out, &first, "split_boundary", documentExtractionSplitBoundary(range_kind));
+        try appendJsonFieldString(alloc, out, &first, "placement", if (previous_range) |range| range.placement else "parent");
+        try appendJsonFieldU64(alloc, out, &first, "owner_group_id", if (previous_range) |range| range.owner_group_id orelse 0 else 0);
+        try appendJsonFieldU64(alloc, out, &first, "placement_generation", if (previous_range) |range| range.placement_generation orelse 0 else 0);
+        try appendJsonFieldString(alloc, out, &first, "route_status", if (previous_range) |range| range.route_status orelse "local_committed" else "local_committed");
+        try appendJsonFieldBool(alloc, out, &first, "split_eligible", if (previous_range) |range| range.split_eligible orelse (end - start > 1) else end - start > 1);
+        try appendJsonFieldString(alloc, out, &first, "start_key", keys[start]);
+        try appendJsonFieldString(alloc, out, &first, "end_key_exclusive", if (end < keys.len) keys[end] else "");
+        try appendJsonFieldString(alloc, out, &first, "last_key", keys[end - 1]);
+        try appendJsonFieldUsize(alloc, out, &first, "child_count", end - start);
+        if (units.len >= end) {
+            var text_bytes: usize = 0;
+            for (units[start..end]) |unit| text_bytes += unit.text.len;
+            try appendJsonFieldUsize(alloc, out, &first, "text_bytes", text_bytes);
+        }
+        try out.append(alloc, '}');
+        range_index.* += 1;
+        start = end;
+    }
+}
+
+fn documentExtractionSplitBoundary(range_kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, range_kind, "chunk")) return "chunk";
+    return "unit";
+}
+
+fn documentExtractionRangeEnd(
+    key_count: usize,
+    units: []const document_extraction_mod.Unit,
+    start: usize,
+) usize {
+    var end = start;
+    var text_bytes: usize = 0;
+    const use_text_limit = units.len == key_count;
+    while (end < key_count and end - start < document_extraction_range_target_children) {
+        if (use_text_limit) {
+            const unit_bytes = units[end].text.len;
+            if (end > start and text_bytes + unit_bytes > document_extraction_range_target_text_bytes) break;
+            text_bytes += unit_bytes;
+        }
+        end += 1;
+    }
+    return end;
+}
+
+fn findDocumentArtifactChildRange(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) ?*const types.DocumentArtifactChildRange {
+    for (ranges) |*range| {
+        if (std.mem.eql(u8, range.range_id, range_id) and
+            std.mem.eql(u8, range.range_kind, range_kind) and
+            std.mem.eql(u8, range.artifact_name, artifact_name))
+        {
+            return range;
+        }
+    }
+    return null;
+}
+
+fn countKeysNotIn(keys: []const []const u8, exclude_keys: []const []const u8) usize {
+    var count: usize = 0;
+    for (keys) |key| {
+        if (!runtimeContainsConstKey(exclude_keys, key)) count += 1;
+    }
+    return count;
+}
+
+fn documentExtractionRangeRoute(
+    ranges: []const types.DocumentArtifactChildRange,
+    range_id: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+) DocumentExtractionRangeRoute {
+    const range = findDocumentArtifactChildRange(ranges, range_id, range_kind, artifact_name) orelse return .{ .range_id = range_id };
+    return .{
+        .range_id = range_id,
+        .route_status = range.route_status orelse "local_committed",
+        .owner_group_id = range.owner_group_id orelse 0,
+    };
+}
+
+fn unitDescriptorFingerprintMatches(descriptors: []const DocumentExtractionUnitDescriptor, key: []const u8, fingerprint: []const u8) bool {
+    if (fingerprint.len == 0) return false;
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.key, key) and std.mem.eql(u8, descriptor.fingerprint, fingerprint)) return true;
+    }
+    return false;
+}
+
+fn countUnitDescriptorsByFingerprintMatch(
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_match: bool,
+) usize {
+    var count: usize = 0;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched == want_match) count += 1;
+    }
+    return count;
+}
+
+fn appendDocumentExtractionUnitMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    artifact_name: []const u8,
+    descriptors: []const DocumentExtractionUnitDescriptor,
+    comparison: []const DocumentExtractionUnitDescriptor,
+    want_fingerprint_match: bool,
+) !void {
+    const count = countUnitDescriptorsByFingerprintMatch(descriptors, comparison, want_fingerprint_match);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (descriptors) |descriptor| {
+        const matched = unitDescriptorFingerprintMatches(comparison, descriptor.key, descriptor.fingerprint);
+        if (matched != want_fingerprint_match) continue;
+        if (first_key == null) first_key = descriptor.key;
+        last_key = descriptor.key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", "unit");
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try appendJsonFieldBool(alloc, out, &first, "fingerprint_match", want_fingerprint_match);
+    try out.append(alloc, '}');
+}
+
+fn appendDocumentExtractionMergeOperation(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_operation: *bool,
+    op: []const u8,
+    range_kind: []const u8,
+    artifact_name: []const u8,
+    keys: []const []const u8,
+    exclude_keys: []const []const u8,
+) !void {
+    const count = countKeysNotIn(keys, exclude_keys);
+    if (count == 0) return;
+
+    var first_key: ?[]const u8 = null;
+    var last_key: ?[]const u8 = null;
+    for (keys) |key| {
+        if (runtimeContainsConstKey(exclude_keys, key)) continue;
+        if (first_key == null) first_key = key;
+        last_key = key;
+    }
+
+    if (first_operation.*) {
+        first_operation.* = false;
+    } else {
+        try out.append(alloc, ',');
+    }
+
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, out, &first, "op", op);
+    try appendJsonFieldString(alloc, out, &first, "range_kind", range_kind);
+    try appendJsonFieldString(alloc, out, &first, "artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, out, &first, "first_key", first_key.?);
+    try appendJsonFieldString(alloc, out, &first, "last_key", last_key.?);
+    try appendJsonFieldUsize(alloc, out, &first, "key_count", count);
+    try out.append(alloc, '}');
+}
+
+fn documentExtractionManifestPayloadAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    fingerprint: []const u8,
+    extraction: document_extraction_mod.Result,
+    unit_keys: []const []const u8,
+    unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    chunk_keys: []const []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    previous_unit_keys: []const []const u8,
+    previous_unit_descriptors: []const DocumentExtractionUnitDescriptor,
+    previous_chunk_keys: []const []const u8,
+    manifest_generation: u64,
+    from_generation: u64,
+    to_generation: u64,
+    merge_status: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var first = true;
+    try out.append(alloc, '{');
+    try appendJsonFieldString(alloc, &out, &first, "_parent_doc_key", doc_key);
+    try appendJsonFieldString(alloc, &out, &first, "_artifact_name", artifact_name);
+    try appendJsonFieldString(alloc, &out, &first, "artifact_type", "document_units");
+    try appendJsonFieldU64(alloc, &out, &first, "manifest_version", 2);
+    try appendJsonFieldU64(alloc, &out, &first, "generation", manifest_generation);
+    try appendJsonFieldString(alloc, &out, &first, "source_url", source_url);
+    try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
+    try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
+    try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.unsupported_reason.len > 0) {
+        try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    try appendJsonFieldName(alloc, &out, &first, "child_ranges");
+    try out.append(alloc, '[');
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
+    try out.append(alloc, ']');
+    try appendJsonFieldName(alloc, &out, &first, "range_policy");
+    try appendDocumentExtractionRangePolicy(alloc, &out);
+    try appendJsonFieldName(alloc, &out, &first, "merge_plan");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendJsonFieldU64(alloc, &out, &merge_first, "plan_version", 1);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "from_generation", from_generation);
+    try appendJsonFieldU64(alloc, &out, &merge_first, "to_generation", to_generation);
+    try appendJsonFieldString(alloc, &out, &merge_first, "status", merge_status);
+    try appendJsonFieldString(alloc, &out, &merge_first, "operation_granularity", "unit_fingerprint");
+    try appendJsonFieldName(alloc, &out, &merge_first, "operations");
+    try out.append(alloc, '[');
+    var first_operation = true;
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "keep", artifact_name, unit_descriptors, previous_unit_descriptors, true);
+    try appendDocumentExtractionUnitMergeOperation(alloc, &out, &first_operation, "upsert", artifact_name, unit_descriptors, previous_unit_descriptors, false);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "upsert", "chunk", "derived_chunks", chunk_keys, &.{});
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "unit", artifact_name, previous_unit_keys, unit_keys);
+    try appendDocumentExtractionMergeOperation(alloc, &out, &first_operation, "delete", "chunk", "derived_chunks", previous_chunk_keys, chunk_keys);
+    try out.append(alloc, ']');
+    try out.append(alloc, '}');
+    try appendJsonFieldName(alloc, &out, &first, "coverage_plan");
+    try out.append(alloc, '{');
+    var coverage_first = true;
+    try appendJsonFieldU64(alloc, &out, &coverage_first, "plan_version", 1);
+    try appendJsonFieldString(alloc, &out, &coverage_first, "full_text_replay", "stored_artifact_required");
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "full_text_replay_suppressed", false);
+    try appendJsonFieldBool(alloc, &out, &coverage_first, "watermark_required_before_suppression", true);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, internal_keys.graph_asset_state_kind);
+    try internal_keys.appendEncodedComponent(&list, alloc, index_name);
+    try internal_keys.appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn runtimeMentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+}
+
+fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+) ![][]const u8 {
+    if (source.mention_edge_type.len == 0) return try runtime.alloc.alloc([]const u8, 0);
+
+    var protected = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (protected.items) |key| runtime.alloc.free(@constCast(key));
+        protected.deinit(runtime.alloc);
+    }
+
+    for (runtime.index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source.artifact_name)) continue;
+
+        const state_name = try runtimeMentionGraphStateNameAlloc(runtime.alloc, source.artifact_name, cfg.resolution_artifact);
+        defer runtime.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, doc_key, index_name, state_name);
+        defer runtime.alloc.free(state_key);
+
+        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key) orelse continue;
+        defer freeOwnedConstKeySlice(runtime.alloc, state_keys);
+        for (state_keys) |key| {
+            try protected.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+        }
+    }
+
+    return try protected.toOwnedSlice(runtime.alloc);
+}
+
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendU32Big(&out, alloc, @intCast(writes.len));
+    for (writes) |write| {
+        try appendU32Big(&out, alloc, @intCast(write.key.len));
+        try out.appendSlice(alloc, write.key);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {
+    const alloc = runtime.alloc;
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        std.mem.Allocator.Error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer alloc.free(raw);
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return null;
+    const keys = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+        alloc.free(keys);
+    }
+    for (keys) |*key| {
+        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (len > raw.len - pos) return error.InvalidGraphAssetState;
+        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
+        pos += len;
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
+    if (bytes.len - pos.* < @sizeOf(u32)) return error.EndOfStream;
+    const value = std.mem.readInt(u32, bytes[pos.*..][0..@sizeOf(u32)], .big);
+    pos.* += @sizeOf(u32);
+    return value;
+}
+
+fn appendU32Big(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
+    const be = std.mem.nativeToBig(u32, value);
+    try out.appendSlice(alloc, std.mem.asBytes(&be));
+}
+
+fn freeOwnedConstKeySlice(alloc: Allocator, keys: []const []const u8) void {
+    for (keys) |key| alloc.free(@constCast(key));
+    if (keys.len > 0) alloc.free(keys);
+}
+
 fn recordArtifactBytes(runtime: *EnrichmentRuntime, kind: enrichment_artifact_codec.Kind, byte_count: usize) void {
     const bytes: u64 = @intCast(byte_count);
     switch (kind) {
         .dense_embedding => runtime.dense_artifact_bytes_written += bytes,
         .sparse_embedding => runtime.sparse_artifact_bytes_written += bytes,
-        .chunk_json, .summary_text => runtime.chunk_artifact_bytes_written += bytes,
+        .chunk_json, .asset => runtime.chunk_artifact_bytes_written += bytes,
         .graph_edge => {},
     }
 }
@@ -2582,6 +5173,77 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     return enrichment_artifact_codec.hashSource(source.string);
 }
 
+fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(source_field) orelse return null;
+    if (source != .string or source.string.len == 0) return null;
+    return try alloc.dupe(u8, source.string);
+}
+
+fn storedChunkEmbeddingSourcesForRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+) ![]ChunkEmbeddingSource {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", artifact_name);
+    defer runtime.alloc.free(prefix);
+    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, existing);
+
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            runtime.alloc.free(source.key);
+            runtime.alloc.free(source.text);
+        }
+        sources.deinit(runtime.alloc);
+    }
+
+    for (existing) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        const text = (try chunkPayloadTextAlloc(runtime.alloc, entry.value, request.source_field)) orelse continue;
+        errdefer runtime.alloc.free(text);
+        try sources.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, entry.key),
+            .text = text,
+        });
+    }
+    return try sources.toOwnedSlice(runtime.alloc);
+}
+
+fn chunkEmbeddingSourcesForRequest(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+) ![]ChunkEmbeddingSource {
+    const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    errdefer {
+        for (sources.items) |source| {
+            runtime.alloc.free(source.key);
+            runtime.alloc.free(source.text);
+        }
+        sources.deinit(runtime.alloc);
+    }
+    for (chunks) |chunk| {
+        const source = chunk.text orelse continue;
+        if (source.len == 0) continue;
+        try sources.append(runtime.alloc, .{
+            .key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
+            .text = try runtime.alloc.dupe(u8, source),
+        });
+    }
+    if (sources.items.len > 0) return try sources.toOwnedSlice(runtime.alloc);
+
+    const stored = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
+    if (stored.len > 0) return stored;
+    runtime.alloc.free(stored);
+    return try sources.toOwnedSlice(runtime.alloc);
+}
+
 fn chunkKeysForDenseRequest(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -2589,6 +5251,24 @@ fn chunkKeysForDenseRequest(
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) ![][]u8 {
     const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    if (chunks.len > 0) return try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
+
+    const stored = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
+    defer freeChunkEmbeddingSources(runtime.alloc, stored);
+    if (stored.len > 0) {
+        const keys = try runtime.alloc.alloc([]u8, stored.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| runtime.alloc.free(key);
+            runtime.alloc.free(keys);
+        }
+        for (stored, 0..) |source, i| {
+            keys[i] = try runtime.alloc.dupe(u8, source.key);
+            initialized += 1;
+        }
+        return keys;
+    }
+
     return try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, chunks);
 }
 
@@ -2641,6 +5321,15 @@ fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []
         if (std.mem.startsWith(u8, key, chunk_key)) return true;
     }
     return false;
+}
+
+fn assetSourceIndexKeyForArtifactAlloc(alloc: Allocator, artifact_key: []const u8) !?[]u8 {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, artifact_key)) orelse return null;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+    return try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, parsed.artifact_name, parsed.doc_key);
 }
 
 fn storePutWithRetry(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
@@ -2774,18 +5463,40 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
     try txn.put(key, value);
+    if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+        defer runtime.alloc.free(marker_key);
+        try txn.put(marker_key, key);
+    }
     try txn.commit();
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
     var batch = try runtime.store.beginBatch();
     errdefer batch.abort();
-    for (writes) |write| try batch.put(write.key, write.value);
+    var marker_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (marker_keys.items) |key| runtime.alloc.free(key);
+        marker_keys.deinit(runtime.alloc);
+    }
+    for (writes) |write| {
+        try batch.put(write.key, write.value);
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, write.key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            try batch.put(marker_key, write.key);
+        }
+    }
     for (deletes) |key| {
         batch.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
+        if (try assetSourceIndexKeyForArtifactAlloc(runtime.alloc, key)) |marker_key| {
+            try marker_keys.append(runtime.alloc, marker_key);
+            batch.delete(marker_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
     try batch.commit();
 }
@@ -2837,6 +5548,37 @@ fn extractSourceText(
     return try alloc.dupe(u8, source.string);
 }
 
+fn extractAssetSourceValue(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]const u8 {
+    if (request.source_template.len > 0) {
+        const rendered = template_remote.renderJsonToTextWithConfig(
+            alloc,
+            request.source_template,
+            raw_doc,
+            remoteRenderConfig(config.secret_store, config.remote_content),
+        ) catch return null;
+        if (rendered.len == 0) {
+            alloc.free(rendered);
+            return null;
+        }
+        return rendered;
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const source = parsed.value.object.get(request.source_field) orelse return null;
+    return switch (source) {
+        .null => null,
+        .string => |value| try alloc.dupe(u8, value),
+        else => try std.json.Stringify.valueAlloc(alloc, source, .{}),
+    };
+}
+
 fn renderSourceParts(
     alloc: Allocator,
     config: Config,
@@ -2853,6 +5595,57 @@ fn renderSourceParts(
         return null;
     }
     return parts;
+}
+
+fn renderSourcePartsJson(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    const parts = try renderSourceParts(alloc, config, raw_doc, request) orelse return null;
+    defer template.freeContentParts(alloc, parts);
+    return try contentPartsJsonAlloc(alloc, parts);
+}
+
+fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template.ContentPart) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (parts, 0..) |part, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (part) {
+            .text => |text| {
+                try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+                try appendJsonString(alloc, &out, text);
+                try out.append(alloc, '}');
+            },
+            .media_url => |url| {
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"url\":");
+                try appendJsonString(alloc, &out, url);
+                try out.append(alloc, '}');
+            },
+            .binary => |binary| {
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
+                const encoded = try alloc.alloc(u8, encoded_len);
+                defer alloc.free(encoded);
+                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
+                try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+                try appendJsonString(alloc, &out, binary.mime_type);
+                try out.appendSlice(alloc, ",\"data\":");
+                try appendJsonString(alloc, &out, encoded);
+                try out.append(alloc, '}');
+            },
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
 }
 
 fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
@@ -2878,6 +5671,130 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "enrichment runtime document extraction manifest uses v2 range and merge shape" {
+    const alloc = std.testing.allocator;
+    const unit_keys = [_][]const u8{
+        "doc:a\x1fartifact\x1fdocument_units_v1\x1funit:a",
+        "doc:a\x1fartifact\x1fdocument_units_v1\x1funit:b",
+    };
+    const chunk_keys = [_][]const u8{
+        "doc:a\x1fartifact\x1fdocument_chunks_v1\x1funit:a\x1fchunk:000000",
+    };
+    const previous_unit_keys = [_][]const u8{
+        "doc:a\x1fartifact\x1fdocument_units_v1\x1funit:a",
+        "doc:a\x1fartifact\x1fdocument_units_v1\x1fstale",
+    };
+    const previous_chunk_keys = [_][]const u8{
+        "doc:a\x1fartifact\x1fdocument_chunks_v1\x1fstale\x1fchunk:000000",
+    };
+    const units = [_]document_extraction_mod.Unit{
+        .{
+            .unit_id = @constCast("unit:a"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("same"),
+            .method = @constCast("text"),
+        },
+        .{
+            .unit_id = @constCast("unit:b"),
+            .unit_type = @constCast("document"),
+            .text = @constCast("changed"),
+            .method = @constCast("text"),
+        },
+    };
+    const extraction = document_extraction_mod.Result{
+        .content_type = @constCast("text/plain"),
+        .route_type = @constCast("text"),
+        .units = @constCast(units[0..]),
+    };
+    const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = unit_keys[0], .fingerprint = "same-fingerprint" },
+        .{ .key = unit_keys[1], .fingerprint = "new-fingerprint" },
+    };
+    const previous_descriptors = [_]DocumentExtractionUnitDescriptor{
+        .{ .key = previous_unit_keys[0], .fingerprint = "same-fingerprint" },
+        .{ .key = previous_unit_keys[1], .fingerprint = "old-fingerprint" },
+    };
+
+    const state = try documentExtractionStateValueAlloc(alloc, "source-fingerprint", &unit_keys, &desired_descriptors, &chunk_keys);
+    defer alloc.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
+
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:text/plain,same",
+        "source-fingerprint",
+        extraction,
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        5,
+        4,
+        5,
+        "converged",
+    );
+    defer alloc.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"manifest_version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"child_ranges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"unit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_kind\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_boundary\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"text_bytes\":11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"range_policy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_target_children\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_target_text_bytes\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"oversized_unit_policy\":\"single_unit_range\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"owner_group_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"placement_generation\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"route_status\":\"local_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"split_eligible\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"coverage_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"full_text_replay\":\"stored_artifact_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"watermark_required_before_suppression\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"merge_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"operation_granularity\":\"unit_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"upsert\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"op\":\"delete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
+
+    const in_progress = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:text/plain,same",
+        "source-fingerprint",
+        extraction,
+        &unit_keys,
+        &desired_descriptors,
+        &chunk_keys,
+        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        4,
+        4,
+        5,
+        "in_progress",
+    );
+    defer alloc.free(in_progress);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"from_generation\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"to_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"status\":\"in_progress\"") != null);
+}
 
 test "extractSourceText with template renders all document fields" {
     const alloc = std.testing.allocator;

@@ -42,7 +42,6 @@ const FieldSelector: React.FC<FieldSelectorProps> = ({
           return (
             <Badge
               key={fieldName}
-              variant="outline"
               className="cursor-pointer hover:bg-accent hover:text-accent-foreground transition-colors"
               onClick={() => onFieldSelect(fieldName)}
               title={title}

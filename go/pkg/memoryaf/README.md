@@ -47,10 +47,10 @@ type Extractor interface {
 }
 ```
 
-The built-in `NERClient` implements this using [Termite](https://antfly.io/termite) with the GLiNER2 model. You can also provide your own implementation (e.g. tool-calling LLM, spaCy, etc.).
+The built-in `NERClient` implements this using Antfly inference with the GLiNER2 model. You can also provide your own implementation (e.g. tool-calling LLM, spaCy, etc.).
 
 ```go
-// Use the built-in Termite/GLiNER2 extractor.
+// Use the built-in Antfly inference/GLiNER2 extractor.
 extractor, err := memoryaf.DefaultNERClient(logger)
 
 // Or pass nil to disable entity extraction entirely.
@@ -169,7 +169,7 @@ Key defaults used by the built-in `NERClient`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Termite URL | `http://localhost:11433` (or `TERMITE_URL` env) | Termite API URL |
+| Antfly inference URL | `http://localhost:11433` (or `ANTFLY_INFERENCE_URL` env) | Antfly inference API URL |
 | NER model | `fastino/gliner2-base-v1` | GLiNER2 model for entity recognition |
 | NER labels | person, organization, project, technology, service, tool, framework, pattern | Entity types to extract |
 | Entity threshold | `0.5` | Minimum entity confidence score |

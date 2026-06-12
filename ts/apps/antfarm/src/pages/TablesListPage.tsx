@@ -15,7 +15,6 @@ import {
   DialogDescription,
   DialogTitle,
   DialogTrigger,
-  GraphPaperBg,
 } from "@antfly/design-system";
 import type { Table as AntflyTable, TableStatus } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -24,7 +23,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { NoTablesState } from "@/components/branded-empty-state";
-import { api } from "../api";
+import { useApi } from "../hooks/use-api-config";
 
 const formatBytes = (bytes: number, decimals = 2) => {
   if (bytes === 0) return "0 Bytes";
@@ -50,6 +49,7 @@ const normalizeTablesResponse = (response: unknown): TableStatus[] => {
 
 const TablesListPage: React.FC = () => {
   const navigate = useNavigate();
+  const api = useApi();
   const [tables, setTables] = useState<TableStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openDropDialog, setOpenDropDialog] = useState(false);
@@ -68,7 +68,7 @@ const TablesListPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [api]);
 
   useEffect(() => {
     fetchTables();
@@ -140,7 +140,7 @@ const TablesListPage: React.FC = () => {
           return (
             <div className="flex items-center gap-2">
               {table.migration && (
-                <Badge variant="outline" className="af-status-badge-warning">
+                <Badge className="af-status-badge-warning">
                   Rebuilding v{table.migration.read_schema.version} → v
                   {table.schema?.version ?? "?"}
                 </Badge>
@@ -180,7 +180,6 @@ const TablesListPage: React.FC = () => {
   return (
     <DashboardPage>
       <div className="relative isolate">
-        <GraphPaperBg className="absolute inset-0 -z-10 rounded-xl" />
         <DashboardPageHeader>
           <div>
             <DashboardPageTitle className="font-aeonik">Tables</DashboardPageTitle>

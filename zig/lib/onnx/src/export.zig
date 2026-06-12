@@ -69,7 +69,7 @@ pub const ExportOptions = struct {
     /// Default opset version (default 17).
     opset_version: u64 = 17,
     /// Graph name.
-    graph_name: []const u8 = "termite_graph",
+    graph_name: []const u8 = "inference_graph",
     /// When true, decompose fused ops (gelu, silu, rms_norm, linear, etc.)
     /// into standard ONNX primitives via the lowering pass before export.
     /// This produces more portable ONNX models at the cost of larger graphs.
@@ -2564,7 +2564,7 @@ test "exportGraph — simple add graph" {
     try std.testing.expectEqual(@as(u64, 8), parsed.ir_version);
 
     const g = parsed.graph.?;
-    try std.testing.expectEqualStrings("termite_graph", g.name);
+    try std.testing.expectEqualStrings("inference_graph", g.name);
     // Should have one Add node
     try std.testing.expectEqual(@as(usize, 1), g.nodes.len);
     try std.testing.expectEqualStrings("Add", g.nodes[0].op_type);

@@ -92,7 +92,7 @@ pub const Config = struct {
         return switch (self.provider) {
             .openai => "https://api.openai.com",
             .ollama => "http://127.0.0.1:11434",
-            .termite => "http://127.0.0.1:8082",
+            .antfly => "http://127.0.0.1:8082",
             else => "",
         };
     }
@@ -157,11 +157,11 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .provider = cfg.provider,
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .termite => null,
+            .antfly => null,
             else => if (cfg.url.len > 0) cfg.url else null,
         },
         .api_url = switch (cfg.provider) {
-            .termite => if (cfg.url.len > 0) cfg.url else null,
+            .antfly => if (cfg.url.len > 0) cfg.url else null,
             else => null,
         },
         .api_key = cfg.api_key,
@@ -200,14 +200,14 @@ test "embedder config round trip" {
     try std.testing.expectEqualStrings("text-embedding-3-small", reparsed.model);
 }
 
-test "embedder config supports termite api_url normalization" {
+test "embedder config supports antfly api_url normalization" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"termite","model":"bge-base-en-v1.5","api_url":"http://localhost:8082"}
+        \\{"provider":"antfly","model":"bge-base-en-v1.5","api_url":"http://localhost:8082"}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);
-    try std.testing.expectEqual(.termite, cfg.provider);
+    try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("http://localhost:8082", cfg.url);
 }
 

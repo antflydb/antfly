@@ -13,7 +13,7 @@ Usage:
 
 Environment Variables:
     PINECONE_API_KEY  - Required. Your Pinecone API key.
-    ANTFLY_BASE_URL   - Optional. Defaults to http://localhost:8080/api/v1
+    ANTFLY_BASE_URL   - Optional. Defaults to http://localhost:8080/db/v1
 """
 
 from dotenv import load_dotenv
@@ -34,7 +34,7 @@ TABLE_NAME = PINECONE_INDEX_NAME          # Antfly table name (using same name)
 INDEX_NAME = "nomic_index"                # Name for the vector index in Antfly
 DISTANCE_METRIC = "cosine"                # Match the metric used by your source index
 
-ANTFLY_BASE_URL = os.getenv("ANTFLY_BASE_URL", "http://localhost:8080/api/v1")
+ANTFLY_BASE_URL = os.getenv("ANTFLY_BASE_URL", "http://localhost:8080/db/v1")
 # ANCHOR_END: config
 
 
