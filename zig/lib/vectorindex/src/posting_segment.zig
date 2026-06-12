@@ -194,6 +194,16 @@ pub const DirectoryCompactionResult = struct {
     }
 };
 
+pub const DirectoryGarbageCollectionStats = struct {
+    manifest_segments: usize = 0,
+    scanned_entries: usize = 0,
+    skipped_entries: usize = 0,
+    segment_files: usize = 0,
+    referenced_segment_files: usize = 0,
+    orphan_segment_files: usize = 0,
+    deleted_segment_files: usize = 0,
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -624,6 +634,48 @@ pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
     };
 }
 
+pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryGarbageCollectionStats {
+    var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, options);
+    defer manifest.deinit(alloc);
+
+    var live_paths = std.StringHashMapUnmanaged(void).empty;
+    defer live_paths.deinit(alloc);
+    const live_path_capacity = std.math.cast(u32, manifest.segments.len) orelse return error.PostingSegmentManifestTooLarge;
+    try live_paths.ensureTotalCapacity(alloc, live_path_capacity);
+    for (manifest.segments) |entry| live_paths.putAssumeCapacity(entry.path, {});
+
+    var stats = DirectoryGarbageCollectionStats{
+        .manifest_segments = manifest.segments.len,
+    };
+
+    var postings_dir = try dir.openDir(io, segment_directory, .{ .iterate = true });
+    defer postings_dir.close(io);
+
+    var iter = postings_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        stats.scanned_entries += 1;
+        if (entry.kind != .file or !isCanonicalSegmentFileName(entry.name)) {
+            stats.skipped_entries += 1;
+            continue;
+        }
+
+        stats.segment_files += 1;
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
+        defer alloc.free(path);
+
+        if (live_paths.contains(path)) {
+            stats.referenced_segment_files += 1;
+            continue;
+        }
+
+        stats.orphan_segment_files += 1;
+        try dir.deleteFile(io, path);
+        stats.deleted_segment_files += 1;
+    }
+
+    return stats;
+}
+
 pub fn writeSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment) !OwnedManifestEntry {
     const path = try segmentPathAlloc(alloc, segment.meta.segment_id);
     errdefer alloc.free(path);
@@ -696,6 +748,12 @@ fn readManifestForCommitAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, opt
     return try decodeManifestAlloc(alloc, manifest_data);
 }
 
+fn readManifestFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !OwnedManifest {
+    const manifest_data = try dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes));
+    defer alloc.free(manifest_data);
+    return try decodeManifestAlloc(alloc, manifest_data);
+}
+
 fn emptyManifestAlloc(alloc: Allocator, next_segment_id: u64) !OwnedManifest {
     return .{
         .next_segment_id = next_segment_id,
@@ -716,6 +774,19 @@ fn manifestEntryViewAlloc(alloc: Allocator, entries: []const OwnedManifestEntry)
 
 pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "postings/{x:0>16}.afps", .{segment_id});
+}
+
+fn isCanonicalSegmentFileName(name: []const u8) bool {
+    if (name.len != 21) return false;
+    if (!std.mem.eql(u8, name[16..], ".afps")) return false;
+    for (name[0..16]) |byte| {
+        if (!isLowerHex(byte)) return false;
+    }
+    return true;
+}
+
+fn isLowerHex(byte: u8) bool {
+    return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
 }
 
 pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const SegmentBlob) !BuiltSegment {
@@ -2180,6 +2251,70 @@ pub fn testDirectoryCompactionReplacesManifestSegments() !void {
     try std.testing.expectEqual(@as(usize, 0), records.len);
 }
 
+pub fn testDirectoryGarbageCollectionDeletesManifestOrphans() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_old = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base_old);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base_old);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const base_new = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 9,
+        .generation = 2,
+        .members = &.{ 30, 40 },
+    });
+    defer alloc.free(base_new);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(9, base_new);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var compacted = try compactDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), compacted.entry.meta.segment_id);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000009999.afps.tmp",
+        .data = "pending-write",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/notes.txt",
+        .data = "ignored",
+    });
+
+    const stats = try collectDirectoryGarbageAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.manifest_segments);
+    try std.testing.expectEqual(@as(usize, 3), stats.segment_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_segment_files);
+    try std.testing.expectEqual(@as(usize, 2), stats.orphan_segment_files);
+    try std.testing.expectEqual(@as(usize, 2), stats.deleted_segment_files);
+    try std.testing.expect(stats.skipped_entries >= 2);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, committed_1.entry.path, alloc, .limited(1)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, committed_2.entry.path, alloc, .limited(1)));
+    const live_segment = try tmp.dir.readFileAlloc(std.testing.io, compacted.entry.path, alloc, .limited(compacted.entry.meta.byte_len + 1));
+    defer alloc.free(live_segment);
+    try std.testing.expectEqual(compacted.entry.meta.byte_len, live_segment.len);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), store.segments.len);
+    try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[0].meta.segment_id);
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2348,6 +2483,10 @@ test "posting segment directory commit appends manifest segments" {
 
 test "posting segment directory compaction replaces manifest segments" {
     try testDirectoryCompactionReplacesManifestSegments();
+}
+
+test "posting segment directory garbage collection deletes manifest orphans" {
+    try testDirectoryGarbageCollectionDeletesManifestOrphans();
 }
 
 test "posting segment compacts segments to live posting entries" {

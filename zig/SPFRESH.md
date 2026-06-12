@@ -141,7 +141,10 @@ Current status:
   file, and publishing the updated manifest with an atomic rename. Segment
   directory compaction can now write a compacted replacement segment first and
   atomically swap the manifest to remove the compacted-away segment ids, leaving
-  old segment files as unreferenced orphans for a later GC pass. Segment
+  old segment files as unreferenced orphans. A manifest-aware directory GC pass
+  can then scan the `postings/` directory and delete only canonical `.afps`
+  segment files that are absent from the current manifest, while ignoring
+  manifest files, temp files, and non-segment entries. Segment
   writers can also produce a manifest-ready built
   segment with validated metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
