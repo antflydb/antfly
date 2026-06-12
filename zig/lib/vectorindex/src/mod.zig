@@ -21,6 +21,7 @@ pub const search = @import("search.zig");
 pub const search_runtime = @import("search_runtime.zig");
 pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
+pub const posting_segment = @import("posting_segment.zig");
 pub const hbc_runtime = @import("hbc_runtime.zig");
 pub const hbc = @import("hbc.zig");
 pub const hbc_index = @import("hbc_index.zig");
@@ -73,6 +74,9 @@ pub const PostingMaintenanceOptions = posting.PostingMaintenanceOptions;
 pub const PostingMaintenanceResult = posting.PostingMaintenanceResult;
 pub const PostingBacklogStats = posting.PostingBacklogStats;
 pub const PostingStore = posting.PostingStore;
+pub const PostingSegmentWriter = posting_segment.Writer;
+pub const PostingSegmentReader = posting_segment.Reader;
+pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const AssignmentMap = posting.AssignmentMap;
 pub const CentroidDirectory = posting.CentroidDirectory;
 pub const meta_key = hbc.meta_key;
@@ -104,3 +108,15 @@ pub const encodeVecKey = hbc.encodeVecKey;
 pub const encodeVecLeafKey = hbc.encodeVecLeafKey;
 pub const encodeVecMetaKey = hbc.encodeVecMetaKey;
 pub const encodeQuantKey = hbc.encodeQuantKey;
+
+test "posting segment stores point and ordered delta values" {
+    try posting_segment.testStoresPointAndOrderedDeltaValues();
+}
+
+test "posting segment rejects duplicate logical entries" {
+    try posting_segment.testRejectsDuplicateLogicalEntries();
+}
+
+test "posting segment validates footer and version" {
+    try posting_segment.testValidatesFooterAndVersion();
+}

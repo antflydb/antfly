@@ -68,6 +68,11 @@ Current status:
 - An opt-in lazy-versus-eager posting maintenance benchmark exists. Current
   local samples show lazy centroid deferral is working, but centroid deferral
   alone is not the dominant write-latency cost in those runs.
+- A first immutable posting segment container now stores opaque packed posting,
+  quantized-checkpoint, and mutation values in a posting-local sorted index.
+  Runtime wiring remains experimental; keeping payloads opaque lets the
+  current packed HBC read path coexist with a WAL tail instead of requiring
+  base/delta replay on every query.
 
 ## Current HBC Shape
 
