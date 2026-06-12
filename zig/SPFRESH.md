@@ -80,10 +80,11 @@ Current status:
   `query_materialization_ns_per_member`, so overlay replay CPU can be compared
   independently of cache and backend effects.
 - The bounded posting-member overlay cache is now keyed by posting id, base
-  generation, and posting mutation version. Hot canonical base/delta queries
-  can reuse materialized members without serving entries across base folds or
-  logical posting mutations; a stored max-delta-sequence high-water mark remains
-  the next refinement.
+  generation, posting mutation version, and the applied delta-tail high-water
+  sequence. Hot canonical base/delta queries can reuse materialized members
+  without serving entries across base folds, logical posting mutations, or
+  newer tail records. Clean-base queries use the known zero high-water mark
+  without scanning the delta tail.
 - HBC maintenance paths that only need base generation/member count now use
   `PostingStore.loadBaseHeader`, while paths that need structural validation
   use `PostingStore.loadBaseStats`; both avoid decoding an owned member array
@@ -593,11 +594,13 @@ implementations cleanly:
    in an invisible process-local buffer unless the WAL/transaction semantics
    make crash recovery and read visibility obvious.
 
-2. Cache hot materialized overlays by generation.
+2. Cache hot materialized overlays by exact replay boundary.
 
    Repeated queries often touch the same large posting. A bounded cache keyed
-   by `(posting_id, base_generation, max_delta_sequence)` could store the
-   materialized member view or a prepared overlay summary.
+   by `(posting_id, base_generation, mutation_version, max_delta_sequence)` now
+   stores the materialized member view for exact clean-base and replayed-tail
+   states. Longer term, the same boundary could cache a prepared overlay
+   summary instead of only final member ids.
 
    Expected win: avoid repeated base decode and delta replay for hot postings.
 
@@ -630,12 +633,15 @@ implementations cleanly:
    Constraint: every specialized path must share the same validation rules as
    the full decoder. Corrupt or unsupported values should fail consistently.
 
-5. Add per-block skip metadata for large base records.
+5. Add per-block skip metadata and runtime block-size evidence.
 
    Sorted canonical base members make it possible to store block offsets and
    last-member ids. Query materialization, fold application, and membership
    checks could then jump to relevant blocks instead of scanning from the
-   start.
+   start. Before changing the public format, add an internal bench-only
+   block-size knob for 16/32/64-member blocks and report
+   `posting_base_value_bytes_per_member` beside
+   `posting_base_decode_ns_per_member`.
 
    Expected win: faster large-posting negative checks, partial decode, and
    sorted merge application.
@@ -668,7 +674,21 @@ implementations cleanly:
    Constraint: use measured thresholds. Large churn-heavy tails may still need
    hash-backed deduplication.
 
-8. Evaluate frame-of-reference base blocks.
+8. Stream fold output directly into base encoding.
+
+   Fold paths should avoid holding both a large materialized member slice and a
+   second worst-case encoded-base buffer when the final base can be emitted from
+   a prepared scratch summary. The target shape is an exact-size prepass or a
+   growable writer that caps retained memory after encoding.
+
+   Expected win: lower peak fold memory and less allocator pressure for large
+   postings.
+
+   Constraint: the encoder must preserve the v1 validation contract and stable
+   ordering. Reservation and rollback behavior must stay compatible with the
+   transaction/storage layer.
+
+9. Evaluate frame-of-reference base blocks.
 
    Varint deltas are simple and good enough for v1, but sorted vector IDs may
    compress better with block-level frame-of-reference plus bit-packed deltas.
@@ -679,7 +699,7 @@ implementations cleanly:
    Constraint: this is a format-version candidate, not a small cleanup. It
    needs side-by-side bench columns before becoming public.
 
-9. Add membership hints for large postings.
+10. Add membership hints for large postings.
 
    For delete/update and some validation paths, compact per-base bloom filters
    or min/max block hints could avoid full decode on negative membership tests.
@@ -689,19 +709,22 @@ implementations cleanly:
    Constraint: hints add bytes and maintenance cost. They should be optional or
    thresholded by posting size.
 
-10. Make fold policy cost-aware.
+11. Make fold policy cost-aware and coalesce fold scans.
 
-    Current fold policy is mostly threshold based. Longer term, folds should
-    consider observed query replay cost, tail bytes, tombstone density, and
-    maintenance resource pressure.
+   Current fold policy is mostly threshold based. Longer term, folds should
+   consider observed query replay cost, tail bytes, tombstone density, and
+   maintenance resource pressure. Fold decision scans and replay/application
+   scans should also converge toward one streaming pass that buffers only a
+   bounded operation summary before deciding whether to fold.
 
-    Expected win: avoid folding cold tiny tails while keeping hot query
-    overlays cheap.
+   Expected win: avoid folding cold tiny tails while keeping hot query
+   overlays cheap, and avoid duplicate cursor/decode work when folding.
 
-    Constraint: avoid unstable feedback loops. Use slow-moving counters and
-    keep hard caps for tail debt.
+   Constraint: avoid unstable feedback loops. Use slow-moving counters and
+   keep hard caps for tail debt. The one-pass fold path should fall back to
+   the simpler scanner when the bounded summary overflows.
 
-11. Move to a segment backend only if LSM costs dominate.
+12. Move to a segment backend only if LSM costs dominate.
 
     A dedicated posting segment backend could pack posting bases and delta
     runs into vector-index-specific files with posting-local indexes, block
