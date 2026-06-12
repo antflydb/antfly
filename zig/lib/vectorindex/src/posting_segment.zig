@@ -262,6 +262,27 @@ pub const OwnedSegmentStore = struct {
     }
 };
 
+pub const LazyDirectoryStore = struct {
+    manifest: OwnedManifest,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: OpenStoreOptions,
+
+    pub fn deinit(self: *LazyDirectoryStore, alloc: Allocator) void {
+        self.manifest.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn snapshot(self: *const LazyDirectoryStore) LazyDirectorySnapshot {
+        return .{
+            .manifest = &self.manifest,
+            .io = self.io,
+            .dir = self.dir,
+            .options = self.options,
+        };
+    }
+};
+
 pub const OpenStoreOptions = struct {
     manifest_path: []const u8 = default_manifest_path,
     max_manifest_bytes: usize = 64 * 1024 * 1024,
@@ -336,6 +357,107 @@ pub const Catalog = struct {
             }
         }
         return best;
+    }
+};
+
+pub const LazyDirectorySnapshot = struct {
+    manifest: *const OwnedManifest,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: OpenStoreOptions,
+
+    pub fn loadBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
+        var i = self.manifest.segments.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.manifest.segments[i];
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+
+            const segment_data = try self.readSegmentAlloc(alloc, entry);
+            defer alloc.free(segment_data);
+            const reader = try Reader.init(segment_data);
+            const base_data = (try reader.getBase(posting_id)) orelse continue;
+            return try posting.PostingFormat.decodeBaseHeader(base_data);
+        }
+        return null;
+    }
+
+    pub fn loadBase(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
+        var i = self.manifest.segments.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.manifest.segments[i];
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+
+            const segment_data = try self.readSegmentAlloc(alloc, entry);
+            defer alloc.free(segment_data);
+            const reader = try Reader.init(segment_data);
+            const base_data = (try reader.getBase(posting_id)) orelse continue;
+            return try posting.PostingFormat.decodeBase(alloc, base_data);
+        }
+        return null;
+    }
+
+    pub fn loadCentroidDirectoryRecord(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
+        var i = self.manifest.segments.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.manifest.segments[i];
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+
+            const segment_data = try self.readSegmentAlloc(alloc, entry);
+            defer alloc.free(segment_data);
+            const reader = try Reader.init(segment_data);
+            const centroid_data = (try reader.getCentroidDirectory(posting_id)) orelse continue;
+            return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
+        }
+        return null;
+    }
+
+    pub fn loadDeltaTail(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
+        return try self.loadDeltaTailFilteredAlloc(alloc, posting_id, null);
+    }
+
+    pub fn loadDeltaTailAfterGeneration(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, generation: u64) ![]posting.PostingDeltaRecord {
+        return try self.loadDeltaTailFilteredAlloc(alloc, posting_id, generation);
+    }
+
+    fn loadDeltaTailFilteredAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        errdefer records.deinit(alloc);
+
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (min_generation) |generation| {
+                if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
+            }
+
+            const segment_data = try self.readSegmentAlloc(alloc, entry);
+            defer alloc.free(segment_data);
+            const reader = try Reader.init(segment_data);
+            var iter = reader.deltas(posting_id);
+            while (try iter.next()) |delta_value| {
+                const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
+                defer alloc.free(decoded);
+                for (decoded) |record| {
+                    if (min_generation) |generation| {
+                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                    }
+                    try records.append(alloc, record);
+                }
+            }
+        }
+
+        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        return try records.toOwnedSlice(alloc);
+    }
+
+    fn readSegmentAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry) ![]u8 {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        const segment_data = try readSegmentFileAlloc(alloc, self.io, self.dir, entry.path, entry.meta.byte_len);
+        errdefer alloc.free(segment_data);
+        try validateSegmentDataMatchesMeta(segment_data, entry.meta);
+        return segment_data;
     }
 };
 
@@ -570,6 +692,15 @@ pub fn openStoreFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir
         .manifest = manifest,
         .owned_data = owned_data,
         .segments = segments,
+    };
+}
+
+pub fn openLazyStoreFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !LazyDirectoryStore {
+    return .{
+        .manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, options),
+        .io = io,
+        .dir = dir,
+        .options = options,
     };
 }
 
@@ -1109,10 +1240,13 @@ pub const Reader = struct {
                 meta.max_posting_id = @max(meta.max_posting_id, entry.posting_id);
             }
             if (entry.kind == .delta) {
-                if (meta.min_delta_sequence == 0 or entry.sequence < meta.min_delta_sequence) {
-                    meta.min_delta_sequence = entry.sequence;
+                var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(try entry.value(self.data));
+                while (try delta_iter.next()) |record| {
+                    if (meta.min_delta_sequence == 0 or record.sequence < meta.min_delta_sequence) {
+                        meta.min_delta_sequence = record.sequence;
+                    }
+                    meta.max_delta_sequence = @max(meta.max_delta_sequence, record.sequence);
                 }
-                meta.max_delta_sequence = @max(meta.max_delta_sequence, entry.sequence);
             }
         }
         return meta;
@@ -2315,6 +2449,105 @@ pub fn testDirectoryGarbageCollectionDeletesManifestOrphans() !void {
     try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[0].meta.segment_id);
 }
 
+pub fn testLazyDirectoryStoreReadsOnlyCandidateSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_7 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base_7);
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base_7);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const base_99 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 99,
+        .generation = 2,
+        .members = &.{ 30, 40 },
+    });
+    defer alloc.free(base_99);
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(99, base_99);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_2.entry.path,
+        .data = "not a segment",
+    });
+
+    try std.testing.expectError(error.CorruptedPostingSegment, openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{}));
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), lazy.manifest.segments.len);
+
+    const snapshot = lazy.snapshot();
+    const header = (try snapshot.loadBaseHeader(alloc, 7)).?;
+    try std.testing.expectEqual(@as(PostingId, 7), header.posting_id);
+    try std.testing.expectEqual(@as(u64, 1), header.generation);
+    try std.testing.expectEqual(@as(usize, 2), header.member_count);
+    try std.testing.expectError(error.CorruptedPostingSegment, snapshot.loadBaseHeader(alloc, 99));
+
+    const missing = try snapshot.loadBaseHeader(alloc, 12345);
+    try std.testing.expect(missing == null);
+}
+
+pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base);
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const stale_sequence = (@as(u64, 1) << 32) | 1;
+    const live_sequence = (@as(u64, 2) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 30 },
+        .{ .sequence = live_sequence, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta);
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendDelta(7, stale_sequence, delta);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    try std.testing.expectEqual(stale_sequence, lazy.manifest.segments[1].meta.min_delta_sequence);
+    try std.testing.expectEqual(live_sequence, lazy.manifest.segments[1].meta.max_delta_sequence);
+    const snapshot = lazy.snapshot();
+
+    const all_records = try snapshot.loadDeltaTail(alloc, 7);
+    defer alloc.free(all_records);
+    try std.testing.expectEqual(@as(usize, 2), all_records.len);
+    try std.testing.expectEqual(stale_sequence, all_records[0].sequence);
+    try std.testing.expectEqual(live_sequence, all_records[1].sequence);
+
+    const current_records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
+    defer alloc.free(current_records);
+    try std.testing.expectEqual(@as(usize, 1), current_records.len);
+    try std.testing.expectEqual(live_sequence, current_records[0].sequence);
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2487,6 +2720,14 @@ test "posting segment directory compaction replaces manifest segments" {
 
 test "posting segment directory garbage collection deletes manifest orphans" {
     try testDirectoryGarbageCollectionDeletesManifestOrphans();
+}
+
+test "posting segment lazy directory store reads only candidate segments" {
+    try testLazyDirectoryStoreReadsOnlyCandidateSegments();
+}
+
+test "posting segment lazy directory store loads delta tail" {
+    try testLazyDirectoryStoreLoadsDeltaTail();
 }
 
 test "posting segment compacts segments to live posting entries" {

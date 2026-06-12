@@ -88,6 +88,8 @@ pub const PostingSegmentCompactResult = posting_segment.CompactResult;
 pub const PostingSegmentCatalog = posting_segment.Catalog;
 pub const PostingSegmentSnapshot = posting_segment.Snapshot;
 pub const OwnedPostingSegmentStore = posting_segment.OwnedSegmentStore;
+pub const LazyPostingSegmentDirectoryStore = posting_segment.LazyDirectoryStore;
+pub const LazyPostingSegmentDirectorySnapshot = posting_segment.LazyDirectorySnapshot;
 pub const PostingSegmentManifestEntry = posting_segment.ManifestEntry;
 pub const PostingSegmentManifest = posting_segment.Manifest;
 pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
@@ -110,6 +112,7 @@ pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
 pub const openPostingSegmentStoreFromDirectoryAlloc = posting_segment.openStoreFromDirectoryAlloc;
+pub const openLazyPostingSegmentStoreFromDirectoryAlloc = posting_segment.openLazyStoreFromDirectoryAlloc;
 pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
 pub const compactPostingSegmentsWithStatsAlloc = posting_segment.compactSegmentsWithStatsAlloc;
 pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
@@ -212,6 +215,18 @@ test "posting segment directory commit appends manifest segments" {
 
 test "posting segment directory compaction replaces manifest segments" {
     try posting_segment.testDirectoryCompactionReplacesManifestSegments();
+}
+
+test "posting segment directory garbage collection deletes manifest orphans" {
+    try posting_segment.testDirectoryGarbageCollectionDeletesManifestOrphans();
+}
+
+test "posting segment lazy directory store reads only candidate segments" {
+    try posting_segment.testLazyDirectoryStoreReadsOnlyCandidateSegments();
+}
+
+test "posting segment lazy directory store loads delta tail" {
+    try posting_segment.testLazyDirectoryStoreLoadsDeltaTail();
 }
 
 test "posting segment compacts segments to live posting entries" {
