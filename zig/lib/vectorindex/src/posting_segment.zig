@@ -35,6 +35,9 @@ const footer_size: usize = 8 + 8 + 4 + 2 + 4;
 const manifest_header_size: usize = 4 + 2 + 4 + 8;
 const manifest_checksum_size: usize = 4;
 
+pub const segment_directory = "postings";
+pub const default_manifest_path = "postings/manifest.afpm";
+
 pub const EntryKind = enum(u8) {
     base = 1,
     delta = 2,
@@ -198,6 +201,12 @@ pub const OwnedSegmentStore = struct {
     pub fn snapshot(self: *const OwnedSegmentStore) Snapshot {
         return .{ .catalog = self.catalog() };
     }
+};
+
+pub const OpenStoreOptions = struct {
+    manifest_path: []const u8 = default_manifest_path,
+    max_manifest_bytes: usize = 64 * 1024 * 1024,
+    max_segment_bytes: usize = 1024 * 1024 * 1024,
 };
 
 pub const Catalog = struct {
@@ -459,6 +468,66 @@ pub fn openStoreAlloc(alloc: Allocator, manifest_data: []const u8, context: anyt
         .owned_data = owned_data,
         .segments = segments,
     };
+}
+
+pub fn openStoreFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !OwnedSegmentStore {
+    const manifest_data = try dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes));
+    defer alloc.free(manifest_data);
+
+    var manifest = try decodeManifestAlloc(alloc, manifest_data);
+    errdefer manifest.deinit(alloc);
+
+    const owned_data = try alloc.alloc([]u8, manifest.segments.len);
+    var owned_count: usize = 0;
+    errdefer {
+        for (owned_data[0..owned_count]) |data| alloc.free(data);
+        alloc.free(owned_data);
+    }
+
+    const segments = try alloc.alloc(SegmentBlob, manifest.segments.len);
+    errdefer alloc.free(segments);
+
+    for (manifest.segments, 0..) |entry, i| {
+        if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
+        errdefer alloc.free(data);
+        try validateSegmentDataMatchesMeta(data, entry.meta);
+        owned_data[i] = data;
+        owned_count += 1;
+        segments[i] = .{
+            .meta = entry.meta,
+            .data = data,
+        };
+    }
+
+    return .{
+        .manifest = manifest,
+        .owned_data = owned_data,
+        .segments = segments,
+    };
+}
+
+pub fn writeSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment) !OwnedManifestEntry {
+    const path = try segmentPathAlloc(alloc, segment.meta.segment_id);
+    errdefer alloc.free(path);
+    try writeFileAtomicallyAlloc(alloc, io, dir, path, segment.data);
+    return .{
+        .meta = segment.meta,
+        .path = path,
+    };
+}
+
+pub fn writeManifestFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    try writeFileAtomicallyAlloc(alloc, io, dir, path, data);
+}
+
+pub fn readSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, max_bytes: usize) ![]u8 {
+    const read_limit = std.math.add(usize, max_bytes, 1) catch max_bytes;
+    const data = try dir.readFileAlloc(io, path, alloc, .limited(read_limit));
+    errdefer alloc.free(data);
+    if (data.len > max_bytes) return error.PostingSegmentTooLarge;
+    _ = try Reader.init(data);
+    return data;
 }
 
 pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
@@ -935,6 +1004,20 @@ fn putNewestPoint(
             .value = value,
         };
     }
+}
+
+fn writeFileAtomicallyAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    try dir.createDirPath(io, segment_directory);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
+    try dir.writeFile(io, .{
+        .sub_path = tmp_path,
+        .data = data,
+    });
+    std.Io.Dir.rename(dir, tmp_path, dir, path, io) catch |err| {
+        dir.deleteFile(io, tmp_path) catch {};
+        return err;
+    };
 }
 
 fn segmentChecksum(data: []const u8) u32 {
@@ -1732,6 +1815,68 @@ pub fn testBuildSegmentProducesManifestReadyMetadata() !void {
     try std.testing.expectEqual(@as(usize, 2), header.member_count);
 }
 
+pub fn testDirectoryStoreRoundTripsSegmentFiles() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 11,
+        .generation = 6,
+        .members = &.{ 100, 200, 300 },
+    });
+    defer alloc.free(base);
+    const delta_sequence = (@as(u64, 7) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 400 },
+    });
+    defer alloc.free(delta);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(11, base);
+    try writer.appendDelta(11, delta_sequence, delta);
+    var built = try writer.buildSegment(12);
+    defer built.deinit(alloc);
+
+    const written = try writeSegmentFileAlloc(alloc, std.testing.io, tmp.dir, built);
+    defer alloc.free(written.path);
+    try std.testing.expectEqual(built.meta.segment_id, written.meta.segment_id);
+    try std.testing.expectEqualStrings("postings/000000000000000c.afps", written.path);
+
+    const manifest_entry = ManifestEntry{
+        .meta = written.meta,
+        .path = written.path,
+    };
+    const manifest_data = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 13,
+        .segments = &.{manifest_entry},
+    });
+    defer alloc.free(manifest_data);
+    try writeManifestFileAlloc(alloc, std.testing.io, tmp.dir, default_manifest_path, manifest_data);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 13), store.manifest.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), store.segments.len);
+
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(11)).?;
+    try std.testing.expectEqual(@as(u64, 6), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+    const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 11, 6);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(delta_sequence, records[0].sequence);
+    try std.testing.expectEqual(@as(posting.VectorId, 400), records[0].vector_id);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = written.path,
+        .data = "not a segment",
+    });
+    try std.testing.expectError(error.CorruptedPostingSegment, openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{}));
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -1888,6 +2033,10 @@ test "posting segment store validates manifest backed segments" {
 
 test "posting segment build produces manifest ready metadata" {
     try testBuildSegmentProducesManifestReadyMetadata();
+}
+
+test "posting segment directory store round trips segment files" {
+    try testDirectoryStoreRoundTripsSegmentFiles();
 }
 
 test "posting segment compacts segments to live posting entries" {

@@ -134,8 +134,10 @@ Current status:
   records segment ids, paths, and posting/delta range metadata for reopen, and
   an owned segment-store opener can rebuild a snapshot from manifest bytes plus
   caller-provided segment reads while validating each segment's actual metadata
-  against the manifest. Segment writers can also produce a manifest-ready
-  built segment with validated metadata and a stable segment path. Runtime
+  against the manifest. Directory helpers can write segment and manifest files
+  through temporary files plus rename, then reopen and validate the store from a
+  manifest path. Segment writers can also produce a manifest-ready built
+  segment with validated metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace; this
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future

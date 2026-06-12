@@ -96,6 +96,10 @@ pub const PostingSegmentManifestReplacementStats = posting_segment.ManifestRepla
 pub const PostingSegmentManifestReplacementResult = posting_segment.ManifestReplacementResult;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
+pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
+pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
+pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
+pub const openPostingSegmentStoreFromDirectoryAlloc = posting_segment.openStoreFromDirectoryAlloc;
 pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
 pub const compactPostingSegmentsWithStatsAlloc = posting_segment.compactSegmentsWithStatsAlloc;
 pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
@@ -186,6 +190,10 @@ test "posting segment store validates manifest backed segments" {
 
 test "posting segment build produces manifest ready metadata" {
     try posting_segment.testBuildSegmentProducesManifestReadyMetadata();
+}
+
+test "posting segment directory store round trips segment files" {
+    try posting_segment.testDirectoryStoreRoundTripsSegmentFiles();
 }
 
 test "posting segment compacts segments to live posting entries" {
