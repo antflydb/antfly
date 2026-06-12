@@ -2594,9 +2594,25 @@ pub const IndexManager = struct {
             const has_repair_debt = backlog.dirty_postings != 0 or
                 backlogHasActionableDeltaTail(backlog, options);
             const has_layout_debt = backlogHasActionableLayoutDebt(backlog, options);
+            const has_segment_backend = entry.index.config.posting_backend == .segments;
+            var reservation = if (has_segment_backend or has_repair_debt or has_layout_debt)
+                self.reserveDensePostingMaintenanceWorkingSet(entry, options) catch {
+                    result.stopped_by_resource_budget = true;
+                    break;
+                }
+            else
+                null;
+            defer if (reservation) |*reserved| reserved.release();
+            const reserved_bytes = if (reservation) |reserved| reserved.bytes else 0;
             var segment_maintenance_steps: usize = 0;
-            if (entry.index.config.posting_backend == .segments) {
-                const segment_stats = try entry.index.maintainPostingSegmentBackend();
+            if (has_segment_backend) {
+                const segment_budget_bytes: usize = if (reserved_bytes == 0)
+                    std.math.maxInt(usize)
+                else
+                    @intCast(@min(reserved_bytes / 2, std.math.maxInt(usize)));
+                const segment_stats = try entry.index.maintainPostingSegmentBackendWithOptions(.{
+                    .max_compaction_input_bytes = segment_budget_bytes,
+                });
                 if (segment_stats.ran) {
                     result.segment_maintenance_runs += 1;
                     result.segment_maintenance_compactions += @intCast(segment_stats.compactions);
@@ -2622,12 +2638,6 @@ pub const IndexManager = struct {
                 continue;
             }
 
-            var reservation = self.reserveDensePostingMaintenanceWorkingSet(entry, options) catch {
-                result.stopped_by_resource_budget = true;
-                break;
-            };
-            defer if (reservation) |*reserved| reserved.release();
-            const reserved_bytes = if (reservation) |reserved| reserved.bytes else 0;
             const reservation_fold_bytes: usize = if (reserved_bytes == 0)
                 std.math.maxInt(usize)
             else

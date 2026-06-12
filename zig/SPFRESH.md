@@ -213,10 +213,12 @@ Current status:
   directory, validating each referenced segment, writing the manifest last, and
   rejecting imports whose manifest does not match the committed marker; this is
   the backup/restore placement primitive, but generic DB snapshots still
-  intentionally export the logical store only. That adapter path is still
-  internal until DB-level restore/import wiring, crash-recovery cleanup,
-  maintenance resource budgets, and public config enablement are wired through
-  the same backend boundary.
+  intentionally export the logical store only. Dense maintenance now runs
+  segment compaction under the existing dense posting maintenance working-set
+  reservation, passing that reservation through as a cap on selected compaction
+  input bytes. That adapter path is still internal until DB-level
+  restore/import wiring, crash-recovery cleanup, and public config enablement
+  are wired through the same backend boundary.
   Dense index config now propagates the parsed physical backend into HBC config,
   but `backend = segments` remains rejected until those operational surfaces are
   complete. The dense index config now separates `backend`, `format`, and
@@ -858,13 +860,15 @@ implementations cleanly:
     compaction, delete, and manifest-size counters. HBC also has a
     committed-manifest export/import primitive that copies and verifies only
     referenced segment files, publishes manifests last, and rejects imports with
-    a manifest that does not match the restored HBC metadata marker. The
-    remaining promotion work is operational: DB restore/import must call those
-    segment artifact hooks for restored HBC indexes, segment maintenance must
-    enforce resource budgets, crash recovery must clean ignored physical
-    manifests/files, and public config must stop rejecting `backend = segments`
-    only after those surfaces are covered. That may reduce LSM key overhead and
-    improve sequential IO.
+    a manifest that does not match the restored HBC metadata marker. Segment
+    maintenance compaction now runs under the dense posting maintenance
+    working-set reservation and caps selected compaction input bytes from that
+    reservation, so physical segment compaction cannot bypass resource pressure.
+    The remaining promotion work is operational: DB restore/import must call
+    those segment artifact hooks for restored HBC indexes, crash recovery must
+    clean ignored physical manifests/files, and public config must stop
+    rejecting `backend = segments` only after those surfaces are covered. That
+    may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

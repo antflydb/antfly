@@ -562,9 +562,13 @@ pub const RuntimeDirectoryStore = struct {
     }
 
     pub fn maintainLoadedManifest(self: *RuntimeDirectoryStore) !DirectoryMaintenanceStats {
+        return try self.maintainLoadedManifestWithOptions(self.options.maintenanceOptions());
+    }
+
+    pub fn maintainLoadedManifestWithOptions(self: *RuntimeDirectoryStore, options: DirectoryMaintenanceOptions) !DirectoryMaintenanceStats {
         if (self.pendingEntries() != 0 or self.pendingDeltaRecords() != 0) return error.PostingSegmentPendingBatch;
         try self.writeLoadedManifest();
-        const stats = try maintainDirectoryStoreAlloc(self.alloc, self.io, self.dir, self.options.maintenanceOptions());
+        const stats = try maintainDirectoryStoreAlloc(self.alloc, self.io, self.dir, options);
         try self.reloadManifest();
         return stats;
     }

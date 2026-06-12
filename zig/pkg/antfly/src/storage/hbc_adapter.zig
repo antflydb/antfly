@@ -1271,6 +1271,10 @@ pub const PostingSegmentMaintenanceStats = struct {
     deleted_temp_files: u64 = 0,
 };
 
+pub const PostingSegmentMaintenanceOptions = struct {
+    max_compaction_input_bytes: usize = std.math.maxInt(usize),
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -2882,6 +2886,10 @@ pub const HBCIndex = struct {
     }
 
     pub fn maintainPostingSegmentBackend(self: *HBCIndex) !PostingSegmentMaintenanceStats {
+        return try self.maintainPostingSegmentBackendWithOptions(.{});
+    }
+
+    pub fn maintainPostingSegmentBackendWithOptions(self: *HBCIndex, options: PostingSegmentMaintenanceOptions) !PostingSegmentMaintenanceStats {
         if (self.posting_segment_runtime == null) return .{};
 
         var needs_reload_from_committed_manifest = false;
@@ -2895,7 +2903,14 @@ pub const HBCIndex = struct {
             const runtime = try self.postingSegmentRuntime();
             if (runtime.store.pendingEntries() != 0 or runtime.store.pendingDeltaRecords() != 0) return .{};
 
-            const maintenance = try runtime.store.maintainLoadedManifest();
+            var maintenance_options = runtime.store.options.maintenanceOptions();
+            if (options.max_compaction_input_bytes != std.math.maxInt(usize)) {
+                maintenance_options.plan.max_input_bytes = if (maintenance_options.plan.max_input_bytes == 0)
+                    options.max_compaction_input_bytes
+                else
+                    @min(maintenance_options.plan.max_input_bytes, options.max_compaction_input_bytes);
+            }
+            const maintenance = try runtime.store.maintainLoadedManifestWithOptions(maintenance_options);
             needs_reload_from_committed_manifest = true;
             const manifest_segments = if (maintenance.compacted)
                 maintenance.compaction.manifest.output_segments
@@ -10956,6 +10971,14 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
             defer alloc.free(materialized);
             try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
         }
+
+        const capped_segment_maintenance = try idx.maintainPostingSegmentBackendWithOptions(.{
+            .max_compaction_input_bytes = 1,
+        });
+        try std.testing.expect(capped_segment_maintenance.ran);
+        try std.testing.expect(!capped_segment_maintenance.compacted);
+        try std.testing.expectEqual(@as(u64, 0), capped_segment_maintenance.compactions);
+        try std.testing.expect(capped_segment_maintenance.manifest_segments > 1);
 
         const segment_maintenance = try idx.maintainPostingSegmentBackend();
         try std.testing.expect(segment_maintenance.ran);
