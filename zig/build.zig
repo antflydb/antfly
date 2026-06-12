@@ -3951,6 +3951,7 @@ pub fn build(b: *std.Build) void {
             "swarm runtime module compiles",
             "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "swarm runtime registers internal group routes explicitly",
+            "swarm runtime registers mcp routes before antfarm catch-all",
             "parse cli accepts config path",
             "parse cli accepts canonical host port and models dir flags",
             "termite config uses cli override before common config",
