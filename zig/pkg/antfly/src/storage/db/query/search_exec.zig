@@ -359,6 +359,9 @@ pub const DenseSearchProfile = struct {
     hbc_search_ns: u64 = 0,
     hbc_runtime_txn_ns: u64 = 0,
     hbc_scratch_acquire_ns: u64 = 0,
+    hbc_search_scratch_allocations: u64 = 0,
+    hbc_search_scratch_allocation_bytes: u64 = 0,
+    hbc_search_scratch_retained_bytes: u64 = 0,
     hbc_node_cache_lookup_ns: u64 = 0,
     hbc_quantized_cache_lookup_ns: u64 = 0,
     hbc_posting_overlay_ns: u64 = 0,
@@ -4503,6 +4506,9 @@ fn searchDenseInternal(
         };
         profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
         profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
+        profile.hbc_search_scratch_allocations = profiled.profile.search_scratch_allocations;
+        profile.hbc_search_scratch_allocation_bytes = profiled.profile.search_scratch_allocation_bytes;
+        profile.hbc_search_scratch_retained_bytes = profiled.profile.search_scratch_retained_bytes;
         profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
         profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
         profile.hbc_posting_overlay_ns = profiled.profile.posting_overlay_ns;
@@ -4866,9 +4872,12 @@ fn logBenchDenseQueryProfile(
         },
     );
     std.log.info(
-        "antfly_bench_dense_query_hbc_overlay index={s} overlay_us={d} calls={d} base_members={d} base_decode_us={d} base_decode_members={d} delta_replay_us={d} delta_replay_records={d} delta_records={d} delta_scan_skips={d} materialized_members={d} fallbacks={d} cache_hits={d} cache_misses={d} cache_evictions={d} cache_admission_skips={d} cache_member_bytes={d}",
+        "antfly_bench_dense_query_hbc_overlay index={s} scratch_allocations={d} scratch_allocation_bytes={d} scratch_retained_bytes={d} overlay_us={d} calls={d} base_members={d} base_decode_us={d} base_decode_members={d} delta_replay_us={d} delta_replay_records={d} delta_records={d} delta_scan_skips={d} materialized_members={d} fallbacks={d} cache_hits={d} cache_misses={d} cache_evictions={d} cache_admission_skips={d} cache_member_bytes={d}",
         .{
             req.index_name orelse "",
+            profile.hbc_search_scratch_allocations,
+            profile.hbc_search_scratch_allocation_bytes,
+            profile.hbc_search_scratch_retained_bytes,
             nsToUs(profile.hbc_posting_overlay_ns),
             profile.hbc_posting_overlay_calls,
             profile.hbc_posting_overlay_base_members,

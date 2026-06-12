@@ -177,6 +177,8 @@ pub const SearchScratch = struct {
     posting_delta_tail_prefetch_decoded_bytes: u64 = 0,
     posting_base_header_cache: [posting_base_header_cache_slot_count]PostingBaseHeaderCacheEntry = [_]PostingBaseHeaderCacheEntry{.{}} ** posting_base_header_cache_slot_count,
     posting_base_header_cache_next_slot: usize = 0,
+    scratch_allocation_count: u64 = 0,
+    scratch_allocation_bytes: u64 = 0,
 
     pub fn init(
         alloc: Allocator,
@@ -232,7 +234,37 @@ pub const SearchScratch = struct {
                 max_posting_member_cache_bytes,
                 max_posting_member_cache_entry_bytes,
             ),
+            .scratch_allocation_count = initialScratchAllocationCount(.{
+                transformed_query,
+                centroid,
+                vector,
+                member_ids,
+                flags,
+                query_storage,
+                distance_storage,
+            }),
+            .scratch_allocation_bytes = byteLen(transformed_query) +
+                byteLen(centroid) +
+                byteLen(vector) +
+                byteLen(member_ids) +
+                byteLen(flags) +
+                byteLen(query_storage) +
+                byteLen(distance_storage),
         };
+    }
+
+    pub fn allocationCount(self: *const SearchScratch) u64 {
+        return self.scratch_allocation_count;
+    }
+
+    pub fn allocationBytes(self: *const SearchScratch) u64 {
+        return self.scratch_allocation_bytes;
+    }
+
+    fn noteScratchAllocation(self: *SearchScratch, byte_count: u64) void {
+        if (byte_count == 0) return;
+        self.scratch_allocation_count +|= 1;
+        self.scratch_allocation_bytes +|= byte_count;
     }
 
     pub fn ensureVectorFetchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -243,7 +275,10 @@ pub const SearchScratch = struct {
 
     pub fn ensureVectorBatchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         const vector_count = try std.math.mul(usize, self.dims, needed);
-        if (self.vector_batch.len < vector_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_count);
+        if (self.vector_batch.len < vector_count) {
+            self.vector_batch = try alloc.realloc(self.vector_batch, vector_count);
+            self.noteScratchAllocation(byteLen(self.vector_batch));
+        }
     }
 
     pub fn ensureDistanceCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -267,6 +302,7 @@ pub const SearchScratch = struct {
         });
         alloc.free(self.query_storage);
         self.query_storage = replacement;
+        self.noteScratchAllocation(byteLen(self.query_storage));
         self.positions = views.positions;
         self.vector_ids = views.vector_ids;
         self.metadata = views.metadata;
@@ -282,6 +318,7 @@ pub const SearchScratch = struct {
         const old_error_bound_len = self.error_bounds.len;
         const new_storage_len = try std.math.mul(usize, needed, 2);
         self.distance_storage = try alloc.realloc(self.distance_storage, new_storage_len);
+        self.noteScratchAllocation(byteLen(self.distance_storage));
         self.distances = self.distance_storage[0..needed];
         self.error_bounds = self.distance_storage[needed .. 2 * needed];
         if (old_error_bound_len != 0) {
@@ -290,17 +327,29 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.flags.len < needed) self.flags = try alloc.realloc(self.flags, needed);
+        if (self.flags.len < needed) {
+            self.flags = try alloc.realloc(self.flags, needed);
+            self.noteScratchAllocation(byteLen(self.flags));
+        }
         try self.ensureVectorFetchCapacity(alloc, needed);
     }
 
     pub fn ensureMemberIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
+        if (self.member_ids.len < needed) {
+            self.member_ids = try alloc.realloc(self.member_ids, needed);
+            self.noteScratchAllocation(byteLen(self.member_ids));
+        }
     }
 
     pub fn ensurePostingOverlayAppendCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.posting_overlay_appended_ids.len < needed) self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, needed);
-        if (self.posting_overlay_appended_live.len < needed) self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, needed);
+        if (self.posting_overlay_appended_ids.len < needed) {
+            self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, needed);
+            self.noteScratchAllocation(byteLen(self.posting_overlay_appended_ids));
+        }
+        if (self.posting_overlay_appended_live.len < needed) {
+            self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, needed);
+            self.noteScratchAllocation(byteLen(self.posting_overlay_appended_live));
+        }
     }
 
     pub fn resetPostingOverlayApply(self: *SearchScratch) void {
@@ -358,7 +407,10 @@ pub const SearchScratch = struct {
 
     pub fn appendPostingDeltaTailCacheRecord(self: *SearchScratch, alloc: Allocator, sequence: u64, vector_id: u64, op: u8) !void {
         if (!self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].valid) return;
+        const old_bytes = self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].bytes();
         try self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].append(alloc, sequence, vector_id, op);
+        const new_bytes = self.posting_delta_tail_cache[self.posting_delta_tail_cache_active_slot].bytes();
+        if (new_bytes > old_bytes) self.noteScratchAllocation(new_bytes);
     }
 
     pub fn invalidatePostingDeltaTailCache(self: *SearchScratch) void {
@@ -465,10 +517,13 @@ pub const SearchScratch = struct {
             evictions += 1;
         }
         try self.posting_member_cache_slots.ensureUnusedCapacity(alloc, 1);
+        const cached_members = try alloc.dupe(u64, members);
+        errdefer alloc.free(cached_members);
+        self.noteScratchAllocation(byteLen(cached_members));
         try self.posting_member_cache.append(alloc, .{
             .posting_id = posting_id,
             .mutation_version = mutation_version,
-            .members = try alloc.dupe(u64, members),
+            .members = cached_members,
             .score = candidate_score,
         });
         self.posting_member_cache_slots.putAssumeCapacity(posting_id, self.posting_member_cache.items.len - 1);
@@ -663,6 +718,14 @@ fn byteLen(values: anytype) u64 {
     return @as(u64, @intCast(values.len * @sizeOf(std.meta.Child(@TypeOf(values)))));
 }
 
+fn initialScratchAllocationCount(slices: anytype) u64 {
+    var count: u64 = 0;
+    inline for (slices) |slice| {
+        if (slice.len != 0) count += 1;
+    }
+    return count;
+}
+
 fn approximateHashMapBytes(capacity: usize, comptime key_size: usize, comptime value_size: usize) u64 {
     if (capacity == 0) return 0;
     return @intCast(capacity * (key_size + value_size + 2));
@@ -703,6 +766,25 @@ test "SearchScratch grows distance capacity without vector fetch buffers" {
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expectEqual(vector_batch_len, scratch.vector_batch.len);
     try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+}
+
+test "SearchScratch reports allocation pressure and retained bytes" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    const initial_allocations = scratch.allocationCount();
+    const initial_allocation_bytes = scratch.allocationBytes();
+    const initial_retained_bytes = scratch.bytes();
+    try std.testing.expect(initial_allocations > 0);
+    try std.testing.expect(initial_allocation_bytes > 0);
+    try std.testing.expect(initial_retained_bytes > 0);
+
+    try scratch.ensureVectorFetchCapacity(alloc, 5);
+
+    try std.testing.expect(scratch.allocationCount() > initial_allocations);
+    try std.testing.expect(scratch.allocationBytes() > initial_allocation_bytes);
+    try std.testing.expect(scratch.bytes() > initial_retained_bytes);
 }
 
 test "SearchScratch caches multiple posting delta tails in a compact ring" {

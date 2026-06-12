@@ -457,6 +457,9 @@ const ProfileTotals = struct {
     setup_ns: u64 = 0,
     runtime_txn_ns: u64 = 0,
     scratch_acquire_ns: u64 = 0,
+    search_scratch_allocations: u64 = 0,
+    search_scratch_allocation_bytes: u64 = 0,
+    search_scratch_retained_bytes: u64 = 0,
     upper_tree_pin_ns: u64 = 0,
     root_load_ns: u64 = 0,
     node_cache_miss_ns: u64 = 0,
@@ -511,6 +514,9 @@ const ProfileTotals = struct {
         self.setup_ns += p.setup_ns;
         self.runtime_txn_ns += p.runtime_txn_ns;
         self.scratch_acquire_ns += p.scratch_acquire_ns;
+        self.search_scratch_allocations += p.search_scratch_allocations;
+        self.search_scratch_allocation_bytes += p.search_scratch_allocation_bytes;
+        self.search_scratch_retained_bytes = @max(self.search_scratch_retained_bytes, p.search_scratch_retained_bytes);
         self.upper_tree_pin_ns += p.upper_tree_pin_ns;
         self.root_load_ns += p.root_load_ns;
         self.node_cache_miss_ns += p.node_cache_miss_ns;
@@ -1210,12 +1216,15 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"profile_total_ns\":{d},\"profile_setup_ns\":{d},\"profile_runtime_txn_ns\":{d},\"profile_scratch_acquire_ns\":{d},\"profile_upper_tree_pin_ns\":{d},\"profile_root_load_ns\":{d},\"profile_node_cache_miss_ns\":{d},\"profile_node_cache_misses\":{d},\"profile_quantized_cache_miss_ns\":{d},\"profile_quantized_cache_misses\":{d},\"profile_quantized_internal_cache_miss_ns\":{d},\"profile_quantized_internal_cache_misses\":{d},\"profile_quantized_leaf_cache_miss_ns\":{d},\"profile_quantized_leaf_cache_misses\":{d}",
+        ",\"profile_total_ns\":{d},\"profile_setup_ns\":{d},\"profile_runtime_txn_ns\":{d},\"profile_scratch_acquire_ns\":{d},\"profile_search_scratch_allocations\":{d},\"profile_search_scratch_allocation_bytes\":{d},\"profile_search_scratch_retained_bytes\":{d},\"profile_upper_tree_pin_ns\":{d},\"profile_root_load_ns\":{d},\"profile_node_cache_miss_ns\":{d},\"profile_node_cache_misses\":{d},\"profile_quantized_cache_miss_ns\":{d},\"profile_quantized_cache_misses\":{d},\"profile_quantized_internal_cache_miss_ns\":{d},\"profile_quantized_internal_cache_misses\":{d},\"profile_quantized_leaf_cache_miss_ns\":{d},\"profile_quantized_leaf_cache_misses\":{d}",
         .{
             totals.total_ns,
             totals.setup_ns,
             totals.runtime_txn_ns,
             totals.scratch_acquire_ns,
+            totals.search_scratch_allocations,
+            totals.search_scratch_allocation_bytes,
+            totals.search_scratch_retained_bytes,
             totals.upper_tree_pin_ns,
             totals.root_load_ns,
             totals.node_cache_miss_ns,

@@ -2093,6 +2093,8 @@ pub fn searchProfiledRequest(
         self.releaseSearchScratch(&scratch_handle);
     }
     const scratch = &scratch_handle.scratch;
+    const scratch_allocation_count_start = if (scratch_handle.from_cache) scratch.allocationCount() else 0;
+    const scratch_allocation_bytes_start = if (scratch_handle.from_cache) scratch.allocationBytes() else 0;
     const transformed_query = self.transformVector(req.query, scratch.transformed_query);
     const transformed_query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(req.query, req.query),
@@ -2177,6 +2179,7 @@ pub fn searchProfiledRequest(
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
+                finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
             }
@@ -2185,6 +2188,7 @@ pub fn searchProfiledRequest(
             approx_results.deinit();
             results.sort();
             if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
@@ -2192,6 +2196,7 @@ pub fn searchProfiledRequest(
         if (packed_bulk_ingest_session) {
             approx_results.deinit();
             const empty = search_results.SearchResults.init(self.alloc, req.k);
+            finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
                 .results = empty,
@@ -2207,6 +2212,7 @@ pub fn searchProfiledRequest(
         error.NotFound => {
             approx_results.deinit();
             const empty = search_results.SearchResults.init(self.alloc, req.k);
+            finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
                 .results = empty,
@@ -2233,6 +2239,7 @@ pub fn searchProfiledRequest(
                 error.NotFound => {
                     approx_results.deinit();
                     const empty = search_results.SearchResults.init(self.alloc, req.k);
+                    finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
                     profile.total_ns = elapsed_fn_u64(total_start);
                     return .{
                         .results = empty,
@@ -2244,6 +2251,7 @@ pub fn searchProfiledRequest(
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
+                finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
             }
@@ -2251,6 +2259,7 @@ pub fn searchProfiledRequest(
             approx_results.deinit();
             results.sort();
             if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
@@ -2318,6 +2327,7 @@ pub fn searchProfiledRequest(
     if (should_rerank) {
         const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
         approx_results.deinit();
+        finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
         profile.total_ns = elapsed_fn_u64(total_start);
         return .{ .results = reranked, .profile = profile };
     }
@@ -2326,8 +2336,15 @@ pub fn searchProfiledRequest(
     approx_results.deinit();
     results.sort();
     if (req.load_metadata) try populateMetadata(self, &txn, &results);
+    finishSearchProfileScratch(&profile, scratch, scratch_allocation_count_start, scratch_allocation_bytes_start);
     profile.total_ns = elapsed_fn_u64(total_start);
     return .{ .results = results, .profile = profile };
+}
+
+fn finishSearchProfileScratch(profile: *search_types.SearchProfile, scratch: anytype, allocation_count_start: u64, allocation_bytes_start: u64) void {
+    profile.search_scratch_allocations = scratch.allocationCount() -| allocation_count_start;
+    profile.search_scratch_allocation_bytes = scratch.allocationBytes() -| allocation_bytes_start;
+    profile.search_scratch_retained_bytes = scratch.bytes();
 }
 
 fn publishSearchStateIfSupported(self: anytype) void {

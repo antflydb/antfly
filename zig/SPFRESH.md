@@ -61,6 +61,12 @@ Current status:
   counters. Read/write benches and query profile metadata now expose
   `profile_posting_base_decode_*` and `profile_posting_delta_replay_*`, so
   comparisons can distinguish base materialization from tail replay.
+- Search profiles scratch allocator pressure and retained workspace bytes.
+  Read/write benches and query profile metadata now expose
+  `profile_search_scratch_allocations`,
+  `profile_search_scratch_allocation_bytes`, and
+  `profile_search_scratch_retained_bytes`, so slab compaction work can be
+  driven by allocator evidence.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
@@ -669,9 +675,9 @@ implementations cleanly:
 ### Benchmark and observability work
 
 The next optimization decisions need counters that separate logical format
-cost from backend cost. This branch now emits the base byte/decode and delta
-byte/replay counters; the remaining counters should be added before making a
-segment-backend decision:
+cost from backend cost. This branch now emits the base byte/decode, delta
+byte/replay, and search scratch allocation/retention counters. The full set to
+keep tracking before making a segment-backend decision is:
 
 - base bytes/member
 - base decode ns/member

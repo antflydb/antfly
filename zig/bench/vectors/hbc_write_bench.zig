@@ -636,6 +636,9 @@ const QueryProfileTotals = struct {
     setup_ns: u64 = 0,
     runtime_txn_ns: u64 = 0,
     scratch_acquire_ns: u64 = 0,
+    search_scratch_allocations: u64 = 0,
+    search_scratch_allocation_bytes: u64 = 0,
+    search_scratch_retained_bytes: u64 = 0,
     upper_tree_pin_ns: u64 = 0,
     root_load_ns: u64 = 0,
     node_cache_miss_ns: u64 = 0,
@@ -690,6 +693,9 @@ const QueryProfileTotals = struct {
         self.setup_ns += p.setup_ns;
         self.runtime_txn_ns += p.runtime_txn_ns;
         self.scratch_acquire_ns += p.scratch_acquire_ns;
+        self.search_scratch_allocations += p.search_scratch_allocations;
+        self.search_scratch_allocation_bytes += p.search_scratch_allocation_bytes;
+        self.search_scratch_retained_bytes = @max(self.search_scratch_retained_bytes, p.search_scratch_retained_bytes);
         self.upper_tree_pin_ns += p.upper_tree_pin_ns;
         self.root_load_ns += p.root_load_ns;
         self.node_cache_miss_ns += p.node_cache_miss_ns;
@@ -2362,12 +2368,15 @@ fn printResult(
             },
         );
         try writer.print(
-            ",\"post_write_profile_total_ns\":{d},\"post_write_profile_setup_ns\":{d},\"post_write_profile_runtime_txn_ns\":{d},\"post_write_profile_scratch_acquire_ns\":{d},\"post_write_profile_upper_tree_pin_ns\":{d},\"post_write_profile_root_load_ns\":{d},\"post_write_profile_node_cache_miss_ns\":{d},\"post_write_profile_node_cache_misses\":{d},\"post_write_profile_quantized_cache_miss_ns\":{d},\"post_write_profile_quantized_cache_misses\":{d},\"post_write_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_profile_quantized_internal_cache_misses\":{d},\"post_write_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_profile_quantized_leaf_cache_misses\":{d}",
+            ",\"post_write_profile_total_ns\":{d},\"post_write_profile_setup_ns\":{d},\"post_write_profile_runtime_txn_ns\":{d},\"post_write_profile_scratch_acquire_ns\":{d},\"post_write_profile_search_scratch_allocations\":{d},\"post_write_profile_search_scratch_allocation_bytes\":{d},\"post_write_profile_search_scratch_retained_bytes\":{d},\"post_write_profile_upper_tree_pin_ns\":{d},\"post_write_profile_root_load_ns\":{d},\"post_write_profile_node_cache_miss_ns\":{d},\"post_write_profile_node_cache_misses\":{d},\"post_write_profile_quantized_cache_miss_ns\":{d},\"post_write_profile_quantized_cache_misses\":{d},\"post_write_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_profile_quantized_internal_cache_misses\":{d},\"post_write_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_profile_quantized_leaf_cache_misses\":{d}",
             .{
                 query.totals.total_ns,
                 query.totals.setup_ns,
                 query.totals.runtime_txn_ns,
                 query.totals.scratch_acquire_ns,
+                query.totals.search_scratch_allocations,
+                query.totals.search_scratch_allocation_bytes,
+                query.totals.search_scratch_retained_bytes,
                 query.totals.upper_tree_pin_ns,
                 query.totals.root_load_ns,
                 query.totals.node_cache_miss_ns,
@@ -2453,12 +2462,15 @@ fn printResult(
                 },
             );
             try writer.print(
-                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d},\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_base_decode_ns\":{d},\"post_write_warm_profile_posting_base_decode_members\":{d},\"post_write_warm_profile_posting_delta_replay_ns\":{d},\"post_write_warm_profile_posting_delta_replay_records\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
+                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_search_scratch_allocations\":{d},\"post_write_warm_profile_search_scratch_allocation_bytes\":{d},\"post_write_warm_profile_search_scratch_retained_bytes\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d},\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_base_decode_ns\":{d},\"post_write_warm_profile_posting_base_decode_members\":{d},\"post_write_warm_profile_posting_delta_replay_ns\":{d},\"post_write_warm_profile_posting_delta_replay_records\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
                 .{
                     query.warm_totals.total_ns,
                     query.warm_totals.setup_ns,
                     query.warm_totals.runtime_txn_ns,
                     query.warm_totals.scratch_acquire_ns,
+                    query.warm_totals.search_scratch_allocations,
+                    query.warm_totals.search_scratch_allocation_bytes,
+                    query.warm_totals.search_scratch_retained_bytes,
                     query.warm_totals.upper_tree_pin_ns,
                     query.warm_totals.root_load_ns,
                     query.warm_totals.node_cache_miss_ns,
