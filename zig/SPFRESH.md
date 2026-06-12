@@ -123,7 +123,9 @@ Current status:
   iteration for future compaction, migration, and backup verification code, and
   the segment module can compact segment blobs by retaining the newest base and
   centroid point records while rewriting only delta records newer than the
-  selected base generation. Snapshot delta reads can also filter by base
+  selected base generation. Compaction reports input/output bytes, retained
+  records, and dropped superseded/stale/duplicate records for future resource
+  accounting and policy tuning. Snapshot delta reads can also filter by base
   generation and use segment delta-range metadata to skip stale tail files
   before decode. A compact
   durable manifest codec with trailer checksum

@@ -92,6 +92,35 @@ pub const BuiltSegment = struct {
     }
 };
 
+pub const CompactionStats = struct {
+    input_segments: usize = 0,
+    input_bytes: usize = 0,
+    input_entries: usize = 0,
+    input_base_records: usize = 0,
+    input_centroid_records: usize = 0,
+    input_delta_values: usize = 0,
+    input_delta_records: usize = 0,
+    retained_base_records: usize = 0,
+    retained_centroid_records: usize = 0,
+    retained_delta_records: usize = 0,
+    dropped_superseded_base_records: usize = 0,
+    dropped_superseded_centroid_records: usize = 0,
+    dropped_stale_delta_records: usize = 0,
+    dropped_duplicate_delta_records: usize = 0,
+    output_bytes: usize = 0,
+    output_entries: usize = 0,
+};
+
+pub const CompactResult = struct {
+    segment: BuiltSegment,
+    stats: CompactionStats,
+
+    pub fn deinit(self: *CompactResult, alloc: Allocator) void {
+        self.segment.deinit(alloc);
+        self.stats = .{};
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -357,19 +386,35 @@ pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
 }
 
 pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const SegmentBlob) !BuiltSegment {
+    const result = try compactSegmentsWithStatsAlloc(alloc, segment_id, segments);
+    return result.segment;
+}
+
+pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments: []const SegmentBlob) !CompactResult {
+    var stats = CompactionStats{
+        .input_segments = segments.len,
+    };
     var bases = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
     defer bases.deinit(alloc);
     var centroids = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
     defer centroids.deinit(alloc);
 
     for (segments) |segment| {
+        stats.input_bytes += segment.data.len;
+        stats.input_entries += segment.meta.entry_count;
         var reader = try Reader.init(segment.data);
         var iter = reader.entries();
         while (try iter.next()) |entry| {
             switch (entry.kind) {
-                .base => try putNewestPoint(alloc, &bases, entry.posting_id, segment.meta.segment_id, entry.value),
-                .centroid_directory => try putNewestPoint(alloc, &centroids, entry.posting_id, segment.meta.segment_id, entry.value),
-                .delta => {},
+                .base => {
+                    stats.input_base_records += 1;
+                    try putNewestPoint(alloc, &bases, entry.posting_id, segment.meta.segment_id, entry.value);
+                },
+                .centroid_directory => {
+                    stats.input_centroid_records += 1;
+                    try putNewestPoint(alloc, &centroids, entry.posting_id, segment.meta.segment_id, entry.value);
+                },
+                .delta => stats.input_delta_values += 1,
             }
         }
     }
@@ -387,9 +432,13 @@ pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const
                 null;
             const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, entry.value);
             defer alloc.free(decoded);
+            stats.input_delta_records += decoded.len;
             for (decoded) |record| {
                 if (base_generation) |generation| {
-                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) {
+                        stats.dropped_stale_delta_records += 1;
+                        continue;
+                    }
                 }
                 try deltas.append(alloc, .{
                     .posting_id = entry.posting_id,
@@ -407,14 +456,18 @@ pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const
         var iter = bases.iterator();
         while (iter.next()) |entry| {
             try writer.appendBase(entry.key_ptr.*, entry.value_ptr.value);
+            stats.retained_base_records += 1;
         }
     }
     {
         var iter = centroids.iterator();
         while (iter.next()) |entry| {
             try writer.appendCentroidDirectory(entry.key_ptr.*, entry.value_ptr.value);
+            stats.retained_centroid_records += 1;
         }
     }
+    stats.dropped_superseded_base_records = stats.input_base_records - stats.retained_base_records;
+    stats.dropped_superseded_centroid_records = stats.input_centroid_records - stats.retained_centroid_records;
 
     var posting_start: usize = 0;
     while (posting_start < deltas.items.len) {
@@ -431,7 +484,9 @@ pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const
             while (j < posting_end and deltas.items[j].record.sequence == chosen.record.sequence) : (j += 1) {
                 chosen = deltas.items[j];
             }
+            stats.dropped_duplicate_delta_records += j - i - 1;
             try records.append(alloc, chosen.record);
+            stats.retained_delta_records += 1;
             i = j;
         }
 
@@ -443,7 +498,13 @@ pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const
         posting_start = posting_end;
     }
 
-    return try writer.buildSegment(segment_id);
+    const segment = try writer.buildSegment(segment_id);
+    stats.output_bytes = segment.data.len;
+    stats.output_entries = segment.meta.entry_count;
+    return .{
+        .segment = segment,
+        .stats = stats,
+    };
 }
 
 const PendingEntry = struct {
@@ -1562,12 +1623,28 @@ pub fn testCompactsSegmentsToLivePostingEntries() !void {
     defer segment_2.deinit(alloc);
 
     const inputs = [_]SegmentBlob{ segment_1.blob(), segment_2.blob() };
-    var compacted = try compactSegmentsAlloc(alloc, 9, inputs[0..]);
+    var compacted = try compactSegmentsWithStatsAlloc(alloc, 9, inputs[0..]);
     defer compacted.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 9), compacted.meta.segment_id);
-    try std.testing.expectEqual(@as(usize, 3), compacted.meta.entry_count);
+    try std.testing.expectEqual(@as(u64, 9), compacted.segment.meta.segment_id);
+    try std.testing.expectEqual(@as(usize, 3), compacted.segment.meta.entry_count);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.input_segments);
+    try std.testing.expectEqual(segment_1.data.len + segment_2.data.len, compacted.stats.input_bytes);
+    try std.testing.expectEqual(segment_1.meta.entry_count + segment_2.meta.entry_count, compacted.stats.input_entries);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.input_base_records);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.input_centroid_records);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.input_delta_values);
+    try std.testing.expectEqual(@as(usize, 5), compacted.stats.input_delta_records);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.retained_base_records);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.retained_centroid_records);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.retained_delta_records);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.dropped_superseded_base_records);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.dropped_superseded_centroid_records);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.dropped_stale_delta_records);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.dropped_duplicate_delta_records);
+    try std.testing.expectEqual(compacted.segment.data.len, compacted.stats.output_bytes);
+    try std.testing.expectEqual(compacted.segment.meta.entry_count, compacted.stats.output_entries);
 
-    const snapshot = Snapshot{ .catalog = .{ .segments = &.{compacted.blob()} } };
+    const snapshot = Snapshot{ .catalog = .{ .segments = &.{compacted.segment.blob()} } };
     const header = (try snapshot.loadBaseHeader(7)).?;
     try std.testing.expectEqual(@as(u64, 3), header.generation);
     try std.testing.expectEqual(@as(usize, 3), header.member_count);
