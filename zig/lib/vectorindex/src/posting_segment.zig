@@ -170,6 +170,30 @@ pub const SegmentCommitResult = struct {
     }
 };
 
+pub const DirectoryCompactionStats = struct {
+    compaction: CompactionStats = .{},
+    manifest: ManifestReplacementStats = .{},
+    segment_id: u64 = 0,
+    segment_bytes: usize = 0,
+    manifest_bytes: usize = 0,
+};
+
+pub const DirectoryCompactionResult = struct {
+    entry: OwnedManifestEntry,
+    stats: DirectoryCompactionStats,
+
+    pub fn deinit(self: *DirectoryCompactionResult, alloc: Allocator) void {
+        alloc.free(self.entry.path);
+        self.* = .{
+            .entry = .{
+                .meta = .{ .segment_id = 0 },
+                .path = &.{},
+            },
+            .stats = .{},
+        };
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -553,6 +577,51 @@ pub fn commitBuiltSegmentToDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std
     defer manifest.deinit(alloc);
     if (segment.meta.segment_id != manifest.next_segment_id) return error.InvalidPostingSegmentManifest;
     return try commitBuiltSegmentToDirectoryWithManifestAlloc(alloc, io, dir, segment, manifest, options);
+}
+
+pub fn compactDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: CommitOptions) !DirectoryCompactionResult {
+    var store = try openStoreFromDirectoryAlloc(alloc, io, dir, .{
+        .manifest_path = options.manifest_path,
+        .max_manifest_bytes = options.max_manifest_bytes,
+        .max_segment_bytes = options.max_segment_bytes,
+    });
+    defer store.deinit(alloc);
+    if (store.segments.len == 0) return error.NoPostingSegmentsToCompact;
+
+    var compacted = try compactSegmentsWithStatsAlloc(alloc, store.manifest.next_segment_id, store.segments);
+    defer compacted.deinit(alloc);
+    if (compacted.segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+
+    const existing_entries = try manifestEntryViewAlloc(alloc, store.manifest.segments);
+    defer alloc.free(existing_entries);
+    const remove_segment_ids = try alloc.alloc(u64, store.manifest.segments.len);
+    defer alloc.free(remove_segment_ids);
+    for (store.manifest.segments, 0..) |entry, i| remove_segment_ids[i] = entry.meta.segment_id;
+
+    const written = try writeSegmentFileAlloc(alloc, io, dir, compacted.segment);
+    errdefer alloc.free(written.path);
+    const new_entry = ManifestEntry{
+        .meta = written.meta,
+        .path = written.path,
+    };
+
+    var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = store.manifest.next_segment_id,
+        .segments = existing_entries,
+    }, remove_segment_ids, &.{new_entry});
+    defer replacement.deinit(alloc);
+
+    try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
+    return .{
+        .entry = written,
+        .stats = .{
+            .compaction = compacted.stats,
+            .manifest = replacement.stats,
+            .segment_id = written.meta.segment_id,
+            .segment_bytes = written.meta.byte_len,
+            .manifest_bytes = replacement.encoded.len,
+        },
+    };
 }
 
 pub fn writeSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment) !OwnedManifestEntry {
@@ -2050,6 +2119,67 @@ pub fn testDirectoryCommitAppendsManifestSegments() !void {
     try std.testing.expectEqual(@as(posting.VectorId, 30), records[0].vector_id);
 }
 
+pub fn testDirectoryCompactionReplacesManifestSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_old = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base_old);
+    const stale_delta_sequence = (@as(u64, 2) << 32) | 1;
+    const stale_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    defer alloc.free(stale_delta);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base_old);
+    try writer_1.appendDelta(7, stale_delta_sequence, stale_delta);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const base_new = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(base_new);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(7, base_new);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var compacted = try compactDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), compacted.entry.meta.segment_id);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.manifest.removed_segments);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.manifest.added_segments);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.manifest.output_segments);
+    try std.testing.expectEqual(@as(u64, 4), compacted.stats.manifest.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), compacted.stats.compaction.dropped_stale_delta_records);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4), store.manifest.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), store.segments.len);
+    try std.testing.expectEqual(@as(u64, 3), store.segments[0].meta.segment_id);
+
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 3), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+    const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 3);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 0), records.len);
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2214,6 +2344,10 @@ test "posting segment directory store round trips segment files" {
 
 test "posting segment directory commit appends manifest segments" {
     try testDirectoryCommitAppendsManifestSegments();
+}
+
+test "posting segment directory compaction replaces manifest segments" {
+    try testDirectoryCompactionReplacesManifestSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {

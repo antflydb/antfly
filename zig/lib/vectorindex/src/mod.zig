@@ -97,10 +97,13 @@ pub const PostingSegmentManifestReplacementResult = posting_segment.ManifestRepl
 pub const PostingSegmentCommitOptions = posting_segment.CommitOptions;
 pub const PostingSegmentCommitStats = posting_segment.SegmentCommitStats;
 pub const PostingSegmentCommitResult = posting_segment.SegmentCommitResult;
+pub const PostingSegmentDirectoryCompactionStats = posting_segment.DirectoryCompactionStats;
+pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCompactionResult;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
 pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWriterToDirectoryAlloc;
 pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuiltSegmentToDirectoryAlloc;
+pub const compactPostingSegmentDirectoryStoreAlloc = posting_segment.compactDirectoryStoreAlloc;
 pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
@@ -203,6 +206,10 @@ test "posting segment directory store round trips segment files" {
 
 test "posting segment directory commit appends manifest segments" {
     try posting_segment.testDirectoryCommitAppendsManifestSegments();
+}
+
+test "posting segment directory compaction replaces manifest segments" {
+    try posting_segment.testDirectoryCompactionReplacesManifestSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {

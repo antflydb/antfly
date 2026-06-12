@@ -139,6 +139,9 @@ Current status:
   manifest path. Segment writers can also commit directly to a directory by
   reading the current manifest, assigning `next_segment_id`, writing the segment
   file, and publishing the updated manifest with an atomic rename. Segment
+  directory compaction can now write a compacted replacement segment first and
+  atomically swap the manifest to remove the compacted-away segment ids, leaving
+  old segment files as unreferenced orphans for a later GC pass. Segment
   writers can also produce a manifest-ready built
   segment with validated metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
