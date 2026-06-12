@@ -2482,6 +2482,14 @@ pub const IndexManager = struct {
         }
     };
 
+    pub const DensePostingSegmentRecoveryStats = struct {
+        scanned_indexes: usize = 0,
+        recovered_indexes: usize = 0,
+        manifest_segments: usize = 0,
+        deleted_orphan_segment_files: usize = 0,
+        deleted_temp_files: usize = 0,
+    };
+
     // Node budget per tree-link repair sweep run from the dense maintenance
     // lane. Repairs persist as the sweep goes, so an exhausted budget simply
     // resumes on the next maintenance pass.
@@ -2555,6 +2563,21 @@ pub const IndexManager = struct {
 
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         return (try self.runDensePostingMaintenanceProfiled(options)).total_steps;
+    }
+
+    pub fn recoverDensePostingSegmentBackends(self: *IndexManager) !DensePostingSegmentRecoveryStats {
+        var stats = DensePostingSegmentRecoveryStats{};
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.config.posting_backend != .segments) continue;
+            stats.scanned_indexes += 1;
+            const recovered = try entry.index.recoverPostingSegmentBackendCrashArtifacts();
+            if (!recovered.ran) continue;
+            stats.recovered_indexes += 1;
+            stats.manifest_segments = @max(stats.manifest_segments, @as(usize, @intCast(recovered.manifest_segments)));
+            stats.deleted_orphan_segment_files += @intCast(recovered.deleted_orphan_segment_files);
+            stats.deleted_temp_files += @intCast(recovered.deleted_temp_files);
+        }
+        return stats;
     }
 
     pub fn runDensePostingMaintenanceProfiled(self: *IndexManager, options: DensePostingMaintenanceOptions) !DensePostingMaintenanceResult {

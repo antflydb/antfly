@@ -5980,6 +5980,18 @@ pub const DB = struct {
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
             std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
             try self.resetManagedIndexAppliedSequences();
+            const segment_recovery = try self.recoverDensePostingSegmentBackendsForRestore();
+            if (segment_recovery.recovered_indexes != 0) {
+                std.log.info(
+                    "restore runtime repair recovered dense posting segment artifacts path={s} indexes={d} deleted_orphans={d} deleted_temps={d}",
+                    .{
+                        self.core.path,
+                        segment_recovery.recovered_indexes,
+                        segment_recovery.deleted_orphan_segment_files,
+                        segment_recovery.deleted_temp_files,
+                    },
+                );
+            }
             try self.refreshManagedIndexWorkersLocked();
             try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_graph", false);
             return true;
@@ -6018,6 +6030,12 @@ pub const DB = struct {
             return true;
         }
         return error.InvalidRestoreState;
+    }
+
+    fn recoverDensePostingSegmentBackendsForRestore(self: *DB) !index_manager_mod.IndexManager.DensePostingSegmentRecoveryStats {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.recoverDensePostingSegmentBackends();
     }
 
     fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
@@ -49845,12 +49863,43 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
         try std.testing.expectEqualStrings("doc:b", before.hits[0].id);
     }
 
+    const orphan_segment_rel = try vectorindex_mod.posting_segment.segmentPathAlloc(alloc, 0xfeed);
+    defer alloc.free(orphan_segment_rel);
+    const orphan_segment_abs = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_segments/{s}", .{ std.mem.span(path), orphan_segment_rel });
+    defer alloc.free(orphan_segment_abs);
+    const orphan_temp_abs = try std.fmt.allocPrint(alloc, "{s}.tmp", .{orphan_segment_abs});
+    defer alloc.free(orphan_temp_abs);
+    {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_segment_abs, .data = "orphan" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_temp_abs, .data = "temp" });
+    }
+    try DB.markRestorePrimaryRestoredForPath(
+        alloc,
+        std.mem.span(path),
+        "snap1",
+        "file:///tmp/backups",
+        "snapshots/snap1",
+        7002,
+    );
+
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = primary_backend,
     });
     defer reopened.close();
     const reopened_entry = reopened.core.index_manager.denseIndex("dv_segments") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 2), reopened_entry.index.stats().active_count);
+    try std.testing.expect(try reopened.restoreRuntimeRepairNeeded());
+    try std.testing.expect(try reopened.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, orphan_segment_abs, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, orphan_temp_abs, .{}));
+    }
 
     var after = try reopened.search(alloc, .{
         .index_name = "dv_segments",

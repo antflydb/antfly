@@ -868,11 +868,17 @@ implementations cleanly:
     reservation, so physical segment compaction cannot bypass resource pressure.
     HBC segment recovery now uses the committed manifest as authority, rewrites
     that manifest into the segment directory, skips compaction, and deletes
-    ignored temp/orphan physical segment files. The remaining promotion work is
-    operational: DB restore/import must call those segment artifact hooks for
-    restored HBC indexes, and public config must stop rejecting
-    `backend = segments` only after that surface is covered. That may reduce LSM
-    key overhead and improve sequential IO.
+    ignored temp/orphan physical segment files. DB restore runtime repair now
+    calls that recovery hook for segment-backed dense indexes, so restored HBC
+    runtimes normalize physical segment artifacts against the committed
+    manifest before completing repair. Public dense config also accepts the
+    opt-in `backend = segments, format = base_delta, version = 1` combination
+    while leaving the default on `lsm + packed_hbc + v1`. The remaining
+    promotion work is operational backup/import coverage for workflows that
+    preserve private HBC index stores: those flows must carry the committed
+    manifest's referenced segment files and invoke the existing HBC
+    export/import primitives. That may reduce LSM key overhead and improve
+    sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
