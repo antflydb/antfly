@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
@@ -170,7 +171,7 @@ fn sleepNs(duration_ns: u64) void {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 const RequestPacer = struct {
@@ -2452,7 +2453,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const auth = req.authorization orelse req.header("authorization") orelse "";
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             const index = self.count;
             if (index < self.headers.len) {
@@ -2471,7 +2472,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         }
 
         fn expectHeader(self: *@This(), index: usize, expected: []const u8) !void {
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             try std.testing.expect(index < self.count);
             try std.testing.expectEqualStrings(expected, self.headers[index] orelse return error.TestUnexpectedResult);

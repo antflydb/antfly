@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
 
@@ -181,7 +182,7 @@ pub const BearerAuthHeaderCache = struct {
         var resolved = try secret.resolveOwnedWithGeneration(out_alloc, secret_store);
         defer resolved.deinit(out_alloc);
 
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
 
         if (self.header == null or self.generation != resolved.cacheGeneration()) {
@@ -534,7 +535,7 @@ pub const FileStore = struct {
     }
 
     fn lock(self: *FileStore) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.mutex);
     }
 
     fn unlock(self: *FileStore) void {

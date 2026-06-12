@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
@@ -354,5 +355,5 @@ fn computeNextLsn(bytes: []const u8) u64 {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }

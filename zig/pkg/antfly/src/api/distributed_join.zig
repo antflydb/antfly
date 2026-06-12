@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const table_reads = @import("table_reads.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
@@ -5582,7 +5583,7 @@ pub fn freeFieldList(alloc: std.mem.Allocator, fields: [][]const u8) void {
 // ---------------------------------------------------------------------------
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 pub fn joinJobNowMillis() u64 {
