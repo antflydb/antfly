@@ -31,7 +31,7 @@ const magic: [4]u8 = "AFPS".*;
 const manifest_magic: [4]u8 = "AFPM".*;
 const version: u16 = 1;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8;
-const footer_size: usize = 8 + 8 + 2 + 4;
+const footer_size: usize = 8 + 8 + 4 + 2 + 4;
 const manifest_header_size: usize = 4 + 2 + 4 + 8;
 
 pub const EntryKind = enum(u8) {
@@ -408,6 +408,7 @@ pub const Writer = struct {
         for (index_entries.items) |entry| try appendIndexEntry(self.alloc, &out, entry);
         try appendU64(self.alloc, &out, @intCast(index_offset));
         try appendU64(self.alloc, &out, @intCast(index_entries.items.len));
+        try appendU32(self.alloc, &out, segmentChecksum(out.items));
         try appendU16(self.alloc, &out, version);
         try out.appendSlice(self.alloc, &magic);
         return try out.toOwnedSlice(self.alloc);
@@ -434,8 +435,11 @@ pub const Reader = struct {
         if (data.len < footer_size) return error.CorruptedPostingSegment;
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[footer_size - magic.len ..], &magic)) return error.BadPostingSegmentMagic;
-        const segment_version = readU16(footer[16..18]);
+        const segment_version = readU16(footer[20..22]);
         if (segment_version != version) return error.UnsupportedPostingSegmentVersion;
+        const stored_checksum = readU32(footer[16..20]);
+        const checksum_end = data.len - footer_size + 16;
+        if (segmentChecksum(data[0..checksum_end]) != stored_checksum) return error.BadPostingSegmentChecksum;
         const index_offset_u64 = readU64(footer[0..8]);
         const entry_count_u64 = readU64(footer[8..16]);
         const index_offset = std.math.cast(usize, index_offset_u64) orelse return error.CorruptedPostingSegment;
@@ -602,6 +606,10 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
         lhs.max_delta_sequence == rhs.max_delta_sequence and
         lhs.byte_len == rhs.byte_len and
         lhs.entry_count == rhs.entry_count;
+}
+
+fn segmentChecksum(data: []const u8) u32 {
+    return std.hash.Crc32.hash(data);
 }
 
 fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: ManifestEntry) !void {
@@ -801,6 +809,16 @@ pub fn testValidatesFooterAndVersion() !void {
     defer alloc.free(bad_version);
     bad_version[bad_version.len - magic.len - 1] = 2;
     try std.testing.expectError(error.UnsupportedPostingSegmentVersion, Reader.init(bad_version));
+
+    var bad_payload = try alloc.dupe(u8, bytes);
+    defer alloc.free(bad_payload);
+    bad_payload[0] ^= 0xff;
+    try std.testing.expectError(error.BadPostingSegmentChecksum, Reader.init(bad_payload));
+
+    var bad_footer_index_offset = try alloc.dupe(u8, bytes);
+    defer alloc.free(bad_footer_index_offset);
+    bad_footer_index_offset[bad_footer_index_offset.len - footer_size] ^= 0xff;
+    try std.testing.expectError(error.BadPostingSegmentChecksum, Reader.init(bad_footer_index_offset));
 }
 
 pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {

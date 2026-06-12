@@ -113,12 +113,13 @@ Current status:
 - The first dedicated posting segment container now exists in
   `posting_segment.zig`. It stores existing v1 posting-base, posting-delta, and
   centroid-directory values in one immutable posting-local indexed blob with
-  footer validation, segment metadata, ordered delta iteration, and a borrowed
-  catalog that can pick the newest point record while merging deltas across
-  segment blobs. The catalog now has a typed snapshot facade that decodes those
-  segment values through the existing logical posting codecs, so future runtime
-  read paths can depend on posting-base, delta-tail, and centroid-directory
-  structs instead of segment byte layout. A compact durable manifest codec
+  footer validation, segment-level checksum validation, segment metadata,
+  ordered delta iteration, and a borrowed catalog that can pick the newest
+  point record while merging deltas across segment blobs. The catalog now has a
+  typed snapshot facade that decodes those segment values through the existing
+  logical posting codecs, so future runtime read paths can depend on
+  posting-base, delta-tail, and centroid-directory structs instead of segment
+  byte layout. A compact durable manifest codec
   records segment ids, paths, and posting/delta range metadata for reopen, and
   an owned segment-store opener can rebuild a snapshot from manifest bytes plus
   caller-provided segment reads while validating each segment's actual metadata
