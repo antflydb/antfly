@@ -224,6 +224,19 @@ pub const DirectoryCopyStats = struct {
     entries: usize = 0,
 };
 
+pub const DirectoryManifestStats = struct {
+    segments: usize = 0,
+    bytes: usize = 0,
+    entries: usize = 0,
+    min_segment_id: u64 = 0,
+    max_segment_id: u64 = 0,
+    next_segment_id: u64 = 0,
+    min_posting_id: PostingId = 0,
+    max_posting_id: PostingId = 0,
+    min_delta_sequence: u64 = 0,
+    max_delta_sequence: u64 = 0,
+};
+
 pub const DirectoryCompactionPlanOptions = struct {
     min_input_segments: usize = 2,
     max_input_segments: usize = 0,
@@ -688,6 +701,49 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
         .encoded = encoded,
         .stats = stats,
     };
+}
+
+pub fn summarizeManifest(manifest: Manifest) !DirectoryManifestStats {
+    try validateManifest(manifest);
+    var stats = DirectoryManifestStats{
+        .segments = manifest.segments.len,
+        .next_segment_id = manifest.next_segment_id,
+    };
+    var saw_segment = false;
+    for (manifest.segments) |entry| {
+        stats.bytes = std.math.add(usize, stats.bytes, entry.meta.byte_len) catch return error.PostingSegmentTooLarge;
+        stats.entries = std.math.add(usize, stats.entries, entry.meta.entry_count) catch return error.PostingSegmentTooLarge;
+        if (!saw_segment) {
+            saw_segment = true;
+            stats.min_segment_id = entry.meta.segment_id;
+            stats.max_segment_id = entry.meta.segment_id;
+            stats.min_posting_id = entry.meta.min_posting_id;
+            stats.max_posting_id = entry.meta.max_posting_id;
+        } else {
+            stats.min_segment_id = @min(stats.min_segment_id, entry.meta.segment_id);
+            stats.max_segment_id = @max(stats.max_segment_id, entry.meta.segment_id);
+            stats.min_posting_id = @min(stats.min_posting_id, entry.meta.min_posting_id);
+            stats.max_posting_id = @max(stats.max_posting_id, entry.meta.max_posting_id);
+        }
+        if (entry.meta.min_delta_sequence != 0) {
+            if (stats.min_delta_sequence == 0 or entry.meta.min_delta_sequence < stats.min_delta_sequence) {
+                stats.min_delta_sequence = entry.meta.min_delta_sequence;
+            }
+            stats.max_delta_sequence = @max(stats.max_delta_sequence, entry.meta.max_delta_sequence);
+        }
+    }
+    return stats;
+}
+
+pub fn summarizeDirectoryManifestAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryManifestStats {
+    var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, options);
+    defer manifest.deinit(alloc);
+    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
+    defer alloc.free(entries);
+    return try summarizeManifest(.{
+        .next_segment_id = manifest.next_segment_id,
+        .segments = entries,
+    });
 }
 
 pub fn planDirectoryCompactionAlloc(alloc: Allocator, manifest: Manifest, options: DirectoryCompactionPlanOptions) !DirectoryCompactionPlan {
@@ -2451,6 +2507,69 @@ pub fn testDirectoryCompactionPlannerSelectsWithinBudgets() !void {
     try std.testing.expect(too_small.stats.insufficient_segments);
 }
 
+pub fn testManifestSummaryAggregatesMetadataWithoutSegmentReads() !void {
+    const entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 10,
+                .max_posting_id = 20,
+                .min_delta_sequence = 30,
+                .max_delta_sequence = 40,
+                .byte_len = 100,
+                .entry_count = 2,
+            },
+            .path = "postings/0000000000000001.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 3,
+                .min_posting_id = 5,
+                .max_posting_id = 25,
+                .byte_len = 250,
+                .entry_count = 4,
+            },
+            .path = "postings/0000000000000003.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 5,
+                .min_posting_id = 30,
+                .max_posting_id = 35,
+                .min_delta_sequence = 20,
+                .max_delta_sequence = 80,
+                .byte_len = 150,
+                .entry_count = 3,
+            },
+            .path = "postings/0000000000000005.afps",
+        },
+    };
+
+    const stats = try summarizeManifest(.{
+        .next_segment_id = 6,
+        .segments = entries[0..],
+    });
+    try std.testing.expectEqual(@as(usize, 3), stats.segments);
+    try std.testing.expectEqual(@as(usize, 500), stats.bytes);
+    try std.testing.expectEqual(@as(usize, 9), stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.min_segment_id);
+    try std.testing.expectEqual(@as(u64, 5), stats.max_segment_id);
+    try std.testing.expectEqual(@as(u64, 6), stats.next_segment_id);
+    try std.testing.expectEqual(@as(PostingId, 5), stats.min_posting_id);
+    try std.testing.expectEqual(@as(PostingId, 35), stats.max_posting_id);
+    try std.testing.expectEqual(@as(u64, 20), stats.min_delta_sequence);
+    try std.testing.expectEqual(@as(u64, 80), stats.max_delta_sequence);
+
+    const empty_segments: [0]ManifestEntry = .{};
+    const empty = try summarizeManifest(.{
+        .next_segment_id = 10,
+        .segments = empty_segments[0..],
+    });
+    try std.testing.expectEqual(@as(usize, 0), empty.segments);
+    try std.testing.expectEqual(@as(u64, 10), empty.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 0), empty.bytes);
+}
+
 const TestSegmentFile = struct {
     path: []const u8,
     data: []const u8,
@@ -2878,6 +2997,50 @@ pub fn testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction() !void {
     defer store.deinit(alloc);
     try std.testing.expectEqual(committed_3.entry.meta.segment_id, store.segments[0].meta.segment_id);
     try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[1].meta.segment_id);
+}
+
+pub fn testDirectoryManifestSummaryReadsOnlyManifest() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    const stats = try summarizeDirectoryManifestAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectEqual(@as(usize, 2), stats.segments);
+    try std.testing.expectEqual(committed_1.entry.meta.byte_len + committed_2.entry.meta.byte_len, stats.bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.min_segment_id);
+    try std.testing.expectEqual(@as(u64, 2), stats.max_segment_id);
+    try std.testing.expectEqual(@as(u64, 3), stats.next_segment_id);
+    try std.testing.expectEqual(@as(PostingId, 7), stats.min_posting_id);
+    try std.testing.expectEqual(@as(PostingId, 7), stats.max_posting_id);
+    try std.testing.expectEqual(delta_sequence, stats.min_delta_sequence);
+    try std.testing.expectEqual(delta_sequence, stats.max_delta_sequence);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_2.entry.path,
+        .data = "not a segment",
+    });
+    _ = try summarizeDirectoryManifestAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectError(error.CorruptedPostingSegment, verifyDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{}));
 }
 
 pub fn testDirectorySelectedCompactionDoesNotReadUnselectedSegments() !void {
@@ -3420,6 +3583,10 @@ test "posting segment directory compaction planner selects within budgets" {
     try testDirectoryCompactionPlannerSelectsWithinBudgets();
 }
 
+test "posting segment manifest summary aggregates metadata without segment reads" {
+    try testManifestSummaryAggregatesMetadataWithoutSegmentReads();
+}
+
 test "posting segment store validates manifest backed segments" {
     try testOpenStoreValidatesManifestBackedSegments();
 }
@@ -3446,6 +3613,10 @@ test "posting segment directory compaction can replace selected segments" {
 
 test "posting segment directory compaction plan from directory feeds selected compaction" {
     try testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction();
+}
+
+test "posting segment directory manifest summary reads only manifest" {
+    try testDirectoryManifestSummaryReadsOnlyManifest();
 }
 
 test "posting segment directory selected compaction does not read unselected segments" {

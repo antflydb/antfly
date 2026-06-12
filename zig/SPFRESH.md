@@ -142,13 +142,14 @@ Current status:
   directory compaction can now write a compacted replacement segment first and
   atomically swap the manifest to remove compacted-away segment ids, either for
   the whole manifest or for an explicit selected segment-id set. That gives
-  future maintenance a bounded compaction primitive: a manifest-only planner
-  can choose oldest segment ids under segment-count and input-byte caps before
-  any segment file is opened, then selected compaction can preserve unselected
-  manifest segments while replacing only the scheduled compaction inputs. The
-  selected path rejects duplicate selected segment ids before segment IO and
-  reads and validates only the selected segment files, not every segment
-  referenced by the manifest. Old segment files are left as
+  future maintenance a bounded compaction primitive: manifest-only summary and
+  planning helpers can report segment/byte/entry/posting/delta ranges and choose
+  oldest segment ids under segment-count and input-byte caps before any segment
+  file is opened, then selected compaction can preserve unselected manifest
+  segments while replacing only the scheduled compaction inputs. The selected
+  path rejects duplicate selected segment ids before segment IO and reads and
+  validates only the selected segment files, not every segment referenced by the
+  manifest. Old segment files are left as
   unreferenced orphans. A manifest-aware
   directory GC pass can then scan the `postings/` directory and delete only
   canonical `.afps` segment files that are absent from the current manifest,
