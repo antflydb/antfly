@@ -6038,6 +6038,18 @@ pub const DB = struct {
         return try self.core.index_manager.recoverDensePostingSegmentBackends();
     }
 
+    pub fn exportDensePostingSegmentArtifactsToDirectory(self: *DB, destination_path: []const u8) !index_manager_mod.IndexManager.DensePostingSegmentArtifactTransferStats {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.exportDensePostingSegmentArtifactsToDirectory(destination_path);
+    }
+
+    pub fn importDensePostingSegmentArtifactsFromDirectory(self: *DB, source_path: []const u8) !index_manager_mod.IndexManager.DensePostingSegmentArtifactTransferStats {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.index_manager.importDensePostingSegmentArtifactsFromDirectory(source_path);
+    }
+
     fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
         var repaired = false;
         while (try self.restoreRuntimeRepairNeeded()) {
@@ -49819,6 +49831,9 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
+    var export_buf: [256]u8 = undefined;
+    const export_path = tempPath(&export_buf);
+    defer cleanupTempDir(export_path);
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     const dense_config =
@@ -49861,6 +49876,20 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
         defer before.deinit();
         try std.testing.expectEqual(@as(u32, 1), before.total_hits);
         try std.testing.expectEqualStrings("doc:b", before.hits[0].id);
+
+        const exported = try db.exportDensePostingSegmentArtifactsToDirectory(std.mem.span(export_path));
+        try std.testing.expectEqual(@as(usize, 1), exported.scanned_indexes);
+        try std.testing.expectEqual(@as(usize, 1), exported.transferred_indexes);
+        try std.testing.expect(exported.segment_files > 0);
+        try std.testing.expect(exported.segment_bytes > 0);
+    }
+
+    {
+        const postings_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_segments/{s}", .{ std.mem.span(path), vectorindex_mod.posting_segment.segment_directory });
+        defer alloc.free(postings_path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().deleteTree(io_impl.io(), postings_path);
     }
 
     const orphan_segment_rel = try vectorindex_mod.posting_segment.segmentPathAlloc(alloc, 0xfeed);
@@ -49869,13 +49898,6 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
     defer alloc.free(orphan_segment_abs);
     const orphan_temp_abs = try std.fmt.allocPrint(alloc, "{s}.tmp", .{orphan_segment_abs});
     defer alloc.free(orphan_temp_abs);
-    {
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_segment_abs, .data = "orphan" });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_temp_abs, .data = "temp" });
-    }
     try DB.markRestorePrimaryRestoredForPath(
         alloc,
         std.mem.span(path),
@@ -49891,6 +49913,18 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
     defer reopened.close();
     const reopened_entry = reopened.core.index_manager.denseIndex("dv_segments") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 2), reopened_entry.index.stats().active_count);
+    const imported = try reopened.importDensePostingSegmentArtifactsFromDirectory(std.mem.span(export_path));
+    try std.testing.expectEqual(@as(usize, 1), imported.scanned_indexes);
+    try std.testing.expectEqual(@as(usize, 1), imported.transferred_indexes);
+    try std.testing.expect(imported.segment_files > 0);
+    try std.testing.expect(imported.segment_bytes > 0);
+    {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_segment_abs, .data = "orphan" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_temp_abs, .data = "temp" });
+    }
     try std.testing.expect(try reopened.restoreRuntimeRepairNeeded());
     try std.testing.expect(try reopened.repairRestoreRuntimeStateStepIfNeeded(alloc));
     {

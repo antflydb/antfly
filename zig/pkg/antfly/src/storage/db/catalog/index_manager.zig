@@ -2490,6 +2490,24 @@ pub const IndexManager = struct {
         deleted_temp_files: usize = 0,
     };
 
+    pub const DensePostingSegmentArtifactTransferStats = struct {
+        scanned_indexes: usize = 0,
+        transferred_indexes: usize = 0,
+        manifest_segments: usize = 0,
+        manifest_bytes: usize = 0,
+        segment_files: usize = 0,
+        segment_bytes: usize = 0,
+
+        fn addCopyStats(self: *@This(), stats: anytype) void {
+            if (stats.manifest_bytes == 0 and stats.segment_files == 0) return;
+            self.transferred_indexes += 1;
+            self.manifest_segments = @max(self.manifest_segments, stats.manifest_segments);
+            self.manifest_bytes += stats.manifest_bytes;
+            self.segment_files += stats.segment_files;
+            self.segment_bytes += stats.segment_bytes;
+        }
+    };
+
     // Node budget per tree-link repair sweep run from the dense maintenance
     // lane. Repairs persist as the sweep goes, so an exhausted budget simply
     // resumes on the next maintenance pass.
@@ -2576,6 +2594,36 @@ pub const IndexManager = struct {
             stats.manifest_segments = @max(stats.manifest_segments, @as(usize, @intCast(recovered.manifest_segments)));
             stats.deleted_orphan_segment_files += @intCast(recovered.deleted_orphan_segment_files);
             stats.deleted_temp_files += @intCast(recovered.deleted_temp_files);
+        }
+        return stats;
+    }
+
+    fn densePostingSegmentArtifactPathAlloc(self: *IndexManager, root_path: []const u8, index_name: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(self.alloc, "{s}/dense-posting-segments/{s}", .{ root_path, index_name });
+    }
+
+    pub fn exportDensePostingSegmentArtifactsToDirectory(self: *IndexManager, root_path: []const u8) !DensePostingSegmentArtifactTransferStats {
+        var stats = DensePostingSegmentArtifactTransferStats{};
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.config.posting_backend != .segments) continue;
+            stats.scanned_indexes += 1;
+            const destination_path = try self.densePostingSegmentArtifactPathAlloc(root_path, entry.config.name);
+            defer self.alloc.free(destination_path);
+            const copied = try entry.index.exportPostingSegmentBackendToDirectory(destination_path);
+            stats.addCopyStats(copied);
+        }
+        return stats;
+    }
+
+    pub fn importDensePostingSegmentArtifactsFromDirectory(self: *IndexManager, root_path: []const u8) !DensePostingSegmentArtifactTransferStats {
+        var stats = DensePostingSegmentArtifactTransferStats{};
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.config.posting_backend != .segments) continue;
+            stats.scanned_indexes += 1;
+            const source_path = try self.densePostingSegmentArtifactPathAlloc(root_path, entry.config.name);
+            defer self.alloc.free(source_path);
+            const copied = try entry.index.importPostingSegmentBackendFromDirectory(source_path);
+            stats.addCopyStats(copied);
         }
         return stats;
     }

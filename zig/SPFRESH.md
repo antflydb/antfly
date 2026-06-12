@@ -873,12 +873,14 @@ implementations cleanly:
     runtimes normalize physical segment artifacts against the committed
     manifest before completing repair. Public dense config also accepts the
     opt-in `backend = segments, format = base_delta, version = 1` combination
-    while leaving the default on `lsm + packed_hbc + v1`. The remaining
-    promotion work is operational backup/import coverage for workflows that
-    preserve private HBC index stores: those flows must carry the committed
-    manifest's referenced segment files and invoke the existing HBC
-    export/import primitives. That may reduce LSM key overhead and improve
-    sequential IO.
+    while leaving the default on `lsm + packed_hbc + v1`. DB and IndexManager
+    now expose aggregate dense posting segment artifact export/import hooks
+    that copy every segment-backed dense index into a deterministic
+    `dense-posting-segments/<index>` bundle and restore it by validating the
+    source manifest against each restored HBC metadata marker. The remaining
+    promotion work is wiring external backup/import orchestration to call those
+    hooks whenever it preserves private HBC index stores. That may reduce LSM
+    key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
