@@ -145,6 +145,31 @@ pub const ManifestReplacementResult = struct {
     }
 };
 
+pub const SegmentCommitStats = struct {
+    input_segments: usize = 0,
+    output_segments: usize = 0,
+    segment_id: u64 = 0,
+    next_segment_id: u64 = 0,
+    segment_bytes: usize = 0,
+    manifest_bytes: usize = 0,
+};
+
+pub const SegmentCommitResult = struct {
+    entry: OwnedManifestEntry,
+    stats: SegmentCommitStats,
+
+    pub fn deinit(self: *SegmentCommitResult, alloc: Allocator) void {
+        alloc.free(self.entry.path);
+        self.* = .{
+            .entry = .{
+                .meta = .{ .segment_id = 0 },
+                .path = &.{},
+            },
+            .stats = .{},
+        };
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -207,6 +232,13 @@ pub const OpenStoreOptions = struct {
     manifest_path: []const u8 = default_manifest_path,
     max_manifest_bytes: usize = 64 * 1024 * 1024,
     max_segment_bytes: usize = 1024 * 1024 * 1024,
+};
+
+pub const CommitOptions = struct {
+    manifest_path: []const u8 = default_manifest_path,
+    max_manifest_bytes: usize = 64 * 1024 * 1024,
+    max_segment_bytes: usize = 1024 * 1024 * 1024,
+    initial_segment_id: u64 = 1,
 };
 
 pub const Catalog = struct {
@@ -507,6 +539,22 @@ pub fn openStoreFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir
     };
 }
 
+pub fn commitWriterToDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, writer: *Writer, options: CommitOptions) !SegmentCommitResult {
+    var manifest = try readManifestForCommitAlloc(alloc, io, dir, options);
+    defer manifest.deinit(alloc);
+
+    var built = try writer.buildSegment(manifest.next_segment_id);
+    defer built.deinit(alloc);
+    return try commitBuiltSegmentToDirectoryWithManifestAlloc(alloc, io, dir, built, manifest, options);
+}
+
+pub fn commitBuiltSegmentToDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment, options: CommitOptions) !SegmentCommitResult {
+    var manifest = try readManifestForCommitAlloc(alloc, io, dir, options);
+    defer manifest.deinit(alloc);
+    if (segment.meta.segment_id != manifest.next_segment_id) return error.InvalidPostingSegmentManifest;
+    return try commitBuiltSegmentToDirectoryWithManifestAlloc(alloc, io, dir, segment, manifest, options);
+}
+
 pub fn writeSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, segment: BuiltSegment) !OwnedManifestEntry {
     const path = try segmentPathAlloc(alloc, segment.meta.segment_id);
     errdefer alloc.free(path);
@@ -528,6 +576,73 @@ pub fn readSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
     if (data.len > max_bytes) return error.PostingSegmentTooLarge;
     _ = try Reader.init(data);
     return data;
+}
+
+fn commitBuiltSegmentToDirectoryWithManifestAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    segment: BuiltSegment,
+    manifest: OwnedManifest,
+    options: CommitOptions,
+) !SegmentCommitResult {
+    if (segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+
+    const existing_entries = try manifestEntryViewAlloc(alloc, manifest.segments);
+    defer alloc.free(existing_entries);
+
+    const written = try writeSegmentFileAlloc(alloc, io, dir, segment);
+    errdefer alloc.free(written.path);
+    const new_entry = ManifestEntry{
+        .meta = written.meta,
+        .path = written.path,
+    };
+
+    var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = manifest.next_segment_id,
+        .segments = existing_entries,
+    }, &.{}, &.{new_entry});
+    defer replacement.deinit(alloc);
+
+    try writeManifestFileAlloc(alloc, io, dir, options.manifest_path, replacement.encoded);
+    return .{
+        .entry = written,
+        .stats = .{
+            .input_segments = manifest.segments.len,
+            .output_segments = replacement.stats.output_segments,
+            .segment_id = written.meta.segment_id,
+            .next_segment_id = replacement.stats.next_segment_id,
+            .segment_bytes = written.meta.byte_len,
+            .manifest_bytes = replacement.encoded.len,
+        },
+    };
+}
+
+fn readManifestForCommitAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: CommitOptions) !OwnedManifest {
+    const manifest_data = dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return emptyManifestAlloc(alloc, options.initial_segment_id),
+        else => return err,
+    };
+    defer alloc.free(manifest_data);
+    return try decodeManifestAlloc(alloc, manifest_data);
+}
+
+fn emptyManifestAlloc(alloc: Allocator, next_segment_id: u64) !OwnedManifest {
+    return .{
+        .next_segment_id = next_segment_id,
+        .segments = try alloc.alloc(OwnedManifestEntry, 0),
+    };
+}
+
+fn manifestEntryViewAlloc(alloc: Allocator, entries: []const OwnedManifestEntry) ![]ManifestEntry {
+    const view = try alloc.alloc(ManifestEntry, entries.len);
+    for (entries, 0..) |entry, i| {
+        view[i] = .{
+            .meta = entry.meta,
+            .path = entry.path,
+        };
+    }
+    return view;
 }
 
 pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
@@ -1877,6 +1992,64 @@ pub fn testDirectoryStoreRoundTripsSegmentFiles() !void {
     try std.testing.expectError(error.CorruptedPostingSegment, openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{}));
 }
 
+pub fn testDirectoryCommitAppendsManifestSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_7 = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base_7);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base_7);
+
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), committed_1.entry.meta.segment_id);
+    try std.testing.expectEqual(@as(u64, 2), committed_1.stats.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 0), committed_1.stats.input_segments);
+    try std.testing.expectEqual(@as(usize, 1), committed_1.stats.output_segments);
+
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    const delta_7 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    defer alloc.free(delta_7);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendDelta(7, delta_sequence, delta_7);
+
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), committed_2.entry.meta.segment_id);
+    try std.testing.expectEqual(@as(u64, 3), committed_2.stats.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), committed_2.stats.input_segments);
+    try std.testing.expectEqual(@as(usize, 2), committed_2.stats.output_segments);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), store.manifest.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 2), store.segments.len);
+    try std.testing.expectEqual(@as(u64, 1), store.segments[0].meta.segment_id);
+    try std.testing.expectEqual(@as(u64, 2), store.segments[1].meta.segment_id);
+
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 1), header.generation);
+    try std.testing.expectEqual(@as(usize, 2), header.member_count);
+    const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(delta_sequence, records[0].sequence);
+    try std.testing.expectEqual(@as(posting.VectorId, 30), records[0].vector_id);
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2037,6 +2210,10 @@ test "posting segment build produces manifest ready metadata" {
 
 test "posting segment directory store round trips segment files" {
     try testDirectoryStoreRoundTripsSegmentFiles();
+}
+
+test "posting segment directory commit appends manifest segments" {
+    try testDirectoryCommitAppendsManifestSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {

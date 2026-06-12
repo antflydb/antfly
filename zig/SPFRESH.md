@@ -136,7 +136,10 @@ Current status:
   caller-provided segment reads while validating each segment's actual metadata
   against the manifest. Directory helpers can write segment and manifest files
   through temporary files plus rename, then reopen and validate the store from a
-  manifest path. Segment writers can also produce a manifest-ready built
+  manifest path. Segment writers can also commit directly to a directory by
+  reading the current manifest, assigning `next_segment_id`, writing the segment
+  file, and publishing the updated manifest with an atomic rename. Segment
+  writers can also produce a manifest-ready built
   segment with validated metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is

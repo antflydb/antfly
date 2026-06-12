@@ -94,8 +94,13 @@ pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
 pub const OwnedPostingSegmentManifest = posting_segment.OwnedManifest;
 pub const PostingSegmentManifestReplacementStats = posting_segment.ManifestReplacementStats;
 pub const PostingSegmentManifestReplacementResult = posting_segment.ManifestReplacementResult;
+pub const PostingSegmentCommitOptions = posting_segment.CommitOptions;
+pub const PostingSegmentCommitStats = posting_segment.SegmentCommitStats;
+pub const PostingSegmentCommitResult = posting_segment.SegmentCommitResult;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
+pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWriterToDirectoryAlloc;
+pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuiltSegmentToDirectoryAlloc;
 pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
@@ -194,6 +199,10 @@ test "posting segment build produces manifest ready metadata" {
 
 test "posting segment directory store round trips segment files" {
     try posting_segment.testDirectoryStoreRoundTripsSegmentFiles();
+}
+
+test "posting segment directory commit appends manifest segments" {
+    try posting_segment.testDirectoryCommitAppendsManifestSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {
