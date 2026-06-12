@@ -176,7 +176,10 @@ Current status:
   with validated metadata and a stable segment path. Segment manifests now
   persist trusted index offsets and checksums, and lazy segment snapshots use
   verified range reads for base, centroid, and delta-tail records instead of
-  loading the full segment file for matching postings. A bounded segment
+  loading the full segment file for matching postings. Lazy member
+  materialization now scans each candidate segment index once, reusing those
+  verified index bytes to find the latest base and relevant delta values before
+  reading value ranges. A bounded segment
   directory batch writer can accumulate posting-local records under entry/byte
   caps and flush them through the existing atomic segment+manifest commit path,
   including coalescing individual posting delta records into one encoded
