@@ -1708,12 +1708,22 @@ pub const PostingStore = struct {
         if (!node.is_leaf) return error.ExpectedLeaf;
         if (vector_ids.len == 0 or node.members.len == 0) return 0;
 
+        var removed_set = if (shouldHashRemovedMembers(node.members.len, vector_ids.len)) blk: {
+            var set = std.AutoHashMapUnmanaged(VectorId, void).empty;
+            errdefer set.deinit(alloc);
+            try set.ensureTotalCapacity(alloc, @intCast(vector_ids.len));
+            for (vector_ids) |vector_id| try set.put(alloc, vector_id, {});
+            break :blk set;
+        } else null;
+        defer if (removed_set) |*set| set.deinit(alloc);
+
         var kept = try alloc.alloc(u64, node.members.len);
         errdefer alloc.free(kept);
         var kept_count: usize = 0;
         var removed_count: usize = 0;
         for (node.members) |member_id| {
-            if (containsMember(vector_ids, member_id)) {
+            const should_remove = if (removed_set) |*set| set.contains(member_id) else containsMember(vector_ids, member_id);
+            if (should_remove) {
                 removed_count += 1;
             } else {
                 kept[kept_count] = member_id;
@@ -2918,6 +2928,10 @@ fn containsMember(members: []const VectorId, vector_id: VectorId) bool {
     return indexOfMember(members, vector_id) != null;
 }
 
+fn shouldHashRemovedMembers(member_count: usize, removed_count: usize) bool {
+    return member_count >= 32 and removed_count >= 8;
+}
+
 fn indexHasExternalVectorLoader(index: anytype) bool {
     const Index = switch (@typeInfo(@TypeOf(index))) {
         .pointer => |ptr| ptr.child,
@@ -3618,6 +3632,32 @@ test "posting store appends and removes members" {
     const removed = try PostingStore.removeMembers(alloc, &node, &[_]u64{ 1, 9 });
     try std.testing.expectEqual(@as(usize, 1), removed);
     try std.testing.expectEqualSlices(u64, &[_]u64{3}, node.members);
+}
+
+test "posting store hashes large member removals while preserving order" {
+    const alloc = std.testing.allocator;
+    const members = try alloc.alloc(u64, 40);
+    for (members, 0..) |*member, i| member.* = @intCast(i + 1);
+    var node = types.Node{
+        .id = 7,
+        .is_leaf = true,
+        .level = 1,
+        .parent = 3,
+        .centroid = &.{},
+        .children = &.{},
+        .members = members,
+    };
+    defer node.deinit(alloc);
+
+    const removed = try PostingStore.removeMembers(alloc, &node, &[_]u64{ 2, 4, 6, 8, 10, 12, 14, 16, 16, 999 });
+    try std.testing.expectEqual(@as(usize, 8), removed);
+    try std.testing.expectEqual(@as(usize, 32), node.members.len);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 3, 5, 7, 9 }, node.members[0..5]);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 34, 35, 36, 37, 38, 39, 40 }, node.members[node.members.len - 7 ..]);
+
+    const no_match = try PostingStore.removeMembers(alloc, &node, &[_]u64{ 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007 });
+    try std.testing.expectEqual(@as(usize, 0), no_match);
+    try std.testing.expectEqual(@as(usize, 32), node.members.len);
 }
 
 test "posting state tracks dirty versions" {

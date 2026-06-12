@@ -91,6 +91,10 @@ Current status:
   scratch retention now also releases query, distance, member-id, vector-batch,
   and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,
   then regrows them through the existing `ensure*Capacity` paths.
+- Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
+  repeated linear membership checks to a temporary removal set for larger
+  postings/delete lists, preserving member order while avoiding quadratic CPU
+  in churn-heavy maintenance paths.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
