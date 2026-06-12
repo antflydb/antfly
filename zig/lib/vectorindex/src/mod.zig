@@ -78,6 +78,9 @@ pub const PostingFormat = posting.PostingFormat;
 pub const PostingSegmentWriter = posting_segment.Writer;
 pub const PostingSegmentReader = posting_segment.Reader;
 pub const PostingSegmentEntryKind = posting_segment.EntryKind;
+pub const PostingSegmentMeta = posting_segment.SegmentMeta;
+pub const PostingSegmentBlob = posting_segment.SegmentBlob;
+pub const PostingSegmentCatalog = posting_segment.Catalog;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
 pub const OwnedCentroidDirectoryRecord = posting.OwnedCentroidDirectoryRecord;
 pub const CentroidDirectoryFormat = posting.CentroidDirectoryFormat;
@@ -134,4 +137,8 @@ test "posting segment rejects duplicate logical entries" {
 
 test "posting segment validates footer and version" {
     try posting_segment.testValidatesFooterAndVersion();
+}
+
+test "posting segment catalog looks up newest point records and merged deltas" {
+    try posting_segment.testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
 }

@@ -43,6 +43,72 @@ pub const DeltaValue = struct {
     value: []const u8,
 };
 
+pub const SegmentMeta = struct {
+    segment_id: u64,
+    min_posting_id: PostingId = 0,
+    max_posting_id: PostingId = 0,
+    min_delta_sequence: u64 = 0,
+    max_delta_sequence: u64 = 0,
+    byte_len: usize = 0,
+    entry_count: usize = 0,
+
+    pub fn mayContainPosting(self: SegmentMeta, posting_id: PostingId) bool {
+        return self.entry_count != 0 and posting_id >= self.min_posting_id and posting_id <= self.max_posting_id;
+    }
+};
+
+pub const SegmentBlob = struct {
+    meta: SegmentMeta,
+    data: []const u8,
+};
+
+pub const Catalog = struct {
+    segments: []const SegmentBlob,
+
+    pub fn getBase(self: Catalog, posting_id: PostingId) !?[]const u8 {
+        return try self.getLatestExact(posting_id, .base);
+    }
+
+    pub fn getCentroidDirectory(self: Catalog, posting_id: PostingId) !?[]const u8 {
+        return try self.getLatestExact(posting_id, .centroid_directory);
+    }
+
+    pub fn collectDeltas(self: Catalog, alloc: Allocator, posting_id: PostingId) ![]DeltaValue {
+        var deltas = std.ArrayListUnmanaged(DeltaValue).empty;
+        errdefer deltas.deinit(alloc);
+        for (self.segments) |segment| {
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            var reader = try Reader.init(segment.data);
+            var iter = reader.deltas(posting_id);
+            while (try iter.next()) |delta| {
+                try deltas.append(alloc, delta);
+            }
+        }
+        std.mem.sort(DeltaValue, deltas.items, {}, deltaValueLessThan);
+        return try deltas.toOwnedSlice(alloc);
+    }
+
+    fn getLatestExact(self: Catalog, posting_id: PostingId, kind: EntryKind) !?[]const u8 {
+        var best_segment_id: u64 = 0;
+        var best: ?[]const u8 = null;
+        for (self.segments) |segment| {
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (best != null and segment.meta.segment_id <= best_segment_id) continue;
+            var reader = try Reader.init(segment.data);
+            const value = switch (kind) {
+                .base => try reader.getBase(posting_id),
+                .centroid_directory => try reader.getCentroidDirectory(posting_id),
+                .delta => null,
+            };
+            if (value) |found| {
+                best_segment_id = segment.meta.segment_id;
+                best = found;
+            }
+        }
+        return best;
+    }
+};
+
 const PendingEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
@@ -189,6 +255,34 @@ pub const Reader = struct {
         };
     }
 
+    pub fn metadata(self: Reader, segment_id: u64) !SegmentMeta {
+        var meta = SegmentMeta{
+            .segment_id = segment_id,
+            .byte_len = self.data.len,
+            .entry_count = self.entry_count,
+        };
+        if (self.entry_count == 0) return meta;
+
+        var i: usize = 0;
+        while (i < self.entry_count) : (i += 1) {
+            const entry = try self.indexEntry(i);
+            if (i == 0) {
+                meta.min_posting_id = entry.posting_id;
+                meta.max_posting_id = entry.posting_id;
+            } else {
+                meta.min_posting_id = @min(meta.min_posting_id, entry.posting_id);
+                meta.max_posting_id = @max(meta.max_posting_id, entry.posting_id);
+            }
+            if (entry.kind == .delta) {
+                if (meta.min_delta_sequence == 0 or entry.sequence < meta.min_delta_sequence) {
+                    meta.min_delta_sequence = entry.sequence;
+                }
+                meta.max_delta_sequence = @max(meta.max_delta_sequence, entry.sequence);
+            }
+        }
+        return meta;
+    }
+
     fn getExact(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) !?[]const u8 {
         const index = self.lowerBound(posting_id, kind, sequence);
         if (index >= self.entry_count) return null;
@@ -276,6 +370,10 @@ fn rejectDuplicateEntries(entries: []const PendingEntry) !void {
 
 fn pendingEntryLessThan(_: void, lhs: PendingEntry, rhs: PendingEntry) bool {
     return compareEntryKey(lhs.posting_id, lhs.kind, lhs.sequence, rhs.posting_id, rhs.kind, rhs.sequence) == .lt;
+}
+
+fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
+    return lhs.sequence < rhs.sequence;
 }
 
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
@@ -391,6 +489,70 @@ pub fn testValidatesFooterAndVersion() !void {
     try std.testing.expectError(error.UnsupportedPostingSegmentVersion, Reader.init(bad_version));
 }
 
+pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
+    const alloc = std.testing.allocator;
+    const old_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(old_base);
+    const new_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(new_base);
+    const delta_10 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = 10, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta_10);
+    const delta_8 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = 8, .op = .tombstone, .vector_id = 20 },
+    });
+    defer alloc.free(delta_8);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, old_base);
+    try writer_1.appendDelta(7, 10, delta_10);
+    const segment_1 = try writer_1.build();
+    defer alloc.free(segment_1);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(7, new_base);
+    try writer_2.appendDelta(7, 8, delta_8);
+    const segment_2 = try writer_2.build();
+    defer alloc.free(segment_2);
+
+    const reader_1 = try Reader.init(segment_1);
+    const reader_2 = try Reader.init(segment_2);
+    const meta_1 = try reader_1.metadata(1);
+    const meta_2 = try reader_2.metadata(2);
+    try std.testing.expect(meta_1.mayContainPosting(7));
+    try std.testing.expectEqual(@as(usize, 2), meta_1.entry_count);
+    try std.testing.expectEqual(@as(u64, 10), meta_1.min_delta_sequence);
+    try std.testing.expectEqual(@as(u64, 10), meta_1.max_delta_sequence);
+    try std.testing.expectEqual(segment_1.len, meta_1.byte_len);
+
+    const blobs = [_]SegmentBlob{
+        .{ .meta = meta_1, .data = segment_1 },
+        .{ .meta = meta_2, .data = segment_2 },
+    };
+    const catalog = Catalog{ .segments = blobs[0..] };
+    try std.testing.expectEqualSlices(u8, new_base, (try catalog.getBase(7)).?);
+    try std.testing.expect(try catalog.getBase(8) == null);
+
+    const deltas = try catalog.collectDeltas(alloc, 7);
+    defer alloc.free(deltas);
+    try std.testing.expectEqual(@as(usize, 2), deltas.len);
+    try std.testing.expectEqual(@as(u64, 8), deltas[0].sequence);
+    try std.testing.expectEqualSlices(u8, delta_8, deltas[0].value);
+    try std.testing.expectEqual(@as(u64, 10), deltas[1].sequence);
+    try std.testing.expectEqualSlices(u8, delta_10, deltas[1].value);
+}
+
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresBaseCentroidAndOrderedDeltaValues();
 }
@@ -401,4 +563,8 @@ test "posting segment rejects duplicate logical entries" {
 
 test "posting segment validates footer and version" {
     try testValidatesFooterAndVersion();
+}
+
+test "posting segment catalog looks up newest point records and merged deltas" {
+    try testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
 }

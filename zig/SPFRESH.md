@@ -113,9 +113,11 @@ Current status:
 - The first dedicated posting segment container now exists in
   `posting_segment.zig`. It stores existing v1 posting-base, posting-delta, and
   centroid-directory values in one immutable posting-local indexed blob with
-  footer validation and ordered delta iteration. Runtime reads/writes still use
-  the LSM-backed namespace; this segment container is the file-format substrate
-  for a future `backend = segments, format = base_delta, version = 1` mode.
+  footer validation, segment metadata, ordered delta iteration, and a borrowed
+  catalog that can pick the newest point record while merging deltas across
+  segment blobs. Runtime reads/writes still use the LSM-backed namespace; this
+  segment container/catalog is the file-format substrate for a future
+  `backend = segments, format = base_delta, version = 1` mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
