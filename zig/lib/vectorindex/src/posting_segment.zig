@@ -162,19 +162,30 @@ pub const Catalog = struct {
     }
 
     pub fn collectDeltas(self: Catalog, alloc: Allocator, posting_id: PostingId) ![]DeltaValue {
-        return try self.collectDeltasAfterSequence(alloc, posting_id, 0);
-    }
-
-    pub fn collectDeltasAfterSequence(self: Catalog, alloc: Allocator, posting_id: PostingId, min_sequence_exclusive: u64) ![]DeltaValue {
         var deltas = std.ArrayListUnmanaged(DeltaValue).empty;
         errdefer deltas.deinit(alloc);
         for (self.segments) |segment| {
             if (!segment.meta.mayContainPosting(posting_id)) continue;
-            if (segment.meta.max_delta_sequence != 0 and segment.meta.max_delta_sequence <= min_sequence_exclusive) continue;
             var reader = try Reader.init(segment.data);
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta| {
-                if (delta.sequence <= min_sequence_exclusive) continue;
+                try deltas.append(alloc, delta);
+            }
+        }
+        std.mem.sort(DeltaValue, deltas.items, {}, deltaValueLessThan);
+        return try deltas.toOwnedSlice(alloc);
+    }
+
+    pub fn collectDeltasAfterGeneration(self: Catalog, alloc: Allocator, posting_id: PostingId, base_generation: u64) ![]DeltaValue {
+        var deltas = std.ArrayListUnmanaged(DeltaValue).empty;
+        errdefer deltas.deinit(alloc);
+        for (self.segments) |segment| {
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= base_generation) continue;
+            var reader = try Reader.init(segment.data);
+            var iter = reader.deltas(posting_id);
+            while (try iter.next()) |delta| {
+                if (posting.PostingFormat.deltaSequenceGeneration(delta.sequence) <= base_generation) continue;
                 try deltas.append(alloc, delta);
             }
         }
@@ -226,11 +237,22 @@ pub const Snapshot = struct {
     }
 
     pub fn loadDeltaTail(self: Snapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
-        return try self.loadDeltaTailAfterGeneration(alloc, posting_id, 0);
+        const delta_values = try self.catalog.collectDeltas(alloc, posting_id);
+        defer alloc.free(delta_values);
+
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        errdefer records.deinit(alloc);
+        for (delta_values) |delta_value| {
+            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
+            defer alloc.free(decoded);
+            try records.appendSlice(alloc, decoded);
+        }
+        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        return try records.toOwnedSlice(alloc);
     }
 
     pub fn loadDeltaTailAfterGeneration(self: Snapshot, alloc: Allocator, posting_id: PostingId, generation: u64) ![]posting.PostingDeltaRecord {
-        const delta_values = try self.catalog.collectDeltasAfterSequence(alloc, posting_id, generation);
+        const delta_values = try self.catalog.collectDeltasAfterGeneration(alloc, posting_id, generation);
         defer alloc.free(delta_values);
 
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
@@ -239,7 +261,7 @@ pub const Snapshot = struct {
             const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
             defer alloc.free(decoded);
             for (decoded) |record| {
-                if (record.sequence <= generation) continue;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
                 try records.append(alloc, record);
             }
         }
@@ -914,26 +936,28 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
         .members = &.{ 10, 20, 30 },
     });
     defer alloc.free(new_base);
+    const delta_10_sequence = (@as(u64, 10) << 32) | 1;
+    const delta_8_sequence = (@as(u64, 8) << 32) | 1;
     const delta_10 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = 10, .op = .insert, .vector_id = 40 },
+        .{ .sequence = delta_10_sequence, .op = .insert, .vector_id = 40 },
     });
     defer alloc.free(delta_10);
     const delta_8 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = 8, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = delta_8_sequence, .op = .tombstone, .vector_id = 20 },
     });
     defer alloc.free(delta_8);
 
     var writer_1 = Writer.init(alloc);
     defer writer_1.deinit();
     try writer_1.appendBase(7, old_base);
-    try writer_1.appendDelta(7, 10, delta_10);
+    try writer_1.appendDelta(7, delta_10_sequence, delta_10);
     const segment_1 = try writer_1.build();
     defer alloc.free(segment_1);
 
     var writer_2 = Writer.init(alloc);
     defer writer_2.deinit();
     try writer_2.appendBase(7, new_base);
-    try writer_2.appendDelta(7, 8, delta_8);
+    try writer_2.appendDelta(7, delta_8_sequence, delta_8);
     const segment_2 = try writer_2.build();
     defer alloc.free(segment_2);
 
@@ -943,8 +967,8 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     const meta_2 = try reader_2.metadata(2);
     try std.testing.expect(meta_1.mayContainPosting(7));
     try std.testing.expectEqual(@as(usize, 2), meta_1.entry_count);
-    try std.testing.expectEqual(@as(u64, 10), meta_1.min_delta_sequence);
-    try std.testing.expectEqual(@as(u64, 10), meta_1.max_delta_sequence);
+    try std.testing.expectEqual(delta_10_sequence, meta_1.min_delta_sequence);
+    try std.testing.expectEqual(delta_10_sequence, meta_1.max_delta_sequence);
     try std.testing.expectEqual(segment_1.len, meta_1.byte_len);
 
     const blobs = [_]SegmentBlob{
@@ -958,15 +982,15 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     const deltas = try catalog.collectDeltas(alloc, 7);
     defer alloc.free(deltas);
     try std.testing.expectEqual(@as(usize, 2), deltas.len);
-    try std.testing.expectEqual(@as(u64, 8), deltas[0].sequence);
+    try std.testing.expectEqual(delta_8_sequence, deltas[0].sequence);
     try std.testing.expectEqualSlices(u8, delta_8, deltas[0].value);
-    try std.testing.expectEqual(@as(u64, 10), deltas[1].sequence);
+    try std.testing.expectEqual(delta_10_sequence, deltas[1].sequence);
     try std.testing.expectEqualSlices(u8, delta_10, deltas[1].value);
 
-    const later_deltas = try catalog.collectDeltasAfterSequence(alloc, 7, 8);
+    const later_deltas = try catalog.collectDeltasAfterGeneration(alloc, 7, 8);
     defer alloc.free(later_deltas);
     try std.testing.expectEqual(@as(usize, 1), later_deltas.len);
-    try std.testing.expectEqual(@as(u64, 10), later_deltas[0].sequence);
+    try std.testing.expectEqual(delta_10_sequence, later_deltas[0].sequence);
     try std.testing.expectEqualSlices(u8, delta_10, later_deltas[0].value);
 }
 
@@ -991,17 +1015,21 @@ pub fn testSnapshotLoadsTypedPostingValues() !void {
         .centroid = &.{ 1.0, 2.0, 3.0 },
     });
     defer alloc.free(centroid);
+    const delta_20_sequence = (@as(u64, 20) << 32) | 1;
+    const delta_2_sequence = (@as(u64, 2) << 32) | 1;
+    const delta_10_sequence = (@as(u64, 10) << 32) | 1;
+    const delta_12_sequence = (@as(u64, 12) << 32) | 1;
     const delta_20 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = 20, .op = .insert, .vector_id = 40 },
+        .{ .sequence = delta_20_sequence, .op = .insert, .vector_id = 40 },
     });
     defer alloc.free(delta_20);
     const delta_2 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = 2, .op = .insert, .vector_id = 15 },
+        .{ .sequence = delta_2_sequence, .op = .insert, .vector_id = 15 },
     });
     defer alloc.free(delta_2);
     const delta_10 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = 10, .op = .tombstone, .vector_id = 20 },
-        .{ .sequence = 12, .op = .replace, .vector_id = 30 },
+        .{ .sequence = delta_10_sequence, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = delta_12_sequence, .op = .replace, .vector_id = 30 },
     });
     defer alloc.free(delta_10);
 
@@ -1009,14 +1037,14 @@ pub fn testSnapshotLoadsTypedPostingValues() !void {
     defer writer_1.deinit();
     try writer_1.appendBase(7, base);
     try writer_1.appendCentroidDirectory(7, centroid);
-    try writer_1.appendDelta(7, 20, delta_20);
-    try writer_1.appendDelta(7, 2, delta_2);
+    try writer_1.appendDelta(7, delta_20_sequence, delta_20);
+    try writer_1.appendDelta(7, delta_2_sequence, delta_2);
     const segment_1 = try writer_1.build();
     defer alloc.free(segment_1);
 
     var writer_2 = Writer.init(alloc);
     defer writer_2.deinit();
-    try writer_2.appendDelta(7, 10, delta_10);
+    try writer_2.appendDelta(7, delta_10_sequence, delta_10);
     const segment_2 = try writer_2.build();
     defer alloc.free(segment_2);
 
@@ -1060,30 +1088,30 @@ pub fn testSnapshotLoadsTypedPostingValues() !void {
     const records = try snapshot.loadDeltaTail(alloc, 7);
     defer alloc.free(records);
     try std.testing.expectEqual(@as(usize, 4), records.len);
-    try std.testing.expectEqual(@as(u64, 2), records[0].sequence);
+    try std.testing.expectEqual(delta_2_sequence, records[0].sequence);
     try std.testing.expectEqual(posting.PostingDeltaOp.insert, records[0].op);
     try std.testing.expectEqual(@as(posting.VectorId, 15), records[0].vector_id);
-    try std.testing.expectEqual(@as(u64, 10), records[1].sequence);
+    try std.testing.expectEqual(delta_10_sequence, records[1].sequence);
     try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, records[1].op);
     try std.testing.expectEqual(@as(posting.VectorId, 20), records[1].vector_id);
-    try std.testing.expectEqual(@as(u64, 12), records[2].sequence);
+    try std.testing.expectEqual(delta_12_sequence, records[2].sequence);
     try std.testing.expectEqual(posting.PostingDeltaOp.replace, records[2].op);
     try std.testing.expectEqual(@as(posting.VectorId, 30), records[2].vector_id);
-    try std.testing.expectEqual(@as(u64, 20), records[3].sequence);
+    try std.testing.expectEqual(delta_20_sequence, records[3].sequence);
     try std.testing.expectEqual(posting.PostingDeltaOp.insert, records[3].op);
     try std.testing.expectEqual(@as(posting.VectorId, 40), records[3].vector_id);
 
     const current_records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 3);
     defer alloc.free(current_records);
     try std.testing.expectEqual(@as(usize, 3), current_records.len);
-    try std.testing.expectEqual(@as(u64, 10), current_records[0].sequence);
-    try std.testing.expectEqual(@as(u64, 12), current_records[1].sequence);
-    try std.testing.expectEqual(@as(u64, 20), current_records[2].sequence);
+    try std.testing.expectEqual(delta_10_sequence, current_records[0].sequence);
+    try std.testing.expectEqual(delta_12_sequence, current_records[1].sequence);
+    try std.testing.expectEqual(delta_20_sequence, current_records[2].sequence);
 
     const later_records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 12);
     defer alloc.free(later_records);
     try std.testing.expectEqual(@as(usize, 1), later_records.len);
-    try std.testing.expectEqual(@as(u64, 20), later_records[0].sequence);
+    try std.testing.expectEqual(delta_20_sequence, later_records[0].sequence);
 
     const missing_records = try snapshot.loadDeltaTail(alloc, 8);
     defer alloc.free(missing_records);
