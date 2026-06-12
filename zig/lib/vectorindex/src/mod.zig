@@ -79,6 +79,7 @@ pub const PostingSegmentWriter = posting_segment.Writer;
 pub const PostingSegmentReader = posting_segment.Reader;
 pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const PostingSegmentEntryValue = posting_segment.EntryValue;
+pub const PostingSegmentValueLocation = posting_segment.ValueLocation;
 pub const PostingSegmentEntryIterator = posting_segment.EntryIterator;
 pub const PostingSegmentMeta = posting_segment.SegmentMeta;
 pub const PostingSegmentBlob = posting_segment.SegmentBlob;

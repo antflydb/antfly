@@ -1455,7 +1455,23 @@ const IndexEntry = struct {
     offset: usize,
     len: usize,
 
+    fn location(self: IndexEntry) ValueLocation {
+        return .{
+            .offset = self.offset,
+            .len = self.len,
+        };
+    }
+
     fn value(self: IndexEntry, data: []const u8) ![]const u8 {
+        return try self.location().value(data);
+    }
+};
+
+pub const ValueLocation = struct {
+    offset: usize,
+    len: usize,
+
+    pub fn value(self: ValueLocation, data: []const u8) ![]const u8 {
         const end = std.math.add(usize, self.offset, self.len) catch return error.CorruptedPostingSegment;
         if (end > data.len) return error.CorruptedPostingSegment;
         return data[self.offset..end];
@@ -1611,8 +1627,16 @@ pub const Reader = struct {
         return try self.getExact(posting_id, .base, 0);
     }
 
+    pub fn getBaseLocation(self: Reader, posting_id: PostingId) !?ValueLocation {
+        return try self.getExactLocation(posting_id, .base, 0);
+    }
+
     pub fn getCentroidDirectory(self: Reader, posting_id: PostingId) !?[]const u8 {
         return try self.getExact(posting_id, .centroid_directory, 0);
+    }
+
+    pub fn getCentroidDirectoryLocation(self: Reader, posting_id: PostingId) !?ValueLocation {
+        return try self.getExactLocation(posting_id, .centroid_directory, 0);
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -1662,11 +1686,18 @@ pub const Reader = struct {
     }
 
     fn getExact(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) !?[]const u8 {
+        const location = (try self.getExactLocation(posting_id, kind, sequence)) orelse return null;
+        return try location.value(self.data);
+    }
+
+    fn getExactLocation(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) !?ValueLocation {
         const index = self.lowerBound(posting_id, kind, sequence);
         if (index >= self.entry_count) return null;
         const entry = try self.indexEntry(index);
         if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != sequence) return null;
-        return try entry.value(self.data);
+        const location = entry.location();
+        _ = try location.value(self.data);
+        return location;
     }
 
     fn lowerBound(self: Reader, posting_id: PostingId, kind: EntryKind, sequence: u64) usize {
@@ -2051,6 +2082,30 @@ pub fn testStoresBaseCentroidAndOrderedDeltaValues() !void {
     try std.testing.expectEqual(@as(u64, 0), centroid_entry.sequence);
     try std.testing.expectEqualSlices(u8, centroid, centroid_entry.value);
     try std.testing.expect(try entry_iter.next() == null);
+}
+
+pub fn testReaderReportsPointValueLocations() !void {
+    const alloc = std.testing.allocator;
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(7, "base-value");
+    try writer.appendCentroidDirectory(7, "centroid-value");
+    try writer.appendBase(9, "other-base");
+
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    const reader = try Reader.init(bytes);
+    const base_location = (try reader.getBaseLocation(7)).?;
+    const centroid_location = (try reader.getCentroidDirectoryLocation(7)).?;
+    try std.testing.expect(base_location.offset < reader.index_offset);
+    try std.testing.expect(centroid_location.offset < reader.index_offset);
+    try std.testing.expectEqualSlices(u8, "base-value", try base_location.value(bytes));
+    try std.testing.expectEqualSlices(u8, "centroid-value", try centroid_location.value(bytes));
+    try std.testing.expectEqualSlices(u8, (try reader.getBase(7)).?, try base_location.value(bytes));
+    try std.testing.expectEqualSlices(u8, (try reader.getCentroidDirectory(7)).?, try centroid_location.value(bytes));
+    try std.testing.expect(try reader.getBaseLocation(8) == null);
+    try std.testing.expect(try reader.getCentroidDirectoryLocation(8) == null);
 }
 
 pub fn testRejectsDuplicateLogicalEntries() !void {
@@ -3656,6 +3711,10 @@ pub fn testCompactsSegmentsToLivePostingEntries() !void {
 
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresBaseCentroidAndOrderedDeltaValues();
+}
+
+test "posting segment reader reports point value locations" {
+    try testReaderReportsPointValueLocations();
 }
 
 test "posting segment rejects duplicate logical entries" {

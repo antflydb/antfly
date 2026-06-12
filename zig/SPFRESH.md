@@ -120,8 +120,9 @@ Current status:
   logical posting codecs, so future runtime read paths can depend on
   posting-base, delta-tail, and centroid-directory structs instead of segment
   byte layout. Segment readers also expose deterministic logical-entry
-  iteration for future compaction, migration, and backup verification code, and
-  the segment module can compact segment blobs by retaining the newest base and
+  iteration plus indexed point-value locations for future compaction,
+  migration, backup verification, and range-read plumbing, and the segment
+  module can compact segment blobs by retaining the newest base and
   centroid point records while rewriting only delta records newer than the
   selected base generation. Compaction reports input/output bytes, retained
   records, and dropped superseded/stale/duplicate records for future resource
@@ -797,8 +798,11 @@ implementations cleanly:
 
     A dedicated posting segment backend could pack posting bases and delta
     runs into vector-index-specific files with posting-local indexes, block
-    offsets, and compact append batches. That may reduce LSM key overhead and
-    improve sequential IO.
+    offsets, compact append batches, and a partial-read integrity scheme. The
+    current segment v1 footer checksum validates whole files, so production
+    range reads should either add per-value/per-block checksums or a trusted
+    verification cache before lazy point lookups stop reading full segment
+    files. That may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
