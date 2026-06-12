@@ -30,8 +30,8 @@ pub const PostingId = posting.PostingId;
 const magic: [4]u8 = "AFPS".*;
 const manifest_magic: [4]u8 = "AFPM".*;
 const version: u16 = 1;
-const index_entry_size: usize = 8 + 1 + 8 + 8 + 8;
-const footer_size: usize = 8 + 8 + 4 + 2 + 4;
+const index_entry_size: usize = 8 + 1 + 8 + 8 + 8 + 4;
+const footer_size: usize = 8 + 8 + 4 + 4 + 2 + 4;
 const manifest_header_size: usize = 4 + 2 + 4 + 8;
 const manifest_checksum_size: usize = 4;
 
@@ -1454,11 +1454,13 @@ const IndexEntry = struct {
     sequence: u64,
     offset: usize,
     len: usize,
+    value_checksum: u32,
 
     fn location(self: IndexEntry) ValueLocation {
         return .{
             .offset = self.offset,
             .len = self.len,
+            .value_checksum = self.value_checksum,
         };
     }
 
@@ -1470,11 +1472,19 @@ const IndexEntry = struct {
 pub const ValueLocation = struct {
     offset: usize,
     len: usize,
+    value_checksum: u32,
 
     pub fn value(self: ValueLocation, data: []const u8) ![]const u8 {
         const end = std.math.add(usize, self.offset, self.len) catch return error.CorruptedPostingSegment;
         if (end > data.len) return error.CorruptedPostingSegment;
-        return data[self.offset..end];
+        const bytes = data[self.offset..end];
+        try self.verifyValue(bytes);
+        return bytes;
+    }
+
+    pub fn verifyValue(self: ValueLocation, bytes: []const u8) !void {
+        if (bytes.len != self.len) return error.CorruptedPostingSegment;
+        if (valueChecksum(bytes) != self.value_checksum) return error.BadPostingSegmentChecksum;
     }
 };
 
@@ -1570,13 +1580,17 @@ pub const Writer = struct {
                 .sequence = entry.sequence,
                 .offset = offset,
                 .len = entry.value.len,
+                .value_checksum = valueChecksum(entry.value),
             });
         }
 
         const index_offset = out.items.len;
         for (index_entries.items) |entry| try appendIndexEntry(self.alloc, &out, entry);
+        const index_end = out.items.len;
+        const stored_index_checksum = indexChecksum(out.items[index_offset..index_end]);
         try appendU64(self.alloc, &out, @intCast(index_offset));
         try appendU64(self.alloc, &out, @intCast(index_entries.items.len));
+        try appendU32(self.alloc, &out, stored_index_checksum);
         try appendU32(self.alloc, &out, segmentChecksum(out.items));
         try appendU16(self.alloc, &out, version);
         try out.appendSlice(self.alloc, &magic);
@@ -1604,10 +1618,10 @@ pub const Reader = struct {
         if (data.len < footer_size) return error.CorruptedPostingSegment;
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[footer_size - magic.len ..], &magic)) return error.BadPostingSegmentMagic;
-        const segment_version = readU16(footer[20..22]);
+        const segment_version = readU16(footer[24..26]);
         if (segment_version != version) return error.UnsupportedPostingSegmentVersion;
-        const stored_checksum = readU32(footer[16..20]);
-        const checksum_end = data.len - footer_size + 16;
+        const stored_checksum = readU32(footer[20..24]);
+        const checksum_end = data.len - footer_size + 20;
         if (segmentChecksum(data[0..checksum_end]) != stored_checksum) return error.BadPostingSegmentChecksum;
         const index_offset_u64 = readU64(footer[0..8]);
         const entry_count_u64 = readU64(footer[8..16]);
@@ -1616,6 +1630,8 @@ pub const Reader = struct {
         const index_bytes = std.math.mul(usize, entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
         const index_end = std.math.add(usize, index_offset, index_bytes) catch return error.CorruptedPostingSegment;
         if (index_offset > data.len - footer_size or index_end != data.len - footer_size) return error.CorruptedPostingSegment;
+        const stored_index_checksum = readU32(footer[16..20]);
+        if (indexChecksum(data[index_offset..index_end]) != stored_index_checksum) return error.BadPostingSegmentChecksum;
         return .{
             .data = data,
             .index_offset = index_offset,
@@ -1736,6 +1752,7 @@ pub const Reader = struct {
             .sequence = readU64(raw[9..17]),
             .offset = offset,
             .len = len,
+            .value_checksum = readU32(raw[33..37]),
         };
     }
 };
@@ -1780,6 +1797,7 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
     try appendU64(alloc, out, entry.sequence);
     try appendU64(alloc, out, @intCast(entry.offset));
     try appendU64(alloc, out, @intCast(entry.len));
+    try appendU32(alloc, out, entry.value_checksum);
 }
 
 fn validateManifest(manifest: Manifest) !void {
@@ -1850,6 +1868,14 @@ fn writeFileAtomicallyAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
 }
 
 fn segmentChecksum(data: []const u8) u32 {
+    return std.hash.Crc32.hash(data);
+}
+
+fn indexChecksum(data: []const u8) u32 {
+    return std.hash.Crc32.hash(data);
+}
+
+fn valueChecksum(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
 }
 
@@ -2102,10 +2128,23 @@ pub fn testReaderReportsPointValueLocations() !void {
     try std.testing.expect(centroid_location.offset < reader.index_offset);
     try std.testing.expectEqualSlices(u8, "base-value", try base_location.value(bytes));
     try std.testing.expectEqualSlices(u8, "centroid-value", try centroid_location.value(bytes));
+    try base_location.verifyValue("base-value");
+    try std.testing.expectError(error.BadPostingSegmentChecksum, base_location.verifyValue("base-VALUE"));
+    try std.testing.expectError(error.CorruptedPostingSegment, base_location.verifyValue("base"));
     try std.testing.expectEqualSlices(u8, (try reader.getBase(7)).?, try base_location.value(bytes));
     try std.testing.expectEqualSlices(u8, (try reader.getCentroidDirectory(7)).?, try centroid_location.value(bytes));
     try std.testing.expect(try reader.getBaseLocation(8) == null);
     try std.testing.expect(try reader.getCentroidDirectoryLocation(8) == null);
+
+    var bad_value_checksum = try alloc.dupe(u8, bytes);
+    defer alloc.free(bad_value_checksum);
+    bad_value_checksum[reader.index_offset + 33] ^= 0xff;
+    const index_checksum_pos = bad_value_checksum.len - footer_size + 16;
+    const segment_checksum_pos = bad_value_checksum.len - footer_size + 20;
+    std.mem.writeInt(u32, bad_value_checksum[index_checksum_pos..][0..4], indexChecksum(bad_value_checksum[reader.index_offset .. bad_value_checksum.len - footer_size]), .big);
+    std.mem.writeInt(u32, bad_value_checksum[segment_checksum_pos..][0..4], segmentChecksum(bad_value_checksum[0..segment_checksum_pos]), .big);
+    const bad_reader = try Reader.init(bad_value_checksum);
+    try std.testing.expectError(error.BadPostingSegmentChecksum, bad_reader.getBaseLocation(7));
 }
 
 pub fn testRejectsDuplicateLogicalEntries() !void {

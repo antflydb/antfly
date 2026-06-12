@@ -113,9 +113,10 @@ Current status:
 - The first dedicated posting segment container now exists in
   `posting_segment.zig`. It stores existing v1 posting-base, posting-delta, and
   centroid-directory values in one immutable posting-local indexed blob with
-  footer validation, segment-level checksum validation, segment metadata,
-  ordered delta iteration, and a borrowed catalog that can pick the newest
-  point record while merging deltas across segment blobs. The catalog now has a
+  footer validation, segment-level checksum validation, index checksum
+  validation, per-value checksum validation, segment metadata, ordered delta
+  iteration, and a borrowed catalog that can pick the newest point record while
+  merging deltas across segment blobs. The catalog now has a
   typed snapshot facade that decodes those segment values through the existing
   logical posting codecs, so future runtime read paths can depend on
   posting-base, delta-tail, and centroid-directory structs instead of segment
@@ -798,11 +799,12 @@ implementations cleanly:
 
     A dedicated posting segment backend could pack posting bases and delta
     runs into vector-index-specific files with posting-local indexes, block
-    offsets, compact append batches, and a partial-read integrity scheme. The
-    current segment v1 footer checksum validates whole files, so production
-    range reads should either add per-value/per-block checksums or a trusted
-    verification cache before lazy point lookups stop reading full segment
-    files. That may reduce LSM key overhead and improve sequential IO.
+    offsets, compact append batches, and a partial-read integrity scheme.
+    Segment v1 blobs now carry whole-segment, index, and per-value checksums,
+    so a future lazy point lookup can verify the index bytes and the fetched
+    value bytes without reading the whole segment. Runtime still needs the
+    range-read plumbing and policy before lazy point lookups stop reading full
+    segment files. That may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
