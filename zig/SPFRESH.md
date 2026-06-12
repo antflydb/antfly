@@ -144,7 +144,9 @@ Current status:
   the whole manifest or for an explicit selected segment-id set. That gives
   future maintenance a bounded compaction primitive that can preserve
   unselected manifest segments while replacing only the scheduled compaction
-  inputs. Old segment files are left as unreferenced orphans. A manifest-aware
+  inputs; the selected path reads and validates only the selected segment files,
+  not every segment referenced by the manifest. Old segment files are left as
+  unreferenced orphans. A manifest-aware
   directory GC pass can then scan the `postings/` directory and delete only
   canonical `.afps` segment files that are absent from the current manifest,
   while ignoring manifest files, temp files, and non-segment entries. The

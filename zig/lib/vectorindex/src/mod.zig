@@ -226,6 +226,10 @@ test "posting segment directory compaction can replace selected segments" {
     try posting_segment.testDirectoryCompactionCanReplaceSelectedSegments();
 }
 
+test "posting segment directory selected compaction does not read unselected segments" {
+    try posting_segment.testDirectorySelectedCompactionDoesNotReadUnselectedSegments();
+}
+
 test "posting segment directory garbage collection deletes manifest orphans" {
     try posting_segment.testDirectoryGarbageCollectionDeletesManifestOrphans();
 }

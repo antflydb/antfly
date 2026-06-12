@@ -883,29 +883,46 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
 ) !DirectoryCompactionResult {
     if (segment_ids.len == 0) return error.NoPostingSegmentsToCompact;
 
-    var store = try openStoreFromDirectoryAlloc(alloc, io, dir, .{
+    var manifest = try readManifestFromDirectoryAlloc(alloc, io, dir, .{
         .manifest_path = options.manifest_path,
         .max_manifest_bytes = options.max_manifest_bytes,
         .max_segment_bytes = options.max_segment_bytes,
     });
-    defer store.deinit(alloc);
+    defer manifest.deinit(alloc);
+
+    const existing_entries = try manifestEntryViewAlloc(alloc, manifest.segments);
+    defer alloc.free(existing_entries);
 
     const selected = try alloc.alloc(SegmentBlob, segment_ids.len);
     defer alloc.free(selected);
+    const selected_data = try alloc.alloc([]u8, segment_ids.len);
+    var selected_data_count: usize = 0;
+    defer {
+        for (selected_data[0..selected_data_count]) |data| alloc.free(data);
+        alloc.free(selected_data);
+    }
+
     var selected_count: usize = 0;
-    for (store.segments) |segment| {
-        if (!segmentIdIn(segment.meta.segment_id, segment_ids)) continue;
-        selected[selected_count] = segment;
+    for (manifest.segments) |entry| {
+        if (!segmentIdIn(entry.meta.segment_id, segment_ids)) continue;
+        if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+
+        const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
+        errdefer alloc.free(data);
+        try validateSegmentDataMatchesMeta(data, entry.meta);
+        selected_data[selected_data_count] = data;
+        selected_data_count += 1;
+        selected[selected_count] = .{
+            .meta = entry.meta,
+            .data = data,
+        };
         selected_count += 1;
     }
     if (selected_count != segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
 
-    var compacted = try compactSegmentsWithStatsAlloc(alloc, store.manifest.next_segment_id, selected[0..selected_count]);
+    var compacted = try compactSegmentsWithStatsAlloc(alloc, manifest.next_segment_id, selected[0..selected_count]);
     defer compacted.deinit(alloc);
     if (compacted.segment.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
-
-    const existing_entries = try manifestEntryViewAlloc(alloc, store.manifest.segments);
-    defer alloc.free(existing_entries);
 
     const written = try writeSegmentFileAlloc(alloc, io, dir, compacted.segment);
     errdefer alloc.free(written.path);
@@ -915,7 +932,7 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
     };
 
     var replacement = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
-        .next_segment_id = store.manifest.next_segment_id,
+        .next_segment_id = manifest.next_segment_id,
         .segments = existing_entries,
     }, segment_ids, &.{new_entry});
     defer replacement.deinit(alloc);
@@ -2634,6 +2651,63 @@ pub fn testDirectoryCompactionCanReplaceSelectedSegments() !void {
     try std.testing.expectEqualSlices(posting.VectorId, &.{90}, posting_9);
 }
 
+pub fn testDirectorySelectedCompactionDoesNotReadUnselectedSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var writer_3 = Writer.init(alloc);
+    defer writer_3.deinit();
+    try writer_3.appendPostingBase(.{
+        .posting_id = 9,
+        .generation = 1,
+        .members = &.{90},
+    });
+    var committed_3 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_3, .{});
+    defer committed_3.deinit(alloc);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_3.entry.path,
+        .data = "not a segment",
+    });
+    try std.testing.expectError(error.CorruptedPostingSegment, openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{}));
+
+    var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, std.testing.io, tmp.dir, &.{ committed_1.entry.meta.segment_id, committed_2.entry.meta.segment_id }, .{});
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), compacted.stats.manifest.output_segments);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), lazy.manifest.segments.len);
+    try std.testing.expectEqual(committed_3.entry.meta.segment_id, lazy.manifest.segments[0].meta.segment_id);
+    try std.testing.expectEqual(compacted.entry.meta.segment_id, lazy.manifest.segments[1].meta.segment_id);
+
+    const snapshot = lazy.snapshot();
+    const posting_7 = (try snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(posting_7);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, posting_7);
+    try std.testing.expectError(error.CorruptedPostingSegment, snapshot.materializeMembers(alloc, 9));
+}
+
 pub fn testDirectoryGarbageCollectionDeletesManifestOrphans() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3135,6 +3209,10 @@ test "posting segment directory compaction replaces manifest segments" {
 
 test "posting segment directory compaction can replace selected segments" {
     try testDirectoryCompactionCanReplaceSelectedSegments();
+}
+
+test "posting segment directory selected compaction does not read unselected segments" {
+    try testDirectorySelectedCompactionDoesNotReadUnselectedSegments();
 }
 
 test "posting segment directory garbage collection deletes manifest orphans" {
