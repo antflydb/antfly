@@ -148,7 +148,10 @@ Current status:
   has a manifest-only lazy directory store: it can reopen by decoding the
   manifest without reading every segment file, then read and validate only
   manifest entries whose posting range can contain the requested posting. Segment
-  writers can also produce a manifest-ready built
+  writers now also have typed helpers for appending posting-base,
+  posting-delta batch, and centroid-directory records, and eager/lazy snapshots
+  can materialize the authoritative member view directly from segment-backed
+  base+delta values. Segment writers can also produce a manifest-ready built
   segment with validated metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is

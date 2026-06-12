@@ -229,6 +229,10 @@ test "posting segment lazy directory store loads delta tail" {
     try posting_segment.testLazyDirectoryStoreLoadsDeltaTail();
 }
 
+test "posting segment typed base delta facade round trips through directory store" {
+    try posting_segment.testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore();
+}
+
 test "posting segment compacts segments to live posting entries" {
     try posting_segment.testCompactsSegmentsToLivePostingEntries();
 }

@@ -331,7 +331,6 @@ pub const Catalog = struct {
             var reader = try Reader.init(segment.data);
             var iter = reader.deltas(posting_id);
             while (try iter.next()) |delta| {
-                if (posting.PostingFormat.deltaSequenceGeneration(delta.sequence) <= base_generation) continue;
                 try deltas.append(alloc, delta);
             }
         }
@@ -420,6 +419,14 @@ pub const LazyDirectorySnapshot = struct {
 
     pub fn loadDeltaTailAfterGeneration(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, generation: u64) ![]posting.PostingDeltaRecord {
         return try self.loadDeltaTailFilteredAlloc(alloc, posting_id, generation);
+    }
+
+    pub fn materializeMembers(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
+        var base = (try self.loadBase(alloc, posting_id)) orelse return null;
+        defer base.deinit(alloc);
+        const records = try self.loadDeltaTailAfterGeneration(alloc, posting_id, base.generation);
+        defer alloc.free(records);
+        return try posting.PostingFormat.materializeMembersAfterGeneration(alloc, base.members, records, base.generation);
     }
 
     fn loadDeltaTailFilteredAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -514,6 +521,14 @@ pub const Snapshot = struct {
         }
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
         return try records.toOwnedSlice(alloc);
+    }
+
+    pub fn materializeMembers(self: Snapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
+        var base = (try self.loadBase(alloc, posting_id)) orelse return null;
+        defer base.deinit(alloc);
+        const records = try self.loadDeltaTailAfterGeneration(alloc, posting_id, base.generation);
+        defer alloc.free(records);
+        return try posting.PostingFormat.materializeMembersAfterGeneration(alloc, base.members, records, base.generation);
     }
 };
 
@@ -1096,6 +1111,12 @@ pub const Writer = struct {
         }, value);
     }
 
+    pub fn appendPostingBase(self: *Writer, base: posting.PostingBase) !void {
+        const encoded = try posting.PostingFormat.encodeBase(self.alloc, base);
+        defer self.alloc.free(encoded);
+        try self.appendBase(base.posting_id, encoded);
+    }
+
     pub fn appendCentroidDirectory(self: *Writer, posting_id: PostingId, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
@@ -1104,12 +1125,27 @@ pub const Writer = struct {
         }, value);
     }
 
+    pub fn appendCentroidDirectoryRecord(self: *Writer, record: posting.CentroidDirectoryRecord) !void {
+        const encoded = try posting.CentroidDirectoryFormat.encode(self.alloc, record);
+        defer self.alloc.free(encoded);
+        try self.appendCentroidDirectory(record.posting_id, encoded);
+    }
+
     pub fn appendDelta(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
         try self.appendEntry(.{
             .posting_id = posting_id,
             .kind = .delta,
             .sequence = sequence,
         }, value);
+    }
+
+    pub fn appendPostingDeltaRecords(self: *Writer, posting_id: PostingId, records: []const posting.PostingDeltaRecord) !void {
+        if (records.len == 0) return;
+        var min_sequence = records[0].sequence;
+        for (records[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
+        const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, records);
+        defer self.alloc.free(encoded);
+        try self.appendDelta(posting_id, min_sequence, encoded);
     }
 
     fn appendEntry(self: *Writer, key: struct {
@@ -2548,6 +2584,67 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqual(live_sequence, current_records[0].sequence);
 }
 
+pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20 },
+    });
+    try writer_1.appendCentroidDirectoryRecord(.{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 9,
+        .payload_version = 4,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 3.5,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const stale_sequence = (@as(u64, 1) << 32) | 1;
+    const tombstone_sequence = (@as(u64, 3) << 32) | 1;
+    const insert_sequence = (@as(u64, 3) << 32) | 2;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 99 },
+        .{ .sequence = tombstone_sequence, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = insert_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var eager = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer eager.deinit(alloc);
+    const eager_snapshot = eager.snapshot();
+    const eager_members = (try eager_snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(eager_members);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 30 }, eager_members);
+    var eager_centroid = (try eager_snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer eager_centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 9), eager_centroid.mutation_version);
+    try std.testing.expectEqual(posting.CentroidDirectoryFormat.dirty_flag, eager_centroid.flags);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    const lazy_snapshot = lazy.snapshot();
+    const lazy_members = (try lazy_snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(lazy_members);
+    try std.testing.expectEqualSlices(posting.VectorId, eager_members, lazy_members);
+    const missing = try lazy_snapshot.materializeMembers(alloc, 12345);
+    try std.testing.expect(missing == null);
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2728,6 +2825,10 @@ test "posting segment lazy directory store reads only candidate segments" {
 
 test "posting segment lazy directory store loads delta tail" {
     try testLazyDirectoryStoreLoadsDeltaTail();
+}
+
+test "posting segment typed base delta facade round trips through directory store" {
+    try testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore();
 }
 
 test "posting segment compacts segments to live posting entries" {
