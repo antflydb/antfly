@@ -216,9 +216,11 @@ Current status:
   intentionally export the logical store only. Dense maintenance now runs
   segment compaction under the existing dense posting maintenance working-set
   reservation, passing that reservation through as a cap on selected compaction
-  input bytes. That adapter path is still internal until DB-level
-  restore/import wiring, crash-recovery cleanup, and public config enablement
-  are wired through the same backend boundary.
+  input bytes. HBC segment recovery can reload from the committed manifest
+  marker, rewrite that manifest into the segment directory, skip compaction, and
+  delete ignored temp/orphan physical segment files. That adapter path is still
+  internal until DB-level restore/import wiring and public config enablement are
+  wired through the same backend boundary.
   Dense index config now propagates the parsed physical backend into HBC config,
   but `backend = segments` remains rejected until those operational surfaces are
   complete. The dense index config now separates `backend`, `format`, and
@@ -864,11 +866,13 @@ implementations cleanly:
     maintenance compaction now runs under the dense posting maintenance
     working-set reservation and caps selected compaction input bytes from that
     reservation, so physical segment compaction cannot bypass resource pressure.
-    The remaining promotion work is operational: DB restore/import must call
-    those segment artifact hooks for restored HBC indexes, crash recovery must
-    clean ignored physical manifests/files, and public config must stop
-    rejecting `backend = segments` only after those surfaces are covered. That
-    may reduce LSM key overhead and improve sequential IO.
+    HBC segment recovery now uses the committed manifest as authority, rewrites
+    that manifest into the segment directory, skips compaction, and deletes
+    ignored temp/orphan physical segment files. The remaining promotion work is
+    operational: DB restore/import must call those segment artifact hooks for
+    restored HBC indexes, and public config must stop rejecting
+    `backend = segments` only after that surface is covered. That may reduce LSM
+    key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

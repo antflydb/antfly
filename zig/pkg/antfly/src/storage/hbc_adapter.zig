@@ -2942,6 +2942,30 @@ pub const HBCIndex = struct {
         return maintenance_summary;
     }
 
+    pub fn recoverPostingSegmentBackendCrashArtifacts(self: *HBCIndex) !PostingSegmentMaintenanceStats {
+        if (self.posting_segment_runtime == null) return .{};
+
+        try self.reloadPostingSegmentRuntimeFromCommittedManifest();
+
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+
+        const runtime = try self.postingSegmentRuntime();
+        if (runtime.store.pendingEntries() != 0 or runtime.store.pendingDeltaRecords() != 0) return .{};
+
+        var options = runtime.store.options.maintenanceOptions();
+        options.compact = false;
+        const maintenance = try runtime.store.maintainLoadedManifestWithOptions(options);
+        return .{
+            .ran = true,
+            .manifest_segments = @intCast(maintenance.manifest.segments),
+            .compacted = false,
+            .compactions = 0,
+            .deleted_orphan_segment_files = @intCast(maintenance.garbage.deleted_segment_files),
+            .deleted_temp_files = @intCast(maintenance.temporary.deleted_temp_files),
+        };
+    }
+
     pub fn exportPostingSegmentBackendToDirectory(self: *HBCIndex, destination_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
         if (self.posting_segment_runtime == null) return .{};
 
@@ -11015,6 +11039,33 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         const imported = try idx.importPostingSegmentBackendFromDirectory(std.mem.span(export_path));
         try std.testing.expectEqual(exported.segment_files, imported.segment_files);
         try std.testing.expectEqual(exported.segment_bytes, imported.segment_bytes);
+
+        const orphan_segment_rel = try vectorindex_posting_segment.segmentPathAlloc(alloc, 0xfeed);
+        defer alloc.free(orphan_segment_rel);
+        const orphan_segment_abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(path), orphan_segment_rel });
+        defer alloc.free(orphan_segment_abs);
+        const orphan_temp_abs = try std.fmt.allocPrint(alloc, "{s}.tmp", .{orphan_segment_abs});
+        defer alloc.free(orphan_temp_abs);
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_segment_abs, .data = "orphan" });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = orphan_temp_abs, .data = "temp" });
+        }
+
+        const recovered = try idx.recoverPostingSegmentBackendCrashArtifacts();
+        try std.testing.expect(recovered.ran);
+        try std.testing.expect(!recovered.compacted);
+        try std.testing.expectEqual(@as(u64, 1), recovered.deleted_orphan_segment_files);
+        try std.testing.expectEqual(@as(u64, 1), recovered.deleted_temp_files);
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, orphan_segment_abs, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, orphan_temp_abs, .{}));
+        }
 
         {
             var read_txn = try idx.beginReadTxn();
