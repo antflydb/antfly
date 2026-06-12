@@ -218,17 +218,17 @@ Current status:
   reservation, passing that reservation through as a cap on selected compaction
   input bytes. HBC segment recovery can reload from the committed manifest
   marker, rewrite that manifest into the segment directory, skip compaction, and
-  delete ignored temp/orphan physical segment files. That adapter path is still
-  internal until DB-level restore/import wiring and public config enablement are
-  wired through the same backend boundary.
-  Dense index config now propagates the parsed physical backend into HBC config,
-  but `backend = segments` remains rejected until those operational surfaces are
-  complete. The dense index config now separates `backend`, `format`, and
-  `version`; `backend = segments` is reserved until runtime reads/writes can use
-  the segment store across the full DB lifecycle. This
+  delete ignored temp/orphan physical segment files. The dense index config now
+  separates `backend`, `format`, and `version`; `backend = segments,
+  format = base_delta, version = 1` is an opt-in DB-facing mode while the
+  default remains `backend = lsm, format = packed_hbc, version = 1`. Generic DB
+  snapshots still intentionally export the logical store only and inherit the
+  existing dense-index restore-repair behavior for generated/stored embedding
+  artifacts. Workflows that preserve or transfer an HBC private index store must
+  carry the segment artifacts with the committed segment manifest using the HBC
+  export/import hooks. This
   segment container/catalog/snapshot/manifest/build/open stack is the
-  file-format substrate for a future
-  `backend = segments, format = base_delta, version = 1` mode.
+  file-format substrate for the segment-backed base/delta mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.

@@ -49795,6 +49795,74 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "db segment-backed dense index is opt-in and persists across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const dense_config =
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "metric": "l2_squared",
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
+        \\  "version": 1
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_segments",
+            .kind = .dense_vector,
+            .config_json = dense_config,
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"embedding\":[0,0]}" },
+                .{ .key = "doc:b", .value = "{\"embedding\":[10,0]}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.runUntilIdle();
+
+        var before = try db.search(alloc, .{
+            .index_name = "dv_segments",
+            .dense = .{ .vector = &.{ 10.0, 0.0 }, .k = 1 },
+            .limit = 1,
+            .include_stored = false,
+        });
+        defer before.deinit();
+        try std.testing.expectEqual(@as(u32, 1), before.total_hits);
+        try std.testing.expectEqualStrings("doc:b", before.hits[0].id);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+    });
+    defer reopened.close();
+    const reopened_entry = reopened.core.index_manager.denseIndex("dv_segments") orelse return error.IndexNotFound;
+    try std.testing.expectEqual(@as(u64, 2), reopened_entry.index.stats().active_count);
+
+    var after = try reopened.search(alloc, .{
+        .index_name = "dv_segments",
+        .dense = .{ .vector = &.{ 10.0, 0.0 }, .k = 1 },
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+    try std.testing.expectEqualStrings("doc:b", after.hits[0].id);
+}
+
 test "db restore snapshot rejects invalid doc identity metadata" {
     const alloc = std.testing.allocator;
 

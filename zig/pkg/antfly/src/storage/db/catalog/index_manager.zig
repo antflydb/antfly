@@ -13366,7 +13366,17 @@ fn denseStorageDefaults(backend: DenseConfig.Backend, format: DenseConfig.Format
                 else => error.InvalidIndexConfig,
             },
         },
-        .segments => error.InvalidIndexConfig,
+        .segments => switch (format) {
+            .packed_hbc => error.InvalidIndexConfig,
+            .base_delta => switch (version) {
+                1 => .{
+                    .centroid_directory_mode = .hbc,
+                    .posting_storage_mode = .base_delta,
+                    .lazy_posting_maintenance = true,
+                },
+                else => error.InvalidIndexConfig,
+            },
+        },
     };
 }
 
@@ -15056,6 +15066,30 @@ test "parseDenseConfig maps lsm base_delta format v1 to base delta defaults" {
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
 }
 
+test "parseDenseConfig maps segment base_delta format v1 to segment backend defaults" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 128,
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
+        \\  "version": 1
+        \\}
+    ;
+
+    const cfg = try parseDenseConfig(alloc, raw);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(DenseConfig.Backend.segments, cfg.backend);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingBackend.segments, densePostingBackend(cfg.backend));
+    try std.testing.expectEqual(DenseConfig.Format.base_delta, cfg.format);
+    try std.testing.expectEqual(@as(u32, 1), cfg.version);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.hbc, cfg.centroid_directory_mode);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingStorageMode.base_delta, cfg.posting_storage_mode);
+    try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
+}
+
 test "parseDenseConfig rejects unsupported dense storage axes" {
     const alloc = std.testing.allocator;
 
@@ -15089,8 +15123,17 @@ test "parseDenseConfig rejects unsupported dense storage axes" {
         \\  "field": "embedding",
         \\  "dims": 128,
         \\  "backend": "segments",
-        \\  "format": "base_delta",
+        \\  "format": "packed_hbc",
         \\  "version": 1
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 128,
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
+        \\  "version": 2
         \\}
     ));
     try std.testing.expectEqual(hbc_mod.HBCConfig.PostingBackend.segments, densePostingBackend(.segments));
