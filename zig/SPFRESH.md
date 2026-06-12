@@ -79,6 +79,10 @@ Current status:
   `query_materialization_ns_per_posting`, and
   `query_materialization_ns_per_member`, so overlay replay CPU can be compared
   independently of cache and backend effects.
+- HBC maintenance paths that only need to validate a posting base or read its
+  member count now use `PostingStore.loadBaseStats` instead of decoding an
+  owned member array, moving the specialized count/stat base-decode path into
+  live code.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.

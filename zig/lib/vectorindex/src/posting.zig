@@ -1843,6 +1843,11 @@ pub const PostingStore = struct {
         return try PostingFormat.decodeBase(index.alloc, data);
     }
 
+    pub fn loadBaseStats(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseStats {
+        const data = try loadBaseData(index, txn, posting_id, is_not_found);
+        return try PostingFormat.decodeBaseStats(data);
+    }
+
     pub fn deleteBaseAndCentroidRecords(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !void {
         var base_key_buf: [10]u8 = undefined;
         index.deleteNamespaced(txn, .nodes, hbc.encodePostingBaseKey(&base_key_buf, posting_id)) catch |err| {
@@ -4211,6 +4216,12 @@ test "posting store persists base records and appends deltas through namespace h
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(PostingId, 9), loaded.posting_id);
     try std.testing.expectEqualSlices(VectorId, members[0..], loaded.members);
+    const base_stats = try PostingStore.loadBaseStats(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    try std.testing.expectEqual(@as(PostingId, 9), base_stats.header.posting_id);
+    try std.testing.expectEqual(@as(u64, 4), base_stats.header.generation);
+    try std.testing.expectEqual(members.len, base_stats.header.member_count);
+    try std.testing.expectEqual(@as(usize, 1), base_stats.block_count);
+    try std.testing.expectEqual(index.base_value.len, base_stats.encoded_len);
     try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_base_put_calls);
     try std.testing.expectEqual(@as(u64, members.len), index.write_profile.posting_base_members);
     try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_base_blocks);
