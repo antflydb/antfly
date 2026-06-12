@@ -81,6 +81,12 @@ pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const PostingSegmentMeta = posting_segment.SegmentMeta;
 pub const PostingSegmentBlob = posting_segment.SegmentBlob;
 pub const PostingSegmentCatalog = posting_segment.Catalog;
+pub const PostingSegmentManifestEntry = posting_segment.ManifestEntry;
+pub const PostingSegmentManifest = posting_segment.Manifest;
+pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
+pub const OwnedPostingSegmentManifest = posting_segment.OwnedManifest;
+pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
+pub const decodePostingSegmentManifestAlloc = posting_segment.decodeManifestAlloc;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
 pub const OwnedCentroidDirectoryRecord = posting.OwnedCentroidDirectoryRecord;
 pub const CentroidDirectoryFormat = posting.CentroidDirectoryFormat;
@@ -141,4 +147,12 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try posting_segment.testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment manifest codec round trips segment metadata" {
+    try posting_segment.testManifestCodecRoundTripsSegmentMetadata();
+}
+
+test "posting segment manifest codec rejects invalid data" {
+    try posting_segment.testManifestCodecRejectsInvalidData();
 }

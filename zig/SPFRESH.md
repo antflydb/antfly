@@ -115,8 +115,10 @@ Current status:
   centroid-directory values in one immutable posting-local indexed blob with
   footer validation, segment metadata, ordered delta iteration, and a borrowed
   catalog that can pick the newest point record while merging deltas across
-  segment blobs. Runtime reads/writes still use the LSM-backed namespace; this
-  segment container/catalog is the file-format substrate for a future
+  segment blobs. A compact durable manifest codec records segment ids, paths,
+  and posting/delta range metadata for reopen. Runtime reads/writes still use
+  the LSM-backed namespace; this segment container/catalog/manifest stack is
+  the file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state

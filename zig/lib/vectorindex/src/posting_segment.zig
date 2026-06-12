@@ -28,9 +28,11 @@ const posting = @import("posting.zig");
 pub const PostingId = posting.PostingId;
 
 const magic: [4]u8 = "AFPS".*;
+const manifest_magic: [4]u8 = "AFPM".*;
 const version: u16 = 1;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8;
 const footer_size: usize = 8 + 8 + 2 + 4;
+const manifest_header_size: usize = 4 + 2 + 4 + 8;
 
 pub const EntryKind = enum(u8) {
     base = 1,
@@ -60,6 +62,35 @@ pub const SegmentMeta = struct {
 pub const SegmentBlob = struct {
     meta: SegmentMeta,
     data: []const u8,
+};
+
+pub const ManifestEntry = struct {
+    meta: SegmentMeta,
+    path: []const u8,
+};
+
+pub const Manifest = struct {
+    next_segment_id: u64,
+    segments: []const ManifestEntry,
+};
+
+pub const OwnedManifestEntry = struct {
+    meta: SegmentMeta,
+    path: []u8,
+};
+
+pub const OwnedManifest = struct {
+    next_segment_id: u64,
+    segments: []OwnedManifestEntry,
+
+    pub fn deinit(self: *OwnedManifest, alloc: Allocator) void {
+        for (self.segments) |entry| alloc.free(entry.path);
+        alloc.free(self.segments);
+        self.* = .{
+            .next_segment_id = 0,
+            .segments = &.{},
+        };
+    }
 };
 
 pub const Catalog = struct {
@@ -108,6 +139,51 @@ pub const Catalog = struct {
         return best;
     }
 };
+
+pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
+    if (manifest.segments.len > std.math.maxInt(u32)) return error.PostingSegmentManifestTooLarge;
+    try validateManifest(manifest);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, &manifest_magic);
+    try appendU16(alloc, &out, version);
+    try appendU32(alloc, &out, @intCast(manifest.segments.len));
+    try appendU64(alloc, &out, manifest.next_segment_id);
+    for (manifest.segments) |entry| {
+        try appendManifestEntry(alloc, &out, entry);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
+    if (data.len < manifest_header_size) return error.CorruptedPostingSegmentManifest;
+    if (!std.mem.eql(u8, data[0..4], &manifest_magic)) return error.BadPostingSegmentManifestMagic;
+    if (readU16(data[4..6]) != version) return error.UnsupportedPostingSegmentManifestVersion;
+    const entry_count_u32 = readU32(data[6..10]);
+    const next_segment_id = readU64(data[10..18]);
+    const entry_count = std.math.cast(usize, entry_count_u32) orelse return error.CorruptedPostingSegmentManifest;
+    var pos: usize = manifest_header_size;
+    const entries = try alloc.alloc(OwnedManifestEntry, entry_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |entry| alloc.free(entry.path);
+        alloc.free(entries);
+    }
+    while (initialized < entries.len) {
+        const entry = try readManifestEntry(alloc, data, &pos);
+        if (initialized != 0 and entries[initialized - 1].meta.segment_id >= entry.meta.segment_id) {
+            alloc.free(entry.path);
+            return error.InvalidPostingSegmentManifest;
+        }
+        entries[initialized] = entry;
+        initialized += 1;
+    }
+    if (pos != data.len) return error.CorruptedPostingSegmentManifest;
+    return .{
+        .next_segment_id = next_segment_id,
+        .segments = entries,
+    };
+}
 
 const PendingEntry = struct {
     posting_id: PostingId,
@@ -356,6 +432,78 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
     try appendU64(alloc, out, @intCast(entry.len));
 }
 
+fn validateManifest(manifest: Manifest) !void {
+    var previous_segment_id: ?u64 = null;
+    for (manifest.segments) |entry| {
+        try validateManifestEntry(entry);
+        if (entry.meta.segment_id >= manifest.next_segment_id) return error.InvalidPostingSegmentManifest;
+        if (previous_segment_id) |previous| {
+            if (previous >= entry.meta.segment_id) return error.InvalidPostingSegmentManifest;
+        }
+        previous_segment_id = entry.meta.segment_id;
+    }
+}
+
+fn validateManifestEntry(entry: ManifestEntry) !void {
+    if (entry.path.len == 0 or entry.path.len > std.math.maxInt(u32)) return error.InvalidPostingSegmentManifest;
+    if (entry.meta.entry_count == 0) return error.InvalidPostingSegmentManifest;
+    if (entry.meta.byte_len == 0) return error.InvalidPostingSegmentManifest;
+    if (entry.meta.min_posting_id > entry.meta.max_posting_id) return error.InvalidPostingSegmentManifest;
+    if (entry.meta.min_delta_sequence != 0 and entry.meta.max_delta_sequence < entry.meta.min_delta_sequence) return error.InvalidPostingSegmentManifest;
+}
+
+fn appendManifestEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: ManifestEntry) !void {
+    try appendU64(alloc, out, entry.meta.segment_id);
+    try appendU64(alloc, out, entry.meta.min_posting_id);
+    try appendU64(alloc, out, entry.meta.max_posting_id);
+    try appendU64(alloc, out, entry.meta.min_delta_sequence);
+    try appendU64(alloc, out, entry.meta.max_delta_sequence);
+    try appendU64(alloc, out, @intCast(entry.meta.byte_len));
+    try appendU64(alloc, out, @intCast(entry.meta.entry_count));
+    try appendU32(alloc, out, @intCast(entry.path.len));
+    try out.appendSlice(alloc, entry.path);
+}
+
+fn readManifestEntry(alloc: Allocator, data: []const u8, pos: *usize) !OwnedManifestEntry {
+    const fixed_size = 7 * @sizeOf(u64) + @sizeOf(u32);
+    if (pos.* > data.len or data.len - pos.* < fixed_size) return error.CorruptedPostingSegmentManifest;
+    const segment_id = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const min_posting_id = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const max_posting_id = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const min_delta_sequence = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const max_delta_sequence = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const byte_len_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const entry_count_u64 = readU64(data[pos.*..][0..8]);
+    pos.* += 8;
+    const path_len_u32 = readU32(data[pos.*..][0..4]);
+    pos.* += 4;
+    const path_len = std.math.cast(usize, path_len_u32) orelse return error.CorruptedPostingSegmentManifest;
+    if (path_len == 0 or pos.* > data.len or data.len - pos.* < path_len) return error.CorruptedPostingSegmentManifest;
+    const path = try alloc.dupe(u8, data[pos.* .. pos.* + path_len]);
+    errdefer alloc.free(path);
+    pos.* += path_len;
+    const meta = SegmentMeta{
+        .segment_id = segment_id,
+        .min_posting_id = min_posting_id,
+        .max_posting_id = max_posting_id,
+        .min_delta_sequence = min_delta_sequence,
+        .max_delta_sequence = max_delta_sequence,
+        .byte_len = std.math.cast(usize, byte_len_u64) orelse return error.CorruptedPostingSegmentManifest,
+        .entry_count = std.math.cast(usize, entry_count_u64) orelse return error.CorruptedPostingSegmentManifest,
+    };
+    try validateManifestEntry(.{ .meta = meta, .path = path });
+    return .{
+        .meta = meta,
+        .path = path,
+    };
+}
+
 fn rejectDuplicateEntries(entries: []const PendingEntry) !void {
     if (entries.len < 2) return;
     var i: usize = 1;
@@ -392,6 +540,12 @@ fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !vo
     try out.appendSlice(alloc, &buf);
 }
 
+fn appendU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try out.appendSlice(alloc, &buf);
+}
+
 fn appendU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
@@ -400,6 +554,10 @@ fn appendU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !vo
 
 fn readU16(bytes: *const [2]u8) u16 {
     return std.mem.readInt(u16, bytes, .big);
+}
+
+fn readU32(bytes: *const [4]u8) u32 {
+    return std.mem.readInt(u32, bytes, .big);
 }
 
 fn readU64(bytes: *const [8]u8) u64 {
@@ -553,6 +711,114 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     try std.testing.expectEqualSlices(u8, delta_10, deltas[1].value);
 }
 
+pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
+    const alloc = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 7,
+                .max_posting_id = 9,
+                .min_delta_sequence = 10,
+                .max_delta_sequence = 20,
+                .byte_len = 4096,
+                .entry_count = 12,
+            },
+            .path = "postings/000001.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 2,
+                .min_posting_id = 10,
+                .max_posting_id = 12,
+                .byte_len = 2048,
+                .entry_count = 3,
+            },
+            .path = "postings/000002.afps",
+        },
+    };
+    const encoded = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 3,
+        .segments = entries[0..],
+    });
+    defer alloc.free(encoded);
+
+    var decoded = try decodeManifestAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), decoded.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 2), decoded.segments.len);
+    for (entries, decoded.segments) |expected, actual| {
+        try std.testing.expectEqual(expected.meta.segment_id, actual.meta.segment_id);
+        try std.testing.expectEqual(expected.meta.min_posting_id, actual.meta.min_posting_id);
+        try std.testing.expectEqual(expected.meta.max_posting_id, actual.meta.max_posting_id);
+        try std.testing.expectEqual(expected.meta.min_delta_sequence, actual.meta.min_delta_sequence);
+        try std.testing.expectEqual(expected.meta.max_delta_sequence, actual.meta.max_delta_sequence);
+        try std.testing.expectEqual(expected.meta.byte_len, actual.meta.byte_len);
+        try std.testing.expectEqual(expected.meta.entry_count, actual.meta.entry_count);
+        try std.testing.expectEqualStrings(expected.path, actual.path);
+    }
+}
+
+pub fn testManifestCodecRejectsInvalidData() !void {
+    const alloc = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 2,
+                .min_posting_id = 7,
+                .max_posting_id = 7,
+                .byte_len = 128,
+                .entry_count = 1,
+            },
+            .path = "postings/000002.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 8,
+                .max_posting_id = 8,
+                .byte_len = 128,
+                .entry_count = 1,
+            },
+            .path = "postings/000001.afps",
+        },
+    };
+    try std.testing.expectError(error.InvalidPostingSegmentManifest, encodeManifestAlloc(alloc, .{
+        .next_segment_id = 3,
+        .segments = entries[0..],
+    }));
+
+    const valid_entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 7,
+                .max_posting_id = 7,
+                .byte_len = 128,
+                .entry_count = 1,
+            },
+            .path = "postings/000001.afps",
+        },
+    };
+    const encoded = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 2,
+        .segments = valid_entries[0..],
+    });
+    defer alloc.free(encoded);
+
+    var bad_magic = try alloc.dupe(u8, encoded);
+    defer alloc.free(bad_magic);
+    bad_magic[0] = 'x';
+    try std.testing.expectError(error.BadPostingSegmentManifestMagic, decodeManifestAlloc(alloc, bad_magic));
+
+    var bad_version = try alloc.dupe(u8, encoded);
+    defer alloc.free(bad_version);
+    bad_version[5] = 2;
+    try std.testing.expectError(error.UnsupportedPostingSegmentManifestVersion, decodeManifestAlloc(alloc, bad_version));
+
+    try std.testing.expectError(error.CorruptedPostingSegmentManifest, decodeManifestAlloc(alloc, encoded[0 .. encoded.len - 1]));
+}
+
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresBaseCentroidAndOrderedDeltaValues();
 }
@@ -567,4 +833,12 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment manifest codec round trips segment metadata" {
+    try testManifestCodecRoundTripsSegmentMetadata();
+}
+
+test "posting segment manifest codec rejects invalid data" {
+    try testManifestCodecRejectsInvalidData();
 }
