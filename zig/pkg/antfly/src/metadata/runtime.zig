@@ -18,11 +18,14 @@ const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
+const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const platform_time = @import("../platform/time.zig");
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
+const metadata_raft_retained_entries = 1024;
+const metadata_raft_compaction_min_interval_entries = 512;
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -34,6 +37,17 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
         .max_apply_tasks_per_round = 16,
+        .applied_log_retained_entries = metadata_raft_retained_entries,
+        .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
+        .applied_log_compaction_single_node_only = false,
+    };
+}
+
+fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
+    return .{
+        .compaction_retained_entries = metadata_raft_retained_entries,
+        .compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
+        .compaction_single_node_only = false,
     };
 }
 
@@ -158,6 +172,7 @@ pub const HealthSource = struct {
         const host_metrics = svc.raft.host.http_host.metricsSnapshot();
         const svc_metrics = svc.metrics();
         const memory = svc.memoryDiagnostics();
+        const raft_storage = self.server.metadataRaftStorageDiagnostics();
 
         const append = antfly.common.health_server.appendPromMetric;
 
@@ -221,6 +236,17 @@ pub const HealthSource = struct {
         try append(writer, "antfly_metadata_projected_core_snapshot_schema_progresses", "gauge", "Schema-progress records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.schema_progresses));
         try append(writer, "antfly_metadata_projected_core_snapshot_restore_progresses", "gauge", "Restore-progress records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.restore_progresses));
         try append(writer, "antfly_metadata_projected_core_snapshot_replication_source_statuses", "gauge", "Replication source statuses retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.replication_source_statuses));
+
+        try append(writer, "antfly_metadata_raft_memory_storage_groups", "gauge", "Raft groups counted in metadata raft MemoryStorage diagnostics", @intCast(raft_storage.groups));
+        try append(writer, "antfly_metadata_raft_memory_storage_entries", "gauge", "Raft log entries retained by metadata raft MemoryStorage", @intCast(raft_storage.entries));
+        try append(writer, "antfly_metadata_raft_memory_storage_entry_capacity", "gauge", "Raft log entry capacity retained by metadata raft MemoryStorage", @intCast(raft_storage.entry_capacity));
+        try append(writer, "antfly_metadata_raft_memory_storage_entry_payload_bytes", "gauge", "Raft log entry payload bytes retained by metadata raft MemoryStorage", @intCast(raft_storage.entry_payload_bytes));
+        try append(writer, "antfly_metadata_raft_memory_storage_estimated_bytes", "gauge", "Approximate bytes retained by metadata raft MemoryStorage", @intCast(raft_storage.estimated_bytes));
+        try append(writer, "antfly_metadata_raft_memory_storage_max_entries_per_group", "gauge", "Maximum raft log entries retained by any metadata raft group MemoryStorage", @intCast(raft_storage.max_entries_per_group));
+        try append(writer, "antfly_metadata_raft_memory_storage_min_first_index", "gauge", "Minimum first raft log index retained by metadata raft MemoryStorage", raft_storage.min_first_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_max_last_index", "gauge", "Maximum last raft log index retained by metadata raft MemoryStorage", raft_storage.max_last_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_max_snapshot_index", "gauge", "Maximum snapshot index retained by metadata raft MemoryStorage", raft_storage.max_snapshot_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_compactions_total", "counter", "Total metadata raft MemoryStorage compactions reported by the replica state provider", raft_storage.storage_compactions);
 
         try append(writer, "antfly_metadata_json_response_calls_total", "counter", "Metadata JSON responses allocated by the metadata HTTP server", memory.json_response.calls);
         try append(writer, "antfly_metadata_json_response_bytes_total", "counter", "Total JSON response body bytes allocated by the metadata HTTP server", memory.json_response.bytes_total);
@@ -286,6 +312,60 @@ pub const ServerConfig = struct {
     secret_store: ?*antfly.common.secrets.FileStore = null,
 };
 
+const MetadataRaftStorageDiagnostics = struct {
+    groups: usize = 0,
+    entries: usize = 0,
+    entry_capacity: usize = 0,
+    entry_payload_bytes: usize = 0,
+    estimated_bytes: usize = 0,
+    max_entries_per_group: usize = 0,
+    min_first_index: raft_engine.core.types.Index = 0,
+    max_last_index: raft_engine.core.types.Index = 0,
+    max_snapshot_index: raft_engine.core.types.Index = 0,
+    storage_compactions: u64 = 0,
+};
+
+const MetadataRaftStorageDiagnosticsCache = struct {
+    groups: std.atomic.Value(usize) = .init(0),
+    entries: std.atomic.Value(usize) = .init(0),
+    entry_capacity: std.atomic.Value(usize) = .init(0),
+    entry_payload_bytes: std.atomic.Value(usize) = .init(0),
+    estimated_bytes: std.atomic.Value(usize) = .init(0),
+    max_entries_per_group: std.atomic.Value(usize) = .init(0),
+    min_first_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    max_last_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    max_snapshot_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    storage_compactions: std.atomic.Value(u64) = .init(0),
+
+    fn store(self: *MetadataRaftStorageDiagnosticsCache, value: MetadataRaftStorageDiagnostics) void {
+        self.groups.store(value.groups, .monotonic);
+        self.entries.store(value.entries, .monotonic);
+        self.entry_capacity.store(value.entry_capacity, .monotonic);
+        self.entry_payload_bytes.store(value.entry_payload_bytes, .monotonic);
+        self.estimated_bytes.store(value.estimated_bytes, .monotonic);
+        self.max_entries_per_group.store(value.max_entries_per_group, .monotonic);
+        self.min_first_index.store(value.min_first_index, .monotonic);
+        self.max_last_index.store(value.max_last_index, .monotonic);
+        self.max_snapshot_index.store(value.max_snapshot_index, .monotonic);
+        self.storage_compactions.store(value.storage_compactions, .monotonic);
+    }
+
+    fn load(self: *const MetadataRaftStorageDiagnosticsCache) MetadataRaftStorageDiagnostics {
+        return .{
+            .groups = self.groups.load(.monotonic),
+            .entries = self.entries.load(.monotonic),
+            .entry_capacity = self.entry_capacity.load(.monotonic),
+            .entry_payload_bytes = self.entry_payload_bytes.load(.monotonic),
+            .estimated_bytes = self.estimated_bytes.load(.monotonic),
+            .max_entries_per_group = self.max_entries_per_group.load(.monotonic),
+            .min_first_index = self.min_first_index.load(.monotonic),
+            .max_last_index = self.max_last_index.load(.monotonic),
+            .max_snapshot_index = self.max_snapshot_index.load(.monotonic),
+            .storage_compactions = self.storage_compactions.load(.monotonic),
+        };
+    }
+};
+
 pub const Server = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
@@ -296,10 +376,12 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: ServerConfig) !Server {
         var result: Server = undefined;
         result.alloc = alloc;
+        result.raft_storage_diagnostics = .{};
         result.store = try alloc.create(raft_engine.core.MemoryStorage);
         errdefer alloc.destroy(result.store);
         result.store.* = raft_engine.core.MemoryStorage.init(alloc);
@@ -351,6 +433,7 @@ pub const Server = struct {
                         },
                     },
                 },
+                .wal_replica_state = metadataWalReplicaStateConfig(),
             },
             .admin_listener = .{
                 .bind_host = result.admin_bind_host,
@@ -472,6 +555,7 @@ pub const Server = struct {
         self.server.svc.observe_local_replica_root = false;
         defer self.server.svc.observe_local_replica_root = observe_local_replica_root;
         try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
         _ = try self.server.svc.ensureMetadataReplica(.{
             .group_id = metadata_group_id,
             .replica_id = 1,
@@ -482,6 +566,7 @@ pub const Server = struct {
 
     pub fn runRound(self: *Server) !void {
         try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
     }
 
     pub fn runCdcRound(self: *Server) !void {
@@ -506,6 +591,44 @@ pub const Server = struct {
 
     pub fn metadataHttpService(self: *Server) *antfly.metadata_service.MetadataHttpService {
         return self.server.svc;
+    }
+
+    pub fn metadataRaftStorageDiagnostics(self: *Server) MetadataRaftStorageDiagnostics {
+        return self.raft_storage_diagnostics.load();
+    }
+
+    fn refreshMetadataRaftStorageDiagnostics(self: *Server) void {
+        self.raft_storage_diagnostics.store(self.collectMetadataRaftStorageDiagnostics());
+    }
+
+    fn collectMetadataRaftStorageDiagnostics(self: *Server) MetadataRaftStorageDiagnostics {
+        if (self.server.svc.raft.host.owned_wal_replica_provider) |provider| {
+            const stats = provider.diagnostics();
+            return .{
+                .groups = stats.groups,
+                .entries = stats.entries,
+                .entry_capacity = stats.entry_capacity,
+                .entry_payload_bytes = stats.entry_payload_bytes,
+                .estimated_bytes = stats.estimated_bytes,
+                .max_entries_per_group = stats.max_entries_per_group,
+                .min_first_index = stats.min_first_index,
+                .max_last_index = stats.max_last_index,
+                .max_snapshot_index = stats.max_snapshot_index,
+                .storage_compactions = stats.storage_compactions,
+            };
+        }
+        const storage = self.store.diagnostics();
+        return .{
+            .groups = if (storage.entries > 0 or storage.snapshot_index > 0) 1 else 0,
+            .entries = storage.entries,
+            .entry_capacity = storage.entry_capacity,
+            .entry_payload_bytes = storage.entry_payload_bytes,
+            .estimated_bytes = storage.estimated_bytes,
+            .max_entries_per_group = storage.entries,
+            .min_first_index = storage.first_index,
+            .max_last_index = storage.last_index,
+            .max_snapshot_index = storage.snapshot_index,
+        };
     }
 
     pub fn baseUri(self: *Server, alloc: std.mem.Allocator) ![]u8 {
@@ -1090,6 +1213,65 @@ fn expectMetricPresent(output: []const u8, name: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, output, help) != null);
 }
 
+fn metadataMemorySoakEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_METADATA_MEMORY_SOAK", false);
+}
+
+fn metadataMemorySoakEnvUsize(comptime name: [*:0]const u8, default: usize) usize {
+    return platform.env.getenvUsize(name) orelse default;
+}
+
+fn printMetadataMemorySoakSample(label: []const u8, round: usize, memory: anytype, raft_storage: anytype) void {
+    std.debug.print(
+        "metadata-memory-soak {s} round={} process_available={} rss={} anon={} private_dirty={} footprint={} malloc_available={} malloc_allocated={} malloc_zone={} projected_cached={} projected_bytes={} projected_tables={} projected_ranges={} projected_stores={} projected_runtime_statuses={} projected_replication_statuses={} raft_groups={} raft_entries={} raft_capacity={} raft_payload_bytes={} raft_estimated_bytes={} raft_max_entries_per_group={} raft_min_first_index={} raft_max_last_index={} raft_max_snapshot_index={} raft_compactions={} ",
+        .{
+            label,
+            round,
+            memory.process.available,
+            memory.process.resident_bytes,
+            memory.process.anonymous_bytes,
+            memory.process.private_dirty_bytes,
+            memory.process.footprint_bytes,
+            memory.process.malloc_available,
+            memory.process.malloc_allocated_bytes,
+            memory.process.malloc_zone_bytes,
+            memory.projected_core_snapshot.cached,
+            memory.projected_core_snapshot.estimated_bytes,
+            memory.projected_core_snapshot.tables,
+            memory.projected_core_snapshot.ranges,
+            memory.projected_core_snapshot.stores,
+            memory.projected_core_snapshot.store_runtime_statuses,
+            memory.projected_core_snapshot.replication_source_statuses,
+            raft_storage.groups,
+            raft_storage.entries,
+            raft_storage.entry_capacity,
+            raft_storage.entry_payload_bytes,
+            raft_storage.estimated_bytes,
+            raft_storage.max_entries_per_group,
+            raft_storage.min_first_index,
+            raft_storage.max_last_index,
+            raft_storage.max_snapshot_index,
+            raft_storage.storage_compactions,
+        },
+    );
+    std.debug.print(
+        "projected_lsm_mutable={} projected_lsm_immutable={} projected_lsm_runs={} projected_lsm_wal={} json_calls={} json_peak={} json_total={} hosted_cache_present={} hosted_cache_entries={} hosted_retired={} hosted_lsm_wal={}\n",
+        .{
+            memory.projected_store_lsm.mutable_bytes,
+            memory.projected_store_lsm.immutable_bytes,
+            memory.projected_store_lsm.total_run_bytes,
+            memory.projected_store_lsm.wal_retained_bytes,
+            memory.json_response.calls,
+            memory.json_response.peak_bytes,
+            memory.json_response.bytes_total,
+            memory.hosted_write_cache.present,
+            memory.hosted_write_cache.cached_entries,
+            memory.hosted_write_cache.retired_entries,
+            memory.hosted_write_cache.lsm_wal_retained_bytes,
+        },
+    );
+}
+
 test "metadata runtime server uses wal replica state backend by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1110,6 +1292,18 @@ test "metadata runtime server uses wal replica state backend by default" {
 
     try std.testing.expect(server.server.svc.raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
+}
+
+test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
+    const runtime_cfg = metadataRaftRuntimeConfig();
+    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
+    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
+    try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
+
+    const wal_cfg = metadataWalReplicaStateConfig();
+    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
+    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
+    try std.testing.expect(!wal_cfg.compaction_single_node_only);
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
@@ -1147,8 +1341,142 @@ test "metadata runtime metrics expose memory ownership buckets" {
     try expectMetricPresent(output, "antfly_metadata_projected_core_snapshot_estimated_bytes");
     try expectMetricPresent(output, "antfly_metadata_projected_store_lsm_wal_retained_bytes");
     try expectMetricPresent(output, "antfly_metadata_json_response_calls_total");
+    try expectMetricPresent(output, "antfly_metadata_raft_memory_storage_estimated_bytes");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_entries");
     try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes");
+}
+
+test "metadata runtime memory soak diagnostic" {
+    if (!metadataMemorySoakEnabled()) return error.SkipZigTest;
+
+    const soak_alloc = std.heap.page_allocator;
+    const rounds = metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_ROUNDS", 2000);
+    const sample_every = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_SAMPLE_EVERY", 100));
+    const table_count = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_TABLES", 4));
+    const ranges_per_table = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_RANGES_PER_TABLE", 8));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/replicas", .{tmp.sub_path});
+    defer soak_alloc.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/catalog.txt", .{tmp.sub_path});
+    defer soak_alloc.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/snapshots", .{tmp.sub_path});
+    defer soak_alloc.free(snapshot_root);
+
+    var server = try Server.init(soak_alloc, .{
+        .local_node_id = 1,
+        .metadata_group_id = group_ids.main_metadata_group_id,
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+        .observe_local_replica_root = false,
+    });
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+
+    const svc = server.metadataHttpService();
+    try svc.registerNode(.{ .node_id = 1, .role = "metadata" });
+    try svc.registerNode(.{ .node_id = 2, .role = "data" });
+    try svc.registerNode(.{ .node_id = 3, .role = "data" });
+    try svc.upsertStore(.{ .store_id = 31, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 900 * 1024 * 1024 });
+    try svc.upsertStore(.{ .store_id = 32, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 850 * 1024 * 1024 });
+    try svc.upsertStore(.{ .store_id = 33, .node_id = 3, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 800 * 1024 * 1024 });
+
+    var table_idx: usize = 0;
+    while (table_idx < table_count) : (table_idx += 1) {
+        const table_id = 1000 + @as(u64, @intCast(table_idx));
+        const table_name = try std.fmt.allocPrint(soak_alloc, "docs_{}", .{table_idx});
+        defer soak_alloc.free(table_name);
+        try svc.upsertTable(.{
+            .table_id = table_id,
+            .name = table_name,
+            .desired_replica_count = 3,
+            .min_ranges = @intCast(ranges_per_table),
+        });
+        var range_idx: usize = 0;
+        while (range_idx < ranges_per_table) : (range_idx += 1) {
+            const start_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:a", .{range_idx});
+            defer soak_alloc.free(start_key);
+            const end_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:z", .{range_idx});
+            defer soak_alloc.free(end_key);
+            try svc.upsertRange(.{
+                .group_id = table_id * 1000 + @as(u64, @intCast(range_idx + 1)),
+                .range_id = @intCast(range_idx + 1),
+                .table_id = table_id,
+                .start_key = start_key,
+                .end_key = end_key,
+            });
+        }
+        try svc.upsertReplicationSourceStatus(.{
+            .table_id = table_id,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = table_name,
+            .cutover_mode = "exported_snapshot",
+            .slot_name = "antfly_metadata_memory_soak_slot",
+            .publication_name = "antfly_metadata_memory_soak_publication",
+            .phase = "streaming",
+            .checkpoint = "lsn:0/16B6B10",
+            .stream_checkpoint = "lsn:0/16B6B10",
+            .lag_records = @intCast(table_idx),
+            .updated_at_ms = 1000 + @as(u64, @intCast(table_idx)),
+        });
+    }
+    try server.runRound();
+
+    const admin = server.server.owned_admin_http_server orelse return error.MissingMetadataAdminServer;
+    printMetadataMemorySoakSample("baseline", 0, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const round_u64: u64 = @intCast(round);
+        const available = (700 * 1024 * 1024) + ((round_u64 % 200) * 1024);
+        try svc.reportStoreStatus(.{
+            .store_id = 31,
+            .live = true,
+            .health_class = "healthy",
+            .capacity_bytes = 1024 * 1024 * 1024,
+            .available_bytes = available,
+            .lease_pressure = @intCast(round % 100),
+            .read_load = @intCast((round * 3) % 1000),
+            .write_load = @intCast((round * 7) % 1000),
+        });
+        try svc.upsertReplicationSourceStatus(.{
+            .table_id = 1000,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = "docs_0",
+            .cutover_mode = "exported_snapshot",
+            .slot_name = "antfly_metadata_memory_soak_slot",
+            .publication_name = "antfly_metadata_memory_soak_publication",
+            .phase = if (round % 17 == 0) "streaming_failed" else "streaming",
+            .checkpoint = "lsn:0/16B6B10",
+            .stream_checkpoint = "lsn:0/16B6B10",
+            .last_error = if (round % 17 == 0) "synthetic intermittent timeout" else "",
+            .failure_class = if (round % 17 == 0) "retryable" else "",
+            .lag_records = round_u64 % 1024,
+            .lag_millis = round_u64 % 4096,
+            .consecutive_failures = if (round % 17 == 0) 1 else 0,
+            .last_source_commit_at_ms = 2000 + round_u64,
+            .last_success_at_ms = 3000 + round_u64,
+            .last_change_applied_at_ms = 4000 + round_u64,
+            .updated_at_ms = 5000 + round_u64,
+        });
+        try server.runRound();
+
+        var status_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
+        defer status_resp.deinit(server.alloc);
+        var snapshot_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.admin_snapshot });
+        defer snapshot_resp.deinit(server.alloc);
+
+        if ((round + 1) % sample_every == 0) {
+            printMetadataMemorySoakSample("sample", round + 1, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
+        }
+    }
+    printMetadataMemorySoakSample("final", rounds, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
 }
 
 test "metadata runtime prefers common config raft url for local id when cli bind is absent" {
