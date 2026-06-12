@@ -140,6 +140,44 @@ pub const Catalog = struct {
     }
 };
 
+pub const Snapshot = struct {
+    catalog: Catalog,
+
+    pub fn getBaseBytes(self: Snapshot, posting_id: PostingId) !?[]const u8 {
+        return try self.catalog.getBase(posting_id);
+    }
+
+    pub fn loadBaseHeader(self: Snapshot, posting_id: PostingId) !?posting.PostingBaseHeader {
+        const base_data = (try self.getBaseBytes(posting_id)) orelse return null;
+        return try posting.PostingFormat.decodeBaseHeader(base_data);
+    }
+
+    pub fn loadBase(self: Snapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
+        const base_data = (try self.getBaseBytes(posting_id)) orelse return null;
+        return try posting.PostingFormat.decodeBase(alloc, base_data);
+    }
+
+    pub fn loadCentroidDirectoryRecord(self: Snapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
+        const centroid_data = (try self.catalog.getCentroidDirectory(posting_id)) orelse return null;
+        return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
+    }
+
+    pub fn loadDeltaTail(self: Snapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
+        const delta_values = try self.catalog.collectDeltas(alloc, posting_id);
+        defer alloc.free(delta_values);
+
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        errdefer records.deinit(alloc);
+        for (delta_values) |delta_value| {
+            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
+            defer alloc.free(decoded);
+            try records.appendSlice(alloc, decoded);
+        }
+        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        return try records.toOwnedSlice(alloc);
+    }
+};
+
 pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     if (manifest.segments.len > std.math.maxInt(u32)) return error.PostingSegmentManifestTooLarge;
     try validateManifest(manifest);
@@ -524,6 +562,10 @@ fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
     return lhs.sequence < rhs.sequence;
 }
 
+fn postingDeltaRecordLessThan(_: void, lhs: posting.PostingDeltaRecord, rhs: posting.PostingDeltaRecord) bool {
+    return lhs.sequence < rhs.sequence;
+}
+
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
     if (lhs_posting_id < rhs_posting_id) return .lt;
     if (lhs_posting_id > rhs_posting_id) return .gt;
@@ -711,6 +753,106 @@ pub fn testCatalogLooksUpNewestPointRecordsAndMergedDeltas() !void {
     try std.testing.expectEqualSlices(u8, delta_10, deltas[1].value);
 }
 
+pub fn testSnapshotLoadsTypedPostingValues() !void {
+    const alloc = std.testing.allocator;
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(base);
+    const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .mutation_version = 11,
+        .payload_version = 9,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 3,
+        .bounds_radius = 2.5,
+        .centroid = &.{ 1.0, 2.0, 3.0 },
+    });
+    defer alloc.free(centroid);
+    const delta_20 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = 20, .op = .insert, .vector_id = 40 },
+    });
+    defer alloc.free(delta_20);
+    const delta_10 = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = 10, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = 12, .op = .replace, .vector_id = 30 },
+    });
+    defer alloc.free(delta_10);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, base);
+    try writer_1.appendCentroidDirectory(7, centroid);
+    try writer_1.appendDelta(7, 20, delta_20);
+    const segment_1 = try writer_1.build();
+    defer alloc.free(segment_1);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendDelta(7, 10, delta_10);
+    const segment_2 = try writer_2.build();
+    defer alloc.free(segment_2);
+
+    const reader_1 = try Reader.init(segment_1);
+    const reader_2 = try Reader.init(segment_2);
+    const meta_1 = try reader_1.metadata(1);
+    const meta_2 = try reader_2.metadata(2);
+    const blobs = [_]SegmentBlob{
+        .{ .meta = meta_1, .data = segment_1 },
+        .{ .meta = meta_2, .data = segment_2 },
+    };
+    const snapshot = Snapshot{ .catalog = .{ .segments = blobs[0..] } };
+
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(PostingId, 7), header.posting_id);
+    try std.testing.expectEqual(@as(u64, 3), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+    try std.testing.expect(try snapshot.loadBaseHeader(8) == null);
+
+    var loaded_base = (try snapshot.loadBase(alloc, 7)).?;
+    defer loaded_base.deinit(alloc);
+    try std.testing.expectEqual(@as(PostingId, 7), loaded_base.posting_id);
+    try std.testing.expectEqual(@as(u64, 3), loaded_base.generation);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, loaded_base.members);
+    try std.testing.expect(try snapshot.loadBase(alloc, 8) == null);
+
+    var loaded_centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer loaded_centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(PostingId, 7), loaded_centroid.posting_id);
+    try std.testing.expectEqual(@as(u64, 3), loaded_centroid.generation);
+    try std.testing.expectEqual(@as(u64, 11), loaded_centroid.mutation_version);
+    try std.testing.expectEqual(@as(u64, 9), loaded_centroid.payload_version);
+    try std.testing.expectEqual(posting.CentroidDirectoryFormat.dirty_flag, loaded_centroid.flags);
+    try std.testing.expectEqual(@as(PostingId, 1), loaded_centroid.parent);
+    try std.testing.expectEqual(@as(u16, 0), loaded_centroid.level);
+    try std.testing.expectEqual(@as(u64, 3), loaded_centroid.member_count);
+    try std.testing.expectEqual(@as(f32, 2.5), loaded_centroid.bounds_radius);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0 }, loaded_centroid.centroid);
+    try std.testing.expect(try snapshot.loadCentroidDirectoryRecord(alloc, 8) == null);
+
+    const records = try snapshot.loadDeltaTail(alloc, 7);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 3), records.len);
+    try std.testing.expectEqual(@as(u64, 10), records[0].sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, records[0].op);
+    try std.testing.expectEqual(@as(posting.VectorId, 20), records[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 12), records[1].sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.replace, records[1].op);
+    try std.testing.expectEqual(@as(posting.VectorId, 30), records[1].vector_id);
+    try std.testing.expectEqual(@as(u64, 20), records[2].sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.insert, records[2].op);
+    try std.testing.expectEqual(@as(posting.VectorId, 40), records[2].vector_id);
+
+    const missing_records = try snapshot.loadDeltaTail(alloc, 8);
+    defer alloc.free(missing_records);
+    try std.testing.expectEqual(@as(usize, 0), missing_records.len);
+}
+
 pub fn testManifestCodecRoundTripsSegmentMetadata() !void {
     const alloc = std.testing.allocator;
     const entries = [_]ManifestEntry{
@@ -833,6 +975,10 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment snapshot loads typed posting values" {
+    try testSnapshotLoadsTypedPostingValues();
 }
 
 test "posting segment manifest codec round trips segment metadata" {

@@ -81,6 +81,7 @@ pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const PostingSegmentMeta = posting_segment.SegmentMeta;
 pub const PostingSegmentBlob = posting_segment.SegmentBlob;
 pub const PostingSegmentCatalog = posting_segment.Catalog;
+pub const PostingSegmentSnapshot = posting_segment.Snapshot;
 pub const PostingSegmentManifestEntry = posting_segment.ManifestEntry;
 pub const PostingSegmentManifest = posting_segment.Manifest;
 pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
@@ -147,6 +148,10 @@ test "posting segment validates footer and version" {
 
 test "posting segment catalog looks up newest point records and merged deltas" {
     try posting_segment.testCatalogLooksUpNewestPointRecordsAndMergedDeltas();
+}
+
+test "posting segment snapshot loads typed posting values" {
+    try posting_segment.testSnapshotLoadsTypedPostingValues();
 }
 
 test "posting segment manifest codec round trips segment metadata" {
