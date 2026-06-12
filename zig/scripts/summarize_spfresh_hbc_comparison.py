@@ -69,6 +69,11 @@ WRITE_COLUMNS = [
     "lsm_l0_runs_vs_packed",
     "lsm_runs",
     "lsm_runs_vs_packed",
+    "posting_lsm_keys",
+    "posting_lsm_bytes",
+    "posting_mutations",
+    "posting_lsm_keys_per_mutation",
+    "posting_lsm_bytes_per_mutation",
     "fg_save_nodes",
     "fg_splits",
     "fg_non_maintenance_splits",
@@ -918,6 +923,24 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "lsm_runs": mean(group, "lsm_total_runs"),
                 "lsm_l0_runs": mean(group, "lsm_l0_runs"),
                 "lsm_run_bytes": mean(group, "lsm_total_run_bytes"),
+                "posting_lsm_keys": mean_numeric_sum(
+                    group,
+                    "posting_base_put_calls",
+                    "posting_delta_append_calls",
+                ),
+                "posting_lsm_bytes": mean_numeric_sum(
+                    group,
+                    "posting_base_key_bytes",
+                    "posting_base_value_bytes",
+                    "posting_delta_key_bytes",
+                    "posting_delta_value_bytes",
+                    "posting_delta_fold_deleted_tail_key_bytes",
+                ),
+                "posting_mutations": mean_numeric_sum(
+                    group,
+                    "posting_base_put_calls",
+                    "posting_delta_records",
+                ),
             }
         )
 
@@ -973,6 +996,14 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["lsm_l0_runs_vs_packed"] = ratio(
             summary.get("lsm_l0_runs"),
             baseline.get("lsm_l0_runs") if baseline else None,
+        )
+        summary["posting_lsm_keys_per_mutation"] = safe_ratio(
+            summary.get("posting_lsm_keys"),
+            summary.get("posting_mutations"),
+        )
+        summary["posting_lsm_bytes_per_mutation"] = safe_ratio(
+            summary.get("posting_lsm_bytes"),
+            summary.get("posting_mutations"),
         )
         summary["fg_delta_records_per_append"] = safe_ratio(
             summary.get("fg_delta_records"),

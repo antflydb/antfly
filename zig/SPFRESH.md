@@ -70,6 +70,9 @@ Current status:
 - Delta folds profile peak retained fold scratch bytes through
   `posting_delta_fold_peak_scratch_bytes`, so maintenance tuning can compare
   fold memory pressure against written base bytes and deleted tail bytes.
+- The comparison summarizer derives posting-family LSM cost through
+  `posting_lsm_keys_per_mutation` and `posting_lsm_bytes_per_mutation`, so
+  backend overhead can be separated from logical base/delta format cost.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
@@ -679,8 +682,9 @@ implementations cleanly:
 
 The next optimization decisions need counters that separate logical format
 cost from backend cost. This branch now emits the base byte/decode, delta
-byte/replay, fold scratch, and search scratch allocation/retention counters.
-The full set to keep tracking before making a segment-backend decision is:
+byte/replay, posting-family LSM cost, fold scratch, and search scratch
+allocation/retention counters. The full set to keep tracking before making a
+segment-backend decision is:
 
 - base bytes/member
 - base decode ns/member
