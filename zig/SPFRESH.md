@@ -191,7 +191,14 @@ Current status:
   directory maintenance step now
   composes temp cleanup, manifest-only compaction planning, selected segment
   compaction, and orphan collection into one bounded stats-returning call for
-  future background maintenance wiring. Runtime
+  future background maintenance wiring. The generic posting store now has a
+  physical posting-backend axis and segment-backend hooks for base,
+  delta-tail, centroid-directory, query materialization, stats, and fold
+  operations, so segment mode fails closed instead of falling through to LSM
+  keys when a concrete index has not implemented the hooks. Dense index config
+  now propagates the parsed physical backend into HBC config, while
+  `backend = segments` remains rejected until the HBC adapter owns a real
+  segment runtime store. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment

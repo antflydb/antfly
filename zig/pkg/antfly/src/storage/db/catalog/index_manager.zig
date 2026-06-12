@@ -1497,6 +1497,7 @@ pub const IndexManager = struct {
             .auto_posting_maintenance_boundary_reassignment_min_improvement = dense_cfg.auto_posting_maintenance_boundary_reassignment_min_improvement,
             .centroid_directory_mode = dense_cfg.centroid_directory_mode,
             .posting_storage_mode = dense_cfg.posting_storage_mode,
+            .posting_backend = densePostingBackend(dense_cfg.backend),
             .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
             .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
             .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
@@ -6232,6 +6233,7 @@ pub const IndexManager = struct {
                     .auto_posting_maintenance_boundary_reassignment_min_improvement = dense_cfg.auto_posting_maintenance_boundary_reassignment_min_improvement,
                     .centroid_directory_mode = dense_cfg.centroid_directory_mode,
                     .posting_storage_mode = dense_cfg.posting_storage_mode,
+                    .posting_backend = densePostingBackend(dense_cfg.backend),
                     .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
                     .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
                     .flat_centroid_block_probe_count = dense_cfg.flat_centroid_block_probe_count,
@@ -13293,6 +13295,13 @@ fn parseDenseFormat(raw: []const u8) !DenseConfig.Format {
     return error.InvalidIndexConfig;
 }
 
+fn densePostingBackend(backend: DenseConfig.Backend) hbc_mod.HBCConfig.PostingBackend {
+    return switch (backend) {
+        .lsm => .lsm,
+        .segments => .segments,
+    };
+}
+
 const DenseFormatDefaults = struct {
     centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode,
     posting_storage_mode: hbc_mod.HBCConfig.PostingStorageMode,
@@ -14977,6 +14986,7 @@ test "parseDenseConfig defaults to lsm packed_hbc format v1" {
     defer cfg.deinit(alloc);
 
     try std.testing.expectEqual(DenseConfig.Backend.lsm, cfg.backend);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingBackend.lsm, densePostingBackend(cfg.backend));
     try std.testing.expectEqual(DenseConfig.Format.packed_hbc, cfg.format);
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.hbc, cfg.centroid_directory_mode);
@@ -15000,6 +15010,7 @@ test "parseDenseConfig maps lsm base_delta format v1 to base delta defaults" {
     defer cfg.deinit(alloc);
 
     try std.testing.expectEqual(DenseConfig.Backend.lsm, cfg.backend);
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingBackend.lsm, densePostingBackend(cfg.backend));
     try std.testing.expectEqual(DenseConfig.Format.base_delta, cfg.format);
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.hbc, cfg.centroid_directory_mode);
@@ -15044,6 +15055,7 @@ test "parseDenseConfig rejects unsupported dense storage axes" {
         \\  "version": 1
         \\}
     ));
+    try std.testing.expectEqual(hbc_mod.HBCConfig.PostingBackend.segments, densePostingBackend(.segments));
 }
 
 test "parseDenseConfig accepts HBC tuning knobs" {

@@ -1474,6 +1474,25 @@ pub const PostingStore = struct {
     const compact_sorted_delta_max_records: usize = 64;
     const delta_tail_prefetch_posting_count: usize = 3;
 
+    fn IndexType(comptime T: type) type {
+        return switch (@typeInfo(T)) {
+            .pointer => |ptr| ptr.child,
+            else => T,
+        };
+    }
+
+    fn postingBackend(index: anytype) types.HBCConfig.PostingBackend {
+        const Index = IndexType(@TypeOf(index));
+        if (comptime @hasField(Index, "config") and @hasField(@TypeOf(index.config), "posting_backend")) {
+            return index.config.posting_backend;
+        }
+        return .lsm;
+    }
+
+    fn useSegmentPostingBackend(index: anytype) bool {
+        return postingBackend(index) == .segments;
+    }
+
     const OwnedMemberScratch = struct {
         member_ids: []VectorId = &.{},
 
@@ -1631,6 +1650,15 @@ pub const PostingStore = struct {
     ) ![]const VectorId {
         if (!shouldMaterializeBaseDeltaForQuery(index, @TypeOf(txn))) {
             return try copyMemberIds(alloc, scratch, posting_view);
+        }
+
+        if (useSegmentPostingBackend(index)) {
+            const materialized = try materializeBaseDeltaMembers(index, txn, posting_view.id, isNotFound);
+            defer index.alloc.free(materialized);
+            try scratch.ensureMemberIdCapacity(alloc, materialized.len);
+            @memcpy(scratch.member_ids[0..materialized.len], materialized);
+            notePostingOverlay(profile, 0, posting_view.members.len, 0, materialized.len);
+            return scratch.member_ids[0..materialized.len];
         }
 
         const start = now_fn();
@@ -1845,18 +1873,36 @@ pub const PostingStore = struct {
     }
 
     pub fn saveBase(index: anytype, txn: anytype, base: PostingBase) !void {
-        var key_buf: [10]u8 = undefined;
         const encoded = try encodeBaseForIndex(index, base);
         defer index.alloc.free(encoded);
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "savePostingBackendBase")) {
+                try index.savePostingBackendBase(txn, base.posting_id, encoded);
+                notePostingBasePut(index, 0, encoded);
+                return;
+            }
+            return error.UnsupportedPostingBackend;
+        }
+        var key_buf: [10]u8 = undefined;
         const key = hbc.encodePostingBaseKey(&key_buf, base.posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
         notePostingBasePut(index, key.len, encoded);
     }
 
     pub fn saveCentroidDirectoryRecord(index: anytype, txn: anytype, record: CentroidDirectoryRecord) !void {
-        var key_buf: [10]u8 = undefined;
         const encoded = try CentroidDirectoryFormat.encode(index.alloc, record);
         defer index.alloc.free(encoded);
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "savePostingBackendCentroidDirectory")) {
+                try index.savePostingBackendCentroidDirectory(txn, record.posting_id, encoded);
+                noteCentroidDirectoryPut(index, 0, encoded.len);
+                return;
+            }
+            return error.UnsupportedPostingBackend;
+        }
+        var key_buf: [10]u8 = undefined;
         const key = hbc.encodeCentroidDirectoryKey(&key_buf, record.posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
         noteCentroidDirectoryPut(index, key.len, encoded.len);
@@ -1867,6 +1913,24 @@ pub const PostingStore = struct {
         defer index.alloc.free(encoded_base);
         const encoded_centroid = try CentroidDirectoryFormat.encode(index.alloc, record);
         defer index.alloc.free(encoded_centroid);
+
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "savePostingBackendBaseAndCentroidDirectory")) {
+                try index.savePostingBackendBaseAndCentroidDirectory(txn, base.posting_id, encoded_base, record.posting_id, encoded_centroid);
+                notePostingBasePut(index, 0, encoded_base);
+                noteCentroidDirectoryPut(index, 0, encoded_centroid.len);
+                return;
+            }
+            if (comptime @hasDecl(Index, "savePostingBackendBase") and @hasDecl(Index, "savePostingBackendCentroidDirectory")) {
+                try index.savePostingBackendBase(txn, base.posting_id, encoded_base);
+                try index.savePostingBackendCentroidDirectory(txn, record.posting_id, encoded_centroid);
+                notePostingBasePut(index, 0, encoded_base);
+                noteCentroidDirectoryPut(index, 0, encoded_centroid.len);
+                return;
+            }
+            return error.UnsupportedPostingBackend;
+        }
 
         var base_key_buf: [10]u8 = undefined;
         const base_key = hbc.encodePostingBaseKey(&base_key_buf, base.posting_id);
@@ -1879,6 +1943,13 @@ pub const PostingStore = struct {
     }
 
     pub fn loadCentroidDirectoryRecord(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedCentroidDirectoryRecord {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendCentroidDirectoryRecord")) {
+                return index.loadPostingBackendCentroidDirectoryRecord(txn, posting_id, is_not_found);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         var key_buf: [10]u8 = undefined;
         const data = index.getNamespaced(txn, .nodes, hbc.encodeCentroidDirectoryKey(&key_buf, posting_id)) catch |err| {
             if (is_not_found(err)) return error.NotFound;
@@ -1888,6 +1959,13 @@ pub const PostingStore = struct {
     }
 
     pub fn loadCentroidDirectoryRecords(index: anytype, txn: anytype) ![]OwnedCentroidDirectoryRecord {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendCentroidDirectoryRecords")) {
+                return index.loadPostingBackendCentroidDirectoryRecords(txn);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -1909,6 +1987,7 @@ pub const PostingStore = struct {
     }
 
     pub fn loadBaseData(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]const u8 {
+        if (useSegmentPostingBackend(index)) return error.UnsupportedPostingBackendBorrowedData;
         var key_buf: [10]u8 = undefined;
         const data = index.getNamespaced(txn, .nodes, hbc.encodePostingBaseKey(&key_buf, posting_id)) catch |err| {
             if (is_not_found(err)) return error.NotFound;
@@ -1918,16 +1997,37 @@ pub const PostingStore = struct {
     }
 
     pub fn loadBase(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedPostingBase {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendBase")) {
+                return index.loadPostingBackendBase(txn, posting_id, is_not_found);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const data = try loadBaseData(index, txn, posting_id, is_not_found);
         return try PostingFormat.decodeBase(index.alloc, data);
     }
 
     pub fn loadBaseHeader(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseHeader {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendBaseHeader")) {
+                return index.loadPostingBackendBaseHeader(txn, posting_id, is_not_found);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const data = try loadBaseData(index, txn, posting_id, is_not_found);
         return try PostingFormat.decodeBaseHeader(data);
     }
 
     pub fn loadBaseStats(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseStats {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendBaseStats")) {
+                return index.loadPostingBackendBaseStats(txn, posting_id, is_not_found);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const data = try loadBaseData(index, txn, posting_id, is_not_found);
         return try PostingFormat.decodeBaseStats(data);
     }
@@ -1944,6 +2044,13 @@ pub const PostingStore = struct {
     }
 
     pub fn deleteDeltaTailIfSupported(index: anytype, txn: anytype, posting_id: PostingId) !void {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "deletePostingBackendDeltaTail")) {
+                _ = try index.deletePostingBackendDeltaTail(txn, posting_id);
+            }
+            return;
+        }
         if (comptime !canScanDeltaTail(@TypeOf(index), @TypeOf(txn))) return;
         _ = try deleteDeltaTail(index, txn, posting_id);
     }
@@ -1959,6 +2066,15 @@ pub const PostingStore = struct {
 
     pub fn appendDeltaRecords(index: anytype, txn: anytype, posting_id: PostingId, records: []const PostingDeltaRecord) !void {
         if (records.len == 0) return;
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "appendPostingBackendDeltaRecords")) {
+                try index.appendPostingBackendDeltaRecords(txn, posting_id, records);
+                notePostingDeltaAppend(index, 0, 0, records.len);
+                return;
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const max_value_bytes = maxPostingDeltaTailValueBytes(index);
         var encoded_scratch: []u8 = &.{};
         defer index.alloc.free(encoded_scratch);
@@ -2015,6 +2131,13 @@ pub const PostingStore = struct {
     }
 
     pub fn loadDeltaTail(index: anytype, txn: anytype, posting_id: PostingId) ![]PostingDeltaRecord {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendDeltaTail")) {
+                return index.loadPostingBackendDeltaTail(txn, posting_id);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -2035,6 +2158,13 @@ pub const PostingStore = struct {
     }
 
     pub fn deltaTailStats(index: anytype, txn: anytype, posting_id: PostingId, base_generation: u64) !PostingDeltaTailStats {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "postingBackendDeltaTailStats")) {
+                return index.postingBackendDeltaTailStats(txn, posting_id, base_generation);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -2243,6 +2373,13 @@ pub const PostingStore = struct {
         member_count: *usize,
         base_generation: u64,
     ) !DeltaReplayResult {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "applyPostingBackendDeltaTailIntoScratch")) {
+                return index.applyPostingBackendDeltaTailIntoScratch(txn, posting_id, alloc, scratch, member_count, base_generation);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         var cursor = try openNamespacedCursor(index, txn, .nodes);
         defer cursor.close();
 
@@ -2276,6 +2413,13 @@ pub const PostingStore = struct {
         member_count: *usize,
         base_generation: u64,
     ) !DeltaReplayResult {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "applyPostingBackendDeltaTailIntoScratch")) {
+                return index.applyPostingBackendDeltaTailIntoScratch(txn, posting_id, alloc, scratch, member_count, base_generation);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         resetPostingOverlayApply(scratch);
         const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
             .pointer => |ptr| ptr.child,
@@ -2352,6 +2496,13 @@ pub const PostingStore = struct {
         member_count: *usize,
         base_generation: u64,
     ) !DeltaReplayResult {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "applyPostingBackendDeltaTailIntoScratch")) {
+                return index.applyPostingBackendDeltaTailIntoScratch(txn, posting_id, alloc, scratch, member_count, base_generation);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         resetPostingOverlayApply(scratch);
         const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
             .pointer => |ptr| ptr.child,
@@ -2608,6 +2759,13 @@ pub const PostingStore = struct {
     }
 
     pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "materializePostingBackendMembers")) {
+                return index.materializePostingBackendMembers(txn, posting_id, is_not_found);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const base_data = try loadBaseData(index, txn, posting_id, is_not_found);
         var scratch = FoldScratch{};
         defer scratch.deinit(index.alloc);
@@ -2657,6 +2815,13 @@ pub const PostingStore = struct {
         is_not_found: fn (anyerror) bool,
         options: FoldDeltaTailOptions,
     ) !FoldDeltaTailResult {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "foldPostingBackendDeltaTailIntoBase")) {
+                return index.foldPostingBackendDeltaTailIntoBase(txn, posting_id, is_not_found, options);
+            }
+            return error.UnsupportedPostingBackend;
+        }
         const base_data = try loadBaseData(index, txn, posting_id, is_not_found);
         const base_header = try PostingFormat.decodeBaseHeader(base_data);
         var scratch = if (comptime @hasDecl(@TypeOf(index.*), "acquirePostingFoldScratch"))
@@ -4053,6 +4218,11 @@ const PostingPersistenceTestIndex = struct {
     write_profile: hbc_runtime.WriteProfile = .{},
     saw_append: bool = false,
     cursor_open_count: u64 = 0,
+    posting_backend_base_saves: u64 = 0,
+    posting_backend_centroid_saves: u64 = 0,
+    posting_backend_delta_appends: u64 = 0,
+    posting_backend_base_loads: u64 = 0,
+    posting_backend_member_materializations: u64 = 0,
 
     fn deinit(self: *PostingPersistenceTestIndex) void {
         if (self.base_value.len > 0) self.alloc.free(self.base_value);
@@ -4183,6 +4353,167 @@ const PostingPersistenceTestIndex = struct {
         if (namespace != .nodes) return error.UnexpectedNamespace;
         self.cursor_open_count += 1;
         return try vector_store.cursorFrom(alloc, PostingPersistenceTestCursor{ .index = self });
+    }
+
+    pub fn savePostingBackendBase(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, encoded: []const u8) !void {
+        self.posting_backend_base_saves += 1;
+        var key_buf: [10]u8 = undefined;
+        try self.putNamespaced(txn, .nodes, hbc.encodePostingBaseKey(&key_buf, posting_id), encoded);
+    }
+
+    pub fn savePostingBackendCentroidDirectory(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, encoded: []const u8) !void {
+        self.posting_backend_centroid_saves += 1;
+        var key_buf: [10]u8 = undefined;
+        try self.putNamespaced(txn, .nodes, hbc.encodeCentroidDirectoryKey(&key_buf, posting_id), encoded);
+    }
+
+    pub fn savePostingBackendBaseAndCentroidDirectory(
+        self: *PostingPersistenceTestIndex,
+        txn: anytype,
+        base_posting_id: PostingId,
+        encoded_base: []const u8,
+        centroid_posting_id: PostingId,
+        encoded_centroid: []const u8,
+    ) !void {
+        try self.savePostingBackendBase(txn, base_posting_id, encoded_base);
+        try self.savePostingBackendCentroidDirectory(txn, centroid_posting_id, encoded_centroid);
+    }
+
+    pub fn appendPostingBackendDeltaRecords(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, records: []const PostingDeltaRecord) !void {
+        self.posting_backend_delta_appends += 1;
+        const encoded = try PostingFormat.encodeDeltaTail(self.alloc, records);
+        defer self.alloc.free(encoded);
+        var key_buf: [18]u8 = undefined;
+        try self.appendNamespaced(txn, .nodes, hbc.encodePostingDeltaKey(&key_buf, posting_id, records[0].sequence), encoded);
+    }
+
+    fn postingBackendBaseData(self: *PostingPersistenceTestIndex, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]const u8 {
+        var key_buf: [10]u8 = undefined;
+        return self.getNamespaced(.{}, .nodes, hbc.encodePostingBaseKey(&key_buf, posting_id)) catch |err| {
+            if (is_not_found(err)) return error.NotFound;
+            return err;
+        };
+    }
+
+    pub fn loadPostingBackendBase(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedPostingBase {
+        _ = txn;
+        self.posting_backend_base_loads += 1;
+        return try PostingFormat.decodeBase(self.alloc, try self.postingBackendBaseData(posting_id, is_not_found));
+    }
+
+    pub fn loadPostingBackendBaseHeader(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseHeader {
+        _ = txn;
+        self.posting_backend_base_loads += 1;
+        return try PostingFormat.decodeBaseHeader(try self.postingBackendBaseData(posting_id, is_not_found));
+    }
+
+    pub fn loadPostingBackendBaseStats(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseStats {
+        _ = txn;
+        self.posting_backend_base_loads += 1;
+        return try PostingFormat.decodeBaseStats(try self.postingBackendBaseData(posting_id, is_not_found));
+    }
+
+    pub fn loadPostingBackendCentroidDirectoryRecord(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedCentroidDirectoryRecord {
+        _ = txn;
+        var key_buf: [10]u8 = undefined;
+        const data = self.getNamespaced(.{}, .nodes, hbc.encodeCentroidDirectoryKey(&key_buf, posting_id)) catch |err| {
+            if (is_not_found(err)) return error.NotFound;
+            return err;
+        };
+        return try CentroidDirectoryFormat.decode(self.alloc, data);
+    }
+
+    pub fn loadPostingBackendDeltaTail(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId) ![]PostingDeltaRecord {
+        _ = txn;
+        var out: std.ArrayList(PostingDeltaRecord) = .empty;
+        errdefer out.deinit(self.alloc);
+        for (self.delta_entries.items) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
+            const decoded = try PostingFormat.decodeDeltaTail(self.alloc, entry.value);
+            defer self.alloc.free(decoded);
+            try out.appendSlice(self.alloc, decoded);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn postingBackendDeltaTailStats(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, base_generation: u64) !PostingDeltaTailStats {
+        _ = txn;
+        var out = PostingDeltaTailStats{};
+        for (self.delta_entries.items) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
+            const stats = try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            out.records += stats.records;
+            out.records_after_generation += stats.records_after_generation;
+            out.tombstones_after_generation += stats.tombstones_after_generation;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
+            out.encoded_key_bytes += entry.key.len;
+            out.encoded_value_bytes += entry.value.len;
+        }
+        return out;
+    }
+
+    pub fn applyPostingBackendDeltaTailIntoScratch(
+        self: *PostingPersistenceTestIndex,
+        txn: anytype,
+        posting_id: PostingId,
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+    ) !DeltaReplayResult {
+        _ = txn;
+        var result = DeltaReplayResult{};
+        for (self.delta_entries.items) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
+            const entry_result = try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(alloc, scratch, member_count, entry.value, base_generation);
+            result.records += entry_result.records;
+            result.max_sequence = @max(result.max_sequence, entry_result.max_sequence);
+        }
+        return result;
+    }
+
+    pub fn materializePostingBackendMembers(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
+        self.posting_backend_member_materializations += 1;
+        var base = try self.loadPostingBackendBase(txn, posting_id, is_not_found);
+        defer base.deinit(self.alloc);
+        const records = try self.loadPostingBackendDeltaTail(txn, posting_id);
+        defer self.alloc.free(records);
+        return try PostingFormat.materializeMembersAfterGeneration(self.alloc, base.members, records, base.generation);
+    }
+
+    pub fn foldPostingBackendDeltaTailIntoBase(
+        self: *PostingPersistenceTestIndex,
+        txn: anytype,
+        posting_id: PostingId,
+        is_not_found: fn (anyerror) bool,
+        options: FoldDeltaTailOptions,
+    ) !FoldDeltaTailResult {
+        const base_header = try self.loadPostingBackendBaseHeader(txn, posting_id, is_not_found);
+        const stats = try self.postingBackendDeltaTailStats(txn, posting_id, base_header.generation);
+        if (!PostingStore.deltaTailShouldFold(base_header.member_count, stats, options)) {
+            return .{
+                .delta_records = stats.records,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
+                .skipped = true,
+            };
+        }
+        const materialized = try self.materializePostingBackendMembers(txn, posting_id, is_not_found);
+        defer self.alloc.free(materialized);
+        const next_generation = base_header.generation +| 1;
+        try PostingStore.saveBase(self, txn, .{
+            .posting_id = posting_id,
+            .generation = next_generation,
+            .members = materialized,
+        });
+        return .{
+            .delta_records = stats.records,
+            .base_member_count = base_header.member_count,
+            .materialized_member_count = materialized.len,
+            .written_base_value_bytes = self.base_value.len,
+            .next_generation = next_generation,
+        };
     }
 
     fn lessDeltaEntry(_: void, a: DeltaEntry, b: DeltaEntry) bool {
@@ -4943,6 +5274,97 @@ test "posting store indexed delta fold compacts tombstones and repeated inserts"
     try std.testing.expect(std.mem.indexOfScalar(VectorId, base_after_fold.members, 200) == null);
     try std.testing.expectEqual(@as(VectorId, 3), base_after_fold.members[base_after_fold.members.len - 2]);
     try std.testing.expectEqual(@as(VectorId, 201), base_after_fold.members[base_after_fold.members.len - 1]);
+}
+
+test "posting store segment backend hooks route posting persistence" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{
+        .alloc = alloc,
+        .config = .{
+            .dims = 2,
+            .posting_storage_mode = .base_delta,
+            .posting_backend = .segments,
+        },
+    };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    try PostingStore.saveBaseAndCentroidDirectoryRecord(&index, &txn, .{
+        .posting_id = 9,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    }, .{
+        .posting_id = 9,
+        .generation = 1,
+        .mutation_version = 1,
+        .payload_version = 1,
+        .flags = CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 1.5,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    try PostingStore.appendDeltaRecords(&index, &txn, 9, &.{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .tombstone, .vector_id = 10 },
+        .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .insert, .vector_id = 30 },
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_base_saves);
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_centroid_saves);
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_delta_appends);
+    try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
+    try std.testing.expectError(error.UnsupportedPostingBackendBorrowedData, PostingStore.loadBaseData(&index, &txn, 9, isNotFoundForPostingPersistenceTest));
+
+    const header = try PostingStore.loadBaseHeader(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    try std.testing.expectEqual(@as(u64, 1), header.generation);
+    try std.testing.expectEqual(@as(u32, 2), header.member_count);
+
+    var centroid = try PostingStore.loadCentroidDirectoryRecord(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), centroid.mutation_version);
+    try std.testing.expectEqual(CentroidDirectoryFormat.dirty_flag, centroid.flags);
+
+    const stats = try PostingStore.deltaTailStats(&index, &txn, 9, 1);
+    try std.testing.expectEqual(@as(usize, 2), stats.records);
+    try std.testing.expectEqual(@as(usize, 2), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);
+
+    const members = try PostingStore.materializeBaseDeltaMembers(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    defer alloc.free(members);
+    try std.testing.expectEqualSlices(VectorId, &.{ 20, 30 }, members);
+
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+    var profile = PostingQueryMaterializeTestProfile{};
+    const query_members = try PostingStore.copyQueryMemberIds(
+        &index,
+        &txn,
+        alloc,
+        &scratch,
+        .{
+            .id = 9,
+            .parent = 1,
+            .level = 0,
+            .centroid = &.{ 1.0, 2.0 },
+            .members = &.{},
+            .state = .{ .mutation_version = 2 },
+        },
+        &profile,
+        postingQueryTestNow,
+        postingQueryTestElapsed,
+    );
+    try std.testing.expectEqualSlices(VectorId, &.{ 20, 30 }, query_members);
+    try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
+    try std.testing.expect(index.posting_backend_member_materializations >= 2);
+
+    const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
+        .min_delta_records = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 2), folded.delta_records);
+    try std.testing.expectEqual(@as(usize, 2), folded.materialized_member_count);
+    try std.testing.expectEqual(@as(u64, 2), folded.next_generation);
+    try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
 }
 
 test "posting store query member copy overlays base and delta tail in shadow mode" {

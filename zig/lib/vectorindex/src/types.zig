@@ -48,6 +48,11 @@ pub const HBCConfig = struct {
         base_delta,
     };
 
+    pub const PostingBackend = enum {
+        lsm,
+        segments,
+    };
+
     storage_backend: StorageBackend = .lmdb,
     dims: u32,
     metric: vec.DistanceMetric = .l2_squared,
@@ -102,6 +107,7 @@ pub const HBCConfig = struct {
     auto_posting_maintenance_boundary_reassignment_min_improvement: f32 = 0.0,
     centroid_directory_mode: CentroidDirectoryMode = .hbc,
     posting_storage_mode: PostingStorageMode = .packed_hbc,
+    posting_backend: PostingBackend = .lsm,
     flat_centroid_block_size: usize = 128,
     flat_centroid_probe_count: usize = 0,
     flat_centroid_block_probe_count: usize = 0,
