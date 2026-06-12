@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
@@ -1515,7 +1516,7 @@ fn freeColumns(alloc: Allocator, columns: []foreign_source.Column) void {
 }
 
 fn lock(mutex: *Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 pub fn registerDefaultExecutor(alloc: Allocator, registry: *foreign_source.Registry) !void {

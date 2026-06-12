@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const bloom = @import("bloom");
 const Allocator = std.mem.Allocator;
@@ -234,7 +235,7 @@ pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
             platform_time.monotonicNs()
         else
             0;
-        while (!backend.mu.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&backend.mu);
         if (@hasDecl(BackendType, "recordBackendLockWait")) {
             backend.recordBackendLockWait(platform_time.monotonicNs() -| started_ns);
         }

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
@@ -32,7 +33,7 @@ var checkpoint_lock_registry_mutex: std.atomic.Mutex = .unlocked;
 var checkpoint_locks: std.StringHashMapUnmanaged(*CheckpointFileLock) = .empty;
 
 fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    platform_sync.lockYielding(mutex);
 }
 
 const CheckpointFileLock = struct {

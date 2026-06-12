@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
@@ -412,7 +413,7 @@ fn enrichmentStageKeyAlloc(
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 test "objectstore-backed progress store supports cas over file uri" {

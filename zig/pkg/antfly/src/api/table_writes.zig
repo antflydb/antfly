@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
@@ -3789,7 +3790,15 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.local_db_mutex.unlock();
             cache.retireFailedOpenLocked(&cached);
         }
-        try cached.db.drainResolverBackfill();
+        // .default_async opens run on the raft apply thread
+        // (applyReplicatedBatchGroupLocal). Draining resolver backfill there
+        // blocks the raft loop on the promotion pipeline, whose cross-shard
+        // entity upserts need raft applies that are queued behind this very
+        // open — observed as a full apply wedge (batch writes timing out
+        // cluster-wide) in the multinode autograph e2e. The promotion and
+        // resolution workers started by this open drain the same backlog
+        // asynchronously instead.
+        if (mode != .default_async) try cached.db.drainResolverBackfill();
         return cached;
     }
 
@@ -10615,7 +10624,12 @@ fn sleepNs(duration_ns: u64) void {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    // Bounded spin, then yield (platform_sync): local_db_mutex guards cache
+    // bookkeeping that can take a while under contention (opens,
+    // invalidation), and a pure spin pins a core per waiter — on
+    // CPU-constrained hosts (CI runners) that starves the very threads that
+    // would release the lock.
+    platform_sync.lockYielding(mutex);
 }
 
 fn recoverProvisionedTransactionsOnce(
