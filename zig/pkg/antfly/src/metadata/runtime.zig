@@ -96,7 +96,7 @@ const Factory = struct {
                     .id = record.local_node_id,
                     .group_id = record.group_id,
                     .peers = peers,
-                    .election_tick = 5,
+                    .election_tick = 30,
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
@@ -592,7 +592,7 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 25;
+    const tick_ms = cli.tick_ms orelse 100;
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),

@@ -804,7 +804,7 @@ pub fn runFromIterator(
     };
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 25;
+    const tick_ms = cli.tick_ms orelse 100;
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
