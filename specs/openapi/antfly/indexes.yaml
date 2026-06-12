@@ -63,10 +63,78 @@ components:
         enrichments:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/EnrichmentConfig"
           x-go-type-skip-optional-pointer: true
-          description: "List of enrichment names to apply to documents before indexing. Enrichments must be defined at the table level."
-          example: ["semantic_chunks", "summary"]
+          description: "Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream."
+          example:
+            - name: document_chunks_v1
+              kind: chunk
+              field: text
+              source_artifact_name: document_units_v1
+              chunk_size: 512
+            - name: document_chunk_dense_v1
+              kind: embedding
+              field: text
+              source_artifact_name: document_chunks_v1
+              expected_dims: 768
+    EnrichmentKind:
+      type: string
+      enum:
+        - chunk
+        - asset
+        - embedding
+      description: "Managed generated artifact kind."
+    EnrichmentConfig:
+      type: object
+      description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+          description: "Stable generated artifact name."
+        kind:
+          $ref: "#/components/schemas/EnrichmentKind"
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Source field to read from the source document or source artifact payload."
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Optional template for generated text input."
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts."
+        expected_dims:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: "Expected embedding dimension for embedding enrichments."
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: "Chunk size for chunk enrichments."
+        chunk_overlap:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: "Chunk overlap for chunk enrichments."
+        chunker_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Serialized chunker configuration for chunk enrichments."
+        content_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Produced asset content type for asset enrichments."
+        producer_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Serialized asset producer configuration."
     FullTextIndexConfig:
       type: object
       properties:
@@ -148,6 +216,14 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Field to extract embeddings from (managed indexes only; not allowed when external=true)"
+        embedding_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings."
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source."
         template:
           x-go-type-skip-optional-pointer: true
           type: string

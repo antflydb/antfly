@@ -68,3 +68,7 @@ test "managed embedder resolves file-backed api key rotation at request time" {
 test "managed embedder dimension probe validation modes" {
     try managed_embedder.testDimensionProbeValidationModes();
 }
+
+test "managed embedder artifact backed embedding translation" {
+    try managed_embedder.testArtifactBackedEmbeddingTranslation();
+}
