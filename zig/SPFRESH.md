@@ -73,6 +73,12 @@ Current status:
 - The comparison summarizer derives posting-family LSM cost through
   `posting_lsm_keys_per_mutation` and `posting_lsm_bytes_per_mutation`, so
   backend overhead can be separated from logical base/delta format cost.
+- The comparison summarizer also reports query materialization cost through
+  `post_query_materialization_ns_per_posting`,
+  `post_query_materialization_ns_per_member`,
+  `query_materialization_ns_per_posting`, and
+  `query_materialization_ns_per_member`, so overlay replay CPU can be compared
+  independently of cache and backend effects.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
@@ -682,9 +688,9 @@ implementations cleanly:
 
 The next optimization decisions need counters that separate logical format
 cost from backend cost. This branch now emits the base byte/decode, delta
-byte/replay, posting-family LSM cost, fold scratch, and search scratch
-allocation/retention counters. The full set to keep tracking before making a
-segment-backend decision is:
+byte/replay, posting-family LSM cost, query materialization cost, fold scratch,
+and search scratch allocation/retention counters. The full set to keep
+tracking before making a segment-backend decision is:
 
 - base bytes/member
 - base decode ns/member

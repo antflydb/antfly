@@ -129,6 +129,11 @@ WRITE_COLUMNS = [
     "post_upper_tree_pin_ns",
     "post_child_expand_ns",
     "post_leaf_score_ns",
+    "post_overlay_ns",
+    "post_overlay_calls",
+    "post_overlay_materialized_members",
+    "post_query_materialization_ns_per_posting",
+    "post_query_materialization_ns_per_member",
     "post_rerank_ns",
     "repair_allow_overfull",
     "repair_overfull_limit",
@@ -237,6 +242,10 @@ READ_COLUMNS = [
     "overlay_cache_admission_skips",
     "overlay_cache_member_bytes",
     "overlay_delta_records",
+    "overlay_ns",
+    "overlay_materialized_members",
+    "query_materialization_ns_per_posting",
+    "query_materialization_ns_per_member",
     "posting_base_decode_ns",
     "posting_base_decode_members",
     "posting_base_decode_ns_per_member",
@@ -744,6 +753,21 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "post_write_warm_profile_leaf_score_ns",
                     "post_write_profile_leaf_score_ns",
                 ),
+                "post_overlay_ns": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_overlay_ns",
+                    "post_write_profile_posting_overlay_ns",
+                ),
+                "post_overlay_calls": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_overlay_calls",
+                    "post_write_profile_posting_overlay_calls",
+                ),
+                "post_overlay_materialized_members": preferred_mean(
+                    group,
+                    "post_write_warm_profile_posting_overlay_materialized_members",
+                    "post_write_profile_posting_overlay_materialized_members",
+                ),
                 "post_rerank_ns": preferred_mean(
                     group,
                     "post_write_warm_profile_rerank_ns",
@@ -1045,6 +1069,14 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("posting_delta_replay_ns"),
             summary.get("posting_delta_replay_records"),
         )
+        summary["post_query_materialization_ns_per_posting"] = safe_ratio(
+            summary.get("post_overlay_ns"),
+            summary.get("post_overlay_calls"),
+        )
+        summary["post_query_materialization_ns_per_member"] = safe_ratio(
+            summary.get("post_overlay_ns"),
+            summary.get("post_overlay_materialized_members"),
+        )
         summary["fg_route_items_per_leaf_group"] = safe_ratio(
             summary.get("fg_route_items"),
             summary.get("fg_route_leaf_groups"),
@@ -1104,6 +1136,8 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "overlay_cache_admission_skips": mean(group, "profile_posting_overlay_cache_admission_skips"),
                 "overlay_cache_member_bytes": mean(group, "profile_posting_overlay_cache_member_bytes"),
                 "overlay_delta_records": mean(group, "profile_posting_overlay_delta_records"),
+                "overlay_ns": mean(group, "profile_posting_overlay_ns"),
+                "overlay_materialized_members": mean(group, "profile_posting_overlay_materialized_members"),
                 "posting_base_decode_ns": mean(group, "profile_posting_base_decode_ns"),
                 "posting_base_decode_members": mean(group, "profile_posting_base_decode_members"),
                 "posting_delta_replay_ns": mean(group, "profile_posting_delta_replay_ns"),
@@ -1156,6 +1190,14 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["posting_delta_replay_ns_per_record"] = safe_ratio(
             summary.get("posting_delta_replay_ns"),
             summary.get("posting_delta_replay_records"),
+        )
+        summary["query_materialization_ns_per_posting"] = safe_ratio(
+            summary.get("overlay_ns"),
+            summary.get("overlay_calls"),
+        )
+        summary["query_materialization_ns_per_member"] = safe_ratio(
+            summary.get("overlay_ns"),
+            summary.get("overlay_materialized_members"),
         )
     return summaries
 
