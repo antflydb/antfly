@@ -3929,7 +3929,7 @@ paths:
 
         artifact. The job advances through the same bounded per-shard repair
 
-        primitive used by `:reprocess`, and stores returned continuation
+        primitive used by `/reprocess`, and stores returned continuation
 
         cursors so hosted controllers can resume large sharded table repairs
 

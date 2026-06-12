@@ -1034,7 +1034,7 @@ export interface paths {
          * Create a derived document artifact reprocess job
          * @description Creates a durable user-facing repair job for a derived document
          *     artifact. The job advances through the same bounded per-shard repair
-         *     primitive used by `:reprocess`, and stores returned continuation
+         *     primitive used by `/reprocess`, and stores returned continuation
          *     cursors so hosted controllers can resume large sharded table repairs
          *     without collapsing progress into a single global key cursor.
          */
