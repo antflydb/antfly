@@ -5737,7 +5737,11 @@ pub const DB = struct {
         defer self.alloc.free(snapshot_root);
         try ensureDirPath(snapshot_root);
 
-        return try self.core.writeSnapshot(snapshot_root);
+        var total = try self.core.writeSnapshot(snapshot_root);
+        const segment_artifacts = try self.core.index_manager.exportDensePostingSegmentArtifactsToDirectory(snapshot_root);
+        total +|= @as(u64, @intCast(segment_artifacts.manifest_bytes));
+        total +|= @as(u64, @intCast(segment_artifacts.segment_bytes));
+        return total;
     }
 
     pub fn sync(self: *DB, full: bool) !void {
@@ -5748,23 +5752,26 @@ pub const DB = struct {
 
     fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, restore_identity: ?RestoreIdentity) !void {
         if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
-        var opened_primary = try openPrimaryStore(alloc, path, .{
-            .map_size = opts.map_size,
-            .no_sync = opts.no_sync,
-            .primary_backend = opts.primary_backend,
-            .storage = opts.storage,
-            .index_backends = opts.index_backends,
-        });
-        defer {
-            opened_primary.store.close();
-            opened_primary.owner.close(alloc);
-        }
+        {
+            var opened_primary = try openPrimaryStore(alloc, path, .{
+                .map_size = opts.map_size,
+                .no_sync = opts.no_sync,
+                .primary_backend = opts.primary_backend,
+                .storage = opts.storage,
+                .index_backends = opts.index_backends,
+            });
+            defer {
+                opened_primary.store.close();
+                opened_primary.owner.close(alloc);
+            }
 
-        try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
-        try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
-        try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
-        try validateRestoredIdentityNamespace(&opened_primary.store, opts);
-        try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
+            try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
+            try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+            try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
+            try validateRestoredIdentityNamespace(&opened_primary.store, opts);
+            try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
+        }
+        try importSnapshotRuntimeArtifactsToPath(alloc, snapshot_root, path, opts);
         if (restore_identity) |identity| try markRestorePrimaryRestoredForPath(
             alloc,
             path,
@@ -5773,6 +5780,23 @@ pub const DB = struct {
             identity.snapshot_path,
             identity.group_id,
         );
+    }
+
+    fn importSnapshotRuntimeArtifactsToPath(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
+        var import_opts = opts;
+        import_opts.open_mode = .writer_no_replay;
+        import_opts.start_index_workers = false;
+        import_opts.start_optional_runtimes = false;
+
+        var db = try DB.open(alloc, path, import_opts);
+        defer db.close();
+        const imported = try db.importDensePostingSegmentArtifactsFromDirectory(snapshot_root);
+        if (imported.transferred_indexes != 0) {
+            std.log.info(
+                "restored dense posting segment artifacts path={s} indexes={d} segment_files={d} segment_bytes={d}",
+                .{ path, imported.transferred_indexes, imported.segment_files, imported.segment_bytes },
+            );
+        }
     }
 
     fn validateRestoredIdentityNamespace(store: *docstore_mod.DocStore, opts: OpenOptions) !void {
@@ -49944,6 +49968,102 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
     defer after.deinit();
     try std.testing.expectEqual(@as(u32, 1), after.total_hits);
     try std.testing.expectEqualStrings("doc:b", after.hits[0].id);
+}
+
+test "db snapshot restore carries segment-backed dense posting artifacts" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const dense_config =
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "metric": "l2_squared",
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
+        \\  "version": 1
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_segments",
+            .kind = .dense_vector,
+            .config_json = dense_config,
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"embedding\":[0,0]}" },
+                .{ .key = "doc:b", .value = "{\"embedding\":[10,0]}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.runUntilIdle();
+
+        const snapshot_size = try db.snapshot("snap1");
+        try std.testing.expect(snapshot_size > 0);
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+    const artifact_manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/dense-posting-segments/dv_segments/{s}",
+        .{ snapshot_root, vectorindex_mod.posting_segment.default_manifest_path },
+    );
+    defer alloc.free(artifact_manifest_path);
+    const hbc_store_snapshot_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/dense-posting-segments/dv_segments/hbc-store.afhs",
+        .{snapshot_root},
+    );
+    defer alloc.free(hbc_store_snapshot_path);
+    {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.accessAbsolute(io_impl.io(), artifact_manifest_path, .{});
+        try std.Io.Dir.accessAbsolute(io_impl.io(), hbc_store_snapshot_path, .{});
+    }
+
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+    });
+
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+    });
+    defer restored.close();
+
+    var result = try restored.search(alloc, .{
+        .index_name = "dv_segments",
+        .dense = .{ .vector = &.{ 10.0, 0.0 }, .k = 1 },
+        .limit = 1,
+        .include_stored = false,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
 test "db restore snapshot rejects invalid doc identity metadata" {

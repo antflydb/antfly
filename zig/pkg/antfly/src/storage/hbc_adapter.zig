@@ -71,6 +71,10 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 var temp_path_nonce: u64 = 0;
 const posting_segment_manifest_meta_key = "posting_segment_manifest_v1";
+const posting_segment_hbc_store_snapshot_path = "hbc-store.afhs";
+const posting_segment_hbc_store_snapshot_magic = "AFHSSNAP";
+const posting_segment_hbc_store_snapshot_version: u32 = 1;
+const posting_segment_hbc_store_snapshot_max_bytes: usize = 1024 * 1024 * 1024;
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
 
@@ -2966,6 +2970,189 @@ pub const HBCIndex = struct {
         };
     }
 
+    const PostingSegmentPrivateStoreSnapshotStats = struct {
+        entries: usize = 0,
+        bytes: usize = 0,
+    };
+
+    fn postingSegmentSnapshotNamespaceOrdinal(comptime namespace: Namespace) u8 {
+        return switch (namespace) {
+            .nodes => 1,
+            .meta => 2,
+            .quant => 3,
+            .vecs => 4,
+        };
+    }
+
+    fn postingSegmentSnapshotNamespaceFromOrdinal(raw: u8) !Namespace {
+        return switch (raw) {
+            1 => .nodes,
+            2 => .meta,
+            3 => .quant,
+            4 => .vecs,
+            else => error.InvalidPostingSegmentPrivateStoreSnapshot,
+        };
+    }
+
+    fn appendPostingSegmentSnapshotInt(out: *std.ArrayListUnmanaged(u8), value: anytype, alloc: Allocator) !void {
+        var buf: [@sizeOf(@TypeOf(value))]u8 = undefined;
+        std.mem.writeInt(@TypeOf(value), &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+
+    fn appendPostingSegmentPrivateStoreNamespaceSnapshot(
+        self: *HBCIndex,
+        alloc: Allocator,
+        txn: anytype,
+        comptime namespace: Namespace,
+        out: *std.ArrayListUnmanaged(u8),
+        entry_count: *u64,
+    ) !void {
+        var cursor = try self.openNamespacedCursor(alloc, txn, namespace);
+        defer cursor.close();
+
+        var maybe_entry = try cursor.first();
+        while (maybe_entry) |entry| : (maybe_entry = try cursor.next()) {
+            try out.append(alloc, postingSegmentSnapshotNamespaceOrdinal(namespace));
+            try appendPostingSegmentSnapshotInt(out, @as(u64, @intCast(entry.key.len)), alloc);
+            try appendPostingSegmentSnapshotInt(out, @as(u64, @intCast(entry.value.len)), alloc);
+            try out.appendSlice(alloc, entry.key);
+            try out.appendSlice(alloc, entry.value);
+            entry_count.* += 1;
+        }
+    }
+
+    fn exportPostingSegmentPrivateStoreSnapshotToDirectory(
+        self: *HBCIndex,
+        io: std.Io,
+        destination_dir: std.Io.Dir,
+    ) !PostingSegmentPrivateStoreSnapshotStats {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(self.alloc);
+        try encoded.appendSlice(self.alloc, posting_segment_hbc_store_snapshot_magic);
+        try appendPostingSegmentSnapshotInt(&encoded, @as(u32, posting_segment_hbc_store_snapshot_version), self.alloc);
+        const count_offset = encoded.items.len;
+        try appendPostingSegmentSnapshotInt(&encoded, @as(u64, 0), self.alloc);
+
+        var entry_count: u64 = 0;
+        try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .nodes, &encoded, &entry_count);
+        try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .meta, &encoded, &entry_count);
+        try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .quant, &encoded, &entry_count);
+        try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .vecs, &encoded, &entry_count);
+        std.mem.writeInt(u64, encoded.items[count_offset..][0..8], entry_count, .little);
+
+        try destination_dir.writeFile(io, .{
+            .sub_path = posting_segment_hbc_store_snapshot_path,
+            .data = encoded.items,
+        });
+        return .{
+            .entries = @intCast(entry_count),
+            .bytes = encoded.items.len,
+        };
+    }
+
+    fn validatePostingSegmentPrivateStoreSnapshot(raw: []const u8) !PostingSegmentPrivateStoreSnapshotStats {
+        if (raw.len < posting_segment_hbc_store_snapshot_magic.len + @sizeOf(u32) + @sizeOf(u64)) {
+            return error.InvalidPostingSegmentPrivateStoreSnapshot;
+        }
+        if (!std.mem.eql(u8, raw[0..posting_segment_hbc_store_snapshot_magic.len], posting_segment_hbc_store_snapshot_magic)) {
+            return error.InvalidPostingSegmentPrivateStoreSnapshot;
+        }
+        var cursor: usize = posting_segment_hbc_store_snapshot_magic.len;
+        const version = std.mem.readInt(u32, raw[cursor..][0..4], .little);
+        cursor += 4;
+        if (version != posting_segment_hbc_store_snapshot_version) return error.UnsupportedPostingSegmentPrivateStoreSnapshot;
+        const entry_count = std.mem.readInt(u64, raw[cursor..][0..8], .little);
+        cursor += 8;
+
+        var entries_seen: u64 = 0;
+        while (entries_seen < entry_count) : (entries_seen += 1) {
+            if (cursor + 17 > raw.len) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+            _ = try postingSegmentSnapshotNamespaceFromOrdinal(raw[cursor]);
+            cursor += 1;
+            const key_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            const value_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            if (key_len > raw.len - cursor) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+            cursor += key_len;
+            if (value_len > raw.len - cursor) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+            cursor += value_len;
+        }
+        if (cursor != raw.len) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+        return .{
+            .entries = @intCast(entry_count),
+            .bytes = raw.len,
+        };
+    }
+
+    fn putPostingSegmentSnapshotEntry(self: *HBCIndex, txn: anytype, namespace: Namespace, key: []const u8, value: []const u8) !void {
+        switch (namespace) {
+            .nodes => try self.putNamespaced(txn, .nodes, key, value),
+            .meta => try self.putNamespaced(txn, .meta, key, value),
+            .quant => try self.putNamespaced(txn, .quant, key, value),
+            .vecs => try self.putNamespaced(txn, .vecs, key, value),
+        }
+    }
+
+    fn reloadMetadataFromStoreAfterSnapshotImport(self: *HBCIndex) !void {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        const existing = try self.getNamespaced(&txn, .meta, meta_key);
+        self.metadata = IndexMetadata.decode(existing);
+        self.refreshPublishedSearchState();
+        try self.reloadPostingSegmentRuntimeFromCommittedManifest();
+    }
+
+    fn importPostingSegmentPrivateStoreSnapshotFromDirectory(
+        self: *HBCIndex,
+        io: std.Io,
+        source_dir: std.Io.Dir,
+    ) !?PostingSegmentPrivateStoreSnapshotStats {
+        const raw = source_dir.readFileAlloc(
+            io,
+            posting_segment_hbc_store_snapshot_path,
+            self.alloc,
+            .limited(posting_segment_hbc_store_snapshot_max_bytes),
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        const snapshot_stats = try validatePostingSegmentPrivateStoreSnapshot(raw);
+
+        var txn = try self.beginRuntimeBatchTxn();
+        errdefer txn.abort();
+        try self.clearNamespace(&txn, .nodes);
+        try self.clearNamespace(&txn, .meta);
+        try self.clearNamespace(&txn, .quant);
+        try self.clearNamespace(&txn, .vecs);
+
+        var cursor: usize = posting_segment_hbc_store_snapshot_magic.len + @sizeOf(u32);
+        const entry_count = std.mem.readInt(u64, raw[cursor..][0..8], .little);
+        cursor += 8;
+        var entries_seen: u64 = 0;
+        while (entries_seen < entry_count) : (entries_seen += 1) {
+            const namespace = try postingSegmentSnapshotNamespaceFromOrdinal(raw[cursor]);
+            cursor += 1;
+            const key_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            const value_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            const key = raw[cursor .. cursor + key_len];
+            cursor += key_len;
+            const value = raw[cursor .. cursor + value_len];
+            cursor += value_len;
+            try self.putPostingSegmentSnapshotEntry(&txn, namespace, key, value);
+        }
+        try txn.commit();
+        try self.reloadMetadataFromStoreAfterSnapshotImport();
+        return snapshot_stats;
+    }
+
     pub fn exportPostingSegmentBackendToDirectory(self: *HBCIndex, destination_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
         if (self.posting_segment_runtime == null) return .{};
 
@@ -2982,6 +3169,7 @@ pub const HBCIndex = struct {
         try std.Io.Dir.cwd().createDirPath(io, destination_path);
         var destination_dir = try std.Io.Dir.cwd().openDir(io, destination_path, .{ .iterate = true });
         defer destination_dir.close(io);
+        _ = try self.exportPostingSegmentPrivateStoreSnapshotToDirectory(io, destination_dir);
 
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
@@ -2999,18 +3187,30 @@ pub const HBCIndex = struct {
     pub fn importPostingSegmentBackendFromDirectory(self: *HBCIndex, source_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
         if (self.posting_segment_runtime == null) return .{};
 
+        var io_impl = std.Io.Threaded.init(self.alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var source_dir = std.Io.Dir.cwd().openDir(io, source_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                var txn = try self.beginReadTxn();
+                defer txn.abort();
+                _ = self.getNamespaced(&txn, .meta, posting_segment_manifest_meta_key) catch |manifest_err| switch (manifest_err) {
+                    error.NotFound => return .{},
+                    else => return manifest_err,
+                };
+                return err;
+            },
+            else => return err,
+        };
+        defer source_dir.close(io);
+        _ = try self.importPostingSegmentPrivateStoreSnapshotFromDirectory(io, source_dir);
+
         var txn = try self.beginReadTxn();
         defer txn.abort();
         const committed_manifest_data = self.getNamespaced(&txn, .meta, posting_segment_manifest_meta_key) catch |err| switch (err) {
             error.NotFound => return .{},
             else => return err,
         };
-
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        var source_dir = try std.Io.Dir.cwd().openDir(io, source_path, .{ .iterate = true });
-        defer source_dir.close(io);
 
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();

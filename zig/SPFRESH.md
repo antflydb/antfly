@@ -208,12 +208,13 @@ Current status:
   committed manifest snapshot, compact selected segment files, collect
   temp/orphan files, publish the replacement manifest through the same LSM meta
   transaction, and report compact segment counters through dense posting
-  maintenance stats and Prometheus. HBC can also export and import the segment
-  artifacts referenced by the committed manifest marker through a standalone
-  directory, validating each referenced segment, writing the manifest last, and
-  rejecting imports whose manifest does not match the committed marker; this is
-  the backup/restore placement primitive, but generic DB snapshots still
-  intentionally export the logical store only. Dense maintenance now runs
+  maintenance stats and Prometheus. HBC can also export and import a
+  self-contained segment-backed posting bundle through a standalone directory:
+  the bundle contains a versioned snapshot of the HBC private namespaces plus
+  the segment artifacts referenced by the committed manifest marker. Import
+  restores the private namespace snapshot first, validates each referenced
+  segment, writes the manifest last, and rejects imports whose manifest does
+  not match the restored committed marker. Dense maintenance now runs
   segment compaction under the existing dense posting maintenance working-set
   reservation, passing that reservation through as a cap on selected compaction
   input bytes. HBC segment recovery can reload from the committed manifest
@@ -222,11 +223,10 @@ Current status:
   separates `backend`, `format`, and `version`; `backend = segments,
   format = base_delta, version = 1` is an opt-in DB-facing mode while the
   default remains `backend = lsm, format = packed_hbc, version = 1`. Generic DB
-  snapshots still intentionally export the logical store only and inherit the
-  existing dense-index restore-repair behavior for generated/stored embedding
-  artifacts. Workflows that preserve or transfer an HBC private index store must
-  carry the segment artifacts with the committed segment manifest using the HBC
-  export/import hooks. This
+  snapshots now include the self-contained bundle for segment-backed dense
+  indexes and restore it before runtime repair begins, while non-segment dense
+  indexes keep the existing logical-store rebuild behavior for generated/stored
+  embedding artifacts. This
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for the segment-backed base/delta mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
@@ -874,13 +874,14 @@ implementations cleanly:
     manifest before completing repair. Public dense config also accepts the
     opt-in `backend = segments, format = base_delta, version = 1` combination
     while leaving the default on `lsm + packed_hbc + v1`. DB and IndexManager
-    now expose aggregate dense posting segment artifact export/import hooks
+    now expose aggregate dense posting segment snapshot export/import hooks
     that copy every segment-backed dense index into a deterministic
-    `dense-posting-segments/<index>` bundle and restore it by validating the
-    source manifest against each restored HBC metadata marker. The remaining
-    promotion work is wiring external backup/import orchestration to call those
-    hooks whenever it preserves private HBC index stores. That may reduce LSM
-    key overhead and improve sequential IO.
+    `dense-posting-segments/<index>` bundle. Each bundle carries a versioned
+    HBC private-namespace snapshot plus the referenced segment files, so DB
+    snapshots and restores can preserve segment-backed dense indexes through
+    the public snapshot API instead of relying on external orchestration to
+    stitch HBC metadata and segment files together. That may reduce LSM key
+    overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
