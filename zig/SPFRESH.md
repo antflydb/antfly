@@ -119,10 +119,12 @@ Current status:
   segment values through the existing logical posting codecs, so future runtime
   read paths can depend on posting-base, delta-tail, and centroid-directory
   structs instead of segment byte layout. A compact durable manifest codec
-  records segment ids, paths, and posting/delta range metadata for reopen.
-  Runtime reads/writes still use the LSM-backed namespace; this
-  segment container/catalog/snapshot/manifest stack is the file-format substrate
-  for a future
+  records segment ids, paths, and posting/delta range metadata for reopen, and
+  an owned segment-store opener can rebuild a snapshot from manifest bytes plus
+  caller-provided segment reads while validating each segment's actual metadata
+  against the manifest. Runtime reads/writes still use the LSM-backed
+  namespace; this segment container/catalog/snapshot/manifest/open stack is the
+  file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
