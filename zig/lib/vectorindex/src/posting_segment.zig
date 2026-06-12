@@ -46,6 +46,13 @@ pub const DeltaValue = struct {
     value: []const u8,
 };
 
+pub const EntryValue = struct {
+    posting_id: PostingId,
+    kind: EntryKind,
+    sequence: u64,
+    value: []const u8,
+};
+
 pub const SegmentMeta = struct {
     segment_id: u64,
     min_posting_id: PostingId = 0,
@@ -488,6 +495,13 @@ pub const Reader = struct {
         };
     }
 
+    pub fn entries(self: Reader) EntryIterator {
+        return .{
+            .reader = self,
+            .index = 0,
+        };
+    }
+
     pub fn metadata(self: Reader, segment_id: u64) !SegmentMeta {
         var meta = SegmentMeta{
             .segment_id = segment_id,
@@ -575,6 +589,23 @@ pub const DeltaIterator = struct {
         if (entry.posting_id != self.posting_id or entry.kind != .delta) return null;
         self.index += 1;
         return .{
+            .sequence = entry.sequence,
+            .value = try entry.value(self.reader.data),
+        };
+    }
+};
+
+pub const EntryIterator = struct {
+    reader: Reader,
+    index: usize,
+
+    pub fn next(self: *EntryIterator) !?EntryValue {
+        if (self.index >= self.reader.entry_count) return null;
+        const entry = try self.reader.indexEntry(self.index);
+        self.index += 1;
+        return .{
+            .posting_id = entry.posting_id,
+            .kind = entry.kind,
             .sequence = entry.sequence,
             .value = try entry.value(self.reader.data),
         };
@@ -803,6 +834,32 @@ pub fn testStoresBaseCentroidAndOrderedDeltaValues() !void {
     try std.testing.expectEqual(@as(u64, 5), second.sequence);
     try std.testing.expectEqualSlices(u8, delta_5, second.value);
     try std.testing.expect(try iter.next() == null);
+
+    var entry_iter = reader.entries();
+    const base_entry = (try entry_iter.next()).?;
+    try std.testing.expectEqual(@as(PostingId, 7), base_entry.posting_id);
+    try std.testing.expectEqual(EntryKind.base, base_entry.kind);
+    try std.testing.expectEqual(@as(u64, 0), base_entry.sequence);
+    try std.testing.expectEqualSlices(u8, base, base_entry.value);
+
+    const delta_4_entry = (try entry_iter.next()).?;
+    try std.testing.expectEqual(@as(PostingId, 7), delta_4_entry.posting_id);
+    try std.testing.expectEqual(EntryKind.delta, delta_4_entry.kind);
+    try std.testing.expectEqual(@as(u64, 4), delta_4_entry.sequence);
+    try std.testing.expectEqualSlices(u8, delta_4, delta_4_entry.value);
+
+    const delta_5_entry = (try entry_iter.next()).?;
+    try std.testing.expectEqual(@as(PostingId, 7), delta_5_entry.posting_id);
+    try std.testing.expectEqual(EntryKind.delta, delta_5_entry.kind);
+    try std.testing.expectEqual(@as(u64, 5), delta_5_entry.sequence);
+    try std.testing.expectEqualSlices(u8, delta_5, delta_5_entry.value);
+
+    const centroid_entry = (try entry_iter.next()).?;
+    try std.testing.expectEqual(@as(PostingId, 7), centroid_entry.posting_id);
+    try std.testing.expectEqual(EntryKind.centroid_directory, centroid_entry.kind);
+    try std.testing.expectEqual(@as(u64, 0), centroid_entry.sequence);
+    try std.testing.expectEqualSlices(u8, centroid, centroid_entry.value);
+    try std.testing.expect(try entry_iter.next() == null);
 }
 
 pub fn testRejectsDuplicateLogicalEntries() !void {

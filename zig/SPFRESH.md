@@ -119,8 +119,10 @@ Current status:
   typed snapshot facade that decodes those segment values through the existing
   logical posting codecs, so future runtime read paths can depend on
   posting-base, delta-tail, and centroid-directory structs instead of segment
-  byte layout. Snapshot delta reads can also filter by base generation and use
-  segment delta-range metadata to skip stale tail files before decode. A compact
+  byte layout. Segment readers also expose deterministic logical-entry
+  iteration for future compaction, migration, and backup verification code.
+  Snapshot delta reads can also filter by base generation and use segment
+  delta-range metadata to skip stale tail files before decode. A compact
   durable manifest codec with trailer checksum
   records segment ids, paths, and posting/delta range metadata for reopen, and
   an owned segment-store opener can rebuild a snapshot from manifest bytes plus
