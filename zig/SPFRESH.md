@@ -175,9 +175,8 @@ Current status:
   and valid. Segment writers can also produce a manifest-ready built segment
   with validated metadata and a stable segment path. Segment manifests now
   persist trusted index offsets and checksums, and lazy segment snapshots use
-  verified range reads for base and centroid point records instead of loading
-  the full segment file. Delta-tail iteration still reads matching segment
-  files until the segment index grows a delta-range iterator. Runtime
+  verified range reads for base, centroid, and delta-tail records instead of
+  loading the full segment file for matching postings. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment

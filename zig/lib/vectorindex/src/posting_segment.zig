@@ -505,20 +505,9 @@ pub const LazyDirectorySnapshot = struct {
                 if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
             }
 
-            const segment_data = try self.readSegmentAlloc(alloc, entry);
-            defer alloc.free(segment_data);
-            const reader = try Reader.init(segment_data);
-            var iter = reader.deltas(posting_id);
-            while (try iter.next()) |delta_value| {
-                const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
-                defer alloc.free(decoded);
-                for (decoded) |record| {
-                    if (min_generation) |generation| {
-                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                    }
-                    try records.append(alloc, record);
-                }
-            }
+            const segment_records = try self.readDeltaRecordsAlloc(alloc, entry, posting_id, min_generation);
+            defer alloc.free(segment_records);
+            try records.appendSlice(alloc, segment_records);
         }
 
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
@@ -539,6 +528,14 @@ pub const LazyDirectorySnapshot = struct {
             .meta = entry.meta,
             .path = entry.path,
         }, posting_id, kind);
+    }
+
+    fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        return try readSegmentDeltaRecordsAlloc(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id, min_generation);
     }
 };
 
@@ -1214,26 +1211,42 @@ pub fn readSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
 
 pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?[]u8 {
     if (kind == .delta) return error.InvalidPostingSegmentEntryKind;
-    try validateManifestEntry(entry);
-    const index_bytes = std.math.mul(usize, entry.meta.entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
-    const index_end = std.math.add(usize, entry.meta.index_offset, index_bytes) catch return error.CorruptedPostingSegment;
-    if (entry.meta.index_offset > entry.meta.byte_len or index_end > entry.meta.byte_len - footer_size) return error.CorruptedPostingSegment;
-
-    const index_data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(entry.meta.index_offset), index_bytes);
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
-    if (indexChecksum(index_data) != entry.meta.index_checksum) return error.BadPostingSegmentChecksum;
 
     const match_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, kind, 0);
     if (match_index >= entry.meta.entry_count) return null;
     const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
     if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
-    const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
-    if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
 
-    const value = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(found.offset), found.len);
-    errdefer alloc.free(value);
-    try found.location().verifyValue(value);
-    return value;
+    return try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+}
+
+pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+    errdefer records.deinit(alloc);
+
+    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+    while (index < entry.meta.entry_count) : (index += 1) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+
+        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+        defer alloc.free(value);
+        const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, value);
+        defer alloc.free(decoded);
+        for (decoded) |record| {
+            if (min_generation) |generation| {
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+            }
+            try records.append(alloc, record);
+        }
+    }
+
+    return try records.toOwnedSlice(alloc);
 }
 
 fn commitBuiltSegmentToDirectoryWithManifestAlloc(
@@ -1879,6 +1892,28 @@ fn validateSegmentDataMatchesMeta(data: []const u8, expected: SegmentMeta) !void
     if (!segmentMetaEql(actual, expected)) return error.InvalidPostingSegment;
 }
 
+fn readSegmentIndexAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry) ![]u8 {
+    try validateManifestEntry(entry);
+    const index_bytes = std.math.mul(usize, entry.meta.entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
+    const index_end = std.math.add(usize, entry.meta.index_offset, index_bytes) catch return error.CorruptedPostingSegment;
+    if (entry.meta.index_offset > entry.meta.byte_len or index_end > entry.meta.byte_len - footer_size) return error.CorruptedPostingSegment;
+
+    const index_data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(entry.meta.index_offset), index_bytes);
+    errdefer alloc.free(index_data);
+    if (indexChecksum(index_data) != entry.meta.index_checksum) return error.BadPostingSegmentChecksum;
+    return index_data;
+}
+
+fn readSegmentEntryValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, found: IndexEntry) ![]u8 {
+    const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+    if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+
+    const value = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(found.offset), found.len);
+    errdefer alloc.free(value);
+    try found.location().verifyValue(value);
+    return value;
+}
+
 fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
     return lhs.segment_id == rhs.segment_id and
         lhs.min_posting_id == rhs.min_posting_id and
@@ -2238,6 +2273,14 @@ pub fn testSegmentPointValueRangeReadsVerifyIndexAndValue() !void {
     var writer = Writer.init(alloc);
     defer writer.deinit();
     try writer.appendBase(7, base);
+    const stale_sequence = (@as(u64, 1) << 32) | 1;
+    const live_sequence = (@as(u64, 3) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 40 },
+        .{ .sequence = live_sequence, .op = .tombstone, .vector_id = 20 },
+    });
+    defer alloc.free(delta);
+    try writer.appendDelta(7, stale_sequence, delta);
 
     var committed = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer, .{});
     defer committed.deinit(alloc);
@@ -2251,11 +2294,22 @@ pub fn testSegmentPointValueRangeReadsVerifyIndexAndValue() !void {
     try std.testing.expectEqualSlices(u8, base, loaded);
     try std.testing.expect(try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 8, .base) == null);
     try std.testing.expectError(error.InvalidPostingSegmentEntryKind, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .delta));
+    const delta_records = try readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, null);
+    defer alloc.free(delta_records);
+    try std.testing.expectEqual(@as(usize, 2), delta_records.len);
+    try std.testing.expectEqual(stale_sequence, delta_records[0].sequence);
+    try std.testing.expectEqual(live_sequence, delta_records[1].sequence);
+    const live_delta_records = try readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, 2);
+    defer alloc.free(live_delta_records);
+    try std.testing.expectEqual(@as(usize, 1), live_delta_records.len);
+    try std.testing.expectEqual(live_sequence, live_delta_records[0].sequence);
 
     const original = try tmp.dir.readFileAlloc(std.testing.io, committed.entry.path, alloc, .limited(committed.entry.meta.byte_len + 1));
     defer alloc.free(original);
     const reader = try Reader.init(original);
     const base_location = (try reader.getBaseLocation(7)).?;
+    const delta_index = reader.lowerBound(7, .delta, 0);
+    const delta_entry = try reader.indexEntry(delta_index);
 
     var corrupt_footer = try alloc.dupe(u8, original);
     defer alloc.free(corrupt_footer);
@@ -2277,6 +2331,12 @@ pub fn testSegmentPointValueRangeReadsVerifyIndexAndValue() !void {
     corrupt_value[base_location.offset] ^= 0xff;
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_value });
     try std.testing.expectError(error.BadPostingSegmentChecksum, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base));
+
+    var corrupt_delta_value = try alloc.dupe(u8, original);
+    defer alloc.free(corrupt_delta_value);
+    corrupt_delta_value[delta_entry.offset] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = committed.entry.path, .data = corrupt_delta_value });
+    try std.testing.expectError(error.BadPostingSegmentChecksum, readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, null));
 }
 
 pub fn testRejectsDuplicateLogicalEntries() !void {

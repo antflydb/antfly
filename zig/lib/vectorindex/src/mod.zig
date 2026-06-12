@@ -128,6 +128,7 @@ pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
 pub const readPostingSegmentPointValueAlloc = posting_segment.readSegmentPointValueAlloc;
+pub const readPostingSegmentDeltaRecordsAlloc = posting_segment.readSegmentDeltaRecordsAlloc;
 pub const openPostingSegmentStoreFromDirectoryAlloc = posting_segment.openStoreFromDirectoryAlloc;
 pub const openLazyPostingSegmentStoreFromDirectoryAlloc = posting_segment.openLazyStoreFromDirectoryAlloc;
 pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
