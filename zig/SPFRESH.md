@@ -79,6 +79,11 @@ Current status:
   `query_materialization_ns_per_posting`, and
   `query_materialization_ns_per_member`, so overlay replay CPU can be compared
   independently of cache and backend effects.
+- The bounded posting-member overlay cache is now keyed by posting id, base
+  generation, and posting mutation version. Hot canonical base/delta queries
+  can reuse materialized members without serving entries across base folds or
+  logical posting mutations; a stored max-delta-sequence high-water mark remains
+  the next refinement.
 - HBC maintenance paths that only need to validate a posting base or read its
   member count now use `PostingStore.loadBaseStats` instead of decoding an
   owned member array, moving the specialized count/stat base-decode path into

@@ -1609,15 +1609,6 @@ pub const PostingStore = struct {
 
         const start = now_fn();
         const canonical_base_delta = baseDeltaIsCanonical(index);
-        if (canonical_base_delta) {
-            if (copyCachedPostingMembersIfAvailable(scratch, posting_view, profile)) |cached_member_ids| {
-                notePostingOverlay(profile, elapsed_fn(start), cached_member_ids.len, 0, cached_member_ids.len);
-                return cached_member_ids;
-            }
-            notePostingOverlayCacheMiss(profile);
-            try notePostingMemberCacheMissIfAvailable(scratch, alloc, posting_view.id);
-        }
-
         const base_data = loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
             if (isNotFound(err)) {
                 notePostingOverlayFallback(profile);
@@ -1630,13 +1621,21 @@ pub const PostingStore = struct {
             notePostingOverlayFallback(profile);
             return try copyMemberIds(alloc, scratch, posting_view);
         }
+        if (canonical_base_delta) {
+            if (copyCachedPostingMembersIfAvailable(scratch, posting_view, base_header.generation, profile)) |cached_member_ids| {
+                notePostingOverlay(profile, elapsed_fn(start), cached_member_ids.len, 0, cached_member_ids.len);
+                return cached_member_ids;
+            }
+            notePostingOverlayCacheMiss(profile);
+            try notePostingMemberCacheMissIfAvailable(scratch, alloc, posting_view.id);
+        }
 
         if (canonical_base_delta and base_header.generation >= posting_view.state.mutation_version) {
             const decode_start = now_fn();
             _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
             notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
             const member_ids = scratch.member_ids[0..base_header.member_count];
-            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, member_ids, profile);
+            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base_header.generation, member_ids, profile);
             notePostingOverlayDeltaScanSkip(profile);
             notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, 0, base_header.member_count);
             return member_ids;
@@ -1662,7 +1661,7 @@ pub const PostingStore = struct {
         }
 
         if (canonical_base_delta) {
-            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, materialized, profile);
+            try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base_header.generation, materialized, profile);
         }
         notePostingOverlay(profile, elapsed_fn(start), base_header.member_count, delta_records_after_base, materialized.len);
         return materialized;
@@ -3368,6 +3367,7 @@ fn notePostingDeltaReplay(profile: anytype, elapsed_ns: u64, record_count: usize
 fn copyCachedPostingMembersIfAvailable(
     scratch: anytype,
     posting_view: PostingView,
+    base_generation: u64,
     profile: anytype,
 ) ?[]const VectorId {
     const Scratch = switch (@typeInfo(@TypeOf(scratch))) {
@@ -3375,7 +3375,7 @@ fn copyCachedPostingMembersIfAvailable(
         else => @TypeOf(scratch),
     };
     if (comptime !@hasDecl(Scratch, "cachedPostingMembers")) return null;
-    const cached = scratch.cachedPostingMembers(posting_view.id, posting_view.state.mutation_version) orelse return null;
+    const cached = scratch.cachedPostingMembers(posting_view.id, base_generation, posting_view.state.mutation_version) orelse return null;
     notePostingOverlayCacheHit(profile);
     return cached;
 }
@@ -3384,6 +3384,7 @@ fn cachePostingMembersIfAvailable(
     scratch: anytype,
     alloc: std.mem.Allocator,
     posting_view: PostingView,
+    base_generation: u64,
     members: []const VectorId,
     profile: anytype,
 ) !void {
@@ -3392,7 +3393,7 @@ fn cachePostingMembersIfAvailable(
         else => @TypeOf(scratch),
     };
     if (comptime !@hasDecl(Scratch, "cachePostingMembers")) return;
-    const result = try scratch.cachePostingMembers(alloc, posting_view.id, posting_view.state.mutation_version, members);
+    const result = try scratch.cachePostingMembers(alloc, posting_view.id, base_generation, posting_view.state.mutation_version, members);
     notePostingOverlayCacheResult(profile, result.evictions, result.admission_skips, result.member_bytes);
 }
 
