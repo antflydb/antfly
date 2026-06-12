@@ -149,7 +149,7 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
     assert lookup.get("version") == "1"
 
     reprocess = stateful_api.post(
-        f"{_document_artifact_path(table_name, first_doc, DOCUMENT_UNITS_ARTIFACT)}:reprocess",
+        f"{_document_artifact_path(table_name, first_doc, DOCUMENT_UNITS_ARTIFACT)}/reprocess",
         {},
     )
     assert reprocess["reprocess"] == "triggered"
@@ -185,7 +185,7 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
     current = started
     for _ in range(6):
         current = stateful_api.post(
-            f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/reprocess-jobs/{job_id}:advance",
+            f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/reprocess-jobs/{job_id}/advance",
             {},
         )
         assert current["job_id"] == started["job_id"]
@@ -208,7 +208,7 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
     assert polled["scanned"] == current["scanned"]
 
     terminal_advance = stateful_api.post(
-        f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/reprocess-jobs/{job_id}:advance",
+        f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/reprocess-jobs/{job_id}/advance",
         {},
     )
     assert terminal_advance["phase"] == "succeeded"

@@ -1,0 +1,82 @@
+package docsaf
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"testing"
+	"time"
+)
+
+func TestSourceDocumentFromContentItemInline(t *testing.T) {
+	item := ContentItem{
+		Path:        "guide/intro.md",
+		Content:     []byte("# Intro\nhello"),
+		ContentType: "text/markdown",
+		Metadata: map[string]any{
+			"source_type": "filesystem",
+			"file_size":   int64(13),
+			"mod_time":    time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		},
+	}
+
+	doc, err := SourceDocumentFromContentItem(item, SourceDocumentOptions{
+		InlineContent: true,
+		IDPrefix:      "docs",
+	})
+	if err != nil {
+		t.Fatalf("SourceDocumentFromContentItem: %v", err)
+	}
+
+	sum := sha256.Sum256(item.Content)
+	if doc.ID != "docs/guide/intro.md" {
+		t.Fatalf("ID = %q", doc.ID)
+	}
+	if doc.URL == "" || doc.URL[:len("data:text/markdown;base64,")] != "data:text/markdown;base64," {
+		t.Fatalf("unexpected URL %q", doc.URL)
+	}
+	if doc.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("SHA256 = %q", doc.SHA256)
+	}
+	if doc.SourceKind != "filesystem" {
+		t.Fatalf("SourceKind = %q", doc.SourceKind)
+	}
+	if doc.SizeBytes != 13 {
+		t.Fatalf("SizeBytes = %d", doc.SizeBytes)
+	}
+
+	record := doc.ToDocument()
+	if record["content"] != nil {
+		t.Fatalf("source rows must not contain extracted content: %#v", record)
+	}
+	if record["_type"] != "source_document" {
+		t.Fatalf("_type = %#v", record["_type"])
+	}
+}
+
+func TestBuildSourceDocumentsRequiresURL(t *testing.T) {
+	source := singleItemSource{item: ContentItem{
+		Path:    "a.txt",
+		Content: []byte("alpha"),
+	}}
+
+	_, err := BuildSourceDocuments(context.Background(), source, SourceDocumentOptions{})
+	if err == nil {
+		t.Fatal("expected missing source URL error")
+	}
+}
+
+type singleItemSource struct {
+	item ContentItem
+}
+
+func (s singleItemSource) Type() string    { return "test" }
+func (s singleItemSource) BaseURL() string { return "" }
+func (s singleItemSource) Traverse(context.Context) (<-chan ContentItem, <-chan error) {
+	items := make(chan ContentItem, 1)
+	errs := make(chan error, 1)
+	items <- s.item
+	close(items)
+	close(errs)
+	return items, errs
+}

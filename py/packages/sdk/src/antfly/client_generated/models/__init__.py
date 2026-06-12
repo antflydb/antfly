@@ -137,6 +137,8 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
+from .enrichment_config import EnrichmentConfig
+from .enrichment_kind import EnrichmentKind
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -669,6 +671,8 @@ __all__ = (
     "EmbeddingsIndexStatsIndexType",
     "EmbeddingType1",
     "EmbeddingType3",
+    "EnrichmentConfig",
+    "EnrichmentKind",
     "Error",
     "EvalConfig",
     "EvalOptions",

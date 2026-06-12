@@ -18,6 +18,8 @@ const builtin = @import("builtin");
 pub const Stats = struct {
     available: bool = false,
     resident_bytes: u64 = 0,
+    anonymous_bytes: u64 = 0,
+    private_dirty_bytes: u64 = 0,
     footprint_bytes: u64 = 0,
     wired_bytes: u64 = 0,
     pageins: u64 = 0,
@@ -27,6 +29,7 @@ pub const Stats = struct {
 };
 
 pub fn snapshot() Stats {
+    if (builtin.os.tag == .linux) return linuxSnapshot();
     if (builtin.os.tag != .macos) return .{};
 
     var info: darwin.rusage_info_current = std.mem.zeroes(darwin.rusage_info_current);
@@ -45,6 +48,55 @@ pub fn snapshot() Stats {
     stats.malloc_allocated_bytes = malloc_stats.allocated_bytes;
     stats.malloc_zone_bytes = malloc_stats.zone_bytes;
     return stats;
+}
+
+fn linuxSnapshot() Stats {
+    var out = linuxStatusSnapshot() orelse return .{};
+    out.private_dirty_bytes = linuxStatusValueBytes("/proc/self/smaps_rollup", "Private_Dirty:") orelse 0;
+    return out;
+}
+
+fn linuxStatusSnapshot() ?Stats {
+    var buf: [16 * 1024]u8 = undefined;
+    const contents = readProcFile("/proc/self/status", &buf) orelse return null;
+    const resident_bytes = parseProcStatusBytes(contents, "VmRSS:") orelse return null;
+    const anonymous_bytes = parseProcStatusBytes(contents, "RssAnon:") orelse 0;
+    return .{
+        .available = true,
+        .resident_bytes = resident_bytes,
+        .anonymous_bytes = anonymous_bytes,
+        .footprint_bytes = resident_bytes,
+    };
+}
+
+fn linuxStatusValueBytes(path: []const u8, key: []const u8) ?u64 {
+    var buf: [64 * 1024]u8 = undefined;
+    const contents = readProcFile(path, &buf) orelse return null;
+    return parseProcStatusBytes(contents, key);
+}
+
+fn readProcFile(path: []const u8, buf: []u8) ?[]const u8 {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
+    defer file.close(io_impl.io());
+    var reader = file.reader(io_impl.io(), &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
+}
+
+fn parseProcStatusBytes(contents: []const u8, key: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        var fields = std.mem.tokenizeAny(u8, line[key.len..], " \t");
+        const raw_value = fields.next() orelse return null;
+        const value = std.fmt.parseInt(u64, raw_value, 10) catch return null;
+        const unit = fields.next() orelse return value;
+        if (std.mem.eql(u8, unit, "kB")) return value * 1024;
+        return value;
+    }
+    return null;
 }
 
 const darwin = if (builtin.os.tag == .macos) struct {

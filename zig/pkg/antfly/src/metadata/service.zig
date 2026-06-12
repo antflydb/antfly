@@ -30,6 +30,7 @@ const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_storage = @import("storage/mod.zig");
 const platform_clock = @import("../platform/clock.zig");
+const process_memory_mod = @import("../platform/process_memory.zig");
 const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("transition_state.zig");
@@ -396,6 +397,74 @@ const ProjectedCoreSnapshot = struct {
         if (self.merge_transitions.len > 0) alloc.free(self.merge_transitions);
         self.* = undefined;
     }
+
+    fn diagnostics(self: *const @This()) ProjectedCoreSnapshotDiagnostics {
+        var out = ProjectedCoreSnapshotDiagnostics{
+            .cached = true,
+            .tables = self.tables.len,
+            .ranges = self.ranges.len,
+            .stores = self.stores.len,
+            .store_group_statuses = 0,
+            .store_runtime_statuses = 0,
+            .placement_intents = self.placement_intents.len,
+            .shuffle_join_leases = self.shuffle_join_leases.len,
+            .schema_progresses = self.schema_progresses.len,
+            .restore_progresses = self.restore_progresses.len,
+            .replication_source_statuses = self.replication_source_statuses.len,
+            .split_transitions = self.split_transitions.len,
+            .merge_transitions = self.merge_transitions.len,
+            .estimated_bytes = @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
+                @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len +
+                @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
+                @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
+                @sizeOf(metadata_table_manager.ShuffleJoinLeaseRecord) * self.shuffle_join_leases.len +
+                @sizeOf(metadata_table_manager.SchemaProgressRecord) * self.schema_progresses.len +
+                @sizeOf(metadata_table_manager.RestoreProgressRecord) * self.restore_progresses.len +
+                @sizeOf(metadata_table_manager.ReplicationSourceStatusRecord) * self.replication_source_statuses.len +
+                @sizeOf(transition_state.SplitTransitionRecord) * self.split_transitions.len +
+                @sizeOf(transition_state.MergeTransitionRecord) * self.merge_transitions.len,
+        };
+        for (self.tables) |record| {
+            out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
+                record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
+                record.placement_role.len + record.restore_backup_id.len + record.restore_location.len;
+        }
+        for (self.ranges) |record| {
+            out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
+                record.restore_backup_id.len + record.restore_location.len + record.restore_snapshot_path.len;
+        }
+        for (self.stores) |record| {
+            out.store_group_statuses += record.group_statuses.len;
+            out.store_runtime_statuses += record.runtime_statuses.len;
+            out.estimated_bytes += record.api_url.len + record.raft_url.len + record.role.len +
+                record.health_class.len + record.failure_domain.len +
+                @sizeOf(metadata_table_manager.GroupStatusReport) * record.group_statuses.len +
+                @sizeOf(metadata_table_manager.RuntimeGroupStatusReport) * record.runtime_statuses.len;
+            for (record.runtime_statuses) |status| {
+                out.estimated_bytes += status.table_name.len + status.source.len + status.freshness.len +
+                    @sizeOf(metadata_table_manager.RuntimeIndexStatusReport) * status.indexes.len;
+                for (status.indexes) |index| out.estimated_bytes += index.name.len + index.kind.len;
+            }
+        }
+        for (self.placement_intents) |intent| {
+            out.estimated_bytes += @sizeOf(u64) * intent.peer_node_ids.len;
+            if (intent.record.snapshot_bootstrap) |record| out.estimated_bytes += record.snapshot_id.len + record.uri.len;
+            if (intent.record.backup_restore_bootstrap) |record| out.estimated_bytes += record.backup_id.len + record.location.len + record.snapshot_path.len;
+        }
+        for (self.restore_progresses) |record| {
+            out.estimated_bytes += record.backup_id.len + record.snapshot_path.len + record.phase.len + record.last_error.len;
+        }
+        for (self.replication_source_statuses) |record| {
+            out.estimated_bytes += record.source_kind.len + record.external_table.len + record.cutover_mode.len +
+                record.slot_name.len + record.publication_name.len + record.phase.len + record.checkpoint.len +
+                record.prepared_checkpoint.len + record.stream_checkpoint.len + record.last_error.len + record.failure_class.len;
+        }
+        for (self.split_transitions) |record| {
+            out.estimated_bytes += optionalLen(record.split_key) + optionalLen(record.source_range_end) + optionalLen(record.rollback_reason);
+        }
+        for (self.merge_transitions) |record| out.estimated_bytes += optionalLen(record.rollback_reason);
+        return out;
+    }
 };
 
 const ProjectedCoreSnapshotCache = struct {
@@ -409,6 +478,96 @@ const ProjectedCoreSnapshotCache = struct {
         self.* = .{};
     }
 };
+
+const ProjectedCoreSnapshotDiagnostics = struct {
+    cached: bool = false,
+    tables: usize = 0,
+    ranges: usize = 0,
+    stores: usize = 0,
+    store_group_statuses: usize = 0,
+    store_runtime_statuses: usize = 0,
+    placement_intents: usize = 0,
+    shuffle_join_leases: usize = 0,
+    schema_progresses: usize = 0,
+    restore_progresses: usize = 0,
+    replication_source_statuses: usize = 0,
+    split_transitions: usize = 0,
+    merge_transitions: usize = 0,
+    estimated_bytes: usize = 0,
+};
+
+pub const JsonResponseDiagnostics = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+};
+
+pub const LsmRetentionDiagnostics = struct {
+    mutable_bytes: u64 = 0,
+    immutable_bytes: u64 = 0,
+    total_run_bytes: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    wal_retained_segments: u64 = 0,
+    active_readers: u64 = 0,
+    obsolete_paths: u64 = 0,
+    obsolete_paths_pinned_by_readers: u64 = 0,
+    obsolete_paths_pinned_by_versions: u64 = 0,
+    bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+};
+
+pub const MetadataMemoryDiagnostics = struct {
+    process: process_memory_mod.Stats = .{},
+    json_response: JsonResponseDiagnostics = .{},
+    projected_core_snapshot: ProjectedCoreSnapshotDiagnostics = .{},
+    projected_store_lsm: LsmRetentionDiagnostics = .{},
+    hosted_write_cache: api_table_writes.HostedManagedDbCacheDiagnostics = .{},
+};
+
+fn optionalLen(value: ?[]const u8) usize {
+    return if (value) |bytes| bytes.len else 0;
+}
+
+fn lsmRetentionDiagnostics(stats: anytype) LsmRetentionDiagnostics {
+    return .{
+        .mutable_bytes = stats.mutable_bytes,
+        .immutable_bytes = stats.immutable_bytes,
+        .total_run_bytes = stats.total_run_bytes,
+        .wal_retained_bytes = stats.wal_retained_bytes,
+        .wal_retained_segments = stats.wal_retained_segments,
+        .active_readers = stats.active_readers,
+        .obsolete_paths = stats.obsolete_paths,
+        .obsolete_paths_pinned_by_readers = stats.obsolete_paths_pinned_by_readers,
+        .obsolete_paths_pinned_by_versions = stats.obsolete_paths_pinned_by_versions,
+        .bulk_ingest_current_scan_clone_active_bytes = stats.bulk_ingest_current_scan_clone_active_bytes,
+    };
+}
+
+fn recordJsonResponseAllocationCounters(
+    calls: *std.atomic.Value(u64),
+    bytes_total: *std.atomic.Value(u64),
+    peak_bytes: *std.atomic.Value(u64),
+    bytes: usize,
+) void {
+    const amount: u64 = @intCast(bytes);
+    _ = calls.fetchAdd(1, .monotonic);
+    _ = bytes_total.fetchAdd(amount, .monotonic);
+    var observed = peak_bytes.load(.monotonic);
+    while (amount > observed) {
+        observed = peak_bytes.cmpxchgWeak(observed, amount, .monotonic, .monotonic) orelse break;
+    }
+}
+
+fn jsonResponseDiagnosticsFromCounters(
+    calls: *const std.atomic.Value(u64),
+    bytes_total: *const std.atomic.Value(u64),
+    peak_bytes: *const std.atomic.Value(u64),
+) JsonResponseDiagnostics {
+    return .{
+        .calls = calls.load(.monotonic),
+        .bytes_total = bytes_total.load(.monotonic),
+        .peak_bytes = peak_bytes.load(.monotonic),
+    };
+}
 
 const LocalPlacementInputs = struct {
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -732,6 +891,9 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    json_response_calls: std.atomic.Value(u64) = .init(0),
+    json_response_bytes_total: std.atomic.Value(u64) = .init(0),
+    json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -1192,6 +1354,23 @@ pub const MetadataService = struct {
         return self.raft.metrics;
     }
 
+    pub fn recordJsonResponseAllocation(self: *MetadataService, bytes: usize) void {
+        recordJsonResponseAllocationCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+            bytes,
+        );
+    }
+
+    pub fn jsonResponseDiagnostics(self: *MetadataService) JsonResponseDiagnostics {
+        return jsonResponseDiagnosticsFromCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+        );
+    }
+
     pub fn head(self: *MetadataService) metadata_api.MetadataHead {
         return .{
             .metadata_group_id = self.metadata_group_id,
@@ -1201,6 +1380,14 @@ pub const MetadataService = struct {
 
     pub fn status(self: *MetadataService) !MetadataStatus {
         var current_status = try snapshotStatus(self.alloc, self.metadata_group_id, self, self.metrics());
+        current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
+        return current_status;
+    }
+
+    pub fn metadataStatus(self: *MetadataService) !MetadataStatus {
+        var current_status = try snapshotStatusWithOptions(self.alloc, self.metadata_group_id, self, self.metrics(), .{
+            .include_reconciliation_planning = true,
+        });
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         return current_status;
     }
@@ -1858,6 +2045,9 @@ pub const MetadataHttpService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
+    json_response_calls: std.atomic.Value(u64) = .init(0),
+    json_response_bytes_total: std.atomic.Value(u64) = .init(0),
+    json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     raft: raft_service.ManagedHttpHostService,
 
     pub fn init(
@@ -2288,6 +2478,11 @@ pub const MetadataHttpService = struct {
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
+        const has_reconcile_lease = try self.ensureReconcileLease();
+        logMetadataRunRoundPhase("ensure_reconcile_lease", phase_start_ns);
+        if (!has_reconcile_lease) return;
+
+        phase_start_ns = platform_time.monotonicNs();
         var local_projection_inputs = try captureLocalProjectionInputs(self);
         defer freeLocalProjectionInputs(self, &local_projection_inputs);
         logMetadataRunRoundPhase("capture_projection_inputs", phase_start_ns);
@@ -2310,10 +2505,6 @@ pub const MetadataHttpService = struct {
             else => return err,
         };
         logMetadataRunRoundPhase("refresh_local_schema_progress", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        const has_reconcile_lease = try self.ensureReconcileLease();
-        logMetadataRunRoundPhase("ensure_reconcile_lease", phase_start_ns);
-        if (!has_reconcile_lease) return;
         phase_start_ns = platform_time.monotonicNs();
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
@@ -2375,6 +2566,9 @@ pub const MetadataHttpService = struct {
         }
         if (!self.observe_local_replica_root) return;
 
+        const has_reconcile_lease = try self.ensureReconcileLease();
+        if (!has_reconcile_lease) return;
+
         var local_projection_inputs = try captureLocalProjectionInputs(self);
         defer freeLocalProjectionInputs(self, &local_projection_inputs);
 
@@ -2389,8 +2583,6 @@ pub const MetadataHttpService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
-        const has_reconcile_lease = try self.ensureReconcileLease();
-        if (!has_reconcile_lease) return;
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -2548,9 +2740,35 @@ pub const MetadataHttpService = struct {
         return current_status;
     }
 
+    pub fn recordJsonResponseAllocation(self: *MetadataHttpService, bytes: usize) void {
+        recordJsonResponseAllocationCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+            bytes,
+        );
+    }
+
+    pub fn jsonResponseDiagnostics(self: *MetadataHttpService) JsonResponseDiagnostics {
+        return jsonResponseDiagnosticsFromCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+        );
+    }
+
+    pub fn metadataStatus(self: *MetadataHttpService) !MetadataStatus {
+        var current_status = try snapshotStatusWithOptions(self.alloc, self.metadata_group_id, self, self.metrics(), .{
+            .include_reconciliation_planning = true,
+        });
+        current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
+        current_status.metrics = self.metrics();
+        return current_status;
+    }
+
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
         var snapshot: metadata_api.AdminSnapshot = .{
-            .status = try self.status(),
+            .status = try self.metadataStatus(),
             .tables = &.{},
             .ranges = &.{},
             .stores = &.{},
@@ -2676,6 +2894,26 @@ pub const MetadataHttpService = struct {
             };
         }
         return &(self.projected_core_snapshot_cache.snapshot orelse unreachable);
+    }
+
+    pub fn memoryDiagnostics(self: *MetadataHttpService) MetadataMemoryDiagnostics {
+        var out = MetadataMemoryDiagnostics{
+            .process = process_memory_mod.snapshot(),
+            .json_response = self.jsonResponseDiagnostics(),
+            .hosted_write_cache = if (self.replica_root_dir) |root|
+                api_table_writes.hostedManagedDbCacheDiagnosticsForRoot(root)
+            else
+                .{},
+        };
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.projected_core_snapshot_cache.snapshot) |*snapshot| {
+            out.projected_core_snapshot = snapshot.diagnostics();
+        }
+        if (self.projectedStore()) |store| {
+            out.projected_store_lsm = lsmRetentionDiagnostics(store.snapshotMaintenanceStats());
+        }
+        return out;
     }
 
     pub fn listProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
@@ -5038,16 +5276,30 @@ pub fn snapshotStatus(
     service: anytype,
     metrics: raft_service.ManagedServiceMetrics,
 ) !MetadataStatus {
+    return try snapshotStatusWithOptions(alloc, metadata_group_id, service, metrics, .{});
+}
+
+const SnapshotStatusOptions = struct {
+    include_reconciliation_planning: bool = false,
+};
+
+pub fn snapshotStatusWithOptions(
+    alloc: std.mem.Allocator,
+    metadata_group_id: u64,
+    service: anytype,
+    metrics: raft_service.ManagedServiceMetrics,
+    options: SnapshotStatusOptions,
+) !MetadataStatus {
     const SourceType = @TypeOf(service);
     const SourceDeclType = switch (@typeInfo(SourceType)) {
         .pointer => |pointer| pointer.child,
         else => SourceType,
     };
     const PlanningSummary = struct {
-        placement_upserts: usize,
-        placement_removals: usize,
-        repair_placement_groups: usize,
-        rebalance_placement_groups: usize,
+        placement_upserts: usize = 0,
+        placement_removals: usize = 0,
+        repair_placement_groups: usize = 0,
+        rebalance_placement_groups: usize = 0,
     };
     const now_ms = realtimeNowMillis();
     const lease_stats = if (@hasDecl(SourceDeclType, "reconcileLeaseStats"))
@@ -5222,44 +5474,47 @@ pub fn snapshotStatus(
         );
     }
 
-    var status_state = metadata_state.MetadataState.init(alloc);
-    defer status_state.deinit();
-    try status_state.syncProjected(service);
-    try status_state.seedDesiredFromProjected();
-    var current = try status_state.captureCurrent(service);
-    defer current.deinit(alloc);
-    var reconciler = metadata_reconciler.Reconciler.init(alloc);
-    defer reconciler.deinit();
-    var plan = try reconciler.computePlan(
-        status_state.tableManager(),
-        status_state.placementCandidates(),
-        status_state.placementCandidateInfo(),
-        current.current,
-    );
-    defer plan.deinit(alloc);
-    const planning: PlanningSummary = .{
-        .placement_upserts = plan.placement_upserts.len,
-        .placement_removals = plan.placement_removals.len,
-        .repair_placement_groups = plan.repair_placement_groups,
-        .rebalance_placement_groups = plan.rebalance_placement_groups,
-    };
     var doc_identity_lifecycle_unknown: usize = 0;
     var doc_identity_lifecycle_preserving: usize = 0;
     var doc_identity_lifecycle_reassigning: usize = 0;
     var doc_identity_lifecycle_rebuild_required: usize = 0;
     var doc_identity_lifecycle_ready: usize = 0;
-    for (current.current.merged_group_statuses) |merged_status| {
-        const lifecycle = metadata_reconciler.deriveDocIdentityLifecycle(merged_status);
-        if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_unknown)) {
-            doc_identity_lifecycle_unknown += 1;
-        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_preserving)) {
-            doc_identity_lifecycle_preserving += 1;
-        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_reassigning)) {
-            doc_identity_lifecycle_reassigning += 1;
-        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_rebuild_required)) {
-            doc_identity_lifecycle_rebuild_required += 1;
-        } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_ready)) {
-            doc_identity_lifecycle_ready += 1;
+    var planning: PlanningSummary = .{};
+    if (options.include_reconciliation_planning) {
+        var status_state = metadata_state.MetadataState.init(alloc);
+        defer status_state.deinit();
+        try status_state.syncProjected(service);
+        try status_state.seedDesiredFromProjected();
+        var current = try status_state.captureCurrent(service);
+        defer current.deinit(alloc);
+        var reconciler = metadata_reconciler.Reconciler.init(alloc);
+        defer reconciler.deinit();
+        var plan = try reconciler.computePlan(
+            status_state.tableManager(),
+            status_state.placementCandidates(),
+            status_state.placementCandidateInfo(),
+            current.current,
+        );
+        defer plan.deinit(alloc);
+        planning = .{
+            .placement_upserts = plan.placement_upserts.len,
+            .placement_removals = plan.placement_removals.len,
+            .repair_placement_groups = plan.repair_placement_groups,
+            .rebalance_placement_groups = plan.rebalance_placement_groups,
+        };
+        for (current.current.merged_group_statuses) |merged_status| {
+            const lifecycle = metadata_reconciler.deriveDocIdentityLifecycle(merged_status);
+            if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_unknown)) {
+                doc_identity_lifecycle_unknown += 1;
+            } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_preserving)) {
+                doc_identity_lifecycle_preserving += 1;
+            } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_reassigning)) {
+                doc_identity_lifecycle_reassigning += 1;
+            } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_rebuild_required)) {
+                doc_identity_lifecycle_rebuild_required += 1;
+            } else if (std.mem.eql(u8, lifecycle, metadata_reconciler.doc_identity_lifecycle_ready)) {
+                doc_identity_lifecycle_ready += 1;
+            }
         }
     }
 
@@ -8022,7 +8277,7 @@ test "metadata service status reports repair and rebalance counts" {
     });
     try svc.runRound();
 
-    const repair_status = try svc.status();
+    const repair_status = try svc.metadataStatus();
     try std.testing.expectEqual(@as(u64, 1972), repair_status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 1), repair_status.projected_tables);
     try std.testing.expectEqual(@as(usize, 1), repair_status.projected_tables_with_replication_sources);
@@ -8124,7 +8379,7 @@ test "metadata service status reports repair and rebalance counts" {
     });
     try svc.runRound();
 
-    const rebalance_status = try svc.status();
+    const rebalance_status = try svc.metadataStatus();
     try std.testing.expectEqual(@as(usize, 1), rebalance_status.overloaded_stores);
     try std.testing.expectEqual(@as(usize, 1), rebalance_status.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 0), rebalance_status.rebalance_placement_groups);

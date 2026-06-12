@@ -7675,7 +7675,7 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/artifacts/{artifactName}:reprocess:
+  /tables/{tableName}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
         in: path
@@ -7743,7 +7743,7 @@ paths:
       description: |
         Creates a durable user-facing repair job for a derived document
         artifact. The job advances through the same bounded per-shard repair
-        primitive used by `:reprocess`, and stores returned continuation
+        primitive used by `/reprocess`, and stores returned continuation
         cursors so hosted controllers can resume large sharded table repairs
         without collapsing progress into a single global key cursor.
       tags:
@@ -7810,7 +7810,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance:
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance:
     parameters:
       - name: tableName
         in: path
@@ -7859,7 +7859,7 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel:
+  /tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel:
     parameters:
       - name: tableName
         in: path
@@ -7953,7 +7953,7 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess:
+  /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
         in: path

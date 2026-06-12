@@ -42,6 +42,7 @@
 //   --seed <n>                   RNG seed (default: 42)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const inference = @import("inference_internal");
 const ml = @import("ml");
@@ -1594,7 +1595,9 @@ fn resolveSpanLabelPositiveWeights(
         const value_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
         if (label.len == 0 or value_text.len == 0) return error.InvalidSpanLabelPositiveWeights;
         const label_idx = indexOfEntityLabel(entity_labels, label) orelse {
-            print("error: unknown label in --span-label-positive-weights: {s}\n", .{label});
+            if (!builtin.is_test) {
+                print("error: unknown label in --span-label-positive-weights: {s}\n", .{label});
+            }
             return error.UnknownSpanLabelPositiveWeight;
         };
         if (seen[label_idx]) return error.DuplicateSpanLabelPositiveWeight;

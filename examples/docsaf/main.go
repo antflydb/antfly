@@ -1,22 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	exampleentity "github.com/antflydb/antfly/examples/docsaf/entity"
 	"github.com/antflydb/antfly/go/pkg/docsaf"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
-// StringSliceFlag allows repeated flags to build a slice
+// StringSliceFlag allows repeated flags to build a slice.
 type StringSliceFlag []string
 
 func (s *StringSliceFlag) String() string {
@@ -28,118 +29,117 @@ func (s *StringSliceFlag) Set(value string) error {
 	return nil
 }
 
+type sourceFlags struct {
+	dirPath         *string
+	baseURL         *string
+	inlineContent   *bool
+	idPrefix        *string
+	includePatterns StringSliceFlag
+	excludePatterns StringSliceFlag
+}
+
+func registerSourceFlags(fs *flag.FlagSet) sourceFlags {
+	flags := sourceFlags{
+		dirPath:       fs.String("dir", "", "Path to directory containing source documents (required)"),
+		baseURL:       fs.String("base-url", "", "Fetchable URL prefix for source documents"),
+		inlineContent: fs.Bool("inline-content", false, "Encode source bytes as data: URLs for local smoke tests"),
+		idPrefix:      fs.String("id-prefix", "", "Optional prefix for source document IDs"),
+	}
+	fs.Var(&flags.includePatterns, "include", "Include pattern (can be repeated, supports ** wildcards)")
+	fs.Var(&flags.excludePatterns, "exclude", "Exclude pattern (can be repeated, supports ** wildcards)")
+	return flags
+}
+
+func (f sourceFlags) validate() error {
+	if *f.dirPath == "" {
+		return fmt.Errorf("--dir flag is required")
+	}
+	if *f.baseURL == "" && !*f.inlineContent {
+		return fmt.Errorf("set --base-url for fetchable source URLs or --inline-content for local smoke tests")
+	}
+	fileInfo, err := os.Stat(*f.dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to access path: %w", err)
+	}
+	if !fileInfo.IsDir() {
+		return fmt.Errorf("--dir must be a directory")
+	}
+	return nil
+}
+
+func (f sourceFlags) source() *docsaf.FilesystemSource {
+	return docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
+		BaseDir:         *f.dirPath,
+		BaseURL:         *f.baseURL,
+		IncludePatterns: f.includePatterns,
+		ExcludePatterns: f.excludePatterns,
+	})
+}
+
+func (f sourceFlags) options() docsaf.SourceDocumentOptions {
+	return docsaf.SourceDocumentOptions{
+		InlineContent: *f.inlineContent,
+		BaseURL:       *f.baseURL,
+		IDPrefix:      *f.idPrefix,
+	}
+}
+
+func (f sourceFlags) print() {
+	fmt.Printf("Directory: %s\n", *f.dirPath)
+	if *f.baseURL != "" {
+		fmt.Printf("Base URL: %s\n", *f.baseURL)
+	}
+	fmt.Printf("Inline content: %v\n", *f.inlineContent)
+	if *f.idPrefix != "" {
+		fmt.Printf("ID prefix: %s\n", *f.idPrefix)
+	}
+	if len(f.includePatterns) > 0 {
+		fmt.Printf("Include patterns: %v\n", f.includePatterns)
+	}
+	if len(f.excludePatterns) > 0 {
+		fmt.Printf("Exclude patterns: %v\n", f.excludePatterns)
+	}
+}
+
 // ANCHOR: prepare_cmd
 func prepareCmd(args []string) error {
 	fs := flag.NewFlagSet("prepare", flag.ExitOnError)
-	dirPath := fs.String("dir", "", "Path to directory containing documentation files (required)")
 	outputFile := fs.String("output", "docs.json", "Output JSON file path")
-	baseURL := fs.String("base-url", "", "Base URL for generating document links (optional)")
-
-	entityExtraction := exampleentity.RegisterFlags(fs)
-
-	var includePatterns StringSliceFlag
-	var excludePatterns StringSliceFlag
-	fs.Var(&includePatterns, "include", "Include pattern (can be repeated, supports ** wildcards)")
-	fs.Var(&excludePatterns, "exclude", "Exclude pattern (can be repeated, supports ** wildcards)")
+	sourceFlags := registerSourceFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
-
-	if *dirPath == "" {
-		return fmt.Errorf("--dir flag is required")
+	if err := sourceFlags.validate(); err != nil {
+		return err
 	}
 
-	// Verify path exists and is a directory
-	fileInfo, err := os.Stat(*dirPath)
+	fmt.Printf("=== docsaf prepare - Build Source Document Rows ===\n")
+	sourceFlags.print()
+	fmt.Printf("Output: %s\n\n", *outputFile)
+
+	docs, err := docsaf.BuildSourceDocuments(context.Background(), sourceFlags.source(), sourceFlags.options())
 	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
+		return fmt.Errorf("failed to build source documents: %w", err)
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("no source documents found")
 	}
 
-	if !fileInfo.IsDir() {
-		return fmt.Errorf("--dir must be a directory")
-	}
+	records := docsaf.SourceDocumentRecords(docs)
+	fmt.Printf("Found %d source documents\n", len(docs))
+	printDocumentSample(docs)
 
-	fmt.Printf("=== docsaf prepare - Process Documentation Files ===\n")
-	fmt.Printf("Directory: %s\n", *dirPath)
-	fmt.Printf("Output: %s\n", *outputFile)
-	if len(includePatterns) > 0 {
-		fmt.Printf("Include patterns: %v\n", includePatterns)
-	}
-	if len(excludePatterns) > 0 {
-		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
-	}
-	entityExtraction.Print(os.Stdout)
-	fmt.Printf("\n")
-
-	// Create filesystem source and processor using library
-	source := docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
-		BaseDir:         *dirPath,
-		BaseURL:         *baseURL,
-		IncludePatterns: includePatterns,
-		ExcludePatterns: excludePatterns,
-	})
-	processor := docsaf.NewProcessor(source, docsaf.DefaultRegistry())
-
-	// Process all files in the directory
-	fmt.Printf("Processing documentation files (chunking by markdown headings)...\n")
-	sections, err := processor.Process(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to process directory: %w", err)
-	}
-
-	fmt.Printf("Found %d documents\n\n", len(sections))
-
-	if len(sections) == 0 {
-		return fmt.Errorf("no supported files found in directory")
-	}
-
-	// Count sections by type
-	typeCounts := make(map[string]int)
-	for _, section := range sections {
-		typeCounts[section.Type]++
-	}
-
-	fmt.Printf("Document types found:\n")
-	for docType, count := range typeCounts {
-		fmt.Printf("  - %s: %d\n", docType, count)
-	}
-	fmt.Printf("\n")
-
-	// Show sample of documents
-	fmt.Printf("Sample documents:\n")
-	for i, section := range sections {
-		if i >= 10 {
-			fmt.Printf("  ... and %d more\n", len(sections)-i)
-			break
-		}
-		fmt.Printf("  [%d] %s (%s) - %s\n",
-			i+1, section.Title, section.Type, section.FilePath)
-	}
-	fmt.Printf("\n")
-
-	// Extract entities if an extractor model is configured.
-	entityResult, err := entityExtraction.Run(context.Background(), sections)
-	if err != nil {
-		return fmt.Errorf("entity extraction failed: %w", err)
-	}
-
-	// Convert sections to records map, enriching sections with extraction results when configured.
-	records := exampleentity.BuildRecords(sections, entityResult)
-
-	// Write to JSON file
 	fmt.Printf("Writing %d records to %s...\n", len(records), *outputFile)
 	jsonData, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-
-	err = os.WriteFile(*outputFile, jsonData, 0644)
-	if err != nil {
+	if err := os.WriteFile(*outputFile, jsonData, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
-	fmt.Printf("Prepared data written to %s\n", *outputFile)
+	fmt.Printf("Prepared source rows written to %s\n", *outputFile)
 	return nil
 }
 
@@ -155,77 +155,51 @@ func loadCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if it doesn't exist")
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model to use (e.g., embeddinggemma)")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model: fixed-bert-tokenizer, fixed-bpe-tokenizer, or any ONNX model directory name")
-	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
-	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
+	chunkSize := fs.Int("chunk-size", 512, "Target characters/tokens for unit-derived chunks")
+	chunkOverlap := fs.Int("chunk-overlap", 50, "Overlap for unit-derived chunks")
+	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Ollama embedding model for managed vector search")
+	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
 
 	ctx := context.Background()
-
-	// Create Antfly client
 	client, err := antfly.NewAntflyClient(*antflyURL, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to create Antfly client: %w", err)
 	}
 
-	fmt.Printf("=== docsaf load - Load Data to Antfly ===\n")
+	fmt.Printf("=== docsaf load - Load Source Rows To Antfly ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
 	fmt.Printf("Table: %s\n", *tableName)
 	fmt.Printf("Input: %s\n", *inputFile)
 	fmt.Printf("Dry run: %v\n\n", *dryRun)
 
-	// Read JSON file first (needed to detect entity records for graph index)
-	fmt.Printf("Reading records from %s...\n", *inputFile)
 	jsonData, err := os.ReadFile(*inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
-
 	var records map[string]any
-	err = json.Unmarshal(jsonData, &records)
-	if err != nil {
+	if err := json.Unmarshal(jsonData, &records); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
+	fmt.Printf("Loaded %d source records\n\n", len(records))
 
-	fmt.Printf("Loaded %d records\n\n", len(records))
-
-	// Create table if requested
 	if *createTable {
-		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
-
-		// Create embedding index configuration
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingModel, *embeddingDims)
 		if err != nil {
-			return fmt.Errorf("failed to create embedding index config: %w", err)
+			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
-
-		indexes := map[string]antfly.IndexConfig{
-			"embeddings": *embeddingIndex,
-		}
-
-		// Auto-detect entity records and add graph index
-		if exampleentity.HasEntityRecords(records) {
-			graphIndex, err := createGraphIndex()
-			if err != nil {
-				return fmt.Errorf("failed to create graph index config: %w", err)
-			}
-			indexes["knowledge"] = *graphIndex
-			fmt.Printf("Detected entity records, adding knowledge graph index\n")
-		}
-
-		if err := createTableWithIndexes(ctx, client, *tableName, *numShards, indexes); err != nil {
+		if err := createTableWithIndexes(ctx, *antflyURL, client, *tableName, *numShards, indexes); err != nil {
 			return fmt.Errorf("error creating table: %w", err)
 		}
 	}
 
-	// Perform linear merge with sorted pages
 	pages := sortedPages(records, *batchSize)
 	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
 		DryRun:    *dryRun,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
 			fmt.Printf("[batch %d] upserted: %d, skipped: %d, deleted: %d, took: %s\n",
 				batch, result.Upserted, result.Skipped, result.Deleted, result.Took)
@@ -247,151 +221,62 @@ func syncCmd(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "docs", "Table name to merge into")
-	dirPath := fs.String("dir", "", "Path to directory containing documentation files (required)")
-	baseURL := fs.String("base-url", "", "Base URL for generating document links (optional)")
 	dryRun := fs.Bool("dry-run", false, "Preview changes without applying them")
 	createTable := fs.Bool("create-table", false, "Create table if it doesn't exist")
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Embedding model to use (e.g., embeddinggemma)")
-	chunkerModel := fs.String("chunker-model", "fixed-bert-tokenizer", "Chunker model: fixed-bert-tokenizer, fixed-bpe-tokenizer, or any ONNX model directory name")
-	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
-	overlapTokens := fs.Int("overlap-tokens", 50, "Overlap tokens for chunking")
-
-	entityExtraction := exampleentity.RegisterFlags(fs)
-
-	var includePatterns StringSliceFlag
-	var excludePatterns StringSliceFlag
-	fs.Var(&includePatterns, "include", "Include pattern (can be repeated, supports ** wildcards)")
-	fs.Var(&excludePatterns, "exclude", "Exclude pattern (can be repeated, supports ** wildcards)")
+	chunkSize := fs.Int("chunk-size", 512, "Target characters/tokens for unit-derived chunks")
+	chunkOverlap := fs.Int("chunk-overlap", 50, "Overlap for unit-derived chunks")
+	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Ollama embedding model for managed vector search")
+	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
+	sourceFlags := registerSourceFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
-
-	if *dirPath == "" {
-		return fmt.Errorf("--dir flag is required")
-	}
-
-	// Verify path exists and is a directory before any remote operations
-	fileInfo, err := os.Stat(*dirPath)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-	if !fileInfo.IsDir() {
-		return fmt.Errorf("--dir must be a directory")
+	if err := sourceFlags.validate(); err != nil {
+		return err
 	}
 
 	ctx := context.Background()
-
-	// Create Antfly client
 	client, err := antfly.NewAntflyClient(*antflyURL, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to create Antfly client: %w", err)
 	}
 
-	fmt.Printf("=== docsaf sync - Full Pipeline ===\n")
+	fmt.Printf("=== docsaf sync - Source Rows + Derived Hierarchy ===\n")
 	fmt.Printf("Antfly URL: %s\n", *antflyURL)
 	fmt.Printf("Table: %s\n", *tableName)
-	fmt.Printf("Directory: %s\n", *dirPath)
-	fmt.Printf("Dry run: %v\n", *dryRun)
-	if len(includePatterns) > 0 {
-		fmt.Printf("Include patterns: %v\n", includePatterns)
-	}
-	if len(excludePatterns) > 0 {
-		fmt.Printf("Exclude patterns: %v\n", excludePatterns)
-	}
-	entityExtraction.Print(os.Stdout)
-	fmt.Printf("\n")
+	sourceFlags.print()
+	fmt.Printf("Dry run: %v\n\n", *dryRun)
 
-	// Create table if requested
 	if *createTable {
-		fmt.Printf("Creating table '%s' with %d shards...\n", *tableName, *numShards)
-
-		// Create embedding index configuration
-		embeddingIndex, err := createEmbeddingIndex(*embeddingModel, *chunkerModel, *targetTokens, *overlapTokens)
+		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingModel, *embeddingDims)
 		if err != nil {
-			return fmt.Errorf("failed to create embedding index config: %w", err)
+			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
-
-		indexes := map[string]antfly.IndexConfig{
-			"embeddings": *embeddingIndex,
-		}
-
-		// Add a graph index when extraction is enabled.
-		if entityExtraction.Enabled() {
-			graphIndex, err := createGraphIndex()
-			if err != nil {
-				return fmt.Errorf("failed to create graph index config: %w", err)
-			}
-			indexes["knowledge"] = *graphIndex
-		}
-
-		if err := createTableWithIndexes(ctx, client, *tableName, *numShards, indexes); err != nil {
+		if err := createTableWithIndexes(ctx, *antflyURL, client, *tableName, *numShards, indexes); err != nil {
 			return fmt.Errorf("error creating table: %w", err)
 		}
 	}
 
-	// Create filesystem source and processor using library
-	source := docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
-		BaseDir:         *dirPath,
-		BaseURL:         *baseURL,
-		IncludePatterns: includePatterns,
-		ExcludePatterns: excludePatterns,
-	})
-	processor := docsaf.NewProcessor(source, docsaf.DefaultRegistry())
-
-	// Process all files in the directory
-	fmt.Printf("Processing documentation files (chunking by markdown headings)...\n")
-	sections, err := processor.Process(context.Background())
+	docs, err := docsaf.BuildSourceDocuments(ctx, sourceFlags.source(), sourceFlags.options())
 	if err != nil {
-		return fmt.Errorf("failed to process directory: %w", err)
+		return fmt.Errorf("failed to build source documents: %w", err)
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("no source documents found")
 	}
 
-	fmt.Printf("Found %d documents\n\n", len(sections))
+	fmt.Printf("Found %d source documents\n", len(docs))
+	printDocumentSample(docs)
 
-	if len(sections) == 0 {
-		return fmt.Errorf("no supported files found in directory")
-	}
-
-	// Count sections by type
-	typeCounts := make(map[string]int)
-	for _, section := range sections {
-		typeCounts[section.Type]++
-	}
-
-	fmt.Printf("Document types found:\n")
-	for docType, count := range typeCounts {
-		fmt.Printf("  - %s: %d\n", docType, count)
-	}
-	fmt.Printf("\n")
-
-	// Show sample of documents
-	fmt.Printf("Sample documents:\n")
-	for i, section := range sections {
-		if i >= 10 {
-			fmt.Printf("  ... and %d more\n", len(sections)-i)
-			break
-		}
-		fmt.Printf("  [%d] %s (%s) - %s\n",
-			i+1, section.Title, section.Type, section.FilePath)
-	}
-	fmt.Printf("\n")
-
-	// Extract entities if an extractor model is configured.
-	entityResult, err := entityExtraction.Run(ctx, sections)
-	if err != nil {
-		return fmt.Errorf("entity extraction failed: %w", err)
-	}
-
-	// Convert sections to records map, enriching sections with extraction results when configured.
-	records := exampleentity.BuildRecords(sections, entityResult)
-
-	// Perform linear merge with sorted pages
+	records := docsaf.SourceDocumentRecords(docs)
 	pages := sortedPages(records, *batchSize)
 	mergeResult, err := client.ExecuteLinearMerge(ctx, *tableName, pages, antfly.ExecuteLinearMergeOptions{
 		DryRun:    *dryRun,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 		OnBatch: func(batch int, result *antfly.LinearMergeResult) {
 			fmt.Printf("[batch %d] upserted: %d, skipped: %d, deleted: %d, took: %s\n",
 				batch, result.Upserted, result.Skipped, result.Deleted, result.Took)
@@ -408,100 +293,154 @@ func syncCmd(args []string) error {
 
 // ANCHOR_END: sync_cmd
 
-// ANCHOR: create_embedding_index
-// createEmbeddingIndex creates an embedding index configuration with chunking
-func createEmbeddingIndex(embeddingModel, chunkerModel string, targetTokens, overlapTokens int) (*antfly.IndexConfig, error) {
-	embeddingIndexConfig := antfly.IndexConfig{
-		Name: "embeddings",
-		Type: antfly.IndexTypeEmbeddings,
+func printDocumentSample(docs []docsaf.SourceDocument) {
+	fmt.Printf("\nSample source documents:\n")
+	for i, doc := range docs {
+		if i >= 10 {
+			fmt.Printf("  ... and %d more\n", len(docs)-i)
+			break
+		}
+		fmt.Printf("  [%d] %s (%s) - %s\n", i+1, doc.ID, doc.MIMEType, doc.URL)
+	}
+	fmt.Printf("\n")
+}
+
+func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingModel string, embeddingDims int) (map[string]any, error) {
+	sourceConfig := map[string]any{
+		"filename_field":     "filename",
+		"content_type_field": "mime_type",
+		"etag_field":         "etag",
+		"checksum_field":     "sha256",
+		"version_field":      "version",
+	}
+	documentUnits := docsaf.DefaultDocumentUnitsArtifact
+	documentChunks := docsaf.DefaultDocumentChunksArtifact
+	documentEmbedding := "document_chunk_dense_v1"
+
+	producerJSON, err := json.Marshal(map[string]any{
+		"type": "document_extraction",
+		"config": map[string]any{
+			"route_preset": "mixed_files",
+			"source":       sourceConfig,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal document extraction producer: %w", err)
 	}
 
-	// Configure embedder
 	embedder, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
 		Model: embeddingModel,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to configure embedder: %w", err)
+		return nil, fmt.Errorf("build embedder config: %w", err)
+	}
+	vectorIndex, err := antfly.NewArtifactEmbeddingIndexConfig("document_vectors", antfly.ArtifactEmbeddingIndexConfig{
+		SourceArtifactName: documentChunks,
+		EmbeddingName:      documentEmbedding,
+		SourceField:        "text",
+		ExpectedDims:       embeddingDims,
+		Embedder:           *embedder,
+		DistanceMetric:     antfly.DistanceMetricCosine,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build vector index config: %w", err)
+	}
+	vectorIndexBody, err := indexConfigMap(*vectorIndex)
+	if err != nil {
+		return nil, fmt.Errorf("marshal vector index config: %w", err)
 	}
 
-	// Configure chunker via Antfly inference.
-	// Model can be "fixed-bert-tokenizer", "fixed-bpe-tokenizer", or any ONNX model directory name
-	chunker := antfly.ChunkerConfig{}
-	err = chunker.FromAntflyChunkerConfig(antfly.AntflyChunkerConfig{
-		Model: chunkerModel,
-		Text: antfly.TextChunkOptions{
-			TargetTokens:  targetTokens,
-			OverlapTokens: overlapTokens,
+	return map[string]any{
+		"document_units": map[string]any{
+			"type": "graph",
+			"source": map[string]any{
+				"kind":     "artifact",
+				"artifact": documentUnits,
+				"path":     "$.edges[*]",
+				"format":   "extraction_relation",
+			},
+			"artifact": map[string]any{
+				"name":         documentUnits,
+				"kind":         "asset",
+				"field":        "url",
+				"content_type": "application/json",
+				"producer_json": map[string]any{
+					"type": "document_extraction",
+					"config": map[string]any{
+						"route_preset": "mixed_files",
+						"source":       sourceConfig,
+					},
+				},
+			},
+			"edge_types": []map[string]any{{"name": "mentions"}},
 		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure chunker: %w", err)
-	}
-
-	// Configure embedding index with chunking
-	// Note: Dimension is calculated automatically based on the embedding model
-	err = embeddingIndexConfig.FromEmbeddingsIndexConfig(antfly.EmbeddingsIndexConfig{
-		Field:    "content",
-		Embedder: *embedder,
-		Chunker:  chunker,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure embedding index: %w", err)
-	}
-
-	return &embeddingIndexConfig, nil
+		"document_text": map[string]any{
+			"type":          "full_text",
+			"field":         "text",
+			"artifact_name": documentChunks,
+			"enrichments": []map[string]any{
+				{
+					"name":          documentUnits,
+					"kind":          "asset",
+					"field":         "url",
+					"content_type":  "application/json",
+					"producer_json": string(producerJSON),
+				},
+				{
+					"name":                 documentChunks,
+					"kind":                 "chunk",
+					"field":                "text",
+					"source_artifact_name": documentUnits,
+					"chunk_size":           chunkSize,
+					"chunk_overlap":        chunkOverlap,
+				},
+			},
+		},
+		"document_vectors": vectorIndexBody,
+	}, nil
 }
 
-// ANCHOR_END: create_embedding_index
-
-// createGraphIndex creates a graph index for entity and relation enrichment.
-func createGraphIndex() (*antfly.IndexConfig, error) {
-	graphIndexConfig := antfly.IndexConfig{
-		Name: "knowledge",
-		Type: antfly.IndexTypeGraph,
-	}
-
-	err := graphIndexConfig.FromGraphIndexConfig(antfly.GraphIndexConfig{
-		EdgeTypes: []antfly.EdgeTypeConfig{
-			{
-				Name:  "mentions_entity",
-				Field: "entities",
-			},
-			{
-				Name:  "mentions_relation",
-				Field: "relations",
-			},
-			{
-				Name:  "relation_head",
-				Field: "head_entity",
-			},
-			{
-				Name:  "relation_tail",
-				Field: "tail_entity",
-			},
-		},
-	})
+func indexConfigMap(index antfly.IndexConfig) (map[string]any, error) {
+	data, err := json.Marshal(index)
 	if err != nil {
 		return nil, err
 	}
-
-	return &graphIndexConfig, nil
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
-// createTableWithIndexes creates the table, logs the result, and waits for shards to be ready.
-func createTableWithIndexes(ctx context.Context, client *antfly.AntflyClient, tableName string, numShards int, indexes map[string]antfly.IndexConfig) error {
-	err := client.CreateTable(ctx, tableName, antfly.CreateTableRequest{
-		NumShards: uint(numShards),
-		Indexes:   indexes,
-	})
+func createTableWithIndexes(ctx context.Context, antflyURL string, client *antfly.AntflyClient, tableName string, numShards int, indexes map[string]any) error {
+	body := map[string]any{
+		"num_shards": numShards,
+		"indexes":    indexes,
+	}
+	data, err := json.Marshal(body)
 	if err != nil {
-		log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
+		return fmt.Errorf("marshal create table request: %w", err)
+	}
+
+	endpoint := strings.TrimRight(antflyURL, "/") + "/tables/" + url.PathEscape(tableName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck // response body close is best effort
+
+	if resp.StatusCode >= 300 {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		log.Printf("Warning: Failed to create table (may already exist): HTTP %d %s\n", resp.StatusCode, strings.TrimSpace(buf.String()))
 	} else {
-		indexNames := make([]string, 0, len(indexes))
-		for name := range indexes {
-			indexNames = append(indexNames, name)
-		}
-		fmt.Printf("Table created with indexes: %s\n\n", strings.Join(indexNames, ", "))
+		fmt.Printf("Table created with indexes: document_units, document_text, document_vectors\n\n")
 	}
 
 	if err := client.WaitForTable(ctx, tableName, 30*time.Second); err != nil {
@@ -516,35 +455,16 @@ var sortedPages = antfly.SortedPages
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "docsaf - Documentation Sync to Antfly\n\n")
+		fmt.Fprintf(os.Stderr, "docsaf - Source Document Sync to Antfly\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  docsaf prepare [flags]  - Process files and create sorted JSON data\n")
-		fmt.Fprintf(os.Stderr, "  docsaf load [flags]     - Load JSON data into Antfly\n")
-		fmt.Fprintf(os.Stderr, "  docsaf sync [flags]     - Full pipeline (prepare + load)\n")
-		fmt.Fprintf(os.Stderr, "\nCommands:\n")
-		fmt.Fprintf(os.Stderr, "  prepare  Process documentation files and save to JSON\n")
-		fmt.Fprintf(os.Stderr, "  load     Load prepared JSON data into Antfly table\n")
-		fmt.Fprintf(os.Stderr, "  sync     Process files and load directly (original behavior)\n")
+		fmt.Fprintf(os.Stderr, "  docsaf prepare [flags]  - Traverse files and create source-row JSON\n")
+		fmt.Fprintf(os.Stderr, "  docsaf load [flags]     - Load source-row JSON into Antfly\n")
+		fmt.Fprintf(os.Stderr, "  docsaf sync [flags]     - Traverse files and load source rows directly\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  # Prepare data\n")
-		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json\n\n")
-		fmt.Fprintf(os.Stderr, "  # Prepare with recognizer-based entity extraction\n")
-		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-model fastino/gliner2-base-v1 \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer \\\n")
-		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept --entity-label api_endpoint\n\n")
-		fmt.Fprintf(os.Stderr, "  # Prepare with relation extraction\n")
-		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir /path/to/docs --output docs.json \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-model some-relations-model \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-kind recognizer --extractor-relations \\\n")
-		fmt.Fprintf(os.Stderr, "    --relation-label depends_on --relation-label implements\n\n")
-		fmt.Fprintf(os.Stderr, "  # Load prepared data\n")
-		fmt.Fprintf(os.Stderr, "  docsaf load --input docs.json --table docs --create-table\n\n")
-		fmt.Fprintf(os.Stderr, "  # Full pipeline with generator-based extraction + knowledge graph\n")
-		fmt.Fprintf(os.Stderr, "  docsaf sync --dir /path/to/docs --table docs --create-table \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-model functiongemma-270m-it \\\n")
-		fmt.Fprintf(os.Stderr, "    --extractor-kind generator \\\n")
-		fmt.Fprintf(os.Stderr, "    --entity-label technology --entity-label concept\n\n")
+		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir ./docs --base-url s3://docs-bucket --output docs.json\n")
+		fmt.Fprintf(os.Stderr, "  docsaf load --input docs.json --table docs --create-table\n")
+		fmt.Fprintf(os.Stderr, "  docsaf sync --dir ./docs --base-url s3://docs-bucket --table docs --create-table\n")
+		fmt.Fprintf(os.Stderr, "  docsaf sync --dir ./docs --inline-content --table docs --create-table\n")
 		os.Exit(1)
 	}
 

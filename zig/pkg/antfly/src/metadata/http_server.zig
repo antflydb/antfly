@@ -111,6 +111,7 @@ pub const AdminSource = struct {
         request_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) anyerror!void = null,
         reseed_replication_source_exact_cutover: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) anyerror!ReseedExactCutoverResult = null,
         forward_metadata_request: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse = null,
+        record_json_response_allocation: ?*const fn (ptr: *anyopaque, bytes: usize) void = null,
     };
 
     pub fn head(self: AdminSource) !metadata_api.MetadataHead {
@@ -224,6 +225,11 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, req);
     }
 
+    pub fn recordJsonResponseAllocation(self: AdminSource, bytes: usize) void {
+        const fn_ptr = self.vtable.record_json_response_allocation orelse return;
+        fn_ptr(self.ptr, bytes);
+    }
+
     pub fn fromMetadataService(svc: *service.MetadataService) AdminSource {
         return .{
             .ptr = svc,
@@ -249,6 +255,7 @@ pub const AdminSource = struct {
                 .request_split = metadataServiceRequestSplit,
                 .request_merge = metadataServiceRequestMerge,
                 .reseed_replication_source_exact_cutover = metadataServiceReseedReplicationSourceExactCutover,
+                .record_json_response_allocation = metadataServiceRecordJsonResponseAllocation,
             },
         };
     }
@@ -279,6 +286,7 @@ pub const AdminSource = struct {
                 .request_merge = metadataHttpServiceRequestMerge,
                 .reseed_replication_source_exact_cutover = metadataHttpServiceReseedReplicationSourceExactCutover,
                 .forward_metadata_request = metadataHttpServiceForwardMetadataRequest,
+                .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
     }
@@ -484,6 +492,11 @@ pub const AdminSource = struct {
         svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
         defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataService, svc, alloc, table_name, source_ordinal, flushMetadataServiceMutation);
+    }
+
+    fn metadataServiceRecordJsonResponseAllocation(ptr: *anyopaque, bytes: usize) void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        svc.recordJsonResponseAllocation(bytes);
     }
 
     fn metadataHttpServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -692,6 +705,11 @@ pub const AdminSource = struct {
         defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataHttpService, svc, alloc, table_name, source_ordinal, flushMetadataHttpServiceMutation);
     }
+
+    fn metadataHttpServiceRecordJsonResponseAllocation(ptr: *anyopaque, bytes: usize) void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        svc.recordJsonResponseAllocation(bytes);
+    }
 };
 
 pub const MetadataHttpServer = struct {
@@ -730,21 +748,21 @@ pub const MetadataHttpServer = struct {
                     defer self.source.freeAdminSnapshot(&snapshot);
                     var status = try buildNodeShutdownStatus(self.alloc, &snapshot, node_id);
                     defer freeNodeShutdownStatus(self.alloc, &status);
-                    return try jsonResponse(self.alloc, status);
+                    return try jsonResponse(self.alloc, self.source, status);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.health)) {
                     return try textResponse(self.alloc, 200, "ok");
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.head)) {
-                    return try jsonResponse(self.alloc, try self.source.head());
+                    return try jsonResponse(self.alloc, self.source, try self.source.head());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.status)) {
-                    return try jsonResponse(self.alloc, try self.source.status());
+                    return try jsonResponse(self.alloc, self.source, try self.source.status());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.admin_snapshot)) {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    return try jsonResponse(self.alloc, snapshot);
+                    return try jsonResponse(self.alloc, self.source, snapshot);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.active_transitions)) {
                     var snapshot = try self.source.adminSnapshot();
@@ -761,7 +779,7 @@ pub const MetadataHttpServer = struct {
                     defer self.alloc.free(split);
                     const merge = try cloneValues(self.alloc, @TypeOf(snapshot.merge_transitions[0]), active.merge);
                     defer self.alloc.free(merge);
-                    return try jsonResponse(self.alloc, Response{
+                    return try jsonResponse(self.alloc, self.source, Response{
                         .split = split,
                         .merge = merge,
                     });
@@ -773,7 +791,7 @@ pub const MetadataHttpServer = struct {
                     defer metadata_admin.freeRangeRefs(self.alloc, refs);
                     const records = try cloneValues(self.alloc, @TypeOf(snapshot.ranges[0]), refs);
                     defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, records);
+                    return try jsonResponse(self.alloc, self.source, records);
                 }
                 if (routes.Routes.matchGroupPlacement(req.uri)) |group_id| {
                     var snapshot = try self.source.adminSnapshot();
@@ -782,7 +800,7 @@ pub const MetadataHttpServer = struct {
                     defer metadata_admin.freePlacementRefs(self.alloc, refs);
                     const records = try cloneValues(self.alloc, @TypeOf(snapshot.placement_intents[0]), refs);
                     defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, records);
+                    return try jsonResponse(self.alloc, self.source, records);
                 }
             },
             .POST => {
@@ -2139,11 +2157,14 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
     return id;
 }
 
-fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
+fn jsonResponse(alloc: std.mem.Allocator, source: AdminSource, value: anytype) !http_common.HttpResponse {
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    errdefer alloc.free(body);
+    source.recordJsonResponseAllocation(body.len);
     return .{
         .status = 200,
         .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
+        .body = body,
     };
 }
 

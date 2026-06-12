@@ -577,9 +577,9 @@ pub const Client = struct {
     }
 
     /// Reprocess a derived document artifact across a table range
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, artifact_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, artifact_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -608,18 +608,18 @@ pub const Client = struct {
     }
 
     /// Advance a derived document artifact reprocess job
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance
     pub fn advanceDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:advance", .{ self.base_url, table_name, artifact_name, job_id });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/advance", .{ self.base_url, table_name, artifact_name, job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
     }
 
     /// Cancel a derived document artifact reprocess job
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel
     pub fn cancelDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:cancel", .{ self.base_url, table_name, artifact_name, job_id });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/cancel", .{ self.base_url, table_name, artifact_name, job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
@@ -649,9 +649,9 @@ pub const Client = struct {
     }
 
     /// Reprocess a derived document artifact
-    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, key, artifact_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, key, artifact_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);

@@ -331,6 +331,10 @@ pub const RaftApplyStore = struct {
         return self.backend.snapshotWriteStats();
     }
 
+    pub fn snapshotMaintenanceStats(self: *const RaftApplyStore) lsm_backend.Backend.MaintenanceStats {
+        return self.backend.snapshotMaintenanceStats();
+    }
+
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataBatch {
         const batch = (try self.ensureLoaded(group_id)) orelse return null;
         return .{
