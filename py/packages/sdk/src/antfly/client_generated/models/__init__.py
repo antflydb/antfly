@@ -135,6 +135,7 @@ from .embedder_provider import EmbedderProvider
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
+from .embeddings_index_config_backend import EmbeddingsIndexConfigBackend
 from .embeddings_index_config_format import EmbeddingsIndexConfigFormat
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -666,6 +667,7 @@ __all__ = (
     "EmbedderConfig",
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
+    "EmbeddingsIndexConfigBackend",
     "EmbeddingsIndexConfigFormat",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsIndexType",

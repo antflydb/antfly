@@ -138,7 +138,10 @@ Current status:
   through temporary files plus rename, then reopen and validate the store from a
   manifest path. Segment writers can also produce a manifest-ready built
   segment with validated metadata and a stable segment path. Runtime
-  reads/writes still use the LSM-backed namespace; this
+  reads/writes still use the LSM-backed namespace. The dense index config now
+  separates `backend`, `format`, and `version`; `backend = segments` is
+  reserved and rejected until runtime reads/writes actually use the segment
+  store instead of silently falling back to LSM. This
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.

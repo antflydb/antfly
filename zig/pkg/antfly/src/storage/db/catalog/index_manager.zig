@@ -11837,15 +11837,21 @@ fn readStr(data: []const u8, pos: *usize) ![]const u8 {
 }
 
 const DenseConfig = struct {
+    const Backend = enum {
+        lsm,
+        segments,
+    };
+
     const Format = enum {
-        lsm_packed,
-        segments_base_delta,
+        packed_hbc,
+        base_delta,
     };
 
     field_name: []u8,
     dims: u32,
     metric: vector_mod.DistanceMetric,
-    format: Format = .lsm_packed,
+    backend: Backend = .lsm,
+    format: Format = .packed_hbc,
     version: u32 = 1,
     split_algo: vector_mod.ClustAlgorithm = .kmeans,
     embedding_name: ?[]u8 = null,
@@ -12101,16 +12107,20 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
     const field = root.object.get("field") orelse return error.InvalidIndexConfig;
     const dims = root.object.get("dims") orelse return error.InvalidIndexConfig;
     const metric = root.object.get("metric");
+    const backend = if (root.object.get("backend")) |value|
+        try parseDenseBackend(value.string)
+    else
+        DenseConfig.Backend.lsm;
     const format = if (root.object.get("format")) |value|
         try parseDenseFormat(value.string)
     else
-        DenseConfig.Format.lsm_packed;
+        DenseConfig.Format.packed_hbc;
     const version = if (root.object.get("version")) |value|
         std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
     else
         1;
 
-    const format_defaults = denseFormatDefaults(format, version) catch return error.InvalidIndexConfig;
+    const format_defaults = denseStorageDefaults(backend, format, version) catch return error.InvalidIndexConfig;
     const posting_base_member_block_size = if (root.object.get("posting_base_member_block_size")) |value|
         try parsePostingBaseMemberBlockSize(value.integer)
     else
@@ -12120,6 +12130,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
         .field_name = try alloc.dupe(u8, field.string),
         .dims = std.math.cast(u32, dims.integer) orelse return error.InvalidIndexConfig,
         .metric = if (metric) |value| try parseMetric(value.string) else .l2_squared,
+        .backend = backend,
         .format = format,
         .version = version,
         .split_algo = if (root.object.get("split_algo")) |value| try parseClustAlgorithm(value.string) else .kmeans,
@@ -13270,9 +13281,15 @@ fn parseDenseRerankPolicy(raw: []const u8) !hbc_mod.HBCConfig.RerankPolicy {
     return error.InvalidIndexConfig;
 }
 
+fn parseDenseBackend(raw: []const u8) !DenseConfig.Backend {
+    if (std.mem.eql(u8, raw, "lsm")) return .lsm;
+    if (std.mem.eql(u8, raw, "segments")) return .segments;
+    return error.InvalidIndexConfig;
+}
+
 fn parseDenseFormat(raw: []const u8) !DenseConfig.Format {
-    if (std.mem.eql(u8, raw, "lsm_packed")) return .lsm_packed;
-    if (std.mem.eql(u8, raw, "segments_base_delta")) return .segments_base_delta;
+    if (std.mem.eql(u8, raw, "packed_hbc")) return .packed_hbc;
+    if (std.mem.eql(u8, raw, "base_delta")) return .base_delta;
     return error.InvalidIndexConfig;
 }
 
@@ -13282,24 +13299,27 @@ const DenseFormatDefaults = struct {
     lazy_posting_maintenance: bool,
 };
 
-fn denseFormatDefaults(format: DenseConfig.Format, version: u32) !DenseFormatDefaults {
-    return switch (format) {
-        .lsm_packed => switch (version) {
-            1 => .{
-                .centroid_directory_mode = .hbc,
-                .posting_storage_mode = .packed_hbc,
-                .lazy_posting_maintenance = false,
+fn denseStorageDefaults(backend: DenseConfig.Backend, format: DenseConfig.Format, version: u32) !DenseFormatDefaults {
+    return switch (backend) {
+        .lsm => switch (format) {
+            .packed_hbc => switch (version) {
+                1 => .{
+                    .centroid_directory_mode = .hbc,
+                    .posting_storage_mode = .packed_hbc,
+                    .lazy_posting_maintenance = false,
+                },
+                else => error.InvalidIndexConfig,
             },
-            else => error.InvalidIndexConfig,
-        },
-        .segments_base_delta => switch (version) {
-            1 => .{
-                .centroid_directory_mode = .hbc,
-                .posting_storage_mode = .base_delta,
-                .lazy_posting_maintenance = true,
+            .base_delta => switch (version) {
+                1 => .{
+                    .centroid_directory_mode = .hbc,
+                    .posting_storage_mode = .base_delta,
+                    .lazy_posting_maintenance = true,
+                },
+                else => error.InvalidIndexConfig,
             },
-            else => error.InvalidIndexConfig,
         },
+        .segments => error.InvalidIndexConfig,
     };
 }
 
@@ -14944,7 +14964,7 @@ test "index manager modeled crash fixtures stay green" {
     try runModeledIndexManagerCrashFixtures(std.testing.allocator);
 }
 
-test "parseDenseConfig defaults to lsm packed format v1" {
+test "parseDenseConfig defaults to lsm packed_hbc format v1" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
@@ -14956,20 +14976,22 @@ test "parseDenseConfig defaults to lsm packed format v1" {
     const cfg = try parseDenseConfig(alloc, raw);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(DenseConfig.Format.lsm_packed, cfg.format);
+    try std.testing.expectEqual(DenseConfig.Backend.lsm, cfg.backend);
+    try std.testing.expectEqual(DenseConfig.Format.packed_hbc, cfg.format);
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.hbc, cfg.centroid_directory_mode);
     try std.testing.expectEqual(hbc_mod.HBCConfig.PostingStorageMode.packed_hbc, cfg.posting_storage_mode);
     try std.testing.expectEqual(false, cfg.lazy_posting_maintenance);
 }
 
-test "parseDenseConfig maps segments base delta format v1 to base delta defaults" {
+test "parseDenseConfig maps lsm base_delta format v1 to base delta defaults" {
     const alloc = std.testing.allocator;
     const raw =
         \\{
         \\  "field": "embedding",
         \\  "dims": 128,
-        \\  "format": "segments_base_delta",
+        \\  "backend": "lsm",
+        \\  "format": "base_delta",
         \\  "version": 1
         \\}
     ;
@@ -14977,21 +14999,22 @@ test "parseDenseConfig maps segments base delta format v1 to base delta defaults
     const cfg = try parseDenseConfig(alloc, raw);
     defer cfg.deinit(alloc);
 
-    try std.testing.expectEqual(DenseConfig.Format.segments_base_delta, cfg.format);
+    try std.testing.expectEqual(DenseConfig.Backend.lsm, cfg.backend);
+    try std.testing.expectEqual(DenseConfig.Format.base_delta, cfg.format);
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.hbc, cfg.centroid_directory_mode);
     try std.testing.expectEqual(hbc_mod.HBCConfig.PostingStorageMode.base_delta, cfg.posting_storage_mode);
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
 }
 
-test "parseDenseConfig rejects unsupported dense format versions" {
+test "parseDenseConfig rejects unsupported dense storage axes" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
         \\{
         \\  "field": "embedding",
         \\  "dims": 128,
-        \\  "format": "segments_base_delta",
+        \\  "format": "base_delta",
         \\  "version": 2
         \\}
     ));
@@ -15000,6 +15023,24 @@ test "parseDenseConfig rejects unsupported dense format versions" {
         \\  "field": "embedding",
         \\  "dims": 128,
         \\  "format": "not_a_format",
+        \\  "version": 1
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 128,
+        \\  "backend": "not_a_backend",
+        \\  "format": "base_delta",
+        \\  "version": 1
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseConfig(alloc,
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 128,
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
         \\  "version": 1
         \\}
     ));
@@ -15012,7 +15053,8 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "field": "embedding",
         \\  "dims": 128,
         \\  "metric": "cosine",
-        \\  "format": "segments_base_delta",
+        \\  "backend": "lsm",
+        \\  "format": "base_delta",
         \\  "version": 1,
         \\  "split_algo": "kmeans",
         \\  "search_width": 256,
@@ -15073,7 +15115,8 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqualStrings("embedding", cfg.field_name);
     try std.testing.expectEqual(@as(u32, 128), cfg.dims);
     try std.testing.expectEqual(vector_mod.DistanceMetric.cosine, cfg.metric);
-    try std.testing.expectEqual(DenseConfig.Format.segments_base_delta, cfg.format);
+    try std.testing.expectEqual(DenseConfig.Backend.lsm, cfg.backend);
+    try std.testing.expectEqual(DenseConfig.Format.base_delta, cfg.format);
     try std.testing.expectEqual(@as(u32, 1), cfg.version);
     try std.testing.expectEqual(vector_mod.ClustAlgorithm.kmeans, cfg.split_algo);
     try std.testing.expectEqual(@as(u32, 256), cfg.search_width);

@@ -582,7 +582,9 @@ pub const EmbeddingsIndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
-    /// Dense vector index storage format. lsm_packed is the legacy packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta segments. Ignored for sparse indexes.
+    /// Dense vector index physical posting backend. lsm stores posting records in the LSM-backed index namespace. segments is reserved for the dedicated posting segment-file backend and is rejected until that runtime path is available. Ignored for sparse indexes.
+    backend: ?[]const u8 = null,
+    /// Dense vector index logical posting format. packed_hbc is the legacy packed HBC posting-list value. base_delta uses immutable posting base values with append-only delta values. Ignored for sparse indexes.
     format: ?[]const u8 = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,

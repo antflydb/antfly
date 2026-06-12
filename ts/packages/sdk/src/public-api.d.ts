@@ -6837,11 +6837,17 @@ export interface components {
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
             /**
-             * @description Dense vector index storage format. lsm_packed is the legacy packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta segments. Ignored for sparse indexes.
-             * @default lsm_packed
+             * @description Dense vector index physical posting backend. lsm stores posting records in the LSM-backed index namespace. segments is reserved for the dedicated posting segment-file backend and is rejected until that runtime path is available. Ignored for sparse indexes.
+             * @default lsm
              * @enum {string}
              */
-            format?: "lsm_packed" | "segments_base_delta";
+            backend?: "lsm" | "segments";
+            /**
+             * @description Dense vector index logical posting format. packed_hbc is the legacy packed HBC posting-list value. base_delta uses immutable posting base values with append-only delta values. Ignored for sparse indexes.
+             * @default packed_hbc
+             * @enum {string}
+             */
+            format?: "packed_hbc" | "base_delta";
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */

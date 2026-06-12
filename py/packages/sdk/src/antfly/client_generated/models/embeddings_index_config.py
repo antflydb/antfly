@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.distance_metric import DistanceMetric
+from ..models.embeddings_index_config_backend import EmbeddingsIndexConfigBackend
 from ..models.embeddings_index_config_format import EmbeddingsIndexConfigFormat
 from ..types import UNSET, Unset
 
@@ -39,9 +40,13 @@ class EmbeddingsIndexConfig:
             distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
                 product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
-            format_ (EmbeddingsIndexConfigFormat | Unset): Dense vector index storage format. lsm_packed is the legacy
-                packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta
-                segments. Ignored for sparse indexes. Default: EmbeddingsIndexConfigFormat.LSM_PACKED.
+            backend (EmbeddingsIndexConfigBackend | Unset): Dense vector index physical posting backend. lsm stores posting
+                records in the LSM-backed index namespace. segments is reserved for the dedicated posting segment-file backend
+                and is rejected until that runtime path is available. Ignored for sparse indexes. Default:
+                EmbeddingsIndexConfigBackend.LSM.
+            format_ (EmbeddingsIndexConfigFormat | Unset): Dense vector index logical posting format. packed_hbc is the
+                legacy packed HBC posting-list value. base_delta uses immutable posting base values with append-only delta
+                values. Ignored for sparse indexes. Default: EmbeddingsIndexConfigFormat.PACKED_HBC.
             mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
             embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
 
@@ -232,7 +237,8 @@ class EmbeddingsIndexConfig:
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
-    format_: EmbeddingsIndexConfigFormat | Unset = EmbeddingsIndexConfigFormat.LSM_PACKED
+    backend: EmbeddingsIndexConfigBackend | Unset = EmbeddingsIndexConfigBackend.LSM
+    format_: EmbeddingsIndexConfigFormat | Unset = EmbeddingsIndexConfigFormat.PACKED_HBC
     mem_only: bool | Unset = UNSET
     embedder: EmbedderConfig | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
@@ -256,6 +262,10 @@ class EmbeddingsIndexConfig:
         distance_metric: str | Unset = UNSET
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
+
+        backend: str | Unset = UNSET
+        if not isinstance(self.backend, Unset):
+            backend = self.backend.value
 
         format_: str | Unset = UNSET
         if not isinstance(self.format_, Unset):
@@ -296,6 +306,8 @@ class EmbeddingsIndexConfig:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if backend is not UNSET:
+            field_dict["backend"] = backend
         if format_ is not UNSET:
             field_dict["format"] = format_
         if mem_only is not UNSET:
@@ -338,6 +350,13 @@ class EmbeddingsIndexConfig:
             distance_metric = UNSET
         else:
             distance_metric = DistanceMetric(_distance_metric)
+
+        _backend = d.pop("backend", UNSET)
+        backend: EmbeddingsIndexConfigBackend | Unset
+        if isinstance(_backend, Unset):
+            backend = UNSET
+        else:
+            backend = EmbeddingsIndexConfigBackend(_backend)
 
         _format_ = d.pop("format", UNSET)
         format_: EmbeddingsIndexConfigFormat | Unset
@@ -382,6 +401,7 @@ class EmbeddingsIndexConfig:
             field=field,
             template=template,
             distance_metric=distance_metric,
+            backend=backend,
             format_=format_,
             mem_only=mem_only,
             embedder=embedder,

@@ -158,14 +158,22 @@ components:
           example: 'Hello, {{#if (eq Name "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old.'
         distance_metric:
           $ref: "#/components/schemas/DistanceMetric"
+        backend:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - lsm
+            - segments
+          default: lsm
+          description: "Dense vector index physical posting backend. lsm stores posting records in the LSM-backed index namespace. segments is reserved for the dedicated posting segment-file backend and is rejected until that runtime path is available. Ignored for sparse indexes."
         format:
           x-go-type-skip-optional-pointer: true
           type: string
           enum:
-            - lsm_packed
-            - segments_base_delta
-          default: lsm_packed
-          description: "Dense vector index storage format. lsm_packed is the legacy packed HBC posting store. segments_base_delta stores immutable posting base records with append-only delta segments. Ignored for sparse indexes."
+            - packed_hbc
+            - base_delta
+          default: packed_hbc
+          description: "Dense vector index logical posting format. packed_hbc is the legacy packed HBC posting-list value. base_delta uses immutable posting base values with append-only delta values. Ignored for sparse indexes."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean

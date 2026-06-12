@@ -877,6 +877,11 @@ fn appendOptionalDenseStorageFormatFields(
     out: *std.ArrayListUnmanaged(u8),
     root: std.json.ObjectMap,
 ) !void {
+    if (root.get("backend")) |backend| {
+        if (backend != .string) return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"backend\":");
+        try appendJsonString(alloc, out, backend.string);
+    }
     if (root.get("format")) |format| {
         if (format != .string) return error.InvalidCreateTableRequest;
         try out.appendSlice(alloc, ",\"format\":");
@@ -2233,28 +2238,30 @@ test "managed embedder translates managed embeddings config into db generator co
 test "managed embedder translates dense storage format and version" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"format":"segments_base_delta","version":1,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\{"type":"embeddings","field":"body","dimension":384,"backend":"lsm","format":"base_delta","version":1,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
     , .{});
     defer parsed.deinit();
 
     const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
     defer std.testing.allocator.free(config_json);
 
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"segments_base_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"backend\":\"lsm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"base_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
 }
 
 test "managed embedder treats dense storage version zero as unspecified" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"format":"segments_base_delta","version":0,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\{"type":"embeddings","field":"body","dimension":384,"backend":"lsm","format":"base_delta","version":0,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
     , .{});
     defer parsed.deinit();
 
     const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
     defer std.testing.allocator.free(config_json);
 
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"segments_base_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"backend\":\"lsm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"base_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\"") == null);
 }
 
