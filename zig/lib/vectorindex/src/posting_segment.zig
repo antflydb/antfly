@@ -33,6 +33,7 @@ const version: u16 = 1;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8;
 const footer_size: usize = 8 + 8 + 4 + 2 + 4;
 const manifest_header_size: usize = 4 + 2 + 4 + 8;
+const manifest_checksum_size: usize = 4;
 
 pub const EntryKind = enum(u8) {
     base = 1,
@@ -239,13 +240,17 @@ pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     for (manifest.segments) |entry| {
         try appendManifestEntry(alloc, &out, entry);
     }
+    try appendU32(alloc, &out, manifestChecksum(out.items));
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
-    if (data.len < manifest_header_size) return error.CorruptedPostingSegmentManifest;
+    if (data.len < manifest_header_size + manifest_checksum_size) return error.CorruptedPostingSegmentManifest;
     if (!std.mem.eql(u8, data[0..4], &manifest_magic)) return error.BadPostingSegmentManifestMagic;
     if (readU16(data[4..6]) != version) return error.UnsupportedPostingSegmentManifestVersion;
+    const manifest_end = data.len - manifest_checksum_size;
+    const stored_checksum = readU32(data[manifest_end..][0..4]);
+    if (manifestChecksum(data[0..manifest_end]) != stored_checksum) return error.BadPostingSegmentManifestChecksum;
     const entry_count_u32 = readU32(data[6..10]);
     const next_segment_id = readU64(data[10..18]);
     const entry_count = std.math.cast(usize, entry_count_u32) orelse return error.CorruptedPostingSegmentManifest;
@@ -265,7 +270,7 @@ pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
         entries[initialized] = entry;
         initialized += 1;
     }
-    if (pos != data.len) return error.CorruptedPostingSegmentManifest;
+    if (pos != manifest_end) return error.CorruptedPostingSegmentManifest;
     return .{
         .next_segment_id = next_segment_id,
         .segments = entries,
@@ -609,6 +614,10 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
 }
 
 fn segmentChecksum(data: []const u8) u32 {
+    return std.hash.Crc32.hash(data);
+}
+
+fn manifestChecksum(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
 }
 
@@ -1090,7 +1099,13 @@ pub fn testManifestCodecRejectsInvalidData() !void {
     bad_version[5] = 2;
     try std.testing.expectError(error.UnsupportedPostingSegmentManifestVersion, decodeManifestAlloc(alloc, bad_version));
 
-    try std.testing.expectError(error.CorruptedPostingSegmentManifest, decodeManifestAlloc(alloc, encoded[0 .. encoded.len - 1]));
+    var bad_entry = try alloc.dupe(u8, encoded);
+    defer alloc.free(bad_entry);
+    bad_entry[18] ^= 0xff;
+    try std.testing.expectError(error.BadPostingSegmentManifestChecksum, decodeManifestAlloc(alloc, bad_entry));
+
+    try std.testing.expectError(error.BadPostingSegmentManifestChecksum, decodeManifestAlloc(alloc, encoded[0 .. encoded.len - 1]));
+    try std.testing.expectError(error.CorruptedPostingSegmentManifest, decodeManifestAlloc(alloc, encoded[0..manifest_header_size]));
 }
 
 const TestSegmentFile = struct {
