@@ -165,6 +165,7 @@ WRITE_COLUMNS = [
     "repair_fold_tail_keys",
     "repair_fold_tail_value_bytes",
     "repair_fold_written_base_value_bytes",
+    "repair_fold_peak_scratch_bytes",
     "repair_fold_base_bytes_per_record",
     "repair_fold_base_tail_ratio",
     "backlog_dirty",
@@ -375,6 +376,14 @@ def preferred_mean(rows: list[dict[str, Any]], preferred_key: str, fallback_key:
     if preferred is not None:
         return preferred
     return mean(rows, fallback_key)
+
+
+def preferred_mean_any(rows: list[dict[str, Any]], *keys: str) -> float | None:
+    for key in keys:
+        value = mean(rows, key)
+        if value is not None:
+            return value
+    return None
 
 
 def preferred_first(rows: list[dict[str, Any]], preferred_key: str, fallback_key: str) -> Any:
@@ -818,6 +827,12 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "repair_fold_written_base_value_bytes": mean(
                     group,
                     "repair_posting_delta_fold_written_base_value_bytes",
+                ),
+                "repair_fold_peak_scratch_bytes": preferred_mean_any(
+                    group,
+                    "posting_repair_before_bulk_finish_delta_fold_peak_scratch_bytes",
+                    "posting_repair_after_write_delta_fold_peak_scratch_bytes",
+                    "repair_posting_delta_fold_peak_scratch_bytes",
                 ),
                 "backlog_dirty": mean(group, "posting_backlog_dirty_postings"),
                 "backlog_delta_tails": mean(group, "posting_backlog_delta_tail_postings"),

@@ -2462,7 +2462,7 @@ fn printResult(
                 },
             );
             try writer.print(
-                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_search_scratch_allocations\":{d},\"post_write_warm_profile_search_scratch_allocation_bytes\":{d},\"post_write_warm_profile_search_scratch_retained_bytes\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d},\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_base_decode_ns\":{d},\"post_write_warm_profile_posting_base_decode_members\":{d},\"post_write_warm_profile_posting_delta_replay_ns\":{d},\"post_write_warm_profile_posting_delta_replay_records\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
+                ",\"post_write_warm_profile_total_ns\":{d},\"post_write_warm_profile_setup_ns\":{d},\"post_write_warm_profile_runtime_txn_ns\":{d},\"post_write_warm_profile_scratch_acquire_ns\":{d},\"post_write_warm_profile_search_scratch_allocations\":{d},\"post_write_warm_profile_search_scratch_allocation_bytes\":{d},\"post_write_warm_profile_search_scratch_retained_bytes\":{d},\"post_write_warm_profile_upper_tree_pin_ns\":{d},\"post_write_warm_profile_root_load_ns\":{d},\"post_write_warm_profile_node_cache_miss_ns\":{d},\"post_write_warm_profile_node_cache_misses\":{d},\"post_write_warm_profile_quantized_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_cache_misses\":{d},\"post_write_warm_profile_quantized_internal_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_internal_cache_misses\":{d},\"post_write_warm_profile_quantized_leaf_cache_miss_ns\":{d},\"post_write_warm_profile_quantized_leaf_cache_misses\":{d}",
                 .{
                     query.warm_totals.total_ns,
                     query.warm_totals.setup_ns,
@@ -2481,6 +2481,11 @@ fn printResult(
                     query.warm_totals.quantized_internal_cache_misses,
                     query.warm_totals.quantized_leaf_cache_miss_ns,
                     query.warm_totals.quantized_leaf_cache_misses,
+                },
+            );
+            try writer.print(
+                ",\"post_write_warm_profile_child_expand_ns\":{d},\"post_write_warm_profile_leaf_score_ns\":{d},\"post_write_warm_profile_posting_overlay_ns\":{d},\"post_write_warm_profile_posting_overlay_calls\":{d},\"post_write_warm_profile_posting_overlay_base_members\":{d},\"post_write_warm_profile_posting_base_decode_ns\":{d},\"post_write_warm_profile_posting_base_decode_members\":{d},\"post_write_warm_profile_posting_delta_replay_ns\":{d},\"post_write_warm_profile_posting_delta_replay_records\":{d},\"post_write_warm_profile_posting_overlay_delta_records\":{d},\"post_write_warm_profile_posting_overlay_delta_scan_skips\":{d},\"post_write_warm_profile_posting_overlay_materialized_members\":{d},\"post_write_warm_profile_posting_overlay_fallbacks\":{d},\"post_write_warm_profile_posting_overlay_cache_hits\":{d},\"post_write_warm_profile_posting_overlay_cache_misses\":{d},\"post_write_warm_profile_posting_overlay_cache_evictions\":{d},\"post_write_warm_profile_posting_overlay_cache_admission_skips\":{d},\"post_write_warm_profile_posting_overlay_cache_member_bytes\":{d},\"post_write_warm_profile_rerank_ns\":{d},\"post_write_warm_profile_rerank_vector_load_ns\":{d}",
+                .{
                     query.warm_totals.child_expand_ns,
                     query.warm_totals.leaf_score_ns,
                     query.warm_totals.posting_overlay_ns,
@@ -2716,7 +2721,7 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"posting_base_blocks\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d}",
+        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"posting_base_blocks\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d},\"posting_delta_fold_peak_scratch_bytes\":{d}",
         .{
             profile.posting_base_put_calls,
             profile.posting_base_key_bytes,
@@ -2742,6 +2747,7 @@ fn printResult(
             profile.posting_delta_fold_deleted_tail_value_bytes,
             profile.posting_delta_fold_written_base_key_bytes,
             profile.posting_delta_fold_written_base_value_bytes,
+            profile.posting_delta_fold_peak_scratch_bytes,
         },
     );
     if (maintenance) |stats| {
@@ -2815,7 +2821,7 @@ fn printResult(
 
 fn printPostingRepairResult(writer: anytype, comptime prefix: []const u8, result: hbc.PostingMaintenanceResult) !void {
     try writer.print(
-        ",\"{s}_limit_reached\":{},\"{s}_remaining_dirty_postings\":{d},\"{s}_remaining_delta_tail_postings\":{d},\"{s}_remaining_overfull_postings\":{d},\"{s}_remaining_postings_at_capacity\":{d},\"{s}_remaining_max_over_capacity_members\":{d}",
+        ",\"{s}_limit_reached\":{},\"{s}_remaining_dirty_postings\":{d},\"{s}_remaining_delta_tail_postings\":{d},\"{s}_remaining_overfull_postings\":{d},\"{s}_remaining_postings_at_capacity\":{d},\"{s}_remaining_max_over_capacity_members\":{d},\"{s}_delta_fold_peak_scratch_bytes\":{d}",
         .{
             prefix,
             result.limit_reached,
@@ -2829,6 +2835,8 @@ fn printPostingRepairResult(writer: anytype, comptime prefix: []const u8, result
             result.remaining_postings_at_capacity,
             prefix,
             result.remaining_max_over_capacity_members,
+            prefix,
+            result.delta_fold_peak_scratch_bytes,
         },
     );
 }

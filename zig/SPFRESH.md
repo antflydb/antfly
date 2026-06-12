@@ -67,6 +67,9 @@ Current status:
   `profile_search_scratch_allocation_bytes`, and
   `profile_search_scratch_retained_bytes`, so slab compaction work can be
   driven by allocator evidence.
+- Delta folds profile peak retained fold scratch bytes through
+  `posting_delta_fold_peak_scratch_bytes`, so maintenance tuning can compare
+  fold memory pressure against written base bytes and deleted tail bytes.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
@@ -676,8 +679,8 @@ implementations cleanly:
 
 The next optimization decisions need counters that separate logical format
 cost from backend cost. This branch now emits the base byte/decode, delta
-byte/replay, and search scratch allocation/retention counters. The full set to
-keep tracking before making a segment-backend decision is:
+byte/replay, fold scratch, and search scratch allocation/retention counters.
+The full set to keep tracking before making a segment-backend decision is:
 
 - base bytes/member
 - base decode ns/member

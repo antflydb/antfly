@@ -1301,6 +1301,7 @@ fn foldPostingDeltaTailIfNeeded(
     if (folded.delta_records == 0) return;
 
     result.delta_fold_attempts += 1;
+    result.delta_fold_peak_scratch_bytes = @max(result.delta_fold_peak_scratch_bytes, @as(u64, @intCast(folded.peak_scratch_bytes)));
     if (folded.skipped) {
         result.delta_fold_skipped += 1;
     } else {
@@ -1785,6 +1786,10 @@ pub fn repairDirtyPostingsTxnWithOptions(
     self.write_profile.posting_maintenance_delta_fold_attempts += result.delta_fold_attempts;
     self.write_profile.posting_maintenance_delta_fold_skipped += result.delta_fold_skipped;
     self.write_profile.posting_maintenance_delta_fold_records += result.delta_fold_records;
+    self.write_profile.posting_delta_fold_peak_scratch_bytes = @max(
+        self.write_profile.posting_delta_fold_peak_scratch_bytes,
+        result.delta_fold_peak_scratch_bytes,
+    );
 
     return result;
 }

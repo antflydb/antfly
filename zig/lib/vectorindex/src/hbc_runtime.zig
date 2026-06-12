@@ -198,6 +198,7 @@ pub const WriteProfile = struct {
     posting_delta_fold_deleted_tail_value_bytes: u64 = 0,
     posting_delta_fold_written_base_key_bytes: u64 = 0,
     posting_delta_fold_written_base_value_bytes: u64 = 0,
+    posting_delta_fold_peak_scratch_bytes: u64 = 0,
     range_put_calls: u64 = 0,
     range_delete_calls: u64 = 0,
     range_key_bytes: u64 = 0,

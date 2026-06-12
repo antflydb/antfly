@@ -101,6 +101,7 @@ pub const FoldDeltaTailResult = struct {
     deleted_tail_value_bytes: usize = 0,
     written_base_key_bytes: usize = 0,
     written_base_value_bytes: usize = 0,
+    peak_scratch_bytes: usize = 0,
     next_generation: u64 = 0,
     skipped: bool = false,
 };
@@ -1335,6 +1336,7 @@ pub const PostingMaintenanceResult = struct {
     delta_fold_attempts: u64 = 0,
     delta_fold_skipped: u64 = 0,
     delta_fold_records: u64 = 0,
+    delta_fold_peak_scratch_bytes: u64 = 0,
     skipped_missing: u64 = 0,
     remaining_dirty_postings: u64 = 0,
     remaining_delta_tail_postings: u64 = 0,
@@ -2569,18 +2571,20 @@ pub const PostingStore = struct {
         const sort_base_members = shouldSortBaseMembers(index);
         const configured_base_member_block_size = postingBaseMemberBlockSize(index);
         const adaptive_scan = try scanDeltaTailAdaptiveForFold(index, txn, posting_id, index.alloc, &scratch, base_header.generation, sort_base_members);
+        var peak_scratch_bytes = scratch.bytes();
         const use_overlay_plan = adaptive_scan.use_overlay_plan;
         const stats = adaptive_scan.stats;
         if (stats.records == 0) {
             return .{
                 .base_member_count = base_header.member_count,
                 .materialized_member_count = base_header.member_count,
+                .peak_scratch_bytes = @intCast(peak_scratch_bytes),
                 .next_generation = base_header.generation,
             };
         }
         if (stats.records_after_generation == 0) {
             const deleted_tail = try deleteDeltaTail(index, txn, posting_id);
-            notePostingDeltaFold(index, 0, base_header.member_count, base_header.member_count, deleted_tail, 0, 0);
+            notePostingDeltaFold(index, 0, base_header.member_count, base_header.member_count, deleted_tail, 0, 0, peak_scratch_bytes);
             return .{
                 .delta_records = stats.records,
                 .base_member_count = base_header.member_count,
@@ -2588,6 +2592,7 @@ pub const PostingStore = struct {
                 .deleted_tail_keys = deleted_tail.keys,
                 .deleted_tail_key_bytes = deleted_tail.key_bytes,
                 .deleted_tail_value_bytes = deleted_tail.value_bytes,
+                .peak_scratch_bytes = @intCast(peak_scratch_bytes),
                 .next_generation = base_header.generation,
             };
         }
@@ -2596,6 +2601,7 @@ pub const PostingStore = struct {
                 .delta_records = stats.records,
                 .base_member_count = base_header.member_count,
                 .materialized_member_count = base_header.member_count,
+                .peak_scratch_bytes = @intCast(peak_scratch_bytes),
                 .next_generation = base_header.generation,
                 .skipped = true,
             };
@@ -2605,6 +2611,7 @@ pub const PostingStore = struct {
                 .delta_records = stats.records,
                 .base_member_count = base_header.member_count,
                 .materialized_member_count = base_header.member_count,
+                .peak_scratch_bytes = @intCast(peak_scratch_bytes),
                 .next_generation = base_header.generation,
                 .skipped = true,
             };
@@ -2656,6 +2663,7 @@ pub const PostingStore = struct {
                 .member_count = materialized_len,
             };
         };
+        peak_scratch_bytes = @max(peak_scratch_bytes, scratch.bytes());
         const materialized_len = folded_base.member_count;
         const encoded = folded_base.encoded;
         var base_key_buf: [10]u8 = undefined;
@@ -2663,7 +2671,7 @@ pub const PostingStore = struct {
         const written_base_value_bytes = encoded.len;
         try saveEncodedBase(index, txn, posting_id, encoded);
         const deleted_tail = try deleteDeltaTail(index, txn, posting_id);
-        notePostingDeltaFold(index, stats.records_after_generation, base_header.member_count, materialized_len, deleted_tail, written_base_key_bytes, written_base_value_bytes);
+        notePostingDeltaFold(index, stats.records_after_generation, base_header.member_count, materialized_len, deleted_tail, written_base_key_bytes, written_base_value_bytes, peak_scratch_bytes);
         return .{
             .delta_records = stats.records,
             .base_member_count = base_header.member_count,
@@ -2673,6 +2681,7 @@ pub const PostingStore = struct {
             .deleted_tail_value_bytes = deleted_tail.value_bytes,
             .written_base_key_bytes = written_base_key_bytes,
             .written_base_value_bytes = written_base_value_bytes,
+            .peak_scratch_bytes = @intCast(peak_scratch_bytes),
             .next_generation = next_generation,
         };
     }
@@ -3124,7 +3133,7 @@ fn notePostingDeltaAppend(index: anytype, key_len: usize, value_len: usize, reco
     index.write_profile.posting_delta_value_bytes += @intCast(value_len);
 }
 
-fn notePostingDeltaFold(index: anytype, record_count: usize, base_member_count: usize, materialized_member_count: usize, deleted_tail: DeleteDeltaTailStats, written_base_key_bytes: usize, written_base_value_bytes: usize) void {
+fn notePostingDeltaFold(index: anytype, record_count: usize, base_member_count: usize, materialized_member_count: usize, deleted_tail: DeleteDeltaTailStats, written_base_key_bytes: usize, written_base_value_bytes: usize, peak_scratch_bytes: u64) void {
     const Index = switch (@typeInfo(@TypeOf(index))) {
         .pointer => |ptr| ptr.child,
         else => @TypeOf(index),
@@ -3139,6 +3148,9 @@ fn notePostingDeltaFold(index: anytype, record_count: usize, base_member_count: 
     index.write_profile.posting_delta_fold_deleted_tail_value_bytes += @intCast(deleted_tail.value_bytes);
     index.write_profile.posting_delta_fold_written_base_key_bytes += @intCast(written_base_key_bytes);
     index.write_profile.posting_delta_fold_written_base_value_bytes += @intCast(written_base_value_bytes);
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_delta_fold_peak_scratch_bytes")) {
+        index.write_profile.posting_delta_fold_peak_scratch_bytes = @max(index.write_profile.posting_delta_fold_peak_scratch_bytes, peak_scratch_bytes);
+    }
 }
 
 fn shouldMaterializeBaseDeltaForQuery(index: anytype, comptime Txn: type) bool {
@@ -4328,6 +4340,7 @@ test "posting store can append multiple delta records in one key" {
     try std.testing.expect(folded.deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(usize, 10), folded.written_base_key_bytes);
     try std.testing.expectEqual(@as(usize, 49), folded.written_base_value_bytes);
+    try std.testing.expect(folded.peak_scratch_bytes > 0);
     try std.testing.expectEqual(@as(usize, 0), index.delta_entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_delta_fold_calls);
     try std.testing.expectEqual(@as(u64, records.len), index.write_profile.posting_delta_fold_records);
@@ -4336,6 +4349,7 @@ test "posting store can append multiple delta records in one key" {
     try std.testing.expect(index.write_profile.posting_delta_fold_deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(u64, 10), index.write_profile.posting_delta_fold_written_base_key_bytes);
     try std.testing.expectEqual(@as(u64, 49), index.write_profile.posting_delta_fold_written_base_value_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(folded.peak_scratch_bytes)), index.write_profile.posting_delta_fold_peak_scratch_bytes);
 }
 
 test "posting store chunks grouped delta records by encoded value target" {
@@ -4549,6 +4563,7 @@ test "posting store scans materializes and folds delta tail into a new base" {
     try std.testing.expect(index.write_profile.posting_delta_fold_deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(u64, 10), index.write_profile.posting_delta_fold_written_base_key_bytes);
     try std.testing.expectEqual(@as(u64, @intCast(folded.written_base_value_bytes)), index.write_profile.posting_delta_fold_written_base_value_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(folded.peak_scratch_bytes)), index.write_profile.posting_delta_fold_peak_scratch_bytes);
 }
 
 test "posting store can defer delta fold until policy threshold is reached" {
