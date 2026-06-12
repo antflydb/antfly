@@ -1398,6 +1398,8 @@ pub const PostingBacklogStats = struct {
     delta_tail_postings: u64 = 0,
     max_delta_tail_records: u64 = 0,
     max_tombstone_tail_records: u64 = 0,
+    max_delta_tail_key_bytes: u64 = 0,
+    max_delta_tail_value_bytes: u64 = 0,
     max_delta_to_base_ratio_bps: u64 = 0,
     overfull_postings: u64 = 0,
     postings_at_capacity: u64 = 0,
@@ -1413,7 +1415,7 @@ pub const PostingBacklogStats = struct {
 
     pub fn write(self: PostingBacklogStats, writer: *std.Io.Writer) !void {
         try writer.print(
-            "posting_backlog scanned_nodes={d} scanned_postings={d} dirty_postings={d} centroid_dirty_postings={d} payload_dirty_postings={d} min_dirty_mutation_version={d} max_dirty_version_age={d} delta_tail_postings={d} max_delta_tail_records={d} max_tombstone_tail_records={d} max_delta_to_base_ratio_bps={d} overfull_postings={d} postings_at_capacity={d} max_over_capacity_members={d} max_centroid_version_lag={d} max_payload_version_lag={d} max_mutation_version={d} skipped_missing={d}\n",
+            "posting_backlog scanned_nodes={d} scanned_postings={d} dirty_postings={d} centroid_dirty_postings={d} payload_dirty_postings={d} min_dirty_mutation_version={d} max_dirty_version_age={d} delta_tail_postings={d} max_delta_tail_records={d} max_tombstone_tail_records={d} max_delta_tail_key_bytes={d} max_delta_tail_value_bytes={d} max_delta_to_base_ratio_bps={d} overfull_postings={d} postings_at_capacity={d} max_over_capacity_members={d} max_centroid_version_lag={d} max_payload_version_lag={d} max_mutation_version={d} skipped_missing={d}\n",
             .{
                 self.scanned_nodes,
                 self.scanned_postings,
@@ -1425,6 +1427,8 @@ pub const PostingBacklogStats = struct {
                 self.delta_tail_postings,
                 self.max_delta_tail_records,
                 self.max_tombstone_tail_records,
+                self.max_delta_tail_key_bytes,
+                self.max_delta_tail_value_bytes,
                 self.max_delta_to_base_ratio_bps,
                 self.overfull_postings,
                 self.postings_at_capacity,

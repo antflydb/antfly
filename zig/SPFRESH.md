@@ -112,7 +112,8 @@ Current status:
   `std.Io.Writer` debug renderer, so we can inspect how much deferred work is
   accumulating, including dirty-posting count, oldest dirty mutation version,
   max dirty age, delta-tail postings, max delta records, max tombstone records,
-  delta-to-base ratio, centroid lag, and payload lag.
+  delta-tail key/value bytes, delta-to-base ratio, centroid lag, and payload
+  lag.
 - A disabled-by-default bounded automatic repair hook now runs before write
   commit when `auto_posting_maintenance_max_postings` is non-zero. Optional
   dirty-count, dirty-age, delta-tail, tombstone-tail, delta-ratio,
@@ -125,9 +126,10 @@ Current status:
 - Dense-index config parsing and DB/API runtime status now expose the lazy
   posting knobs, posting backlog/maintenance counters, and the configured
   automatic-maintenance policy bounds next to the observed debt.
-- DB/API posting status now includes delta-tail debt, tombstone/ratio debt,
-  overfull and at-capacity posting debt, boundary-reassignment capacity skips,
-  swap moves, delta-fold attempts/skips/records, and the dirty-age,
+- DB/API posting status now includes delta-tail record/byte debt,
+  tombstone/ratio debt, overfull and at-capacity posting debt,
+  boundary-reassignment capacity skips, swap moves, delta-fold
+  attempts/skips/records, and the dirty-age,
   delta-tail, centroid/payload lag, layout-change, and overfull-reassignment
   policy caps. These are the production counters and bounds needed to enforce
   the "bounded maintenance, no hidden overfull debt" optimization gate outside
