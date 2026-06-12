@@ -1250,7 +1250,17 @@ pub fn copyDirectoryStoreAlloc(
 ) !DirectoryCopyStats {
     const manifest_data = try source_dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes));
     defer alloc.free(manifest_data);
+    return try copyDirectoryStoreManifestDataAlloc(alloc, io, source_dir, destination_dir, options, manifest_data);
+}
 
+pub fn copyDirectoryStoreManifestDataAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    source_dir: std.Io.Dir,
+    destination_dir: std.Io.Dir,
+    options: OpenStoreOptions,
+    manifest_data: []const u8,
+) !DirectoryCopyStats {
     var manifest = try decodeManifestAlloc(alloc, manifest_data);
     defer manifest.deinit(alloc);
 

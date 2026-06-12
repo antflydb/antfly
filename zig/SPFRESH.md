@@ -208,14 +208,18 @@ Current status:
   committed manifest snapshot, compact selected segment files, collect
   temp/orphan files, publish the replacement manifest through the same LSM meta
   transaction, and report compact segment counters through dense posting
-  maintenance stats and Prometheus. That adapter path is still internal until
-  DB-level backup/restore, crash-recovery cleanup, maintenance resource
-  budgets, and public config enablement are wired through the same backend
-  boundary. Dense index config now propagates the parsed physical backend into
-  HBC config, but `backend = segments` remains rejected until those operational
-  surfaces are complete. The dense index config now separates `backend`,
-  `format`, and `version`; `backend = segments` is reserved until runtime
-  reads/writes can use the segment store across the full DB lifecycle. This
+  maintenance stats and Prometheus. HBC can also export the segment artifacts
+  referenced by the committed manifest marker into a standalone directory,
+  validating each referenced segment and writing the manifest last; this is the
+  backup/restore primitive, but generic DB snapshots still intentionally export
+  the logical store only. That adapter path is still internal until DB-level
+  restore/import wiring, crash-recovery cleanup, maintenance resource budgets,
+  and public config enablement are wired through the same backend boundary.
+  Dense index config now propagates the parsed physical backend into HBC config,
+  but `backend = segments` remains rejected until those operational surfaces are
+  complete. The dense index config now separates `backend`, `format`, and
+  `version`; `backend = segments` is reserved until runtime reads/writes can use
+  the segment store across the full DB lifecycle. This
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
@@ -849,12 +853,15 @@ implementations cleanly:
     can now run segment directory maintenance from the committed manifest,
     compact selected segment files, collect ignored temp/orphan files, publish
     the replacement manifest transactionally, and report segment run,
-    compaction, delete, and manifest-size counters. The remaining promotion work
-    is operational: backup/restore must copy and verify segment files, segment
-    maintenance must enforce resource budgets, crash recovery must clean ignored
-    physical manifests/files, and public config must stop rejecting
-    `backend = segments` only after those surfaces are covered. That may reduce
-    LSM key overhead and improve sequential IO.
+    compaction, delete, and manifest-size counters. HBC also has a
+    committed-manifest export primitive that copies and verifies only referenced
+    segment files before publishing the exported manifest. The remaining
+    promotion work is operational: DB restore/import must place those segment
+    artifacts next to restored HBC indexes, segment maintenance must enforce
+    resource budgets, crash recovery must clean ignored physical manifests/files,
+    and public config must stop rejecting `backend = segments` only after those
+    surfaces are covered. That may reduce LSM key overhead and improve
+    sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

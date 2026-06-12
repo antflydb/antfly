@@ -2927,6 +2927,36 @@ pub const HBCIndex = struct {
         return maintenance_summary;
     }
 
+    pub fn exportPostingSegmentBackendToDirectory(self: *HBCIndex, destination_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
+        if (self.posting_segment_runtime == null) return .{};
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        const manifest_data = self.getNamespaced(&txn, .meta, posting_segment_manifest_meta_key) catch |err| switch (err) {
+            error.NotFound => return .{},
+            else => return err,
+        };
+
+        var io_impl = std.Io.Threaded.init(self.alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try std.Io.Dir.cwd().createDirPath(io, destination_path);
+        var destination_dir = try std.Io.Dir.cwd().openDir(io, destination_path, .{ .iterate = true });
+        defer destination_dir.close(io);
+
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
+            self.alloc,
+            io,
+            runtime.dir,
+            destination_dir,
+            runtime.store.options.openOptions(),
+            manifest_data,
+        );
+    }
+
     pub fn savePostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
         try self.bindPostingSegmentWriteTxn(txn);
         lockAtomic(&self.posting_segment_mu);
@@ -10787,6 +10817,9 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
+    var export_tp: TestPath = .{};
+    const export_path = export_tp.init();
+    defer export_tp.cleanup();
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
     defer modeled_device.deinit();
@@ -10895,6 +10928,24 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         try std.testing.expect(segment_maintenance.compacted);
         try std.testing.expect(segment_maintenance.compactions > 0);
         try std.testing.expect(segment_maintenance.manifest_segments > 0);
+
+        const exported = try idx.exportPostingSegmentBackendToDirectory(std.mem.span(export_path));
+        try std.testing.expect(exported.segment_files > 0);
+        try std.testing.expect(exported.segment_bytes > 0);
+        try std.testing.expectEqual(segment_maintenance.manifest_segments, @as(u64, @intCast(exported.manifest_segments)));
+
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var export_dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(export_path), .{ .iterate = true });
+            defer export_dir.close(io);
+            var exported_store = try vectorindex_posting_segment.openLazyStoreFromDirectoryAlloc(alloc, io, export_dir, .{});
+            defer exported_store.deinit(alloc);
+            const exported_materialized = (try exported_store.snapshot().materializeMembers(alloc, posting_id)) orelse return error.TestExpectedEqual;
+            defer alloc.free(exported_materialized);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, exported_materialized);
+        }
 
         {
             var read_txn = try idx.beginReadTxn();
