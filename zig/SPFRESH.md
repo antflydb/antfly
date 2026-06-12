@@ -140,14 +140,18 @@ Current status:
   reading the current manifest, assigning `next_segment_id`, writing the segment
   file, and publishing the updated manifest with an atomic rename. Segment
   directory compaction can now write a compacted replacement segment first and
-  atomically swap the manifest to remove the compacted-away segment ids, leaving
-  old segment files as unreferenced orphans. A manifest-aware directory GC pass
-  can then scan the `postings/` directory and delete only canonical `.afps`
-  segment files that are absent from the current manifest, while ignoring
-  manifest files, temp files, and non-segment entries. The segment layer also
-  has a manifest-only lazy directory store: it can reopen by decoding the
-  manifest without reading every segment file, then read and validate only
-  manifest entries whose posting range can contain the requested posting. Segment
+  atomically swap the manifest to remove compacted-away segment ids, either for
+  the whole manifest or for an explicit selected segment-id set. That gives
+  future maintenance a bounded compaction primitive that can preserve
+  unselected manifest segments while replacing only the scheduled compaction
+  inputs. Old segment files are left as unreferenced orphans. A manifest-aware
+  directory GC pass can then scan the `postings/` directory and delete only
+  canonical `.afps` segment files that are absent from the current manifest,
+  while ignoring manifest files, temp files, and non-segment entries. The
+  segment layer also has a manifest-only lazy directory store: it can reopen by
+  decoding the manifest without reading every segment file, then read and
+  validate only manifest entries whose posting range can contain the requested
+  posting. Segment
   writers now also have typed helpers for appending posting-base,
   posting-delta batch, and centroid-directory records, and eager/lazy snapshots
   can materialize the authoritative member view directly from segment-backed

@@ -109,6 +109,7 @@ pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
 pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWriterToDirectoryAlloc;
 pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuiltSegmentToDirectoryAlloc;
 pub const compactPostingSegmentDirectoryStoreAlloc = posting_segment.compactDirectoryStoreAlloc;
+pub const compactPostingSegmentDirectoryStoreSegmentIdsAlloc = posting_segment.compactDirectoryStoreSegmentIdsAlloc;
 pub const collectPostingSegmentDirectoryGarbageAlloc = posting_segment.collectDirectoryGarbageAlloc;
 pub const verifyPostingSegmentDirectoryStoreAlloc = posting_segment.verifyDirectoryStoreAlloc;
 pub const copyPostingSegmentDirectoryStoreAlloc = posting_segment.copyDirectoryStoreAlloc;
@@ -219,6 +220,10 @@ test "posting segment directory commit appends manifest segments" {
 
 test "posting segment directory compaction replaces manifest segments" {
     try posting_segment.testDirectoryCompactionReplacesManifestSegments();
+}
+
+test "posting segment directory compaction can replace selected segments" {
+    try posting_segment.testDirectoryCompactionCanReplaceSelectedSegments();
 }
 
 test "posting segment directory garbage collection deletes manifest orphans" {
