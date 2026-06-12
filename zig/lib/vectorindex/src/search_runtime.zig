@@ -575,7 +575,29 @@ pub const SearchScratch = struct {
         alloc.free(self.posting_overlay_appended_live);
         self.posting_overlay_appended_live = &.{};
         self.posting_overlay_appended_count = 0;
-        return true;
+        trimmed = true;
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        alloc.free(self.query_storage);
+        self.query_storage = &.{};
+        self.positions = &.{};
+        self.vector_ids = &.{};
+        self.metadata = &.{};
+        self.lookups = &.{};
+        self.key_views = &.{};
+        self.values = &.{};
+        self.vector_views = &.{};
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        alloc.free(self.distance_storage);
+        self.distance_storage = &.{};
+        self.distances = &.{};
+        self.error_bounds = &.{};
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        alloc.free(self.member_ids);
+        self.member_ids = &.{};
+        if (self.bytes() <= max_retained_bytes) return trimmed;
+        alloc.free(self.flags);
+        self.flags = &.{};
+        return trimmed;
     }
 
     pub fn bytes(self: *const SearchScratch) u64 {
@@ -785,6 +807,44 @@ test "SearchScratch reports allocation pressure and retained bytes" {
     try std.testing.expect(scratch.allocationCount() > initial_allocations);
     try std.testing.expect(scratch.allocationBytes() > initial_allocation_bytes);
     try std.testing.expect(scratch.bytes() > initial_retained_bytes);
+}
+
+test "SearchScratch trims cold slabs and regrows on demand" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureVectorFetchCapacity(alloc, 5);
+    try scratch.ensureRerankCapacity(alloc, 5);
+    try scratch.ensureMemberIdCapacity(alloc, 5);
+    try std.testing.expect(scratch.query_storage.len > 0);
+    try std.testing.expect(scratch.distance_storage.len > 0);
+    try std.testing.expect(scratch.vector_batch.len > 0);
+    try std.testing.expect(scratch.member_ids.len > 0);
+    try std.testing.expect(scratch.flags.len > 0);
+
+    try std.testing.expect(scratch.trimColdScratchForRetention(alloc, 1));
+    try std.testing.expectEqual(@as(usize, 0), scratch.query_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.distance_storage.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.distances.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.error_bounds.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_batch.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.member_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.flags.len);
+
+    try scratch.ensureRerankCapacity(alloc, 5);
+    try scratch.ensureMemberIdCapacity(alloc, 5);
+    try std.testing.expect(scratch.query_storage.len > 0);
+    try std.testing.expect(scratch.positions.len >= 5);
+    try std.testing.expect(scratch.vector_ids.len >= 5);
+    try std.testing.expect(scratch.distance_storage.len >= 10);
+    try std.testing.expect(scratch.distances.len >= 5);
+    try std.testing.expect(scratch.error_bounds.len >= 5);
+    try std.testing.expect(scratch.vector_batch.len >= 20);
+    try std.testing.expect(scratch.member_ids.len >= 5);
+    try std.testing.expect(scratch.flags.len >= 5);
 }
 
 test "SearchScratch caches multiple posting delta tails in a compact ring" {

@@ -87,6 +87,10 @@ Current status:
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full
   member list when the target is absent or found early.
+- `SearchScratch` already groups fixed query arrays into `query_storage`; cold
+  scratch retention now also releases query, distance, member-id, vector-batch,
+  and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,
+  then regrows them through the existing `ensure*Capacity` paths.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.
