@@ -372,11 +372,13 @@ pub const DirectoryBatchWriterOptions = struct {
     commit: CommitOptions = .{},
     max_pending_entries: usize = 1024,
     max_pending_value_bytes: usize = 4 * 1024 * 1024,
+    max_pending_delta_records: usize = 4096,
 };
 
 pub const DirectoryBatchWriterStats = struct {
     flushed_segments: usize = 0,
     committed_entries: usize = 0,
+    committed_delta_records: usize = 0,
     committed_value_bytes: usize = 0,
     committed_segment_bytes: usize = 0,
     committed_manifest_bytes: usize = 0,
@@ -1494,6 +1496,15 @@ const PendingEntry = struct {
     value: []u8,
 };
 
+const PendingDeltaBatch = struct {
+    records: std.ArrayListUnmanaged(posting.PostingDeltaRecord) = .empty,
+
+    fn deinit(self: *PendingDeltaBatch, alloc: Allocator) void {
+        self.records.deinit(alloc);
+        self.* = .{};
+    }
+};
+
 const PointCandidate = struct {
     segment_id: u64,
     value: []const u8,
@@ -1672,6 +1683,8 @@ pub const DirectoryBatchWriter = struct {
     dir: std.Io.Dir,
     options: DirectoryBatchWriterOptions,
     writer: Writer,
+    pending_delta_batches: std.AutoHashMapUnmanaged(PostingId, PendingDeltaBatch) = .empty,
+    pending_delta_records: usize = 0,
     pending_value_bytes: usize = 0,
     stats: DirectoryBatchWriterStats = .{},
 
@@ -1686,12 +1699,18 @@ pub const DirectoryBatchWriter = struct {
     }
 
     pub fn deinit(self: *DirectoryBatchWriter) void {
+        self.clearPendingDeltaBatches();
+        self.pending_delta_batches.deinit(self.alloc);
         self.writer.deinit();
         self.* = undefined;
     }
 
     pub fn pendingEntries(self: DirectoryBatchWriter) usize {
-        return self.writer.entries.items.len;
+        return self.writer.entries.items.len + self.pending_delta_batches.count();
+    }
+
+    pub fn pendingDeltaRecords(self: DirectoryBatchWriter) usize {
+        return self.pending_delta_records;
     }
 
     pub fn appendBase(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
@@ -1719,6 +1738,7 @@ pub const DirectoryBatchWriter = struct {
     }
 
     pub fn appendDelta(self: *DirectoryBatchWriter, posting_id: PostingId, sequence: u64, value: []const u8) !void {
+        if (self.pending_delta_records != 0) _ = try self.flush();
         try self.prepareForAppend(value.len);
         try self.writer.appendDelta(posting_id, sequence, value);
         try self.notePendingAppend(value.len);
@@ -1733,7 +1753,32 @@ pub const DirectoryBatchWriter = struct {
         try self.appendDelta(posting_id, min_sequence, encoded);
     }
 
+    pub fn appendDeltaRecord(self: *DirectoryBatchWriter, posting_id: PostingId, record: posting.PostingDeltaRecord) !void {
+        if (self.options.max_pending_delta_records != 0 and self.pending_delta_records + 1 > self.options.max_pending_delta_records) {
+            _ = try self.flush();
+        }
+        const existed = self.pending_delta_batches.contains(posting_id);
+        if (!existed and self.options.max_pending_entries != 0 and self.pendingEntries() + 1 > self.options.max_pending_entries) {
+            _ = try self.flush();
+        }
+        const gop = try self.pending_delta_batches.getOrPut(self.alloc, posting_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        errdefer if (!gop.found_existing) {
+            gop.value_ptr.deinit(self.alloc);
+            _ = self.pending_delta_batches.remove(posting_id);
+        };
+        try gop.value_ptr.records.append(self.alloc, record);
+        self.pending_delta_records += 1;
+        if (self.options.max_pending_delta_records != 0 and self.pending_delta_records >= self.options.max_pending_delta_records) {
+            _ = try self.flush();
+        }
+    }
+
     pub fn flush(self: *DirectoryBatchWriter) !?SegmentCommitStats {
+        const pending_delta_records = self.pending_delta_records;
+        try self.drainPendingDeltaBatches();
         if (self.writer.entries.items.len == 0) return null;
         const pending_entries = self.writer.entries.items.len;
         const pending_value_bytes = self.pending_value_bytes;
@@ -1742,6 +1787,7 @@ pub const DirectoryBatchWriter = struct {
 
         self.stats.flushed_segments += 1;
         self.stats.committed_entries += pending_entries;
+        self.stats.committed_delta_records += pending_delta_records;
         self.stats.committed_value_bytes += pending_value_bytes;
         self.stats.committed_segment_bytes += result.stats.segment_bytes;
         self.stats.committed_manifest_bytes += result.stats.manifest_bytes;
@@ -1754,8 +1800,8 @@ pub const DirectoryBatchWriter = struct {
     }
 
     fn prepareForAppend(self: *DirectoryBatchWriter, value_len: usize) !void {
-        if (self.writer.entries.items.len == 0) return;
-        if (self.options.max_pending_entries != 0 and self.writer.entries.items.len + 1 > self.options.max_pending_entries) {
+        if (self.pendingEntries() == 0) return;
+        if (self.options.max_pending_entries != 0 and self.pendingEntries() + 1 > self.options.max_pending_entries) {
             _ = try self.flush();
             return;
         }
@@ -1766,13 +1812,37 @@ pub const DirectoryBatchWriter = struct {
 
     fn notePendingAppend(self: *DirectoryBatchWriter, value_len: usize) !void {
         self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, value_len) catch return error.PostingSegmentTooLarge;
-        if (self.options.max_pending_entries != 0 and self.writer.entries.items.len >= self.options.max_pending_entries) {
+        if (self.options.max_pending_entries != 0 and self.pendingEntries() >= self.options.max_pending_entries) {
             _ = try self.flush();
             return;
         }
         if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes) {
             _ = try self.flush();
         }
+    }
+
+    fn drainPendingDeltaBatches(self: *DirectoryBatchWriter) !void {
+        if (self.pending_delta_records == 0) return;
+        var iter = self.pending_delta_batches.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.records.items.len == 0) continue;
+            var min_sequence = entry.value_ptr.records.items[0].sequence;
+            for (entry.value_ptr.records.items[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
+            const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, entry.value_ptr.records.items);
+            defer self.alloc.free(encoded);
+            try self.writer.appendDelta(entry.key_ptr.*, min_sequence, encoded);
+            self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, encoded.len) catch return error.PostingSegmentTooLarge;
+        }
+        self.clearPendingDeltaBatches();
+    }
+
+    fn clearPendingDeltaBatches(self: *DirectoryBatchWriter) void {
+        var iter = self.pending_delta_batches.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.pending_delta_batches.clearRetainingCapacity();
+        self.pending_delta_records = 0;
     }
 
     fn resetPendingWriter(self: *DirectoryBatchWriter) void {
@@ -3315,11 +3385,8 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
         .members = &.{ 10, 20 },
     });
     defer alloc.free(base);
-    const delta_sequence = (@as(u64, 2) << 32) | 1;
-    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
-        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
-    });
-    defer alloc.free(delta);
+    const stale_delta_sequence = (@as(u64, 2) << 32) | 1;
+    const live_delta_sequence = (@as(u64, 3) << 32) | 1;
     const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
         .posting_id = 7,
         .generation = 1,
@@ -3342,19 +3409,25 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
 
     try batcher.appendBase(7, base);
     try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
-    try batcher.appendDelta(7, delta_sequence, delta);
-    try std.testing.expectEqual(@as(usize, 0), batcher.pendingEntries());
-    try std.testing.expectEqual(@as(usize, 1), batcher.stats.flushed_segments);
-    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_entries);
+    try batcher.appendDeltaRecord(7, .{ .sequence = stale_delta_sequence, .op = .insert, .vector_id = 30 });
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 1), batcher.pendingDeltaRecords());
+    try batcher.appendDeltaRecord(7, .{ .sequence = live_delta_sequence, .op = .tombstone, .vector_id = 20 });
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingDeltaRecords());
 
     try batcher.appendCentroidDirectory(7, centroid);
+    try std.testing.expectEqual(@as(usize, 1), batcher.stats.flushed_segments);
+    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_entries);
+    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_delta_records);
     try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
     const final_flush = (try batcher.flush()).?;
     try std.testing.expectEqual(@as(u64, 2), final_flush.segment_id);
     try std.testing.expectEqual(@as(usize, 2), batcher.stats.flushed_segments);
     try std.testing.expectEqual(@as(usize, 3), batcher.stats.committed_entries);
-    try std.testing.expectEqual(base.len + delta.len + centroid.len, batcher.stats.committed_value_bytes);
+    try std.testing.expect(batcher.stats.committed_value_bytes >= base.len + centroid.len);
     try std.testing.expectEqual(@as(usize, 0), batcher.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 0), batcher.pendingDeltaRecords());
     try std.testing.expect(try batcher.flush() == null);
 
     var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
@@ -3367,8 +3440,9 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
     try std.testing.expectEqual(@as(u64, 1), header.generation);
     const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
     defer alloc.free(records);
-    try std.testing.expectEqual(@as(usize, 1), records.len);
-    try std.testing.expectEqual(delta_sequence, records[0].sequence);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(stale_delta_sequence, records[0].sequence);
+    try std.testing.expectEqual(live_delta_sequence, records[1].sequence);
     var loaded_centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
     defer loaded_centroid.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), loaded_centroid.mutation_version);

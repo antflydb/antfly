@@ -179,8 +179,9 @@ Current status:
   loading the full segment file for matching postings. A bounded segment
   directory batch writer can accumulate posting-local records under entry/byte
   caps and flush them through the existing atomic segment+manifest commit path,
-  which gives the future runtime backend an explicit micro-batch append
-  primitive. Runtime
+  including coalescing individual posting delta records into one encoded
+  delta-tail value per posting, which gives the future runtime backend an
+  explicit micro-batch append primitive. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment
