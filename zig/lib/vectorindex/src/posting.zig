@@ -115,7 +115,7 @@ const DeleteDeltaTailStats = struct {
     value_bytes: usize = 0,
 };
 
-const DeltaReplayResult = struct {
+pub const DeltaReplayResult = struct {
     records: usize = 0,
     max_sequence: u64 = 0,
 };

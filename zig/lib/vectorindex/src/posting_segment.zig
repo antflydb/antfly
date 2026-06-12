@@ -633,6 +633,20 @@ pub const LazyDirectorySnapshot = struct {
         return null;
     }
 
+    pub fn loadBaseStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseStats {
+        var i = self.manifest.segments.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.manifest.segments[i];
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+
+            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
+            defer alloc.free(base_data);
+            return try posting.PostingFormat.decodeBaseStats(base_data);
+        }
+        return null;
+    }
+
     pub fn loadBase(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
         var i = self.manifest.segments.len;
         while (i > 0) {
@@ -791,6 +805,11 @@ pub const Snapshot = struct {
     pub fn loadBaseHeader(self: Snapshot, posting_id: PostingId) !?posting.PostingBaseHeader {
         const base_data = (try self.getBaseBytes(posting_id)) orelse return null;
         return try posting.PostingFormat.decodeBaseHeader(base_data);
+    }
+
+    pub fn loadBaseStats(self: Snapshot, posting_id: PostingId) !?posting.PostingBaseStats {
+        const base_data = (try self.getBaseBytes(posting_id)) orelse return null;
+        return try posting.PostingFormat.decodeBaseStats(base_data);
     }
 
     pub fn loadBase(self: Snapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {

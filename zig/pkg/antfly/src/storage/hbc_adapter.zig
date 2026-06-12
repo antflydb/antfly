@@ -60,6 +60,7 @@ const vectorindex_hbc_runtime = @import("antfly_vectorindex").hbc_runtime;
 const vectorindex_hbc = @import("antfly_vectorindex").hbc;
 const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 const vectorindex_posting = @import("antfly_vectorindex").posting;
+const vectorindex_posting_segment = @import("antfly_vectorindex").posting_segment;
 const vectorindex_spfresh_index = @import("antfly_vectorindex").spfresh_index;
 const vectorindex_hbc_transfer = @import("antfly_vectorindex").hbc_transfer;
 const vectorindex_hbc_debug = @import("antfly_vectorindex").hbc_debug;
@@ -1226,10 +1227,46 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 // HBC Index
 // ============================================================================
 
+const PostingSegmentRuntime = struct {
+    alloc: Allocator,
+    io_impl: *std.Io.Threaded,
+    dir: std.Io.Dir,
+    store: vectorindex_posting_segment.RuntimeDirectoryStore,
+
+    fn open(alloc: Allocator, path: []const u8, options: vectorindex_posting_segment.RuntimeDirectoryStoreOptions) !PostingSegmentRuntime {
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        errdefer io_impl.deinit();
+
+        const io = io_impl.io();
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        errdefer dir.close(io);
+
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+            .dir = dir,
+            .store = try vectorindex_posting_segment.RuntimeDirectoryStore.openAlloc(alloc, io, dir, options),
+        };
+    }
+
+    fn deinit(self: *PostingSegmentRuntime) void {
+        const io = self.io_impl.io();
+        self.store.deinit();
+        self.dir.close(io);
+        self.io_impl.deinit();
+        self.alloc.destroy(self.io_impl);
+        self.* = undefined;
+    }
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
     store: vectorindex_store.NamespaceStore,
+    posting_segment_runtime: ?PostingSegmentRuntime,
+    posting_segment_mu: std.atomic.Mutex,
     config: HBCConfig,
     metadata: IndexMetadata,
     published_root_node: AtomicU64,
@@ -1792,10 +1829,18 @@ pub const HBCIndex = struct {
         @memset(metadata_clock_keys, 0);
         @memset(metadata_clock_refs, false);
 
+        var posting_segment_runtime: ?PostingSegmentRuntime = if (effective_config.posting_backend == .segments)
+            try PostingSegmentRuntime.open(alloc, std.mem.span(path), .{})
+        else
+            null;
+        errdefer if (posting_segment_runtime) |*runtime| runtime.deinit();
+
         const idx = HBCIndex{
             .alloc = alloc,
             .env_owner = env_owner,
             .store = store,
+            .posting_segment_runtime = posting_segment_runtime,
+            .posting_segment_mu = .unlocked,
             .config = effective_config,
             .metadata = metadata,
             .published_root_node = .init(metadata.root_node),
@@ -2392,6 +2437,7 @@ pub const HBCIndex = struct {
         self.deferred_oversized_leaves.deinit(self.alloc);
         self.rot.deinit();
         self.quantizer.deinit();
+        if (self.posting_segment_runtime) |*runtime| runtime.deinit();
         self.store.deinit();
         self.env_owner.close(self.alloc);
         self.* = undefined;
@@ -2688,6 +2734,299 @@ pub const HBCIndex = struct {
             => return try txn.openCursor(namespace),
             else => @compileError("expected vectorindex namespace transaction"),
         }
+    }
+
+    fn bindPostingSegmentWriteTxn(self: *HBCIndex, txn: anytype) !void {
+        _ = self;
+        const Child = comptime txnLikeChild(@TypeOf(txn));
+        switch (Child) {
+            vectorindex_store.NamespaceWriteTxn,
+            vectorindex_store.NamespaceBatch,
+            => {},
+            vectorindex_store.NamespaceReadTxn => return error.ReadOnly,
+            else => @compileError("expected vectorindex namespace transaction"),
+        }
+    }
+
+    fn postingSegmentRuntime(self: *HBCIndex) !*PostingSegmentRuntime {
+        if (self.posting_segment_runtime) |*runtime| return runtime;
+        return error.UnsupportedPostingBackend;
+    }
+
+    fn postingSegmentBaseMembersShouldSort(self: *const HBCIndex) bool {
+        return self.config.posting_storage_mode == .base_delta;
+    }
+
+    fn postingSegmentSelectedBaseBlockSize(self: *const HBCIndex, members: []const vectorindex_posting.VectorId) !usize {
+        const configured = vectorindex_posting.PostingFormat.normalizeBaseMemberBlockSize(self.config.posting_base_member_block_size);
+        if (!self.postingSegmentBaseMembersShouldSort() or configured != vectorindex_posting.PostingFormat.base_member_default_block_size) {
+            return configured;
+        }
+
+        const size16 = try vectorindex_posting.PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 16);
+        const size32 = try vectorindex_posting.PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 32);
+        const size64 = try vectorindex_posting.PostingFormat.encodedBaseSizeForMembersWithBlockSize(members, 64);
+        var best_size: usize = 32;
+        var best_len = size32;
+        if (size16 < best_len) {
+            best_size = 16;
+            best_len = size16;
+        }
+        if (size64 < best_len) {
+            best_size = 64;
+        }
+        return best_size;
+    }
+
+    fn encodePostingSegmentBase(self: *HBCIndex, posting_id: u64, generation: u64, members: []const vectorindex_posting.VectorId) ![]u8 {
+        if (!self.postingSegmentBaseMembersShouldSort()) {
+            const block_size = vectorindex_posting.PostingFormat.normalizeBaseMemberBlockSize(self.config.posting_base_member_block_size);
+            return try vectorindex_posting.PostingFormat.encodeBaseWithBlockSize(self.alloc, .{
+                .posting_id = posting_id,
+                .generation = generation,
+                .members = members,
+            }, block_size);
+        }
+
+        const sorted_members = try self.alloc.dupe(vectorindex_posting.VectorId, members);
+        defer self.alloc.free(sorted_members);
+        std.mem.sort(vectorindex_posting.VectorId, sorted_members, {}, comptime std.sort.asc(vectorindex_posting.VectorId));
+        const block_size = try self.postingSegmentSelectedBaseBlockSize(sorted_members);
+        return try vectorindex_posting.PostingFormat.encodeBaseWithBlockSize(self.alloc, .{
+            .posting_id = posting_id,
+            .generation = generation,
+            .members = sorted_members,
+        }, block_size);
+    }
+
+    fn postingSegmentTailShouldFold(base_member_count: usize, tail_stats: vectorindex_posting.PostingDeltaTailStats, options: vectorindex_posting.FoldDeltaTailOptions) bool {
+        if (tail_stats.records == 0) return true;
+        if (tail_stats.records_after_generation == 0) return true;
+        if (tail_stats.records_after_generation >= options.min_delta_records) return true;
+
+        if (options.min_tombstone_records != 0 and tail_stats.tombstones_after_generation >= options.min_tombstone_records) return true;
+        if (options.min_delta_value_bytes != 0 and tail_stats.encoded_value_bytes >= options.min_delta_value_bytes) return true;
+        if (options.min_delta_to_base_ratio_bps != 0) {
+            const denominator = @max(base_member_count, @as(usize, 1));
+            const ratio_bps = (tail_stats.records_after_generation * 10_000) / denominator;
+            if (ratio_bps >= options.min_delta_to_base_ratio_bps) return true;
+        }
+        return false;
+    }
+
+    fn postingSegmentTailExceedsMaterializedLimit(base_member_count: usize, tail_stats: vectorindex_posting.PostingDeltaTailStats, options: vectorindex_posting.FoldDeltaTailOptions) bool {
+        const estimated_members = base_member_count + tail_stats.records_after_generation;
+        if (estimated_members > options.max_materialized_members) return true;
+        const estimated_bytes = std.math.mul(usize, estimated_members, @sizeOf(vectorindex_posting.VectorId)) catch return true;
+        return estimated_bytes > options.max_materialized_bytes;
+    }
+
+    pub fn savePostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        try runtime.store.appendBase(posting_id, encoded);
+        _ = try runtime.store.flush();
+    }
+
+    pub fn savePostingBackendCentroidDirectory(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        try runtime.store.appendCentroidDirectory(posting_id, encoded);
+        _ = try runtime.store.flush();
+    }
+
+    pub fn savePostingBackendBaseAndCentroidDirectory(
+        self: *HBCIndex,
+        txn: anytype,
+        base_posting_id: u64,
+        encoded_base: []const u8,
+        centroid_posting_id: u64,
+        encoded_centroid: []const u8,
+    ) !void {
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        try runtime.store.appendBase(base_posting_id, encoded_base);
+        try runtime.store.appendCentroidDirectory(centroid_posting_id, encoded_centroid);
+        _ = try runtime.store.flush();
+    }
+
+    pub fn appendPostingBackendDeltaRecords(self: *HBCIndex, txn: anytype, posting_id: u64, records: []const vectorindex_posting.PostingDeltaRecord) !void {
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        try runtime.store.appendPostingDeltaRecords(posting_id, records);
+        _ = try runtime.store.flush();
+    }
+
+    pub fn loadPostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.OwnedPostingBase {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().loadBase(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn loadPostingBackendBaseHeader(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.PostingBaseHeader {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().loadBaseHeader(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn loadPostingBackendBaseStats(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.PostingBaseStats {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().loadBaseStats(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn loadPostingBackendCentroidDirectoryRecord(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.OwnedCentroidDirectoryRecord {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().loadCentroidDirectoryRecord(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn loadPostingBackendDeltaTail(self: *HBCIndex, txn: anytype, posting_id: u64) ![]vectorindex_posting.PostingDeltaRecord {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return try runtime.store.snapshot().loadDeltaTail(self.alloc, posting_id);
+    }
+
+    pub fn postingBackendDeltaTailStats(self: *HBCIndex, txn: anytype, posting_id: u64, base_generation: u64) !vectorindex_posting.PostingDeltaTailStats {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        const records = try runtime.store.snapshot().loadDeltaTail(self.alloc, posting_id);
+        defer self.alloc.free(records);
+
+        var out = vectorindex_posting.PostingDeltaTailStats{};
+        out.records = records.len;
+        for (records) |record| {
+            if (vectorindex_posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            out.records_after_generation += 1;
+            if (record.op == .tombstone) out.tombstones_after_generation += 1;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, record.sequence);
+        }
+        return out;
+    }
+
+    pub fn applyPostingBackendDeltaTailIntoScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        posting_id: u64,
+        alloc: Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+    ) !vectorindex_posting.DeltaReplayResult {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        const records = try runtime.store.snapshot().loadDeltaTailAfterGeneration(alloc, posting_id, base_generation);
+        defer alloc.free(records);
+
+        try scratch.ensureMemberIdCapacity(alloc, member_count.* + records.len);
+        var out = vectorindex_posting.DeltaReplayResult{};
+        for (records) |record| {
+            vectorindex_posting.PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
+            out.records += 1;
+            out.max_sequence = @max(out.max_sequence, record.sequence);
+        }
+        return out;
+    }
+
+    pub fn materializePostingBackendMembers(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) ![]vectorindex_posting.VectorId {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().materializeMembers(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
+    pub fn foldPostingBackendDeltaTailIntoBase(
+        self: *HBCIndex,
+        txn: anytype,
+        posting_id: u64,
+        is_not_found: fn (anyerror) bool,
+        options: vectorindex_posting.FoldDeltaTailOptions,
+    ) !vectorindex_posting.FoldDeltaTailResult {
+        _ = is_not_found;
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        const snapshot = runtime.store.snapshot();
+        const base_header = (try snapshot.loadBaseHeader(self.alloc, posting_id)) orelse return error.NotFound;
+        const records = try snapshot.loadDeltaTail(self.alloc, posting_id);
+        defer self.alloc.free(records);
+
+        var tail_stats = vectorindex_posting.PostingDeltaTailStats{ .records = records.len };
+        for (records) |record| {
+            if (vectorindex_posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_header.generation) continue;
+            tail_stats.records_after_generation += 1;
+            if (record.op == .tombstone) tail_stats.tombstones_after_generation += 1;
+            tail_stats.max_sequence_after_generation = @max(tail_stats.max_sequence_after_generation, record.sequence);
+        }
+        if (!postingSegmentTailShouldFold(base_header.member_count, tail_stats, options) or
+            postingSegmentTailExceedsMaterializedLimit(base_header.member_count, tail_stats, options))
+        {
+            return .{
+                .delta_records = tail_stats.records,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
+                .skipped = true,
+            };
+        }
+
+        if (tail_stats.records_after_generation == 0) {
+            return .{
+                .delta_records = tail_stats.records,
+                .base_member_count = base_header.member_count,
+                .materialized_member_count = base_header.member_count,
+                .next_generation = base_header.generation,
+            };
+        }
+
+        const materialized = (try snapshot.materializeMembers(self.alloc, posting_id)) orelse return error.NotFound;
+        defer self.alloc.free(materialized);
+        const next_generation = base_header.generation +| 1;
+        const encoded = try self.encodePostingSegmentBase(posting_id, next_generation, materialized);
+        defer self.alloc.free(encoded);
+        try runtime.store.appendBase(posting_id, encoded);
+        _ = try runtime.store.flush();
+        return .{
+            .delta_records = tail_stats.records,
+            .base_member_count = base_header.member_count,
+            .materialized_member_count = materialized.len,
+            .written_base_value_bytes = encoded.len,
+            .next_generation = next_generation,
+        };
+    }
+
+    pub fn deletePostingBackendDeltaTail(self: *HBCIndex, txn: anytype, posting_id: u64) !void {
+        _ = posting_id;
+        try self.bindPostingSegmentWriteTxn(txn);
     }
 
     pub fn beginRuntimeReadTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
@@ -10331,6 +10670,111 @@ test "base delta posting families survive modeled lsm crash after committed writ
         try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
         try std.testing.expectEqual(@as(u64, 2), results.getHits()[0].vector_id);
         try idx.validateStoredStructure(alloc);
+    }
+}
+
+test "segment posting backend persists posting artifacts outside lsm namespace" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var modeled_device = storage_sim.ModeledDevice.init(alloc);
+    defer modeled_device.deinit();
+    const lsm_options = hbc_backend.LsmOptions{
+        .storage = modeled_device.storage(),
+        .backend_options = .{
+            .flush_threshold = 1,
+        },
+    };
+    const config = HBCConfig{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = false,
+        .storage_backend = .lsm,
+        .posting_storage_mode = .base_delta,
+        .posting_backend = .segments,
+        .lazy_posting_maintenance = true,
+    };
+    const posting_id: u64 = 9;
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        try PostingStore.saveBaseAndCentroidDirectoryRecord(&idx, &txn, .{
+            .posting_id = posting_id,
+            .generation = 1,
+            .members = &.{ 10, 20 },
+        }, .{
+            .posting_id = posting_id,
+            .generation = 1,
+            .mutation_version = 1,
+            .payload_version = 1,
+            .parent = 1,
+            .level = 0,
+            .member_count = 2,
+            .bounds_radius = 1.5,
+            .centroid = &.{ 1.0, 2.0 },
+        });
+        try PostingStore.appendDeltaRecords(&idx, &txn, posting_id, &.{
+            .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .tombstone, .vector_id = 10 },
+            .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .insert, .vector_id = 30 },
+        });
+        try txn.commit();
+
+        var read_txn = try idx.beginReadTxn();
+        defer read_txn.abort();
+
+        var base_key_buf: [10]u8 = undefined;
+        try std.testing.expectError(
+            error.NotFound,
+            idx.getNamespaced(&read_txn, .nodes, vectorindex_hbc.encodePostingBaseKey(&base_key_buf, posting_id)),
+        );
+        try std.testing.expectError(
+            error.UnsupportedPostingBackendBorrowedData,
+            PostingStore.loadBaseData(&idx, &read_txn, posting_id, isNotFound),
+        );
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
+
+        var centroid_record = try PostingStore.loadCentroidDirectoryRecord(&idx, &read_txn, posting_id, isNotFound);
+        defer centroid_record.deinit(alloc);
+        try std.testing.expectEqual(posting_id, centroid_record.posting_id);
+        try std.testing.expectEqual(@as(u64, 2), centroid_record.member_count);
+    }
+
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, config, lsm_options);
+        defer idx.close();
+
+        var fold_txn = try idx.beginWriteTxn();
+        errdefer fold_txn.abort();
+        const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&idx, &fold_txn, posting_id, isNotFound, .{
+            .min_delta_records = 1,
+        });
+        try std.testing.expect(!folded.skipped);
+        try std.testing.expectEqual(@as(usize, 2), folded.materialized_member_count);
+        try std.testing.expectEqual(@as(u64, 2), folded.next_generation);
+        try fold_txn.commit();
+
+        var read_txn = try idx.beginReadTxn();
+        defer read_txn.abort();
+
+        var base = try PostingStore.loadBase(&idx, &read_txn, posting_id, isNotFound);
+        defer base.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 2), base.generation);
+        try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, base.members);
+
+        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+        defer alloc.free(materialized);
+        try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
     }
 }
 
