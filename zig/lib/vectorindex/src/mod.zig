@@ -21,6 +21,7 @@ pub const search = @import("search.zig");
 pub const search_runtime = @import("search_runtime.zig");
 pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
+pub const posting_segment = @import("posting_segment.zig");
 pub const hbc_runtime = @import("hbc_runtime.zig");
 pub const hbc = @import("hbc.zig");
 pub const hbc_index = @import("hbc_index.zig");
@@ -74,6 +75,9 @@ pub const PostingDeltaOp = posting.PostingDeltaOp;
 pub const PostingDeltaRecord = posting.PostingDeltaRecord;
 pub const FoldDeltaTailResult = posting.FoldDeltaTailResult;
 pub const PostingFormat = posting.PostingFormat;
+pub const PostingSegmentWriter = posting_segment.Writer;
+pub const PostingSegmentReader = posting_segment.Reader;
+pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
 pub const OwnedCentroidDirectoryRecord = posting.OwnedCentroidDirectoryRecord;
 pub const CentroidDirectoryFormat = posting.CentroidDirectoryFormat;
@@ -119,3 +123,15 @@ pub const encodePostingBaseKey = hbc.encodePostingBaseKey;
 pub const encodePostingDeltaKey = hbc.encodePostingDeltaKey;
 pub const encodePostingDeltaPrefix = hbc.encodePostingDeltaPrefix;
 pub const encodeCentroidDirectoryKey = hbc.encodeCentroidDirectoryKey;
+
+test "posting segment stores base centroid and ordered delta values" {
+    try posting_segment.testStoresBaseCentroidAndOrderedDeltaValues();
+}
+
+test "posting segment rejects duplicate logical entries" {
+    try posting_segment.testRejectsDuplicateLogicalEntries();
+}
+
+test "posting segment validates footer and version" {
+    try posting_segment.testValidatesFooterAndVersion();
+}

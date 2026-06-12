@@ -110,6 +110,12 @@ Current status:
   configuration and status. This keeps today's behavior stable while giving
   future cost-aware maintenance and overlay-cache high-water checks direct
   signals for tail replay and backend overhead.
+- The first dedicated posting segment container now exists in
+  `posting_segment.zig`. It stores existing v1 posting-base, posting-delta, and
+  centroid-directory values in one immutable posting-local indexed blob with
+  footer validation and ordered delta iteration. Runtime reads/writes still use
+  the LSM-backed namespace; this segment container is the file-format substrate
+  for a future `backend = segments, format = base_delta, version = 1` mode.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.

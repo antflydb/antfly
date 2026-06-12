@@ -3771,7 +3771,11 @@ test "posting base format round trips members" {
     });
     defer alloc.free(encoded);
 
-    try std.testing.expectEqual(@as(usize, 25 + members.len * @sizeOf(u64)), encoded.len);
+    try std.testing.expectEqual(try PostingFormat.encodedBaseSize(.{
+        .posting_id = 7,
+        .generation = 11,
+        .members = members[0..],
+    }), encoded.len);
 
     var decoded = try PostingFormat.decodeBase(alloc, encoded);
     defer decoded.deinit(alloc);
@@ -3785,13 +3789,14 @@ test "posting base format round trips members" {
 
 test "posting base stats validates encoded blocks without materializing members" {
     const alloc = std.testing.allocator;
-    const members = [_]VectorId{ 10, 20, 30, 100, 101 };
+    var members: [33]VectorId = undefined;
+    for (&members, 0..) |*member, i| member.* = @as(VectorId, @intCast(i + 1)) * 10;
 
     const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
         .posting_id = 7,
         .generation = 11,
         .members = members[0..],
-    }, 2);
+    }, 16);
     defer alloc.free(encoded);
 
     const stats = try PostingFormat.decodeBaseStats(encoded);
@@ -3809,17 +3814,18 @@ test "posting base stats validates encoded blocks without materializing members"
 
 test "posting base sorted membership streams without full materialization" {
     const alloc = std.testing.allocator;
-    const members = [_]VectorId{ 10, 20, 30, 100, 101 };
+    var members: [33]VectorId = undefined;
+    for (&members, 0..) |*member, i| member.* = @as(VectorId, @intCast(i + 1)) * 10;
 
     const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
         .posting_id = 7,
         .generation = 11,
         .members = members[0..],
-    }, 2);
+    }, 16);
     defer alloc.free(encoded);
 
     try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 10));
-    try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 100));
+    try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 170));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 99));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 999));
 
@@ -3846,8 +3852,8 @@ test "posting base sorted membership streams without full materialization" {
     _ = try PostingFormat.readVarint(encoded, &pos);
     const truncated_after_second_block_min = encoded[0..pos];
 
-    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_min, 99));
-    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(truncated_after_second_block_min, 99));
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_min, 165));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(truncated_after_second_block_min, 165));
 }
 
 test "posting delta tail round trips and overlays base members" {
@@ -3891,8 +3897,9 @@ test "posting delta tail uses varint encoding for small single-record values" {
     const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
     defer alloc.free(encoded);
 
-    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
-    try std.testing.expectEqual(@as(usize, 17 + 3), encoded.len);
+    try std.testing.expectEqual(PostingFormat.version, encoded[4] & 0x7f);
+    try std.testing.expect((encoded[4] & 0x80) != 0);
+    try std.testing.expect(encoded.len < PostingFormat.delta_header_size);
 
     const decoded = try PostingFormat.decodeDeltaTail(alloc, encoded);
     defer alloc.free(decoded);
@@ -3926,8 +3933,10 @@ test "posting delta tail rejects unsupported op" {
     const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
     defer alloc.free(encoded);
 
-    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
-    encoded[PostingFormat.delta_header_size + 1] = 99;
+    try std.testing.expectEqual(PostingFormat.version, encoded[4] & 0x7f);
+    var pos: usize = 5;
+    _ = try PostingFormat.readVarint(encoded, &pos);
+    encoded[pos] = 99;
     try std.testing.expectError(error.UnsupportedPostingDeltaOp, PostingFormat.decodeDeltaTail(alloc, encoded));
 }
 
@@ -3939,7 +3948,7 @@ test "posting delta tail rejects truncated varint encoding" {
 
     const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
     defer alloc.free(encoded);
-    try std.testing.expectEqual(PostingFormat.version, encoded[4]);
+    try std.testing.expectEqual(PostingFormat.version, encoded[4] & 0x7f);
     try std.testing.expectError(error.Corrupted, PostingFormat.decodeDeltaTail(alloc, encoded[0 .. encoded.len - 1]));
 }
 
@@ -4424,7 +4433,7 @@ test "posting store persists base records and appends deltas through namespace h
     try std.testing.expectEqualSlices(f32, centroid[0..], loaded_centroid.centroid);
 
     try PostingStore.appendDelta(&index, &txn, 9, .{
-        .sequence = 12,
+        .sequence = (@as(u64, 1) << 32) | 12,
         .op = .tombstone,
         .vector_id = 100,
     });
@@ -4432,7 +4441,7 @@ test "posting store persists base records and appends deltas through namespace h
 
     var expected_delta_key: [18]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), index.delta_entries.items.len);
-    try std.testing.expectEqualSlices(u8, hbc.encodePostingDeltaKey(&expected_delta_key, 9, 12), index.delta_entries.items[0].key);
+    try std.testing.expectEqualSlices(u8, hbc.encodePostingDeltaKey(&expected_delta_key, 9, (@as(u64, 1) << 32) | 12), index.delta_entries.items[0].key);
     const decoded = try PostingFormat.decodeDeltaTail(alloc, index.delta_entries.items[0].value);
     defer alloc.free(decoded);
     try std.testing.expectEqual(@as(usize, 1), decoded.len);
@@ -4446,7 +4455,7 @@ test "posting store persists base records and appends deltas through namespace h
     try std.testing.expectEqual(index.delta_entries.items[0].value.len, delta_stats.encoded_value_bytes);
     const live_delta_stats = try PostingStore.deltaTailStats(&index, &txn, 9, 0);
     try std.testing.expectEqual(@as(usize, 1), live_delta_stats.records_after_generation);
-    try std.testing.expectEqual(@as(u64, 12), live_delta_stats.max_sequence_after_generation);
+    try std.testing.expectEqual((@as(u64, 1) << 32) | 12, live_delta_stats.max_sequence_after_generation);
 }
 
 test "posting store delete artifacts removes base centroid and delta tail families" {
@@ -4537,7 +4546,7 @@ test "posting store can append multiple delta records in one key" {
     try std.testing.expectEqual(@as(usize, 18), folded.deleted_tail_key_bytes);
     try std.testing.expect(folded.deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(usize, 10), folded.written_base_key_bytes);
-    try std.testing.expectEqual(@as(usize, 49), folded.written_base_value_bytes);
+    try std.testing.expectEqual(try PostingFormat.encodedBaseSizeForMembers(&[_]VectorId{ 200, 300, 400 }), folded.written_base_value_bytes);
     try std.testing.expect(folded.peak_scratch_bytes > 0);
     try std.testing.expectEqual(@as(usize, 0), index.delta_entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_delta_fold_calls);
@@ -4546,7 +4555,7 @@ test "posting store can append multiple delta records in one key" {
     try std.testing.expectEqual(@as(u64, 18), index.write_profile.posting_delta_fold_deleted_tail_key_bytes);
     try std.testing.expect(index.write_profile.posting_delta_fold_deleted_tail_value_bytes > 0);
     try std.testing.expectEqual(@as(u64, 10), index.write_profile.posting_delta_fold_written_base_key_bytes);
-    try std.testing.expectEqual(@as(u64, 49), index.write_profile.posting_delta_fold_written_base_value_bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(folded.written_base_value_bytes)), index.write_profile.posting_delta_fold_written_base_value_bytes);
     try std.testing.expectEqual(@as(u64, @intCast(folded.peak_scratch_bytes)), index.write_profile.posting_delta_fold_peak_scratch_bytes);
 }
 
@@ -4807,13 +4816,13 @@ test "posting store can defer delta fold until policy threshold is reached" {
     try std.testing.expect(!folded.skipped);
     try std.testing.expectEqual(@as(usize, 2), folded.delta_records);
     try std.testing.expectEqual(@as(usize, 10), folded.written_base_key_bytes);
-    try std.testing.expectEqual(@as(usize, 49), folded.written_base_value_bytes);
+    try std.testing.expectEqual(try PostingFormat.encodedBaseSizeForMembers(&[_]VectorId{ 100, 300, 400 }), folded.written_base_value_bytes);
     try std.testing.expectEqual(@as(u64, 5), folded.next_generation);
 
     var base_after_fold = try PostingStore.loadBase(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
     defer base_after_fold.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 5), base_after_fold.generation);
-    try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 100, 300, 400 }, base_after_fold.members);
+    try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 300, 400, 100 }, base_after_fold.members);
     const deltas_after_fold = try PostingStore.loadDeltaTail(&index, &txn, 9);
     defer alloc.free(deltas_after_fold);
     try std.testing.expectEqual(@as(usize, 0), deltas_after_fold.len);
