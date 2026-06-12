@@ -356,11 +356,112 @@ pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "postings/{x:0>16}.afps", .{segment_id});
 }
 
+pub fn compactSegmentsAlloc(alloc: Allocator, segment_id: u64, segments: []const SegmentBlob) !BuiltSegment {
+    var bases = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
+    defer bases.deinit(alloc);
+    var centroids = std.AutoHashMapUnmanaged(PostingId, PointCandidate).empty;
+    defer centroids.deinit(alloc);
+
+    for (segments) |segment| {
+        var reader = try Reader.init(segment.data);
+        var iter = reader.entries();
+        while (try iter.next()) |entry| {
+            switch (entry.kind) {
+                .base => try putNewestPoint(alloc, &bases, entry.posting_id, segment.meta.segment_id, entry.value),
+                .centroid_directory => try putNewestPoint(alloc, &centroids, entry.posting_id, segment.meta.segment_id, entry.value),
+                .delta => {},
+            }
+        }
+    }
+
+    var deltas = std.ArrayListUnmanaged(DeltaCandidate).empty;
+    defer deltas.deinit(alloc);
+    for (segments) |segment| {
+        var reader = try Reader.init(segment.data);
+        var iter = reader.entries();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .delta) continue;
+            const base_generation = if (bases.get(entry.posting_id)) |base|
+                (try posting.PostingFormat.decodeBaseHeader(base.value)).generation
+            else
+                null;
+            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, entry.value);
+            defer alloc.free(decoded);
+            for (decoded) |record| {
+                if (base_generation) |generation| {
+                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                }
+                try deltas.append(alloc, .{
+                    .posting_id = entry.posting_id,
+                    .segment_id = segment.meta.segment_id,
+                    .record = record,
+                });
+            }
+        }
+    }
+    std.mem.sort(DeltaCandidate, deltas.items, {}, deltaCandidateLessThan);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    {
+        var iter = bases.iterator();
+        while (iter.next()) |entry| {
+            try writer.appendBase(entry.key_ptr.*, entry.value_ptr.value);
+        }
+    }
+    {
+        var iter = centroids.iterator();
+        while (iter.next()) |entry| {
+            try writer.appendCentroidDirectory(entry.key_ptr.*, entry.value_ptr.value);
+        }
+    }
+
+    var posting_start: usize = 0;
+    while (posting_start < deltas.items.len) {
+        const posting_id = deltas.items[posting_start].posting_id;
+        var posting_end = posting_start + 1;
+        while (posting_end < deltas.items.len and deltas.items[posting_end].posting_id == posting_id) : (posting_end += 1) {}
+
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        defer records.deinit(alloc);
+        var i = posting_start;
+        while (i < posting_end) {
+            var chosen = deltas.items[i];
+            var j = i + 1;
+            while (j < posting_end and deltas.items[j].record.sequence == chosen.record.sequence) : (j += 1) {
+                chosen = deltas.items[j];
+            }
+            try records.append(alloc, chosen.record);
+            i = j;
+        }
+
+        if (records.items.len != 0) {
+            const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records.items);
+            defer alloc.free(encoded);
+            try writer.appendDelta(posting_id, records.items[0].sequence, encoded);
+        }
+        posting_start = posting_end;
+    }
+
+    return try writer.buildSegment(segment_id);
+}
+
 const PendingEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
     sequence: u64,
     value: []u8,
+};
+
+const PointCandidate = struct {
+    segment_id: u64,
+    value: []const u8,
+};
+
+const DeltaCandidate = struct {
+    posting_id: PostingId,
+    segment_id: u64,
+    record: posting.PostingDeltaRecord,
 };
 
 const IndexEntry = struct {
@@ -679,6 +780,22 @@ fn segmentMetaEql(lhs: SegmentMeta, rhs: SegmentMeta) bool {
         lhs.entry_count == rhs.entry_count;
 }
 
+fn putNewestPoint(
+    alloc: Allocator,
+    map: *std.AutoHashMapUnmanaged(PostingId, PointCandidate),
+    posting_id: PostingId,
+    segment_id: u64,
+    value: []const u8,
+) !void {
+    const entry = try map.getOrPut(alloc, posting_id);
+    if (!entry.found_existing or segment_id > entry.value_ptr.segment_id) {
+        entry.value_ptr.* = .{
+            .segment_id = segment_id,
+            .value = value,
+        };
+    }
+}
+
 fn segmentChecksum(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
 }
@@ -761,6 +878,14 @@ fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
 
 fn postingDeltaRecordLessThan(_: void, lhs: posting.PostingDeltaRecord, rhs: posting.PostingDeltaRecord) bool {
     return lhs.sequence < rhs.sequence;
+}
+
+fn deltaCandidateLessThan(_: void, lhs: DeltaCandidate, rhs: DeltaCandidate) bool {
+    if (lhs.posting_id < rhs.posting_id) return true;
+    if (lhs.posting_id > rhs.posting_id) return false;
+    if (lhs.record.sequence < rhs.record.sequence) return true;
+    if (lhs.record.sequence > rhs.record.sequence) return false;
+    return lhs.segment_id < rhs.segment_id;
 }
 
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
@@ -1366,6 +1491,108 @@ pub fn testBuildSegmentProducesManifestReadyMetadata() !void {
     try std.testing.expectEqual(@as(usize, 2), header.member_count);
 }
 
+pub fn testCompactsSegmentsToLivePostingEntries() !void {
+    const alloc = std.testing.allocator;
+    const old_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(old_base);
+    const new_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(new_base);
+    const old_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 1,
+        .payload_version = 1,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .centroid = &.{ 1.0, 1.0 },
+    });
+    defer alloc.free(old_centroid);
+    const new_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .mutation_version = 4,
+        .payload_version = 5,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 3,
+        .centroid = &.{ 3.0, 3.0 },
+    });
+    defer alloc.free(new_centroid);
+
+    const stale_sequence = (@as(u64, 2) << 32) | 1;
+    const live_sequence = (@as(u64, 4) << 32) | 1;
+    const duplicate_sequence = (@as(u64, 4) << 32) | 2;
+    const old_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 40 },
+        .{ .sequence = duplicate_sequence, .op = .insert, .vector_id = 50 },
+    });
+    defer alloc.free(old_delta);
+    const new_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = stale_sequence, .op = .tombstone, .vector_id = 40 },
+        .{ .sequence = live_sequence, .op = .insert, .vector_id = 60 },
+        .{ .sequence = duplicate_sequence, .op = .tombstone, .vector_id = 50 },
+    });
+    defer alloc.free(new_delta);
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, old_base);
+    try writer_1.appendCentroidDirectory(7, old_centroid);
+    try writer_1.appendDelta(7, stale_sequence, old_delta);
+    var segment_1 = try writer_1.buildSegment(1);
+    defer segment_1.deinit(alloc);
+
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(7, new_base);
+    try writer_2.appendCentroidDirectory(7, new_centroid);
+    try writer_2.appendDelta(7, stale_sequence, new_delta);
+    var segment_2 = try writer_2.buildSegment(2);
+    defer segment_2.deinit(alloc);
+
+    const inputs = [_]SegmentBlob{ segment_1.blob(), segment_2.blob() };
+    var compacted = try compactSegmentsAlloc(alloc, 9, inputs[0..]);
+    defer compacted.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 9), compacted.meta.segment_id);
+    try std.testing.expectEqual(@as(usize, 3), compacted.meta.entry_count);
+
+    const snapshot = Snapshot{ .catalog = .{ .segments = &.{compacted.blob()} } };
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 3), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+
+    var centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4), centroid.mutation_version);
+    try std.testing.expectEqual(@as(u64, 5), centroid.payload_version);
+    try std.testing.expectEqual(posting.CentroidDirectoryFormat.dirty_flag, centroid.flags);
+
+    const all_records = try snapshot.loadDeltaTail(alloc, 7);
+    defer alloc.free(all_records);
+    try std.testing.expectEqual(@as(usize, 2), all_records.len);
+    try std.testing.expectEqual(live_sequence, all_records[0].sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.insert, all_records[0].op);
+    try std.testing.expectEqual(@as(posting.VectorId, 60), all_records[0].vector_id);
+    try std.testing.expectEqual(duplicate_sequence, all_records[1].sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, all_records[1].op);
+    try std.testing.expectEqual(@as(posting.VectorId, 50), all_records[1].vector_id);
+
+    const current_records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 3);
+    defer alloc.free(current_records);
+    try std.testing.expectEqual(@as(usize, 2), current_records.len);
+}
+
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresBaseCentroidAndOrderedDeltaValues();
 }
@@ -1400,4 +1627,8 @@ test "posting segment store validates manifest backed segments" {
 
 test "posting segment build produces manifest ready metadata" {
     try testBuildSegmentProducesManifestReadyMetadata();
+}
+
+test "posting segment compacts segments to live posting entries" {
+    try testCompactsSegmentsToLivePostingEntries();
 }

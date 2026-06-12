@@ -92,6 +92,7 @@ pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
 pub const OwnedPostingSegmentManifest = posting_segment.OwnedManifest;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
+pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
 pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
 pub const decodePostingSegmentManifestAlloc = posting_segment.decodeManifestAlloc;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
@@ -174,4 +175,8 @@ test "posting segment store validates manifest backed segments" {
 
 test "posting segment build produces manifest ready metadata" {
     try posting_segment.testBuildSegmentProducesManifestReadyMetadata();
+}
+
+test "posting segment compacts segments to live posting entries" {
+    try posting_segment.testCompactsSegmentsToLivePostingEntries();
 }
