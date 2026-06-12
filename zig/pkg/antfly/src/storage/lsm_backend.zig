@@ -4380,6 +4380,10 @@ pub const BackendHandle = struct {
         return self.backend;
     }
 
+    pub fn snapshotMaintenanceStats(self: *const BackendHandle) Backend.MaintenanceStats {
+        return self.backend.snapshotMaintenanceStats();
+    }
+
     pub fn ownedBackgroundRuntime(self: *BackendHandle) ?*background_runtime_mod.BackendRuntime {
         return if (self.background_runtime) |*runtime| runtime.ptr() else null;
     }

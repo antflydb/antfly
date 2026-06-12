@@ -222,6 +222,19 @@ pub const HealthSource = struct {
         try append(writer, "antfly_metadata_projected_core_snapshot_restore_progresses", "gauge", "Restore-progress records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.restore_progresses));
         try append(writer, "antfly_metadata_projected_core_snapshot_replication_source_statuses", "gauge", "Replication source statuses retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.replication_source_statuses));
 
+        try append(writer, "antfly_metadata_json_response_calls_total", "counter", "Metadata JSON responses allocated by the metadata HTTP server", memory.json_response.calls);
+        try append(writer, "antfly_metadata_json_response_bytes_total", "counter", "Total JSON response body bytes allocated by the metadata HTTP server", memory.json_response.bytes_total);
+        try append(writer, "antfly_metadata_json_response_peak_bytes", "gauge", "Largest JSON response body allocated by the metadata HTTP server", memory.json_response.peak_bytes);
+
+        try append(writer, "antfly_metadata_projected_store_lsm_mutable_bytes", "gauge", "Mutable in-memory LSM bytes retained by the metadata projected store", memory.projected_store_lsm.mutable_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_immutable_bytes", "gauge", "Immutable in-memory LSM bytes retained by the metadata projected store", memory.projected_store_lsm.immutable_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_run_bytes", "gauge", "Table-run bytes retained by the metadata projected store LSM", memory.projected_store_lsm.total_run_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_wal_retained_bytes", "gauge", "WAL bytes retained by the metadata projected store LSM", memory.projected_store_lsm.wal_retained_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_wal_retained_segments", "gauge", "WAL segments retained by the metadata projected store LSM", memory.projected_store_lsm.wal_retained_segments);
+        try append(writer, "antfly_metadata_projected_store_lsm_active_readers", "gauge", "Active readers pinning metadata projected store LSM state", memory.projected_store_lsm.active_readers);
+        try append(writer, "antfly_metadata_projected_store_lsm_obsolete_paths", "gauge", "Obsolete LSM paths retained by the metadata projected store", memory.projected_store_lsm.obsolete_paths);
+        try append(writer, "antfly_metadata_projected_store_lsm_bulk_clone_active_bytes", "gauge", "Bulk-ingest current-scan clone bytes retained by the metadata projected store LSM", memory.projected_store_lsm.bulk_ingest_current_scan_clone_active_bytes);
+
         try append(writer, "antfly_metadata_hosted_write_cache_present", "gauge", "Whether a hosted metadata write DB cache exists for this replica root", if (memory.hosted_write_cache.present) 1 else 0);
         try append(writer, "antfly_metadata_hosted_write_cache_roots", "gauge", "Hosted metadata write DB cache roots registered in this process", memory.hosted_write_cache.cached_roots);
         try append(writer, "antfly_metadata_hosted_write_cache_entries", "gauge", "Live hosted metadata write DB cache entries", memory.hosted_write_cache.cached_entries);
@@ -233,6 +246,14 @@ pub const HealthSource = struct {
         try append(writer, "antfly_metadata_hosted_write_cache_bulk_ingest_open_entries", "gauge", "Hosted metadata write DB cache entries with open bulk-ingest sessions", memory.hosted_write_cache.bulk_ingest_open_entries);
         try append(writer, "antfly_metadata_hosted_write_cache_auto_bulk_open_entries", "gauge", "Hosted metadata write DB cache entries with open auto bulk-ingest sessions", memory.hosted_write_cache.auto_bulk_ingest_open_entries);
         try append(writer, "antfly_metadata_hosted_write_cache_auto_bulk_finish_requested_entries", "gauge", "Hosted metadata write DB cache auto bulk-ingest entries that requested finish", memory.hosted_write_cache.auto_bulk_ingest_finish_requested_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_mutable_bytes", "gauge", "Mutable in-memory LSM bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_mutable_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_immutable_bytes", "gauge", "Immutable in-memory LSM bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_immutable_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_run_bytes", "gauge", "Table-run bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_total_run_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes", "gauge", "WAL bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_wal_retained_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_wal_retained_segments", "gauge", "WAL segments retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_wal_retained_segments);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_active_readers", "gauge", "Active readers pinning hosted metadata write DB cache LSM state", memory.hosted_write_cache.lsm_active_readers);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_obsolete_paths", "gauge", "Obsolete LSM paths retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_obsolete_paths);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_bulk_clone_active_bytes", "gauge", "Bulk-ingest current-scan clone bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes);
     }
 };
 
@@ -1063,6 +1084,12 @@ test "metadata runtime cli accepts secret store path" {
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
+fn expectMetricPresent(output: []const u8, name: []const u8) !void {
+    const help = try std.fmt.allocPrint(std.testing.allocator, "# HELP {s}", .{name});
+    defer std.testing.allocator.free(help);
+    try std.testing.expect(std.mem.indexOf(u8, output, help) != null);
+}
+
 test "metadata runtime server uses wal replica state backend by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1083,6 +1110,45 @@ test "metadata runtime server uses wal replica state backend by default" {
 
     try std.testing.expect(server.server.svc.raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
+}
+
+test "metadata runtime metrics expose memory ownership buckets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var server = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+
+    if (server.server.owned_admin_http_server) |admin| {
+        var resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
+        defer resp.deinit(std.testing.allocator);
+    }
+
+    var health = HealthSource{ .server = &server };
+    var buf: [128 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const output = writer.buffered();
+
+    try expectMetricPresent(output, "antfly_process_memory_available");
+    try expectMetricPresent(output, "antfly_metadata_projected_core_snapshot_estimated_bytes");
+    try expectMetricPresent(output, "antfly_metadata_projected_store_lsm_wal_retained_bytes");
+    try expectMetricPresent(output, "antfly_metadata_json_response_calls_total");
+    try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_entries");
+    try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes");
 }
 
 test "metadata runtime prefers common config raft url for local id when cli bind is absent" {

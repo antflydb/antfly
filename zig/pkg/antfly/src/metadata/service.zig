@@ -496,14 +496,77 @@ const ProjectedCoreSnapshotDiagnostics = struct {
     estimated_bytes: usize = 0,
 };
 
+pub const JsonResponseDiagnostics = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+};
+
+pub const LsmRetentionDiagnostics = struct {
+    mutable_bytes: u64 = 0,
+    immutable_bytes: u64 = 0,
+    total_run_bytes: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    wal_retained_segments: u64 = 0,
+    active_readers: u64 = 0,
+    obsolete_paths: u64 = 0,
+    obsolete_paths_pinned_by_readers: u64 = 0,
+    obsolete_paths_pinned_by_versions: u64 = 0,
+    bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+};
+
 pub const MetadataMemoryDiagnostics = struct {
     process: process_memory_mod.Stats = .{},
+    json_response: JsonResponseDiagnostics = .{},
     projected_core_snapshot: ProjectedCoreSnapshotDiagnostics = .{},
+    projected_store_lsm: LsmRetentionDiagnostics = .{},
     hosted_write_cache: api_table_writes.HostedManagedDbCacheDiagnostics = .{},
 };
 
 fn optionalLen(value: ?[]const u8) usize {
     return if (value) |bytes| bytes.len else 0;
+}
+
+fn lsmRetentionDiagnostics(stats: anytype) LsmRetentionDiagnostics {
+    return .{
+        .mutable_bytes = stats.mutable_bytes,
+        .immutable_bytes = stats.immutable_bytes,
+        .total_run_bytes = stats.total_run_bytes,
+        .wal_retained_bytes = stats.wal_retained_bytes,
+        .wal_retained_segments = stats.wal_retained_segments,
+        .active_readers = stats.active_readers,
+        .obsolete_paths = stats.obsolete_paths,
+        .obsolete_paths_pinned_by_readers = stats.obsolete_paths_pinned_by_readers,
+        .obsolete_paths_pinned_by_versions = stats.obsolete_paths_pinned_by_versions,
+        .bulk_ingest_current_scan_clone_active_bytes = stats.bulk_ingest_current_scan_clone_active_bytes,
+    };
+}
+
+fn recordJsonResponseAllocationCounters(
+    calls: *std.atomic.Value(u64),
+    bytes_total: *std.atomic.Value(u64),
+    peak_bytes: *std.atomic.Value(u64),
+    bytes: usize,
+) void {
+    const amount: u64 = @intCast(bytes);
+    _ = calls.fetchAdd(1, .monotonic);
+    _ = bytes_total.fetchAdd(amount, .monotonic);
+    var observed = peak_bytes.load(.monotonic);
+    while (amount > observed) {
+        observed = peak_bytes.cmpxchgWeak(observed, amount, .monotonic, .monotonic) orelse break;
+    }
+}
+
+fn jsonResponseDiagnosticsFromCounters(
+    calls: *const std.atomic.Value(u64),
+    bytes_total: *const std.atomic.Value(u64),
+    peak_bytes: *const std.atomic.Value(u64),
+) JsonResponseDiagnostics {
+    return .{
+        .calls = calls.load(.monotonic),
+        .bytes_total = bytes_total.load(.monotonic),
+        .peak_bytes = peak_bytes.load(.monotonic),
+    };
 }
 
 const LocalPlacementInputs = struct {
@@ -828,6 +891,9 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    json_response_calls: std.atomic.Value(u64) = .init(0),
+    json_response_bytes_total: std.atomic.Value(u64) = .init(0),
+    json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -1286,6 +1352,23 @@ pub const MetadataService = struct {
 
     pub fn metrics(self: *MetadataService) raft_service.ManagedServiceMetrics {
         return self.raft.metrics;
+    }
+
+    pub fn recordJsonResponseAllocation(self: *MetadataService, bytes: usize) void {
+        recordJsonResponseAllocationCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+            bytes,
+        );
+    }
+
+    pub fn jsonResponseDiagnostics(self: *MetadataService) JsonResponseDiagnostics {
+        return jsonResponseDiagnosticsFromCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+        );
     }
 
     pub fn head(self: *MetadataService) metadata_api.MetadataHead {
@@ -1962,6 +2045,9 @@ pub const MetadataHttpService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
+    json_response_calls: std.atomic.Value(u64) = .init(0),
+    json_response_bytes_total: std.atomic.Value(u64) = .init(0),
+    json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     raft: raft_service.ManagedHttpHostService,
 
     pub fn init(
@@ -2654,6 +2740,23 @@ pub const MetadataHttpService = struct {
         return current_status;
     }
 
+    pub fn recordJsonResponseAllocation(self: *MetadataHttpService, bytes: usize) void {
+        recordJsonResponseAllocationCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+            bytes,
+        );
+    }
+
+    pub fn jsonResponseDiagnostics(self: *MetadataHttpService) JsonResponseDiagnostics {
+        return jsonResponseDiagnosticsFromCounters(
+            &self.json_response_calls,
+            &self.json_response_bytes_total,
+            &self.json_response_peak_bytes,
+        );
+    }
+
     pub fn metadataStatus(self: *MetadataHttpService) !MetadataStatus {
         var current_status = try snapshotStatusWithOptions(self.alloc, self.metadata_group_id, self, self.metrics(), .{
             .include_reconciliation_planning = true,
@@ -2796,6 +2899,7 @@ pub const MetadataHttpService = struct {
     pub fn memoryDiagnostics(self: *MetadataHttpService) MetadataMemoryDiagnostics {
         var out = MetadataMemoryDiagnostics{
             .process = process_memory_mod.snapshot(),
+            .json_response = self.jsonResponseDiagnostics(),
             .hosted_write_cache = if (self.replica_root_dir) |root|
                 api_table_writes.hostedManagedDbCacheDiagnosticsForRoot(root)
             else
@@ -2805,6 +2909,9 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         if (self.projected_core_snapshot_cache.snapshot) |*snapshot| {
             out.projected_core_snapshot = snapshot.diagnostics();
+        }
+        if (self.projectedStore()) |store| {
+            out.projected_store_lsm = lsmRetentionDiagnostics(store.snapshotMaintenanceStats());
         }
         return out;
     }

@@ -460,6 +460,14 @@ pub const ProvisionedTableWriteCache = struct {
         bulk_ingest_open_entries: u64 = 0,
         auto_bulk_ingest_open_entries: u64 = 0,
         auto_bulk_ingest_finish_requested_entries: u64 = 0,
+        lsm_mutable_bytes: u64 = 0,
+        lsm_immutable_bytes: u64 = 0,
+        lsm_total_run_bytes: u64 = 0,
+        lsm_wal_retained_bytes: u64 = 0,
+        lsm_wal_retained_segments: u64 = 0,
+        lsm_active_readers: u64 = 0,
+        lsm_obsolete_paths: u64 = 0,
+        lsm_bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
     };
 
     pub const CachedDb = struct {
@@ -804,14 +812,28 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
+            accumulateDiagnosticsLsmStats(&stats, entry.db.trySnapshotLsmMaintenanceStats());
         }
         for (self.retired_entries.items) |entry| {
             stats.retired_active_leases += entry.active_leases;
             if (entry.bulk_ingest_session_open) stats.bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_session_open) stats.auto_bulk_ingest_open_entries += 1;
             if (entry.auto_bulk_ingest_finish_requested) stats.auto_bulk_ingest_finish_requested_entries += 1;
+            accumulateDiagnosticsLsmStats(&stats, entry.db.trySnapshotLsmMaintenanceStats());
         }
         return stats;
+    }
+
+    fn accumulateDiagnosticsLsmStats(stats: *Diagnostics, maintenance: ?lsm_backend.Backend.MaintenanceStats) void {
+        const value = maintenance orelse return;
+        stats.lsm_mutable_bytes +|= value.mutable_bytes;
+        stats.lsm_immutable_bytes +|= value.immutable_bytes;
+        stats.lsm_total_run_bytes +|= value.total_run_bytes;
+        stats.lsm_wal_retained_bytes +|= value.wal_retained_bytes;
+        stats.lsm_wal_retained_segments +|= value.wal_retained_segments;
+        stats.lsm_active_readers +|= value.active_readers;
+        stats.lsm_obsolete_paths +|= value.obsolete_paths;
+        stats.lsm_bulk_ingest_current_scan_clone_active_bytes +|= value.bulk_ingest_current_scan_clone_active_bytes;
     }
 
     pub fn autoBulkIngestMaxIdleNs() u64 {
@@ -1958,6 +1980,14 @@ pub const HostedManagedDbCacheDiagnostics = struct {
     bulk_ingest_open_entries: u64 = 0,
     auto_bulk_ingest_open_entries: u64 = 0,
     auto_bulk_ingest_finish_requested_entries: u64 = 0,
+    lsm_mutable_bytes: u64 = 0,
+    lsm_immutable_bytes: u64 = 0,
+    lsm_total_run_bytes: u64 = 0,
+    lsm_wal_retained_bytes: u64 = 0,
+    lsm_wal_retained_segments: u64 = 0,
+    lsm_active_readers: u64 = 0,
+    lsm_obsolete_paths: u64 = 0,
+    lsm_bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
 };
 
 var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
@@ -2033,6 +2063,14 @@ pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) Host
             .bulk_ingest_open_entries = write_cache.bulk_ingest_open_entries,
             .auto_bulk_ingest_open_entries = write_cache.auto_bulk_ingest_open_entries,
             .auto_bulk_ingest_finish_requested_entries = write_cache.auto_bulk_ingest_finish_requested_entries,
+            .lsm_mutable_bytes = write_cache.lsm_mutable_bytes,
+            .lsm_immutable_bytes = write_cache.lsm_immutable_bytes,
+            .lsm_total_run_bytes = write_cache.lsm_total_run_bytes,
+            .lsm_wal_retained_bytes = write_cache.lsm_wal_retained_bytes,
+            .lsm_wal_retained_segments = write_cache.lsm_wal_retained_segments,
+            .lsm_active_readers = write_cache.lsm_active_readers,
+            .lsm_obsolete_paths = write_cache.lsm_obsolete_paths,
+            .lsm_bulk_ingest_current_scan_clone_active_bytes = write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes,
         };
     }
     return .{ .cached_roots = cached_roots };
