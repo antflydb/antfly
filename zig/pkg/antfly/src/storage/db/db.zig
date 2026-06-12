@@ -415,6 +415,7 @@ const dense_posting_idle_default_fold_delta_tails: bool = true;
 const dense_posting_idle_default_min_delta_records_to_fold: usize = 64;
 const dense_posting_idle_default_min_tombstone_records_to_fold: usize = 16;
 const dense_posting_idle_default_min_delta_to_base_ratio_bps: usize = 0;
+const dense_posting_idle_default_min_delta_value_bytes_to_fold: usize = 0;
 const dense_posting_idle_default_max_delta_tail_postings: usize = std.math.maxInt(usize) - 1;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_split_full_postings: bool = true;
@@ -7990,6 +7991,7 @@ pub const DB = struct {
             .min_delta_records_to_fold = densePostingIdleMinDeltaRecordsToFold(),
             .min_tombstone_records_to_fold = densePostingIdleMinTombstoneRecordsToFold(),
             .min_delta_to_base_ratio_bps = @intCast(densePostingIdleMinDeltaToBaseRatioBps()),
+            .min_delta_value_bytes_to_fold = densePostingIdleMinDeltaValueBytesToFold(),
             .max_delta_tail_postings = densePostingIdleMaxDeltaTailPostings(),
             .max_layout_changes_per_index = densePostingIdleMaxLayoutChangesPerIndex(),
             .split_full_postings = densePostingIdleSplitFullPostings(),
@@ -8825,6 +8827,7 @@ pub const DB = struct {
             .policy_min_delta_records_to_fold = @intCast(config.auto_posting_maintenance_min_delta_records_to_fold),
             .policy_min_tombstone_records_to_fold = @intCast(config.auto_posting_maintenance_min_tombstone_records_to_fold),
             .policy_min_delta_to_base_ratio_bps = config.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+            .policy_min_delta_value_bytes_to_fold = @intCast(config.auto_posting_maintenance_min_delta_value_bytes_to_fold),
             .policy_max_delta_tail_postings = @intCast(config.auto_posting_maintenance_max_delta_tail_postings),
             .policy_min_dirty_postings = @intCast(config.auto_posting_maintenance_min_dirty_postings),
             .policy_max_dirty_version_age = config.auto_posting_maintenance_max_dirty_version_age,
@@ -18493,6 +18496,7 @@ var dense_posting_idle_fold_delta_tails_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_min_delta_records_to_fold_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_min_tombstone_records_to_fold_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_min_delta_to_base_ratio_bps_cache = std.atomic.Value(usize).init(0);
+var dense_posting_idle_min_delta_value_bytes_to_fold_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_delta_tail_postings_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_max_layout_changes_cache = std.atomic.Value(usize).init(0);
 var dense_posting_idle_split_full_postings_cache = std.atomic.Value(usize).init(0);
@@ -18676,6 +18680,14 @@ fn densePostingIdleMinDeltaToBaseRatioBps() usize {
         &dense_posting_idle_min_delta_to_base_ratio_bps_cache,
         "ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_TO_BASE_RATIO_BPS",
         dense_posting_idle_default_min_delta_to_base_ratio_bps,
+    );
+}
+
+fn densePostingIdleMinDeltaValueBytesToFold() usize {
+    return cachedEnvUsize(
+        &dense_posting_idle_min_delta_value_bytes_to_fold_cache,
+        "ANTFLY_DENSE_POSTING_IDLE_MIN_DELTA_VALUE_BYTES_TO_FOLD",
+        dense_posting_idle_default_min_delta_value_bytes_to_fold,
     );
 }
 
@@ -18936,6 +18948,7 @@ fn runBestEffortDenseCatchUpPostingMaintenance(ctx: *AsyncContext, index_name: [
         .min_delta_records_to_fold = dense_posting_idle_default_min_delta_records_to_fold,
         .min_tombstone_records_to_fold = dense_posting_idle_default_min_tombstone_records_to_fold,
         .min_delta_to_base_ratio_bps = 0,
+        .min_delta_value_bytes_to_fold = dense_posting_idle_default_min_delta_value_bytes_to_fold,
         .max_delta_tail_postings = dense_posting_idle_default_max_delta_tail_postings,
         .max_layout_changes_per_index = dense_posting_idle_default_max_layout_changes_per_index,
         .split_full_postings = false,

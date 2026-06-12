@@ -1057,6 +1057,7 @@ pub fn runAutoPostingMaintenanceTxn(self: anytype, txn: anytype) !void {
         .min_delta_records_to_fold = self.config.auto_posting_maintenance_min_delta_records_to_fold,
         .min_tombstone_records_to_fold = self.config.auto_posting_maintenance_min_tombstone_records_to_fold,
         .min_delta_to_base_ratio_bps = self.config.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+        .min_delta_value_bytes_to_fold = self.config.auto_posting_maintenance_min_delta_value_bytes_to_fold,
         .max_delta_tail_postings = self.config.auto_posting_maintenance_max_delta_tail_postings,
         .rebalance_layout = max_layout_changes != 0,
         .split_full_postings = self.config.auto_posting_maintenance_split_full_postings,
@@ -1289,10 +1290,12 @@ fn foldPostingDeltaTailIfNeeded(
         const min_delta_records = if (force_fold) 1 else options.min_delta_records_to_fold;
         const min_tombstone_records = if (force_fold) 0 else options.min_tombstone_records_to_fold;
         const min_delta_to_base_ratio_bps = if (force_fold) 0 else options.min_delta_to_base_ratio_bps;
+        const min_delta_value_bytes = if (force_fold) 0 else options.min_delta_value_bytes_to_fold;
         break :blk posting.PostingStore.foldDeltaTailIntoBaseWithOptions(self, txn, posting_id, isNotFoundGeneric, .{
             .min_delta_records = min_delta_records,
             .min_tombstone_records = min_tombstone_records,
             .min_delta_to_base_ratio_bps = min_delta_to_base_ratio_bps,
+            .min_delta_value_bytes = min_delta_value_bytes,
             .max_materialized_members = options.max_delta_fold_materialized_members,
             .max_materialized_bytes = options.max_delta_fold_materialized_bytes,
         }) catch |err| {

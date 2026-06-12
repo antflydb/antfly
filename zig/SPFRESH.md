@@ -97,8 +97,9 @@ Current status:
   in churn-heavy maintenance paths.
 - Delta-tail scans now carry encoded key/value byte debt alongside record and
   tombstone counts, and fold policy has an internal default-off value-byte
-  threshold. This keeps today's behavior stable while giving future
-  cost-aware maintenance a direct signal for tail replay and backend overhead.
+  threshold wired through maintenance configuration and status. This keeps
+  today's behavior stable while giving future cost-aware maintenance a direct
+  signal for tail replay and backend overhead.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.

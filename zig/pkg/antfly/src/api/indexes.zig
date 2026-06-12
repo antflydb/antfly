@@ -961,6 +961,7 @@ fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.type
     dst.policy_min_delta_records_to_fold = @max(dst.policy_min_delta_records_to_fold, src.policy_min_delta_records_to_fold);
     dst.policy_min_tombstone_records_to_fold = @max(dst.policy_min_tombstone_records_to_fold, src.policy_min_tombstone_records_to_fold);
     dst.policy_min_delta_to_base_ratio_bps = @max(dst.policy_min_delta_to_base_ratio_bps, src.policy_min_delta_to_base_ratio_bps);
+    dst.policy_min_delta_value_bytes_to_fold = @max(dst.policy_min_delta_value_bytes_to_fold, src.policy_min_delta_value_bytes_to_fold);
     dst.policy_max_delta_tail_postings = @max(dst.policy_max_delta_tail_postings, src.policy_max_delta_tail_postings);
     dst.policy_min_dirty_postings = @max(dst.policy_min_dirty_postings, src.policy_min_dirty_postings);
     dst.policy_max_dirty_version_age = @max(dst.policy_max_dirty_version_age, src.policy_max_dirty_version_age);
@@ -1752,6 +1753,8 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.policy_min_tombstone_records_to_fold);
     try out.appendSlice(alloc, ",\"policy_min_delta_to_base_ratio_bps\":");
     try appendIntValue(alloc, out, stats.policy_min_delta_to_base_ratio_bps);
+    try out.appendSlice(alloc, ",\"policy_min_delta_value_bytes_to_fold\":");
+    try appendIntValue(alloc, out, stats.policy_min_delta_value_bytes_to_fold);
     try out.appendSlice(alloc, ",\"policy_max_delta_tail_postings\":");
     try appendIntValue(alloc, out, stats.policy_max_delta_tail_postings);
     try out.appendSlice(alloc, ",\"policy_min_dirty_postings\":");
@@ -3534,6 +3537,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
         .policy_min_delta_records_to_fold = 32,
         .policy_min_tombstone_records_to_fold = 7,
         .policy_min_delta_to_base_ratio_bps = 2000,
+        .policy_min_delta_value_bytes_to_fold = 512,
         .policy_max_delta_tail_postings = 128,
         .policy_min_dirty_postings = 4,
         .policy_max_dirty_version_age = 12,
@@ -3574,6 +3578,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
         .policy_min_delta_records_to_fold = 64,
         .policy_min_tombstone_records_to_fold = 4,
         .policy_min_delta_to_base_ratio_bps = 2500,
+        .policy_min_delta_value_bytes_to_fold = 2048,
         .policy_max_delta_tail_postings = 256,
         .policy_min_dirty_postings = 2,
         .policy_max_dirty_version_age = 7,
@@ -3614,6 +3619,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
     try std.testing.expectEqual(@as(u64, 64), stats.policy_min_delta_records_to_fold);
     try std.testing.expectEqual(@as(u64, 7), stats.policy_min_tombstone_records_to_fold);
     try std.testing.expectEqual(@as(u64, 2500), stats.policy_min_delta_to_base_ratio_bps);
+    try std.testing.expectEqual(@as(u64, 2048), stats.policy_min_delta_value_bytes_to_fold);
     try std.testing.expectEqual(@as(u64, 256), stats.policy_max_delta_tail_postings);
     try std.testing.expectEqual(@as(u64, 4), stats.policy_min_dirty_postings);
     try std.testing.expectEqual(@as(u64, 12), stats.policy_max_dirty_version_age);
@@ -3652,6 +3658,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
     defer encoded.deinit(std.testing.allocator);
     try appendHbcPostingStatus(std.testing.allocator, &encoded, stats);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_delta_tail_postings\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_min_delta_value_bytes_to_fold\":2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_fold_delta_tails\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_dirty_version_age\":12") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_allow_overfull_reassignment\":true") != null);

@@ -1477,6 +1477,7 @@ pub const IndexManager = struct {
             .auto_posting_maintenance_min_delta_records_to_fold = dense_cfg.auto_posting_maintenance_min_delta_records_to_fold,
             .auto_posting_maintenance_min_tombstone_records_to_fold = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_fold,
             .auto_posting_maintenance_min_delta_to_base_ratio_bps = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+            .auto_posting_maintenance_min_delta_value_bytes_to_fold = dense_cfg.auto_posting_maintenance_min_delta_value_bytes_to_fold,
             .auto_posting_maintenance_max_delta_tail_postings = dense_cfg.auto_posting_maintenance_max_delta_tail_postings,
             .auto_posting_maintenance_min_dirty_postings = dense_cfg.auto_posting_maintenance_min_dirty_postings,
             .auto_posting_maintenance_max_dirty_version_age = dense_cfg.auto_posting_maintenance_max_dirty_version_age,
@@ -2431,6 +2432,7 @@ pub const IndexManager = struct {
         min_delta_records_to_fold: usize = 64,
         min_tombstone_records_to_fold: usize = 16,
         min_delta_to_base_ratio_bps: u32 = 2500,
+        min_delta_value_bytes_to_fold: usize = 0,
         max_delta_tail_postings: usize = std.math.maxInt(usize) - 1,
         max_delta_fold_materialized_members: usize = std.math.maxInt(usize),
         max_delta_fold_materialized_bytes: usize = std.math.maxInt(usize),
@@ -2521,6 +2523,11 @@ pub const IndexManager = struct {
         {
             return true;
         }
+        if (options.min_delta_value_bytes_to_fold != 0 and
+            backlog.max_delta_tail_value_bytes >= options.min_delta_value_bytes_to_fold)
+        {
+            return true;
+        }
         if (backlog.delta_tail_postings > options.max_delta_tail_postings) return true;
         return false;
     }
@@ -2608,6 +2615,7 @@ pub const IndexManager = struct {
                 .min_delta_records_to_fold = options.min_delta_records_to_fold,
                 .min_tombstone_records_to_fold = options.min_tombstone_records_to_fold,
                 .min_delta_to_base_ratio_bps = options.min_delta_to_base_ratio_bps,
+                .min_delta_value_bytes_to_fold = options.min_delta_value_bytes_to_fold,
                 .max_delta_tail_postings = options.max_delta_tail_postings,
                 .max_delta_fold_materialized_members = options.max_delta_fold_materialized_members,
                 .max_delta_fold_materialized_bytes = max_delta_fold_materialized_bytes,
@@ -6204,6 +6212,7 @@ pub const IndexManager = struct {
                     .auto_posting_maintenance_min_delta_records_to_fold = dense_cfg.auto_posting_maintenance_min_delta_records_to_fold,
                     .auto_posting_maintenance_min_tombstone_records_to_fold = dense_cfg.auto_posting_maintenance_min_tombstone_records_to_fold,
                     .auto_posting_maintenance_min_delta_to_base_ratio_bps = dense_cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps,
+                    .auto_posting_maintenance_min_delta_value_bytes_to_fold = dense_cfg.auto_posting_maintenance_min_delta_value_bytes_to_fold,
                     .auto_posting_maintenance_max_delta_tail_postings = dense_cfg.auto_posting_maintenance_max_delta_tail_postings,
                     .auto_posting_maintenance_min_dirty_postings = dense_cfg.auto_posting_maintenance_min_dirty_postings,
                     .auto_posting_maintenance_max_dirty_version_age = dense_cfg.auto_posting_maintenance_max_dirty_version_age,
@@ -11861,6 +11870,7 @@ const DenseConfig = struct {
     auto_posting_maintenance_min_delta_records_to_fold: usize = 64,
     auto_posting_maintenance_min_tombstone_records_to_fold: usize = 16,
     auto_posting_maintenance_min_delta_to_base_ratio_bps: u32 = 2500,
+    auto_posting_maintenance_min_delta_value_bytes_to_fold: usize = 0,
     auto_posting_maintenance_max_delta_tail_postings: usize = std.math.maxInt(usize),
     auto_posting_maintenance_min_dirty_postings: usize = 0,
     auto_posting_maintenance_max_dirty_version_age: u64 = 0,
@@ -12210,6 +12220,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
         else
             2500,
+        .auto_posting_maintenance_min_delta_value_bytes_to_fold = if (root.object.get("auto_posting_maintenance_min_delta_value_bytes_to_fold")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            0,
         .auto_posting_maintenance_max_delta_tail_postings = if (root.object.get("auto_posting_maintenance_max_delta_tail_postings")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
@@ -15021,6 +15035,7 @@ test "parseDenseConfig accepts HBC tuning knobs" {
         \\  "auto_posting_maintenance_min_delta_records_to_fold": 99,
         \\  "auto_posting_maintenance_min_tombstone_records_to_fold": 11,
         \\  "auto_posting_maintenance_min_delta_to_base_ratio_bps": 3750,
+        \\  "auto_posting_maintenance_min_delta_value_bytes_to_fold": 4096,
         \\  "auto_posting_maintenance_max_delta_tail_postings": 21,
         \\  "auto_posting_maintenance_min_dirty_postings": 7,
         \\  "auto_posting_maintenance_max_dirty_version_age": 13,
@@ -15081,6 +15096,7 @@ test "parseDenseConfig accepts HBC tuning knobs" {
     try std.testing.expectEqual(@as(usize, 99), cfg.auto_posting_maintenance_min_delta_records_to_fold);
     try std.testing.expectEqual(@as(usize, 11), cfg.auto_posting_maintenance_min_tombstone_records_to_fold);
     try std.testing.expectEqual(@as(u32, 3750), cfg.auto_posting_maintenance_min_delta_to_base_ratio_bps);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.auto_posting_maintenance_min_delta_value_bytes_to_fold);
     try std.testing.expectEqual(@as(usize, 21), cfg.auto_posting_maintenance_max_delta_tail_postings);
     try std.testing.expectEqual(@as(usize, 7), cfg.auto_posting_maintenance_min_dirty_postings);
     try std.testing.expectEqual(@as(u64, 13), cfg.auto_posting_maintenance_max_dirty_version_age);

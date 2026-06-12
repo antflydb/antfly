@@ -1346,6 +1346,7 @@ pub const PostingMaintenanceOptions = struct {
     min_delta_records_to_fold: usize = 64,
     min_tombstone_records_to_fold: usize = 16,
     min_delta_to_base_ratio_bps: u32 = 0,
+    min_delta_value_bytes_to_fold: usize = 0,
     max_delta_tail_postings: usize = std.math.maxInt(usize),
     max_delta_fold_materialized_members: usize = std.math.maxInt(usize),
     max_delta_fold_materialized_bytes: usize = std.math.maxInt(usize),

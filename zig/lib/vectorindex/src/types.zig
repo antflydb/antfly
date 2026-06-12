@@ -82,6 +82,7 @@ pub const HBCConfig = struct {
     auto_posting_maintenance_min_delta_records_to_fold: usize = 64,
     auto_posting_maintenance_min_tombstone_records_to_fold: usize = 16,
     auto_posting_maintenance_min_delta_to_base_ratio_bps: u32 = 2500,
+    auto_posting_maintenance_min_delta_value_bytes_to_fold: usize = 0,
     auto_posting_maintenance_max_delta_tail_postings: usize = std.math.maxInt(usize),
     auto_posting_maintenance_min_dirty_postings: usize = 0,
     auto_posting_maintenance_max_dirty_version_age: u64 = 0,

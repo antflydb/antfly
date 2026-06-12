@@ -9342,9 +9342,10 @@ test "auto posting maintenance can trigger on base delta tail debt" {
     idx.resetWriteProfile();
     const folded = try idx.repairDirtyPostingsWithOptions(.{
         .max_postings = 1,
-        .min_delta_records_to_fold = 1,
+        .min_delta_records_to_fold = 99,
         .min_tombstone_records_to_fold = 99,
         .min_delta_to_base_ratio_bps = 0,
+        .min_delta_value_bytes_to_fold = 1,
     });
     try std.testing.expectEqual(@as(u64, 0), folded.repaired_postings);
     try std.testing.expectEqual(@as(u64, 1), folded.delta_fold_attempts);

@@ -1845,6 +1845,7 @@ pub const HbcPostingStats = struct {
     policy_min_delta_records_to_fold: u64 = 0,
     policy_min_tombstone_records_to_fold: u64 = 0,
     policy_min_delta_to_base_ratio_bps: u64 = 0,
+    policy_min_delta_value_bytes_to_fold: u64 = 0,
     policy_max_delta_tail_postings: u64 = 0,
     policy_min_dirty_postings: u64 = 0,
     policy_max_dirty_version_age: u64 = 0,
