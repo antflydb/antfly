@@ -70,6 +70,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 var temp_path_nonce: u64 = 0;
+const posting_segment_manifest_meta_key = "posting_segment_manifest_v1";
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
 
@@ -1233,7 +1234,7 @@ const PostingSegmentRuntime = struct {
     dir: std.Io.Dir,
     store: vectorindex_posting_segment.RuntimeDirectoryStore,
 
-    fn open(alloc: Allocator, path: []const u8, options: vectorindex_posting_segment.RuntimeDirectoryStoreOptions) !PostingSegmentRuntime {
+    fn open(alloc: Allocator, path: []const u8, options: vectorindex_posting_segment.RuntimeDirectoryStoreOptions, manifest_data: ?[]const u8) !PostingSegmentRuntime {
         const io_impl = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(io_impl);
         io_impl.* = std.Io.Threaded.init(alloc, .{});
@@ -1247,7 +1248,7 @@ const PostingSegmentRuntime = struct {
             .alloc = alloc,
             .io_impl = io_impl,
             .dir = dir,
-            .store = try vectorindex_posting_segment.RuntimeDirectoryStore.openAlloc(alloc, io, dir, options),
+            .store = try vectorindex_posting_segment.RuntimeDirectoryStore.openAllocWithManifestData(alloc, io, dir, options, manifest_data),
         };
     }
 
@@ -1648,9 +1649,13 @@ pub const HBCIndex = struct {
                 try self.publishDeferredNodeKeysForBulkFinishTxn(&batch);
                 try self.publishDeferredQuantizedNodesForBulkFinishTxn(&batch);
                 try self.flushMetadataNow(&batch);
+                const segment_manifest_published = try self.flushPostingSegmentRuntimeToTxn(&batch);
                 const commit_start = nowNs();
                 self.beginPublishedSearchStateRefresh();
-                errdefer self.abortPublishedSearchStateRefresh();
+                errdefer {
+                    self.abortPublishedSearchStateRefresh();
+                    if (segment_manifest_published) self.reloadPostingSegmentRuntimeFromCommittedManifest() catch {};
+                }
                 try batch.commit();
                 self.write_profile.insert_commit_ns += elapsedSince(commit_start);
                 self.finishPublishedSearchStateRefresh();
@@ -1829,8 +1834,24 @@ pub const HBCIndex = struct {
         @memset(metadata_clock_keys, 0);
         @memset(metadata_clock_refs, false);
 
+        var posting_segment_manifest_data: ?[]u8 = null;
+        defer if (posting_segment_manifest_data) |data| alloc.free(data);
+        if (effective_config.posting_backend == .segments) {
+            var txn = try store.beginRead();
+            defer txn.abort();
+            const data = txn.get(.meta, posting_segment_manifest_meta_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (data) |bytes| posting_segment_manifest_data = try alloc.dupe(u8, bytes);
+        }
+
         var posting_segment_runtime: ?PostingSegmentRuntime = if (effective_config.posting_backend == .segments)
-            try PostingSegmentRuntime.open(alloc, std.mem.span(path), .{})
+            try PostingSegmentRuntime.open(alloc, std.mem.span(path), .{
+                .max_pending_entries = 0,
+                .max_pending_value_bytes = 0,
+                .max_pending_delta_records = 0,
+            }, posting_segment_manifest_data)
         else
             null;
         errdefer if (posting_segment_runtime) |*runtime| runtime.deinit();
@@ -2821,13 +2842,42 @@ pub const HBCIndex = struct {
         return estimated_bytes > options.max_materialized_bytes;
     }
 
+    fn flushPostingSegmentRuntimeToTxn(self: *HBCIndex, txn: anytype) !bool {
+        try self.bindPostingSegmentWriteTxn(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = self.postingSegmentRuntime() catch |err| switch (err) {
+            error.UnsupportedPostingBackend => return false,
+        };
+        const committed = try runtime.store.flush();
+        if (committed == null) return false;
+        const manifest_data = try runtime.store.manifestBytesAlloc(self.alloc);
+        defer self.alloc.free(manifest_data);
+        try self.putNamespaced(txn, .meta, posting_segment_manifest_meta_key, manifest_data);
+        return true;
+    }
+
+    fn reloadPostingSegmentRuntimeFromCommittedManifest(self: *HBCIndex) !void {
+        if (self.posting_segment_runtime == null) return;
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const manifest_data = txn.get(.meta, posting_segment_manifest_meta_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        try runtime.store.reloadManifestData(manifest_data);
+    }
+
     pub fn savePostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
         try self.bindPostingSegmentWriteTxn(txn);
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         try runtime.store.appendBase(posting_id, encoded);
-        _ = try runtime.store.flush();
     }
 
     pub fn savePostingBackendCentroidDirectory(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
@@ -2836,7 +2886,6 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         try runtime.store.appendCentroidDirectory(posting_id, encoded);
-        _ = try runtime.store.flush();
     }
 
     pub fn savePostingBackendBaseAndCentroidDirectory(
@@ -2853,7 +2902,6 @@ pub const HBCIndex = struct {
         const runtime = try self.postingSegmentRuntime();
         try runtime.store.appendBase(base_posting_id, encoded_base);
         try runtime.store.appendCentroidDirectory(centroid_posting_id, encoded_centroid);
-        _ = try runtime.store.flush();
     }
 
     pub fn appendPostingBackendDeltaRecords(self: *HBCIndex, txn: anytype, posting_id: u64, records: []const vectorindex_posting.PostingDeltaRecord) !void {
@@ -2862,7 +2910,6 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         try runtime.store.appendPostingDeltaRecords(posting_id, records);
-        _ = try runtime.store.flush();
     }
 
     pub fn loadPostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.OwnedPostingBase {
@@ -3014,7 +3061,6 @@ pub const HBCIndex = struct {
         const encoded = try self.encodePostingSegmentBase(posting_id, next_generation, materialized);
         defer self.alloc.free(encoded);
         try runtime.store.appendBase(posting_id, encoded);
-        _ = try runtime.store.flush();
         return .{
             .delta_records = tail_stats.records,
             .base_member_count = base_header.member_count,
@@ -3938,9 +3984,13 @@ pub const HBCIndex = struct {
 
     pub fn finishWriteTxnOptions(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
         try self.finalizeWriteTxnOptions(txn, options);
+        const segment_manifest_published = try self.flushPostingSegmentRuntimeToTxn(txn);
         const commit_start = nowNs();
         self.beginPublishedSearchStateRefresh();
-        errdefer self.abortPublishedSearchStateRefresh();
+        errdefer {
+            self.abortPublishedSearchStateRefresh();
+            if (segment_manifest_published) self.reloadPostingSegmentRuntimeFromCommittedManifest() catch {};
+        }
         try commitTxn(txn);
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
         self.finishPublishedSearchStateRefresh();
@@ -6237,9 +6287,13 @@ pub const HBCIndex = struct {
         errdefer txn.abort();
         const result = try vectorindex_hbc_index.repairDirtyPostingsTxnWithOptions(self, &txn, options);
         try self.flushMetadata(&txn);
+        const segment_manifest_published = try self.flushPostingSegmentRuntimeToTxn(&txn);
         const commit_start = nowNs();
         self.beginPublishedSearchStateRefresh();
-        errdefer self.abortPublishedSearchStateRefresh();
+        errdefer {
+            self.abortPublishedSearchStateRefresh();
+            if (segment_manifest_published) self.reloadPostingSegmentRuntimeFromCommittedManifest() catch {};
+        }
         try commitTxn(&txn);
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
         self.finishPublishedSearchStateRefresh();
@@ -10725,10 +10779,13 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
             .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .tombstone, .vector_id = 10 },
             .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .insert, .vector_id = 30 },
         });
-        try txn.commit();
+        try idx.finishWriteTxn(&txn);
 
         var read_txn = try idx.beginReadTxn();
         defer read_txn.abort();
+
+        const committed_manifest = try idx.getNamespaced(&read_txn, .meta, posting_segment_manifest_meta_key);
+        try std.testing.expect(committed_manifest.len > 0);
 
         var base_key_buf: [10]u8 = undefined;
         try std.testing.expectError(
@@ -10762,7 +10819,7 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         try std.testing.expect(!folded.skipped);
         try std.testing.expectEqual(@as(usize, 2), folded.materialized_member_count);
         try std.testing.expectEqual(@as(u64, 2), folded.next_generation);
-        try fold_txn.commit();
+        try idx.finishWriteTxn(&fold_txn);
 
         var read_txn = try idx.beginReadTxn();
         defer read_txn.abort();

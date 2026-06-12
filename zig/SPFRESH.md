@@ -199,15 +199,19 @@ Current status:
   now open an owned posting segment runtime store, route base/delta/centroid
   posting hooks through it behind `posting_backend = segments`, materialize and
   fold from the segment manifest, and preserve those posting artifacts across
-  reopen without writing posting-base records into the LSM namespace. That
-  adapter path is still internal: segment writes flush immediately and are not
-  yet coupled to the HBC namespace transaction, visibility publish, bulk-batch
-  lifecycle, or DB-level backup/restore policy. Dense index config now
-  propagates the parsed physical backend into HBC config, but
-  `backend = segments` remains rejected until that transaction/publish coupling
-  is complete. The dense index config now separates `backend`, `format`, and
-  `version`; `backend = segments` is reserved until runtime reads/writes can use
-  the segment store without weakening atomicity. This
+  reopen without writing posting-base records into the LSM namespace. Segment
+  file writes are now staged in the runtime batch and flushed at HBC commit
+  boundaries, where the resulting segment manifest bytes are stored in the same
+  LSM meta transaction as the namespace changes. Reopen prefers that committed
+  manifest marker, so uncommitted directory manifest state is physical garbage,
+  not logical visibility. That adapter path is still internal until DB-level
+  backup/restore, segment maintenance accounting, and public config enablement
+  are wired through the same backend boundary. Dense index config now propagates
+  the parsed physical backend into HBC config, but `backend = segments` remains
+  rejected until those operational surfaces are complete. The dense index config
+  now separates `backend`, `format`, and `version`; `backend = segments` is
+  reserved until runtime reads/writes can use the segment store across the full
+  DB lifecycle. This
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
@@ -835,11 +839,14 @@ implementations cleanly:
     verify the index bytes and fetched value bytes without reading the whole
     segment. HBC now has internal adapter hooks that can write and read posting
     bases, deltas, and centroid-directory records through an owned segment
-    runtime store. The remaining promotion work is transaction/publish coupling:
-    segment batch commits must align with HBC namespace commits, bulk-ingest
-    publish, crash recovery, backup/restore, and maintenance accounting before
-    the public `backend = segments` mode is enabled. That may reduce LSM key
-    overhead and improve sequential IO.
+    runtime store. Segment batch commits now publish the committed manifest via
+    the same LSM meta transaction as HBC namespace commits, including bulk
+    publish windows and posting maintenance writes. The remaining promotion work
+    is operational: backup/restore must copy and verify segment files, segment
+    maintenance must report and enforce resource budgets, crash recovery must
+    clean ignored physical manifests/files, and public config must stop
+    rejecting `backend = segments` only after those surfaces are covered. That
+    may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

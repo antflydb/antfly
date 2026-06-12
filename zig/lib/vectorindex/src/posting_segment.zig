@@ -464,6 +464,19 @@ pub const RuntimeDirectoryStore = struct {
     pub fn openAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: RuntimeDirectoryStoreOptions) !RuntimeDirectoryStore {
         var manifest = try readManifestForCommitAlloc(alloc, io, dir, options.commitOptions());
         errdefer manifest.deinit(alloc);
+        return initWithOwnedManifest(alloc, io, dir, options, manifest);
+    }
+
+    pub fn openAllocWithManifestData(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: RuntimeDirectoryStoreOptions, manifest_data: ?[]const u8) !RuntimeDirectoryStore {
+        var manifest = if (manifest_data) |data|
+            try decodeManifestAlloc(alloc, data)
+        else
+            try emptyManifestAlloc(alloc, options.initial_segment_id);
+        errdefer manifest.deinit(alloc);
+        return initWithOwnedManifest(alloc, io, dir, options, manifest);
+    }
+
+    fn initWithOwnedManifest(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: RuntimeDirectoryStoreOptions, manifest: OwnedManifest) RuntimeDirectoryStore {
         return .{
             .alloc = alloc,
             .io = io,
@@ -547,6 +560,25 @@ pub const RuntimeDirectoryStore = struct {
         errdefer manifest.deinit(self.alloc);
         self.lazy.manifest.deinit(self.alloc);
         self.lazy.manifest = manifest;
+    }
+
+    pub fn reloadManifestData(self: *RuntimeDirectoryStore, manifest_data: ?[]const u8) !void {
+        var manifest = if (manifest_data) |data|
+            try decodeManifestAlloc(self.alloc, data)
+        else
+            try emptyManifestAlloc(self.alloc, self.options.initial_segment_id);
+        errdefer manifest.deinit(self.alloc);
+        self.lazy.manifest.deinit(self.alloc);
+        self.lazy.manifest = manifest;
+    }
+
+    pub fn manifestBytesAlloc(self: RuntimeDirectoryStore, alloc: Allocator) ![]u8 {
+        const entries = try manifestEntryViewAlloc(alloc, self.lazy.manifest.segments);
+        defer alloc.free(entries);
+        return try encodeManifestAlloc(alloc, .{
+            .next_segment_id = self.lazy.manifest.next_segment_id,
+            .segments = entries,
+        });
     }
 };
 
