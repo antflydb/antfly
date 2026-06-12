@@ -83,6 +83,10 @@ Current status:
   member count now use `PostingStore.loadBaseStats` instead of decoding an
   owned member array, moving the specialized count/stat base-decode path into
   live code.
+- Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
+  and a strict validating variant, giving delete/update and validation paths a
+  streaming membership primitive that can stop before materializing the full
+  member list when the target is absent or found early.
 - Leaf postings now carry persisted maintenance state: mutation version,
   centroid refresh version, payload refresh version, and dirty flags. The state
   is stored as a backward-compatible node side record.

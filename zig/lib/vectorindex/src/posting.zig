@@ -841,6 +841,35 @@ pub const PostingFormat = struct {
         return header;
     }
 
+    pub fn baseContainsSortedMember(data: []const u8, vector_id: VectorId) !bool {
+        return try baseContainsSortedMemberWithValidation(data, vector_id, false);
+    }
+
+    pub fn baseContainsSortedMemberStrict(data: []const u8, vector_id: VectorId) !bool {
+        return try baseContainsSortedMemberWithValidation(data, vector_id, true);
+    }
+
+    fn baseContainsSortedMemberWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !bool {
+        var iter = try BaseMemberIterator.init(data);
+        while (try iter.next()) |member| {
+            if (member == vector_id) {
+                if (strict_validation) try drainBaseIterator(&iter);
+                return true;
+            }
+            if (member > vector_id) {
+                if (strict_validation) try drainBaseIterator(&iter);
+                return false;
+            }
+        }
+        try iter.finish();
+        return false;
+    }
+
+    fn drainBaseIterator(iter: *BaseMemberIterator) !void {
+        while (try iter.next()) |_| {}
+        try iter.finish();
+    }
+
     pub fn decodeBaseIntoScratch(
         alloc: std.mem.Allocator,
         scratch: anytype,
@@ -3674,6 +3703,33 @@ test "posting base stats validates encoded blocks without materializing members"
     try std.testing.expectEqual(members.len, header.member_count);
     try std.testing.expectError(error.Corrupted, PostingFormat.decodeBaseStats(encoded[0 .. encoded.len - 1]));
     try std.testing.expectError(error.Corrupted, PostingFormat.validateBase(encoded[0 .. encoded.len - 1]));
+}
+
+test "posting base sorted membership streams without full materialization" {
+    const alloc = std.testing.allocator;
+    const members = [_]VectorId{ 10, 20, 30, 100, 101 };
+
+    const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
+        .posting_id = 7,
+        .generation = 11,
+        .members = members[0..],
+    }, 2);
+    defer alloc.free(encoded);
+
+    try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 10));
+    try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 100));
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 99));
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 999));
+
+    const corrupt = try alloc.alloc(u8, encoded.len + 1);
+    defer alloc.free(corrupt);
+    @memcpy(corrupt[0..encoded.len], encoded);
+    corrupt[encoded.len] = 0;
+
+    try std.testing.expect(try PostingFormat.baseContainsSortedMember(corrupt, 10));
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(corrupt, 15));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 10));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 15));
 }
 
 test "posting delta tail round trips and overlays base members" {
