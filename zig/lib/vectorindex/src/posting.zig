@@ -92,6 +92,7 @@ pub const PostingDeltaTailStats = struct {
     tombstones_after_generation: usize = 0,
     encoded_key_bytes: usize = 0,
     encoded_value_bytes: usize = 0,
+    max_sequence_after_generation: u64 = 0,
 };
 
 pub const FoldDeltaTailResult = struct {
@@ -1052,6 +1053,7 @@ pub const PostingFormat = struct {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
         }
         return stats;
     }
@@ -1085,6 +1087,7 @@ pub const PostingFormat = struct {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
             scratch.appendDeltaRecordAssumeCapacity(record);
         }
         return stats;
@@ -1105,6 +1108,7 @@ pub const PostingFormat = struct {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
             try applyPostingOverlayRecord(alloc, scratch, record);
         }
         return stats;
@@ -1415,6 +1419,7 @@ pub const PostingBacklogStats = struct {
     max_tombstone_tail_records: u64 = 0,
     max_delta_tail_key_bytes: u64 = 0,
     max_delta_tail_value_bytes: u64 = 0,
+    max_delta_tail_sequence: u64 = 0,
     max_delta_to_base_ratio_bps: u64 = 0,
     overfull_postings: u64 = 0,
     postings_at_capacity: u64 = 0,
@@ -1430,7 +1435,7 @@ pub const PostingBacklogStats = struct {
 
     pub fn write(self: PostingBacklogStats, writer: *std.Io.Writer) !void {
         try writer.print(
-            "posting_backlog scanned_nodes={d} scanned_postings={d} dirty_postings={d} centroid_dirty_postings={d} payload_dirty_postings={d} min_dirty_mutation_version={d} max_dirty_version_age={d} delta_tail_postings={d} max_delta_tail_records={d} max_tombstone_tail_records={d} max_delta_tail_key_bytes={d} max_delta_tail_value_bytes={d} max_delta_to_base_ratio_bps={d} overfull_postings={d} postings_at_capacity={d} max_over_capacity_members={d} max_centroid_version_lag={d} max_payload_version_lag={d} max_mutation_version={d} skipped_missing={d}\n",
+            "posting_backlog scanned_nodes={d} scanned_postings={d} dirty_postings={d} centroid_dirty_postings={d} payload_dirty_postings={d} min_dirty_mutation_version={d} max_dirty_version_age={d} delta_tail_postings={d} max_delta_tail_records={d} max_tombstone_tail_records={d} max_delta_tail_key_bytes={d} max_delta_tail_value_bytes={d} max_delta_tail_sequence={d} max_delta_to_base_ratio_bps={d} overfull_postings={d} postings_at_capacity={d} max_over_capacity_members={d} max_centroid_version_lag={d} max_payload_version_lag={d} max_mutation_version={d} skipped_missing={d}\n",
             .{
                 self.scanned_nodes,
                 self.scanned_postings,
@@ -1444,6 +1449,7 @@ pub const PostingBacklogStats = struct {
                 self.max_tombstone_tail_records,
                 self.max_delta_tail_key_bytes,
                 self.max_delta_tail_value_bytes,
+                self.max_delta_tail_sequence,
                 self.max_delta_to_base_ratio_bps,
                 self.overfull_postings,
                 self.postings_at_capacity,
@@ -2039,6 +2045,7 @@ pub const PostingStore = struct {
             out.records += stats.records;
             out.records_after_generation += stats.records_after_generation;
             out.tombstones_after_generation += stats.tombstones_after_generation;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
             out.encoded_key_bytes += entry.key.len;
             out.encoded_value_bytes += entry.value.len;
             maybe_entry = try cursor.next();
@@ -2083,6 +2090,7 @@ pub const PostingStore = struct {
                 if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 out.stats.records_after_generation += 1;
                 if (record.op == .tombstone) out.stats.tombstones_after_generation += 1;
+                out.stats.max_sequence_after_generation = @max(out.stats.max_sequence_after_generation, record.sequence);
                 if (prefer_compact_records and !out.use_overlay_plan) {
                     if (scratch.compactDeltaRecordCount() < compact_sorted_delta_max_records) {
                         try scratch.ensureCompactDeltaCapacity(alloc, scratch.compactDeltaRecordCount() + 1);
@@ -4421,8 +4429,12 @@ test "posting store persists base records and appends deltas through namespace h
     const delta_stats = try PostingStore.deltaTailStats(&index, &txn, 9, std.math.maxInt(u64));
     try std.testing.expectEqual(@as(usize, 1), delta_stats.records);
     try std.testing.expectEqual(@as(usize, 0), delta_stats.records_after_generation);
+    try std.testing.expectEqual(@as(u64, 0), delta_stats.max_sequence_after_generation);
     try std.testing.expectEqual(index.delta_entries.items[0].key.len, delta_stats.encoded_key_bytes);
     try std.testing.expectEqual(index.delta_entries.items[0].value.len, delta_stats.encoded_value_bytes);
+    const live_delta_stats = try PostingStore.deltaTailStats(&index, &txn, 9, 0);
+    try std.testing.expectEqual(@as(usize, 1), live_delta_stats.records_after_generation);
+    try std.testing.expectEqual(@as(u64, 12), live_delta_stats.max_sequence_after_generation);
 }
 
 test "posting store delete artifacts removes base centroid and delta tail families" {

@@ -1036,6 +1036,7 @@ fn updatePostingTailBacklogStats(
     result.max_tombstone_tail_records = @max(result.max_tombstone_tail_records, tombstone_records_after_base);
     result.max_delta_tail_key_bytes = @max(result.max_delta_tail_key_bytes, @as(u64, @intCast(delta_stats.encoded_key_bytes)));
     result.max_delta_tail_value_bytes = @max(result.max_delta_tail_value_bytes, @as(u64, @intCast(delta_stats.encoded_value_bytes)));
+    result.max_delta_tail_sequence = @max(result.max_delta_tail_sequence, delta_stats.max_sequence_after_generation);
     result.max_delta_to_base_ratio_bps = @max(result.max_delta_to_base_ratio_bps, ratio_bps);
 }
 

@@ -8856,6 +8856,7 @@ pub const DB = struct {
             .max_tombstone_tail_records = backlog.max_tombstone_tail_records,
             .max_delta_tail_key_bytes = backlog.max_delta_tail_key_bytes,
             .max_delta_tail_value_bytes = backlog.max_delta_tail_value_bytes,
+            .max_delta_tail_sequence = backlog.max_delta_tail_sequence,
             .max_delta_to_base_ratio_bps = backlog.max_delta_to_base_ratio_bps,
             .overfull_postings = backlog.overfull_postings,
             .postings_at_capacity = backlog.postings_at_capacity,

@@ -995,6 +995,7 @@ fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.type
     dst.max_tombstone_tail_records = @max(dst.max_tombstone_tail_records, src.max_tombstone_tail_records);
     dst.max_delta_tail_key_bytes = @max(dst.max_delta_tail_key_bytes, src.max_delta_tail_key_bytes);
     dst.max_delta_tail_value_bytes = @max(dst.max_delta_tail_value_bytes, src.max_delta_tail_value_bytes);
+    dst.max_delta_tail_sequence = @max(dst.max_delta_tail_sequence, src.max_delta_tail_sequence);
     dst.max_delta_to_base_ratio_bps = @max(dst.max_delta_to_base_ratio_bps, src.max_delta_to_base_ratio_bps);
     dst.overfull_postings += src.overfull_postings;
     dst.postings_at_capacity += src.postings_at_capacity;
@@ -1811,6 +1812,8 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.max_delta_tail_key_bytes);
     try out.appendSlice(alloc, ",\"max_delta_tail_value_bytes\":");
     try appendIntValue(alloc, out, stats.max_delta_tail_value_bytes);
+    try out.appendSlice(alloc, ",\"max_delta_tail_sequence\":");
+    try appendIntValue(alloc, out, stats.max_delta_tail_sequence);
     try out.appendSlice(alloc, ",\"max_delta_to_base_ratio_bps\":");
     try appendIntValue(alloc, out, stats.max_delta_to_base_ratio_bps);
     try out.appendSlice(alloc, ",\"overfull_postings\":");
@@ -3561,6 +3564,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
         .max_tombstone_tail_records = 3,
         .max_delta_tail_key_bytes = 180,
         .max_delta_tail_value_bytes = 640,
+        .max_delta_tail_sequence = 900,
         .max_delta_to_base_ratio_bps = 2500,
         .overfull_postings = 1,
         .postings_at_capacity = 5,
@@ -3602,6 +3606,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
         .max_tombstone_tail_records = 9,
         .max_delta_tail_key_bytes = 120,
         .max_delta_tail_value_bytes = 1024,
+        .max_delta_tail_sequence = 1200,
         .max_delta_to_base_ratio_bps = 5000,
         .overfull_postings = 2,
         .postings_at_capacity = 4,
@@ -3643,6 +3648,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
     try std.testing.expectEqual(@as(u64, 9), stats.max_tombstone_tail_records);
     try std.testing.expectEqual(@as(u64, 180), stats.max_delta_tail_key_bytes);
     try std.testing.expectEqual(@as(u64, 1024), stats.max_delta_tail_value_bytes);
+    try std.testing.expectEqual(@as(u64, 1200), stats.max_delta_tail_sequence);
     try std.testing.expectEqual(@as(u64, 5000), stats.max_delta_to_base_ratio_bps);
     try std.testing.expectEqual(@as(u64, 3), stats.overfull_postings);
     try std.testing.expectEqual(@as(u64, 9), stats.postings_at_capacity);
@@ -3665,6 +3671,7 @@ test "hbc posting status includes layout debt counters and maintenance policy" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"policy_max_over_capacity_reassignment_members\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"max_delta_tail_key_bytes\":180") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"max_delta_tail_value_bytes\":1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"max_delta_tail_sequence\":1200") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"overfull_postings\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"postings_at_capacity\":9") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"maintenance_boundary_reassignment_capacity_skips\":17") != null);

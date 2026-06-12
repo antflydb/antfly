@@ -1874,6 +1874,7 @@ pub const HbcPostingStats = struct {
     max_tombstone_tail_records: u64 = 0,
     max_delta_tail_key_bytes: u64 = 0,
     max_delta_tail_value_bytes: u64 = 0,
+    max_delta_tail_sequence: u64 = 0,
     max_delta_to_base_ratio_bps: u64 = 0,
     overfull_postings: u64 = 0,
     postings_at_capacity: u64 = 0,
