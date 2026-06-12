@@ -1241,6 +1241,7 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
+    try registerMcpRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
 
@@ -1292,6 +1293,19 @@ fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 
 fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return ctx.json(.{ .status = "ready" });
+}
+
+fn registerMcpRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    const mcp_paths = [_][]const u8{
+        routes.mcp_v1,
+        routes.mcp_v1_prefix ++ "*",
+    };
+    inline for (mcp_paths) |path| {
+        try server.get(path, mcpBridgeHandler);
+        try server.post(path, mcpBridgeHandler);
+        try server.delete(path, mcpBridgeHandler);
+    }
 }
 
 fn registerAntfarmRoutes(server: anytype) !void {
@@ -1595,8 +1609,44 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     return AntflyApiHandler.respond(ctx, &resp);
 }
 
+fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const server = active_api_server orelse {
+        _ = ctx.status(503);
+        return ctx.text("not ready");
+    };
+
+    const method: http_common.Method = switch (ctx.request.method) {
+        .GET => .GET,
+        .POST => .POST,
+        .DELETE => .DELETE,
+        else => {
+            _ = ctx.status(405);
+            return ctx.text("method not allowed");
+        },
+    };
+
+    const body_data = (try ctx.body()) orelse "";
+    const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(antfly.public_api.http_server.trusted_principal_header)) |trusted_principal| blk: {
+        const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
+        headers[0] = .{ .name = antfly.public_api.http_server.trusted_principal_header, .value = trusted_principal };
+        break :blk headers;
+    } else &.{};
+
+    const legacy_req = http_common.HttpRequest{
+        .method = method,
+        .uri = ctx.request.uri.raw,
+        .headers = trusted_principal_headers,
+        .authorization = ctx.header("authorization"),
+        .content_type = ctx.header("content-type"),
+        .body = body_data,
+    };
+
+    var resp = try server.handle(legacy_req);
+    return AntflyApiHandler.respond(ctx, &resp);
+}
+
 // Module-level pointer set by the serve thread before listen().
-// Used by explicitly registered internal bridge handlers.
+// Used by explicitly registered protocol/internal bridge handlers.
 var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
 
 // ---------------------------------------------------------------
@@ -1937,6 +1987,7 @@ fn parseBoolFlag(raw: []const u8) ?bool {
 const RecordingRouteMethod = enum {
     get,
     post,
+    delete,
 };
 
 const RecordingRoute = struct {
@@ -1966,6 +2017,10 @@ const RecordingServer = struct {
 
     pub fn post(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
         try self.append(.post, path);
+    }
+
+    pub fn delete(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+        try self.append(.delete, path);
     }
 
     fn hasRoute(self: *const @This(), method: RecordingRouteMethod, path: []const u8) bool {
@@ -2078,6 +2133,23 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_prepare_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_resolve_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_status_suffix));
+}
+
+test "swarm runtime registers mcp routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerMcpRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const routes = antfly.public_api.http_routes.Routes;
+    try std.testing.expect(server.hasRoute(.get, routes.mcp_v1));
+    try std.testing.expect(server.hasRoute(.post, routes.mcp_v1));
+    try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1));
+    try std.testing.expect(server.hasRoute(.get, routes.mcp_v1_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.post, routes.mcp_v1_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
 test "swarm runtime registers antfarm static routes" {
