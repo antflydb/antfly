@@ -139,6 +139,14 @@ export type {
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
   ClassificationTransformationResult,
+  // Connection types
+  ConnectedModel,
+  ConnectedModelType,
+  Connection,
+  ConnectionKind,
+  ConnectionProviderType,
+  ConnectionStatus,
+  ConnectionsResponse,
   CreateTableRequest,
   CreateUserRequest,
   DenseEmbedding,
@@ -180,6 +188,7 @@ export type {
   IndexConfig,
   IndexStatus,
   IndexType,
+  InferenceProviderConnection,
   // Join types
   JoinClause,
   JoinCondition,
@@ -193,6 +202,7 @@ export type {
   MergeProfile,
   MultiBatchRequest,
   MultiBatchResult,
+  ObjectStoreConnection,
   PathWeightMode,
   Permission,
   PermissionType,
@@ -207,6 +217,7 @@ export type {
   QueryResponses,
   QueryResult,
   QueryStrategy,
+  RemoteContentHttpConnection,
   RerankerConfig,
   RerankerProfile,
   ResourceType,

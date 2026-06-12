@@ -161,6 +161,18 @@ export type AggregationDateRange = components["schemas"]["AggregationDateRange"]
 export type DistanceRange = components["schemas"]["DistanceRange"];
 export type AntflyType = components["schemas"]["AntflyType"];
 
+// Connection types
+export type ConnectionsResponse = components["schemas"]["ConnectionsResponse"];
+export type Connection = components["schemas"]["Connection"];
+export type ConnectionKind = components["schemas"]["ConnectionKind"];
+export type ConnectionStatus = components["schemas"]["ConnectionStatus"];
+export type ConnectionProviderType = components["schemas"]["ConnectionProviderType"];
+export type ConnectedModel = components["schemas"]["ConnectedModel"];
+export type ConnectedModelType = components["schemas"]["ConnectedModelType"];
+export type InferenceProviderConnection = components["schemas"]["InferenceProviderConnection"];
+export type ObjectStoreConnection = components["schemas"]["ObjectStoreConnection"];
+export type RemoteContentHttpConnection = components["schemas"]["RemoteContentHttpConnection"];
+
 // Model and reranker types
 export type EmbedderConfig = components["schemas"]["EmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];

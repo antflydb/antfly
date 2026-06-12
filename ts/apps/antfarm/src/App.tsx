@@ -26,6 +26,7 @@ import AntflyRerankingPlaygroundPage from "./pages/AntflyRerankingPlaygroundPage
 import ChatPlaygroundPage from "./pages/ChatPlaygroundPage";
 import ChunkingPlaygroundPage from "./pages/ChunkingPlaygroundPage";
 import ClusterPage from "./pages/ClusterPage";
+import ConnectionsPage from "./pages/ConnectionsPage";
 import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
@@ -91,6 +92,7 @@ function AppContent() {
                           <Route path="/secrets" element={<SecretsPage />} />
                         )}
                         <Route path="/cluster" element={<ClusterPage />} />
+                        <Route path="/connections" element={<ConnectionsPage />} />
                         <Route path="/data/playground/evals" element={<EvalsPlaygroundPage />} />
                         <Route path="/data/playground/rag" element={<RagPlaygroundPage />} />
                         <Route path="/data/playground/chat" element={<ChatPlaygroundPage />} />
