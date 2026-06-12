@@ -103,6 +103,7 @@ pub const PostingSegmentDirectoryCompactionStats = posting_segment.DirectoryComp
 pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCompactionResult;
 pub const PostingSegmentDirectoryGarbageCollectionStats = posting_segment.DirectoryGarbageCollectionStats;
 pub const PostingSegmentDirectoryVerificationStats = posting_segment.DirectoryVerificationStats;
+pub const PostingSegmentDirectoryCopyStats = posting_segment.DirectoryCopyStats;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
 pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWriterToDirectoryAlloc;
@@ -110,6 +111,7 @@ pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuil
 pub const compactPostingSegmentDirectoryStoreAlloc = posting_segment.compactDirectoryStoreAlloc;
 pub const collectPostingSegmentDirectoryGarbageAlloc = posting_segment.collectDirectoryGarbageAlloc;
 pub const verifyPostingSegmentDirectoryStoreAlloc = posting_segment.verifyDirectoryStoreAlloc;
+pub const copyPostingSegmentDirectoryStoreAlloc = posting_segment.copyDirectoryStoreAlloc;
 pub const writePostingSegmentFileAlloc = posting_segment.writeSegmentFileAlloc;
 pub const writePostingSegmentManifestFileAlloc = posting_segment.writeManifestFileAlloc;
 pub const readPostingSegmentFileAlloc = posting_segment.readSegmentFileAlloc;
@@ -237,6 +239,10 @@ test "posting segment typed base delta facade round trips through directory stor
 
 test "posting segment directory verification reports stats and rejects corruption" {
     try posting_segment.testDirectoryVerificationReportsStatsAndRejectsCorruption();
+}
+
+test "posting segment directory copy publishes manifest after segments" {
+    try posting_segment.testDirectoryCopyPublishesManifestAfterSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {

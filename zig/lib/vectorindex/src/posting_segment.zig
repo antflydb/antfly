@@ -216,6 +216,14 @@ pub const DirectoryVerificationStats = struct {
     delta_records: usize = 0,
 };
 
+pub const DirectoryCopyStats = struct {
+    manifest_segments: usize = 0,
+    manifest_bytes: usize = 0,
+    segment_files: usize = 0,
+    segment_bytes: usize = 0,
+    entries: usize = 0,
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -768,6 +776,40 @@ pub fn verifyDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, 
         }
     }
 
+    return stats;
+}
+
+pub fn copyDirectoryStoreAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    source_dir: std.Io.Dir,
+    destination_dir: std.Io.Dir,
+    options: OpenStoreOptions,
+) !DirectoryCopyStats {
+    const manifest_data = try source_dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes));
+    defer alloc.free(manifest_data);
+
+    var manifest = try decodeManifestAlloc(alloc, manifest_data);
+    defer manifest.deinit(alloc);
+
+    var stats = DirectoryCopyStats{
+        .manifest_segments = manifest.segments.len,
+        .manifest_bytes = manifest_data.len,
+    };
+
+    for (manifest.segments) |entry| {
+        if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        const data = try readSegmentFileAlloc(alloc, io, source_dir, entry.path, entry.meta.byte_len);
+        defer alloc.free(data);
+        try validateSegmentDataMatchesMeta(data, entry.meta);
+        try writeFileAtomicallyAlloc(alloc, io, destination_dir, entry.path, data);
+
+        stats.segment_files += 1;
+        stats.segment_bytes += data.len;
+        stats.entries += entry.meta.entry_count;
+    }
+
+    try writeManifestFileAlloc(alloc, io, destination_dir, options.manifest_path, manifest_data);
     return stats;
 }
 
@@ -2752,6 +2794,56 @@ pub fn testDirectoryVerificationReportsStatsAndRejectsCorruption() !void {
     try std.testing.expectError(error.CorruptedPostingSegment, verifyDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{}));
 }
 
+pub fn testDirectoryCopyPublishesManifestAfterSegments() !void {
+    const alloc = std.testing.allocator;
+    var source = std.testing.tmpDir(.{});
+    defer source.cleanup();
+    var destination = std.testing.tmpDir(.{});
+    defer destination.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, source.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence = (@as(u64, 3) << 32) | 1;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, source.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    const stats = try copyDirectoryStoreAlloc(alloc, std.testing.io, source.dir, destination.dir, .{});
+    try std.testing.expectEqual(@as(usize, 2), stats.manifest_segments);
+    try std.testing.expect(stats.manifest_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 2), stats.segment_files);
+    try std.testing.expectEqual(committed_1.entry.meta.byte_len + committed_2.entry.meta.byte_len, stats.segment_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.entries);
+
+    var copied = try openStoreFromDirectoryAlloc(alloc, std.testing.io, destination.dir, .{});
+    defer copied.deinit(alloc);
+    const snapshot = copied.snapshot();
+    const members = (try snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(members);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, members);
+
+    var failed_destination = std.testing.tmpDir(.{});
+    defer failed_destination.cleanup();
+    try source.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_2.entry.path,
+        .data = "not a segment",
+    });
+    try std.testing.expectError(error.CorruptedPostingSegment, copyDirectoryStoreAlloc(alloc, std.testing.io, source.dir, failed_destination.dir, .{}));
+    try std.testing.expectError(error.FileNotFound, failed_destination.dir.readFileAlloc(std.testing.io, default_manifest_path, alloc, .limited(1)));
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2940,6 +3032,10 @@ test "posting segment typed base delta facade round trips through directory stor
 
 test "posting segment directory verification reports stats and rejects corruption" {
     try testDirectoryVerificationReportsStatsAndRejectsCorruption();
+}
+
+test "posting segment directory copy publishes manifest after segments" {
+    try testDirectoryCopyPublishesManifestAfterSegments();
 }
 
 test "posting segment compacts segments to live posting entries" {
