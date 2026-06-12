@@ -1078,7 +1078,7 @@ fn saveCentroidDirectoryForLeaf(self: anytype, txn: anytype, node: *const types.
 
 fn ensurePostingBaseExists(self: anytype, txn: anytype, node: *const types.Node) !void {
     if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) return;
-    _ = posting.PostingStore.loadBaseStats(self, txn, node.id, isNotFoundGeneric) catch |err| {
+    _ = posting.PostingStore.loadBaseHeader(self, txn, node.id, isNotFoundGeneric) catch |err| {
         if (!isNotFoundGeneric(err)) return err;
         try posting.PostingStore.saveBase(self, txn, .{
             .posting_id = node.id,
@@ -1160,8 +1160,8 @@ fn updateBaseDeltaParentMetadata(
             if (packed_value.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
             break :blk packed_value.ids_bytes.len / @sizeOf(u64);
         }
-        const base_stats = try posting.PostingStore.loadBaseStats(self, txn, node_id, isNotFoundGeneric);
-        break :blk base_stats.header.member_count;
+        const base_header = try posting.PostingStore.loadBaseHeader(self, txn, node_id, isNotFoundGeneric);
+        break :blk base_header.member_count;
     };
 
     try posting.PostingStore.saveCentroidDirectoryRecord(self, txn, .{

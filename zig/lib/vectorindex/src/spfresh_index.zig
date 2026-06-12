@@ -1017,14 +1017,13 @@ fn updatePostingTailBacklogStats(
     posting_id: u64,
     result: *posting.PostingBacklogStats,
 ) !void {
-    const base_data = posting.PostingStore.loadBaseData(self, txn, posting_id, isNotFoundGeneric) catch |err| {
+    const base_header = posting.PostingStore.loadBaseHeader(self, txn, posting_id, isNotFoundGeneric) catch |err| {
         if (isNotFoundGeneric(err)) {
             result.skipped_missing += 1;
             return;
         }
         return err;
     };
-    const base_header = try posting.PostingFormat.decodeBaseHeader(base_data);
     const delta_stats = try posting.PostingStore.deltaTailStats(self, txn, posting_id, base_header.generation);
     const delta_records_after_base: u64 = @intCast(delta_stats.records_after_generation);
     const tombstone_records_after_base: u64 = @intCast(delta_stats.tombstones_after_generation);

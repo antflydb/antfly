@@ -1898,6 +1898,11 @@ pub const PostingStore = struct {
         return try PostingFormat.decodeBase(index.alloc, data);
     }
 
+    pub fn loadBaseHeader(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseHeader {
+        const data = try loadBaseData(index, txn, posting_id, is_not_found);
+        return try PostingFormat.decodeBaseHeader(data);
+    }
+
     pub fn loadBaseStats(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !PostingBaseStats {
         const data = try loadBaseData(index, txn, posting_id, is_not_found);
         return try PostingFormat.decodeBaseStats(data);
@@ -4335,6 +4340,10 @@ test "posting store persists base records and appends deltas through namespace h
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(PostingId, 9), loaded.posting_id);
     try std.testing.expectEqualSlices(VectorId, members[0..], loaded.members);
+    const base_header = try PostingStore.loadBaseHeader(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
+    try std.testing.expectEqual(@as(PostingId, 9), base_header.posting_id);
+    try std.testing.expectEqual(@as(u64, 4), base_header.generation);
+    try std.testing.expectEqual(members.len, base_header.member_count);
     const base_stats = try PostingStore.loadBaseStats(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
     try std.testing.expectEqual(@as(PostingId, 9), base_stats.header.posting_id);
     try std.testing.expectEqual(@as(u64, 4), base_stats.header.generation);

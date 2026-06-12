@@ -84,10 +84,10 @@ Current status:
   can reuse materialized members without serving entries across base folds or
   logical posting mutations; a stored max-delta-sequence high-water mark remains
   the next refinement.
-- HBC maintenance paths that only need to validate a posting base or read its
-  member count now use `PostingStore.loadBaseStats` instead of decoding an
-  owned member array, moving the specialized count/stat base-decode path into
-  live code.
+- HBC maintenance paths that only need base generation/member count now use
+  `PostingStore.loadBaseHeader`, while paths that need structural validation
+  use `PostingStore.loadBaseStats`; both avoid decoding an owned member array
+  and keep specialized base-decode modes in live code.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full
