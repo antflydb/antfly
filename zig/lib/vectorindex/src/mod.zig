@@ -108,6 +108,8 @@ pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCom
 pub const PostingSegmentDirectoryCompactionPlanOptions = posting_segment.DirectoryCompactionPlanOptions;
 pub const PostingSegmentDirectoryCompactionPlanStats = posting_segment.DirectoryCompactionPlanStats;
 pub const PostingSegmentDirectoryCompactionPlan = posting_segment.DirectoryCompactionPlan;
+pub const PostingSegmentDirectoryMaintenanceOptions = posting_segment.DirectoryMaintenanceOptions;
+pub const PostingSegmentDirectoryMaintenanceStats = posting_segment.DirectoryMaintenanceStats;
 pub const PostingSegmentDirectoryGarbageCollectionStats = posting_segment.DirectoryGarbageCollectionStats;
 pub const PostingSegmentDirectoryTemporaryCleanupStats = posting_segment.DirectoryTemporaryCleanupStats;
 pub const PostingSegmentDirectoryVerificationStats = posting_segment.DirectoryVerificationStats;
@@ -119,6 +121,7 @@ pub const commitPostingSegmentWriterToDirectoryAlloc = posting_segment.commitWri
 pub const commitBuiltPostingSegmentToDirectoryAlloc = posting_segment.commitBuiltSegmentToDirectoryAlloc;
 pub const compactPostingSegmentDirectoryStoreAlloc = posting_segment.compactDirectoryStoreAlloc;
 pub const compactPostingSegmentDirectoryStoreSegmentIdsAlloc = posting_segment.compactDirectoryStoreSegmentIdsAlloc;
+pub const maintainPostingSegmentDirectoryStoreAlloc = posting_segment.maintainDirectoryStoreAlloc;
 pub const planPostingSegmentDirectoryCompactionAlloc = posting_segment.planDirectoryCompactionAlloc;
 pub const planPostingSegmentDirectoryCompactionFromDirectoryAlloc = posting_segment.planDirectoryCompactionFromDirectoryAlloc;
 pub const summarizePostingSegmentManifest = posting_segment.summarizeManifest;
@@ -260,6 +263,10 @@ test "posting segment directory compaction can replace selected segments" {
 
 test "posting segment directory compaction plan from directory feeds selected compaction" {
     try posting_segment.testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction();
+}
+
+test "posting segment directory maintenance compacts and cleans in one step" {
+    try posting_segment.testDirectoryMaintenanceCompactsAndCleansInOneStep();
 }
 
 test "posting segment directory manifest summary reads only manifest" {

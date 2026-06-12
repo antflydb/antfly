@@ -181,7 +181,10 @@ Current status:
   caps and flush them through the existing atomic segment+manifest commit path,
   including coalescing individual posting delta records into one encoded
   delta-tail value per posting, which gives the future runtime backend an
-  explicit micro-batch append primitive. Runtime
+  explicit micro-batch append primitive. A directory maintenance step now
+  composes temp cleanup, manifest-only compaction planning, selected segment
+  compaction, and orphan collection into one bounded stats-returning call for
+  future background maintenance wiring. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment

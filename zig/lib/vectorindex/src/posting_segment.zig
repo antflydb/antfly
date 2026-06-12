@@ -276,6 +276,23 @@ pub const DirectoryCompactionPlan = struct {
     }
 };
 
+pub const DirectoryMaintenanceOptions = struct {
+    commit: CommitOptions = .{},
+    plan: DirectoryCompactionPlanOptions = .{},
+    compact: bool = true,
+    collect_orphan_segments: bool = true,
+    collect_temporary_files: bool = true,
+};
+
+pub const DirectoryMaintenanceStats = struct {
+    manifest: DirectoryManifestStats = .{},
+    plan: DirectoryCompactionPlanStats = .{},
+    compacted: bool = false,
+    compaction: DirectoryCompactionStats = .{},
+    garbage: DirectoryGarbageCollectionStats = .{},
+    temporary: DirectoryTemporaryCleanupStats = .{},
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -1122,6 +1139,51 @@ pub fn compactDirectoryStoreSegmentIdsAlloc(
             .manifest_bytes = replacement.encoded.len,
         },
     };
+}
+
+pub fn maintainDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: DirectoryMaintenanceOptions) !DirectoryMaintenanceStats {
+    const open_options = OpenStoreOptions{
+        .manifest_path = options.commit.manifest_path,
+        .max_manifest_bytes = options.commit.max_manifest_bytes,
+        .max_segment_bytes = options.commit.max_segment_bytes,
+    };
+    var stats = DirectoryMaintenanceStats{};
+
+    if (options.collect_temporary_files) {
+        stats.temporary = try collectDirectoryTemporaryGarbageAlloc(alloc, io, dir, open_options);
+    }
+
+    var manifest = readManifestFromDirectoryAlloc(alloc, io, dir, open_options) catch |err| switch (err) {
+        error.FileNotFound => return stats,
+        else => return err,
+    };
+    defer manifest.deinit(alloc);
+
+    const entries = try manifestEntryViewAlloc(alloc, manifest.segments);
+    defer alloc.free(entries);
+    const manifest_view = Manifest{
+        .next_segment_id = manifest.next_segment_id,
+        .segments = entries,
+    };
+    stats.manifest = try summarizeManifest(manifest_view);
+
+    if (options.compact) {
+        var plan = try planDirectoryCompactionAlloc(alloc, manifest_view, options.plan);
+        defer plan.deinit(alloc);
+        stats.plan = plan.stats;
+        if (plan.segment_ids.len != 0) {
+            var compacted = try compactDirectoryStoreSegmentIdsAlloc(alloc, io, dir, plan.segment_ids, options.commit);
+            defer compacted.deinit(alloc);
+            stats.compacted = true;
+            stats.compaction = compacted.stats;
+        }
+    }
+
+    if (options.collect_orphan_segments) {
+        stats.garbage = try collectDirectoryGarbageAlloc(alloc, io, dir, open_options);
+    }
+
+    return stats;
 }
 
 pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryGarbageCollectionStats {
@@ -3624,6 +3686,78 @@ pub fn testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction() !void {
     try std.testing.expectEqual(compacted.entry.meta.segment_id, store.segments[1].meta.segment_id);
 }
 
+pub fn testDirectoryMaintenanceCompactsAndCleansInOneStep() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    var writer_3 = Writer.init(alloc);
+    defer writer_3.deinit();
+    try writer_3.appendPostingBase(.{
+        .posting_id = 9,
+        .generation = 1,
+        .members = &.{90},
+    });
+    var committed_3 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_3, .{});
+    defer committed_3.deinit(alloc);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000000099.afps",
+        .data = "orphan segment",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "postings/0000000000000100.afps.tmp",
+        .data = "partial segment",
+    });
+
+    const stats = try maintainDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{
+        .plan = .{ .max_input_segments = 2 },
+    });
+    try std.testing.expectEqual(@as(usize, 3), stats.manifest.segments);
+    try std.testing.expectEqual(@as(usize, 2), stats.plan.selected_segments);
+    try std.testing.expect(stats.plan.stopped_on_segment_limit);
+    try std.testing.expect(stats.compacted);
+    try std.testing.expectEqual(@as(usize, 2), stats.compaction.manifest.removed_segments);
+    try std.testing.expectEqual(@as(usize, 1), stats.compaction.manifest.added_segments);
+    try std.testing.expectEqual(@as(usize, 1), stats.temporary.deleted_temp_files);
+    try std.testing.expectEqual(@as(usize, 3), stats.garbage.deleted_segment_files);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, committed_1.entry.path, alloc, .limited(1)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, committed_2.entry.path, alloc, .limited(1)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, "postings/0000000000000099.afps", alloc, .limited(1)));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(std.testing.io, "postings/0000000000000100.afps.tmp", alloc, .limited(1)));
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), store.segments.len);
+    try std.testing.expectEqual(committed_3.entry.meta.segment_id, store.segments[0].meta.segment_id);
+    try std.testing.expectEqual(stats.compaction.segment_id, store.segments[1].meta.segment_id);
+
+    const snapshot = store.snapshot();
+    const posting_7 = (try snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(posting_7);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, posting_7);
+}
+
 pub fn testDirectoryManifestSummaryReadsOnlyManifest() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4301,6 +4435,10 @@ test "posting segment directory compaction can replace selected segments" {
 
 test "posting segment directory compaction plan from directory feeds selected compaction" {
     try testDirectoryCompactionPlanFromDirectoryFeedsSelectedCompaction();
+}
+
+test "posting segment directory maintenance compacts and cleans in one step" {
+    try testDirectoryMaintenanceCompactsAndCleansInOneStep();
 }
 
 test "posting segment directory manifest summary reads only manifest" {
