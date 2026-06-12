@@ -80,7 +80,8 @@ fn readProcFile(path: []const u8, buf: []u8) ?[]const u8 {
     defer io_impl.deinit();
     var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
     defer file.close(io_impl.io());
-    const n = file.readAll(io_impl.io(), buf) catch return null;
+    var reader = file.reader(io_impl.io(), &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
     return buf[0..n];
 }
 
