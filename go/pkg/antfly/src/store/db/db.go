@@ -1584,9 +1584,13 @@ func (db *DBImpl) OpenIndexes(dir string) error {
 
 func (s *DBImpl) Close() (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
+	var closeErr error
+	if err := s.CloseShadowIndexManager(); err != nil {
+		closeErr = errors.Join(closeErr, fmt.Errorf("closing shadow indexes: %w", err))
+	}
 	if im := s.getIndexManager(); im != nil {
 		if err := im.Close(context.Background()); err != nil {
-			return fmt.Errorf("closing indexes: %w", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("closing indexes: %w", err))
 		}
 	}
 	// Take write lock and set pdb to nil before closing to prevent concurrent access
@@ -1598,16 +1602,16 @@ func (s *DBImpl) Close() (err error) {
 
 	if pdb != nil {
 		if err := pdb.Close(); err != nil {
-			return fmt.Errorf("closing Pebble database: %w", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("closing Pebble database: %w", err))
 		}
 	}
 	// Close S3 storage if configured
 	if s.s3Storage != nil {
 		if err := s.s3Storage.Close(); err != nil {
-			return fmt.Errorf("closing S3 storage: %w", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("closing S3 storage: %w", err))
 		}
 	}
-	return nil
+	return closeErr
 }
 
 // getPebbleOpts creates and configures Pebble options, including S3 storage if enabled.
