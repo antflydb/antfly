@@ -2688,11 +2688,12 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d}",
+        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"posting_base_blocks\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d}",
         .{
             profile.posting_base_put_calls,
             profile.posting_base_key_bytes,
             profile.posting_base_value_bytes,
+            profile.posting_base_blocks,
             profile.centroid_directory_put_calls,
             profile.centroid_directory_key_bytes,
             profile.centroid_directory_value_bytes,

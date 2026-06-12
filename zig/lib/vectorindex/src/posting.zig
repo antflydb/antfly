@@ -1767,7 +1767,7 @@ pub const PostingStore = struct {
         defer index.alloc.free(encoded);
         const key = hbc.encodePostingBaseKey(&key_buf, base.posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
-        notePostingBasePut(index, key.len, encoded.len, base.members.len);
+        notePostingBasePut(index, key.len, encoded);
     }
 
     pub fn saveCentroidDirectoryRecord(index: anytype, txn: anytype, record: CentroidDirectoryRecord) !void {
@@ -1791,7 +1791,7 @@ pub const PostingStore = struct {
         const centroid_key = hbc.encodeCentroidDirectoryKey(&centroid_key_buf, record.posting_id);
         try index.putNamespaced(txn, .nodes, base_key, encoded_base);
         try index.putNamespaced(txn, .nodes, centroid_key, encoded_centroid);
-        notePostingBasePut(index, base_key.len, encoded_base.len, base.members.len);
+        notePostingBasePut(index, base_key.len, encoded_base);
         noteCentroidDirectoryPut(index, centroid_key.len, encoded_centroid.len);
     }
 
@@ -2537,11 +2537,11 @@ pub const PostingStore = struct {
         return estimated_bytes > options.max_materialized_bytes;
     }
 
-    fn saveEncodedBase(index: anytype, txn: anytype, posting_id: PostingId, encoded: []const u8, member_count: usize) !void {
+    fn saveEncodedBase(index: anytype, txn: anytype, posting_id: PostingId, encoded: []const u8) !void {
         var key_buf: [10]u8 = undefined;
         const key = hbc.encodePostingBaseKey(&key_buf, posting_id);
         try index.putNamespaced(txn, .nodes, key, encoded);
-        notePostingBasePut(index, key.len, encoded.len, member_count);
+        notePostingBasePut(index, key.len, encoded);
     }
 
     pub fn foldDeltaTailIntoBaseWithOptions(
@@ -2659,7 +2659,7 @@ pub const PostingStore = struct {
         var base_key_buf: [10]u8 = undefined;
         const written_base_key_bytes = hbc.encodePostingBaseKey(&base_key_buf, posting_id).len;
         const written_base_value_bytes = encoded.len;
-        try saveEncodedBase(index, txn, posting_id, encoded, materialized_len);
+        try saveEncodedBase(index, txn, posting_id, encoded);
         const deleted_tail = try deleteDeltaTail(index, txn, posting_id);
         notePostingDeltaFold(index, stats.records_after_generation, base_header.member_count, materialized_len, deleted_tail, written_base_key_bytes, written_base_value_bytes);
         return .{
@@ -3028,20 +3028,24 @@ fn deleteDeltaTail(index: anytype, txn: anytype, posting_id: PostingId) !DeleteD
     return stats;
 }
 
-fn notePostingBasePut(index: anytype, key_len: usize, value_len: usize, member_count: usize) void {
+fn notePostingBasePut(index: anytype, key_len: usize, encoded: []const u8) void {
     const Index = switch (@typeInfo(@TypeOf(index))) {
         .pointer => |ptr| ptr.child,
         else => @TypeOf(index),
     };
     if (comptime !@hasField(Index, "write_profile")) return;
+    const stats = PostingFormat.decodeBaseStats(encoded) catch return;
     index.write_profile.posting_base_put_calls += 1;
     index.write_profile.posting_base_key_bytes += @intCast(key_len);
-    index.write_profile.posting_base_value_bytes += @intCast(value_len);
+    index.write_profile.posting_base_value_bytes += @intCast(stats.encoded_len);
     if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_members")) {
-        index.write_profile.posting_base_members += @intCast(member_count);
+        index.write_profile.posting_base_members += @intCast(stats.header.member_count);
+    }
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_blocks")) {
+        index.write_profile.posting_base_blocks += @intCast(stats.block_count);
     }
     if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_fixed_width_value_bytes")) {
-        index.write_profile.posting_base_fixed_width_value_bytes += @intCast(PostingFormat.base_header_size + member_count * @sizeOf(VectorId));
+        index.write_profile.posting_base_fixed_width_value_bytes += @intCast(PostingFormat.base_header_size + stats.header.member_count * @sizeOf(VectorId));
     }
 }
 
@@ -4179,6 +4183,9 @@ test "posting store persists base records and appends deltas through namespace h
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(PostingId, 9), loaded.posting_id);
     try std.testing.expectEqualSlices(VectorId, members[0..], loaded.members);
+    try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_base_put_calls);
+    try std.testing.expectEqual(@as(u64, members.len), index.write_profile.posting_base_members);
+    try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_base_blocks);
 
     try PostingStore.saveCentroidDirectoryRecord(&index, &txn, .{
         .posting_id = 9,

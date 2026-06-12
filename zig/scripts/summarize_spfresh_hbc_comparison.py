@@ -85,6 +85,9 @@ WRITE_COLUMNS = [
     "posting_base_fixed_width_value_bytes",
     "posting_base_value_bytes_vs_fixed_width",
     "posting_base_value_bytes_per_member",
+    "posting_base_blocks",
+    "posting_base_members_per_block",
+    "posting_base_value_bytes_per_block",
     "posting_base_decode_ns",
     "posting_base_decode_members",
     "posting_base_decode_ns_per_member",
@@ -575,6 +578,7 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "posting_base_value_bytes": mean(group, "posting_base_value_bytes"),
                 "posting_base_fixed_width_value_bytes": mean(group, "posting_base_fixed_width_value_bytes"),
                 "posting_base_members": mean(group, "posting_base_members"),
+                "posting_base_blocks": mean(group, "posting_base_blocks"),
                 "posting_base_decode_ns": preferred_mean(
                     group,
                     "post_write_warm_profile_posting_base_decode_ns",
@@ -938,6 +942,14 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["posting_base_value_bytes_per_member"] = safe_ratio(
             summary.get("posting_base_value_bytes"),
             summary.get("posting_base_members"),
+        )
+        summary["posting_base_members_per_block"] = safe_ratio(
+            summary.get("posting_base_members"),
+            summary.get("posting_base_blocks"),
+        )
+        summary["posting_base_value_bytes_per_block"] = safe_ratio(
+            summary.get("posting_base_value_bytes"),
+            summary.get("posting_base_blocks"),
         )
         summary["posting_base_decode_ns_per_member"] = safe_ratio(
             summary.get("posting_base_decode_ns"),
