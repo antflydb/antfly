@@ -204,6 +204,18 @@ pub const DirectoryGarbageCollectionStats = struct {
     deleted_segment_files: usize = 0,
 };
 
+pub const DirectoryVerificationStats = struct {
+    manifest_segments: usize = 0,
+    manifest_bytes: usize = 0,
+    segment_files: usize = 0,
+    segment_bytes: usize = 0,
+    entries: usize = 0,
+    base_records: usize = 0,
+    centroid_records: usize = 0,
+    delta_values: usize = 0,
+    delta_records: usize = 0,
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -717,6 +729,46 @@ pub fn openLazyStoreFromDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io
         .dir = dir,
         .options = options,
     };
+}
+
+pub fn verifyDirectoryStoreAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: OpenStoreOptions) !DirectoryVerificationStats {
+    const manifest_data = try dir.readFileAlloc(io, options.manifest_path, alloc, .limited(options.max_manifest_bytes));
+    defer alloc.free(manifest_data);
+
+    var manifest = try decodeManifestAlloc(alloc, manifest_data);
+    defer manifest.deinit(alloc);
+
+    var stats = DirectoryVerificationStats{
+        .manifest_segments = manifest.segments.len,
+        .manifest_bytes = manifest_data.len,
+    };
+
+    for (manifest.segments) |entry| {
+        if (entry.meta.byte_len > options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        const data = try readSegmentFileAlloc(alloc, io, dir, entry.path, entry.meta.byte_len);
+        defer alloc.free(data);
+        try validateSegmentDataMatchesMeta(data, entry.meta);
+
+        stats.segment_files += 1;
+        stats.segment_bytes += data.len;
+        stats.entries += entry.meta.entry_count;
+
+        var reader = try Reader.init(data);
+        var iter = reader.entries();
+        while (try iter.next()) |logical_entry| {
+            switch (logical_entry.kind) {
+                .base => stats.base_records += 1,
+                .centroid_directory => stats.centroid_records += 1,
+                .delta => {
+                    stats.delta_values += 1;
+                    var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(logical_entry.value);
+                    while (try delta_iter.next()) |_| stats.delta_records += 1;
+                },
+            }
+        }
+    }
+
+    return stats;
 }
 
 pub fn commitWriterToDirectoryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, writer: *Writer, options: CommitOptions) !SegmentCommitResult {
@@ -2645,6 +2697,61 @@ pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
     try std.testing.expect(missing == null);
 }
 
+pub fn testDirectoryVerificationReportsStatsAndRejectsCorruption() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20 },
+    });
+    try writer_1.appendCentroidDirectoryRecord(.{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 3,
+        .payload_version = 4,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const delta_sequence_1 = (@as(u64, 3) << 32) | 1;
+    const delta_sequence_2 = (@as(u64, 3) << 32) | 2;
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = delta_sequence_1, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = delta_sequence_2, .op = .insert, .vector_id = 30 },
+    });
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    const stats = try verifyDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{});
+    try std.testing.expectEqual(@as(usize, 2), stats.manifest_segments);
+    try std.testing.expect(stats.manifest_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 2), stats.segment_files);
+    try std.testing.expectEqual(committed_1.entry.meta.byte_len + committed_2.entry.meta.byte_len, stats.segment_bytes);
+    try std.testing.expectEqual(@as(usize, 3), stats.entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.base_records);
+    try std.testing.expectEqual(@as(usize, 1), stats.centroid_records);
+    try std.testing.expectEqual(@as(usize, 1), stats.delta_values);
+    try std.testing.expectEqual(@as(usize, 2), stats.delta_records);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_2.entry.path,
+        .data = "not a segment",
+    });
+    try std.testing.expectError(error.CorruptedPostingSegment, verifyDirectoryStoreAlloc(alloc, std.testing.io, tmp.dir, .{}));
+}
+
 pub fn testCompactsSegmentsToLivePostingEntries() !void {
     const alloc = std.testing.allocator;
     const old_base = try posting.PostingFormat.encodeBase(alloc, .{
@@ -2829,6 +2936,10 @@ test "posting segment lazy directory store loads delta tail" {
 
 test "posting segment typed base delta facade round trips through directory store" {
     try testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore();
+}
+
+test "posting segment directory verification reports stats and rejects corruption" {
+    try testDirectoryVerificationReportsStatsAndRejectsCorruption();
 }
 
 test "posting segment compacts segments to live posting entries" {

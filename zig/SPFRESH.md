@@ -151,8 +151,12 @@ Current status:
   writers now also have typed helpers for appending posting-base,
   posting-delta batch, and centroid-directory records, and eager/lazy snapshots
   can materialize the authoritative member view directly from segment-backed
-  base+delta values. Segment writers can also produce a manifest-ready built
-  segment with validated metadata and a stable segment path. Runtime
+  base+delta values. A directory verification pass now reads the current
+  manifest, validates every referenced segment checksum and metadata entry, and
+  returns manifest, segment-byte, entry, base, centroid, delta-value, and
+  delta-record counts for backup verification and resource accounting. Segment
+  writers can also produce a manifest-ready built segment with validated
+  metadata and a stable segment path. Runtime
   reads/writes still use the LSM-backed namespace. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments` is
   reserved and rejected until runtime reads/writes actually use the segment
