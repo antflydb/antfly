@@ -853,24 +853,38 @@ pub const PostingFormat = struct {
     }
 
     fn baseContainsSortedMemberWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !bool {
-        var iter = try BaseMemberIterator.init(data);
-        while (try iter.next()) |member| {
-            if (member == vector_id) {
-                if (strict_validation) try drainBaseIterator(&iter);
-                return true;
-            }
-            if (member > vector_id) {
-                if (strict_validation) try drainBaseIterator(&iter);
-                return false;
-            }
-        }
-        try iter.finish();
-        return false;
-    }
+        const header = try decodeBaseHeader(data);
+        var pos: usize = base_header_size;
+        var remaining_members = header.member_count;
+        var found = false;
+        var resolved = false;
 
-    fn drainBaseIterator(iter: *BaseMemberIterator) !void {
-        while (try iter.next()) |_| {}
-        try iter.finish();
+        while (remaining_members != 0) {
+            const current_block_count = try readBaseBlockCount(data, &pos, remaining_members);
+            const block_min = try readVarint(data, &pos);
+            if (!resolved and block_min > vector_id) {
+                if (!strict_validation) return false;
+                resolved = true;
+            }
+
+            var block_index: usize = 0;
+            while (block_index < current_block_count) : (block_index += 1) {
+                const delta = try readVarint(data, &pos);
+                const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+                if (resolved) continue;
+                if (member == vector_id) {
+                    if (!strict_validation) return true;
+                    found = true;
+                    resolved = true;
+                } else if (member > vector_id) {
+                    if (!strict_validation) return false;
+                    resolved = true;
+                }
+            }
+            remaining_members -= current_block_count;
+        }
+        if (pos != data.len) return error.Corrupted;
+        return found;
     }
 
     pub fn decodeBaseIntoScratch(
@@ -3798,6 +3812,22 @@ test "posting base sorted membership streams without full materialization" {
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(corrupt, 15));
     try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 10));
     try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 15));
+
+    var pos: usize = PostingFormat.encoded_base_header_size;
+    var remaining_members = members.len;
+    const first_block_count = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
+    _ = try PostingFormat.readVarint(encoded, &pos);
+    var first_block_index: usize = 0;
+    while (first_block_index < first_block_count) : (first_block_index += 1) {
+        _ = try PostingFormat.readVarint(encoded, &pos);
+    }
+    remaining_members -= first_block_count;
+    _ = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
+    _ = try PostingFormat.readVarint(encoded, &pos);
+    const truncated_after_second_block_min = encoded[0..pos];
+
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_min, 99));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(truncated_after_second_block_min, 99));
 }
 
 test "posting delta tail round trips and overlays base members" {

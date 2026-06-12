@@ -91,7 +91,10 @@ Current status:
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full
-  member list when the target is absent or found early.
+  member list when the target is absent or found early. The primitive also
+  checks each encoded block minimum before decoding member deltas, which gives
+  large negative lookups a cheap early exit until richer block skip metadata
+  exists.
 - `SearchScratch` already groups fixed query arrays into `query_storage`; cold
   scratch retention now also releases query, distance, member-id, vector-batch,
   and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,
