@@ -368,6 +368,22 @@ pub const CommitOptions = struct {
     initial_segment_id: u64 = 1,
 };
 
+pub const DirectoryBatchWriterOptions = struct {
+    commit: CommitOptions = .{},
+    max_pending_entries: usize = 1024,
+    max_pending_value_bytes: usize = 4 * 1024 * 1024,
+};
+
+pub const DirectoryBatchWriterStats = struct {
+    flushed_segments: usize = 0,
+    committed_entries: usize = 0,
+    committed_value_bytes: usize = 0,
+    committed_segment_bytes: usize = 0,
+    committed_manifest_bytes: usize = 0,
+    last_segment_id: u64 = 0,
+    next_segment_id: u64 = 0,
+};
+
 pub const Catalog = struct {
     segments: []const SegmentBlob,
 
@@ -1647,6 +1663,122 @@ pub const Writer = struct {
             .meta = meta,
             .data = data,
         };
+    }
+};
+
+pub const DirectoryBatchWriter = struct {
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: DirectoryBatchWriterOptions,
+    writer: Writer,
+    pending_value_bytes: usize = 0,
+    stats: DirectoryBatchWriterStats = .{},
+
+    pub fn init(alloc: Allocator, io: std.Io, dir: std.Io.Dir, options: DirectoryBatchWriterOptions) DirectoryBatchWriter {
+        return .{
+            .alloc = alloc,
+            .io = io,
+            .dir = dir,
+            .options = options,
+            .writer = Writer.init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *DirectoryBatchWriter) void {
+        self.writer.deinit();
+        self.* = undefined;
+    }
+
+    pub fn pendingEntries(self: DirectoryBatchWriter) usize {
+        return self.writer.entries.items.len;
+    }
+
+    pub fn appendBase(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
+        try self.prepareForAppend(value.len);
+        try self.writer.appendBase(posting_id, value);
+        try self.notePendingAppend(value.len);
+    }
+
+    pub fn appendPostingBase(self: *DirectoryBatchWriter, base: posting.PostingBase) !void {
+        const encoded = try posting.PostingFormat.encodeBase(self.alloc, base);
+        defer self.alloc.free(encoded);
+        try self.appendBase(base.posting_id, encoded);
+    }
+
+    pub fn appendCentroidDirectory(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
+        try self.prepareForAppend(value.len);
+        try self.writer.appendCentroidDirectory(posting_id, value);
+        try self.notePendingAppend(value.len);
+    }
+
+    pub fn appendCentroidDirectoryRecord(self: *DirectoryBatchWriter, record: posting.CentroidDirectoryRecord) !void {
+        const encoded = try posting.CentroidDirectoryFormat.encode(self.alloc, record);
+        defer self.alloc.free(encoded);
+        try self.appendCentroidDirectory(record.posting_id, encoded);
+    }
+
+    pub fn appendDelta(self: *DirectoryBatchWriter, posting_id: PostingId, sequence: u64, value: []const u8) !void {
+        try self.prepareForAppend(value.len);
+        try self.writer.appendDelta(posting_id, sequence, value);
+        try self.notePendingAppend(value.len);
+    }
+
+    pub fn appendPostingDeltaRecords(self: *DirectoryBatchWriter, posting_id: PostingId, records: []const posting.PostingDeltaRecord) !void {
+        if (records.len == 0) return;
+        var min_sequence = records[0].sequence;
+        for (records[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
+        const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, records);
+        defer self.alloc.free(encoded);
+        try self.appendDelta(posting_id, min_sequence, encoded);
+    }
+
+    pub fn flush(self: *DirectoryBatchWriter) !?SegmentCommitStats {
+        if (self.writer.entries.items.len == 0) return null;
+        const pending_entries = self.writer.entries.items.len;
+        const pending_value_bytes = self.pending_value_bytes;
+        var result = try commitWriterToDirectoryAlloc(self.alloc, self.io, self.dir, &self.writer, self.options.commit);
+        defer result.deinit(self.alloc);
+
+        self.stats.flushed_segments += 1;
+        self.stats.committed_entries += pending_entries;
+        self.stats.committed_value_bytes += pending_value_bytes;
+        self.stats.committed_segment_bytes += result.stats.segment_bytes;
+        self.stats.committed_manifest_bytes += result.stats.manifest_bytes;
+        self.stats.last_segment_id = result.stats.segment_id;
+        self.stats.next_segment_id = result.stats.next_segment_id;
+
+        const commit_stats = result.stats;
+        self.resetPendingWriter();
+        return commit_stats;
+    }
+
+    fn prepareForAppend(self: *DirectoryBatchWriter, value_len: usize) !void {
+        if (self.writer.entries.items.len == 0) return;
+        if (self.options.max_pending_entries != 0 and self.writer.entries.items.len + 1 > self.options.max_pending_entries) {
+            _ = try self.flush();
+            return;
+        }
+        if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes + value_len > self.options.max_pending_value_bytes) {
+            _ = try self.flush();
+        }
+    }
+
+    fn notePendingAppend(self: *DirectoryBatchWriter, value_len: usize) !void {
+        self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, value_len) catch return error.PostingSegmentTooLarge;
+        if (self.options.max_pending_entries != 0 and self.writer.entries.items.len >= self.options.max_pending_entries) {
+            _ = try self.flush();
+            return;
+        }
+        if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes) {
+            _ = try self.flush();
+        }
+    }
+
+    fn resetPendingWriter(self: *DirectoryBatchWriter) void {
+        self.writer.deinit();
+        self.writer = Writer.init(self.alloc);
+        self.pending_value_bytes = 0;
     }
 };
 
@@ -3172,6 +3304,77 @@ pub fn testDirectoryCommitAppendsManifestSegments() !void {
     try std.testing.expectEqual(@as(posting.VectorId, 30), records[0].vector_id);
 }
 
+pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(base);
+    const delta_sequence = (@as(u64, 2) << 32) | 1;
+    const delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = delta_sequence, .op = .insert, .vector_id = 30 },
+    });
+    defer alloc.free(delta);
+    const centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 2,
+        .payload_version = 3,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 1.25,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    defer alloc.free(centroid);
+
+    var batcher = DirectoryBatchWriter.init(alloc, std.testing.io, tmp.dir, .{
+        .max_pending_entries = 2,
+        .max_pending_value_bytes = 0,
+    });
+    defer batcher.deinit();
+
+    try batcher.appendBase(7, base);
+    try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
+    try batcher.appendDelta(7, delta_sequence, delta);
+    try std.testing.expectEqual(@as(usize, 0), batcher.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 1), batcher.stats.flushed_segments);
+    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_entries);
+
+    try batcher.appendCentroidDirectory(7, centroid);
+    try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
+    const final_flush = (try batcher.flush()).?;
+    try std.testing.expectEqual(@as(u64, 2), final_flush.segment_id);
+    try std.testing.expectEqual(@as(usize, 2), batcher.stats.flushed_segments);
+    try std.testing.expectEqual(@as(usize, 3), batcher.stats.committed_entries);
+    try std.testing.expectEqual(base.len + delta.len + centroid.len, batcher.stats.committed_value_bytes);
+    try std.testing.expectEqual(@as(usize, 0), batcher.pendingEntries());
+    try std.testing.expect(try batcher.flush() == null);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), store.segments.len);
+    try std.testing.expectEqual(@as(u64, 3), store.manifest.next_segment_id);
+
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 1), header.generation);
+    const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(delta_sequence, records[0].sequence);
+    var loaded_centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer loaded_centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), loaded_centroid.mutation_version);
+    try std.testing.expectEqual(@as(u64, 3), loaded_centroid.payload_version);
+}
+
 pub fn testDirectoryCompactionReplacesManifestSegments() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4008,6 +4211,10 @@ test "posting segment directory store round trips segment files" {
 
 test "posting segment directory commit appends manifest segments" {
     try testDirectoryCommitAppendsManifestSegments();
+}
+
+test "posting segment directory batch writer flushes bounded segments" {
+    try testDirectoryBatchWriterFlushesBoundedSegments();
 }
 
 test "posting segment directory compaction replaces manifest segments" {

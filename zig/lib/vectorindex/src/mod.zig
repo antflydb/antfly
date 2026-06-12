@@ -100,6 +100,9 @@ pub const PostingSegmentManifestReplacementResult = posting_segment.ManifestRepl
 pub const PostingSegmentCommitOptions = posting_segment.CommitOptions;
 pub const PostingSegmentCommitStats = posting_segment.SegmentCommitStats;
 pub const PostingSegmentCommitResult = posting_segment.SegmentCommitResult;
+pub const PostingSegmentDirectoryBatchWriterOptions = posting_segment.DirectoryBatchWriterOptions;
+pub const PostingSegmentDirectoryBatchWriterStats = posting_segment.DirectoryBatchWriterStats;
+pub const PostingSegmentDirectoryBatchWriter = posting_segment.DirectoryBatchWriter;
 pub const PostingSegmentDirectoryCompactionStats = posting_segment.DirectoryCompactionStats;
 pub const PostingSegmentDirectoryCompactionResult = posting_segment.DirectoryCompactionResult;
 pub const PostingSegmentDirectoryCompactionPlanOptions = posting_segment.DirectoryCompactionPlanOptions;
@@ -241,6 +244,10 @@ test "posting segment directory store round trips segment files" {
 
 test "posting segment directory commit appends manifest segments" {
     try posting_segment.testDirectoryCommitAppendsManifestSegments();
+}
+
+test "posting segment directory batch writer flushes bounded segments" {
+    try posting_segment.testDirectoryBatchWriterFlushesBoundedSegments();
 }
 
 test "posting segment directory compaction replaces manifest segments" {
