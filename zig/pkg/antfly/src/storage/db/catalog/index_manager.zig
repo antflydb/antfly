@@ -2462,6 +2462,11 @@ pub const IndexManager = struct {
         remaining_overfull_postings: u64 = 0,
         remaining_postings_at_capacity: u64 = 0,
         max_remaining_over_capacity_members: u64 = 0,
+        segment_maintenance_runs: usize = 0,
+        segment_maintenance_compactions: usize = 0,
+        segment_maintenance_deleted_orphans: usize = 0,
+        segment_maintenance_deleted_temps: usize = 0,
+        segment_maintenance_manifest_segments: usize = 0,
         needs_more_work: bool = false,
         elapsed_ns: u64 = 0,
         stopped_by_max_indexes: bool = false,
@@ -2589,8 +2594,31 @@ pub const IndexManager = struct {
             const has_repair_debt = backlog.dirty_postings != 0 or
                 backlogHasActionableDeltaTail(backlog, options);
             const has_layout_debt = backlogHasActionableLayoutDebt(backlog, options);
+            var segment_maintenance_steps: usize = 0;
+            if (entry.index.config.posting_backend == .segments) {
+                const segment_stats = try entry.index.maintainPostingSegmentBackend();
+                if (segment_stats.ran) {
+                    result.segment_maintenance_runs += 1;
+                    result.segment_maintenance_compactions += @intCast(segment_stats.compactions);
+                    result.segment_maintenance_deleted_orphans += @intCast(segment_stats.deleted_orphan_segment_files);
+                    result.segment_maintenance_deleted_temps += @intCast(segment_stats.deleted_temp_files);
+                    result.segment_maintenance_manifest_segments = @max(
+                        result.segment_maintenance_manifest_segments,
+                        @as(usize, @intCast(segment_stats.manifest_segments)),
+                    );
+                    segment_maintenance_steps =
+                        @as(usize, @intCast(segment_stats.compactions)) +
+                        @as(usize, @intCast(segment_stats.deleted_orphan_segment_files)) +
+                        @as(usize, @intCast(segment_stats.deleted_temp_files));
+                    result.total_steps += segment_maintenance_steps;
+                }
+            }
             if (!has_repair_debt and !has_layout_debt) {
-                if (link_repair_steps == 0) result.skipped_clean_indexes += 1;
+                if (link_repair_steps == 0 and segment_maintenance_steps == 0) {
+                    result.skipped_clean_indexes += 1;
+                } else if (segment_maintenance_steps != 0) {
+                    result.attempted_indexes += 1;
+                }
                 continue;
             }
 

@@ -204,14 +204,18 @@ Current status:
   boundaries, where the resulting segment manifest bytes are stored in the same
   LSM meta transaction as the namespace changes. Reopen prefers that committed
   manifest marker, so uncommitted directory manifest state is physical garbage,
-  not logical visibility. That adapter path is still internal until DB-level
-  backup/restore, segment maintenance accounting, and public config enablement
-  are wired through the same backend boundary. Dense index config now propagates
-  the parsed physical backend into HBC config, but `backend = segments` remains
-  rejected until those operational surfaces are complete. The dense index config
-  now separates `backend`, `format`, and `version`; `backend = segments` is
-  reserved until runtime reads/writes can use the segment store across the full
-  DB lifecycle. This
+  not logical visibility. Segment directory maintenance can now run from that
+  committed manifest snapshot, compact selected segment files, collect
+  temp/orphan files, publish the replacement manifest through the same LSM meta
+  transaction, and report compact segment counters through dense posting
+  maintenance stats and Prometheus. That adapter path is still internal until
+  DB-level backup/restore, crash-recovery cleanup, maintenance resource
+  budgets, and public config enablement are wired through the same backend
+  boundary. Dense index config now propagates the parsed physical backend into
+  HBC config, but `backend = segments` remains rejected until those operational
+  surfaces are complete. The dense index config now separates `backend`,
+  `format`, and `version`; `backend = segments` is reserved until runtime
+  reads/writes can use the segment store across the full DB lifecycle. This
   segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
@@ -841,12 +845,16 @@ implementations cleanly:
     bases, deltas, and centroid-directory records through an owned segment
     runtime store. Segment batch commits now publish the committed manifest via
     the same LSM meta transaction as HBC namespace commits, including bulk
-    publish windows and posting maintenance writes. The remaining promotion work
+    publish windows and posting maintenance writes. Dense posting maintenance
+    can now run segment directory maintenance from the committed manifest,
+    compact selected segment files, collect ignored temp/orphan files, publish
+    the replacement manifest transactionally, and report segment run,
+    compaction, delete, and manifest-size counters. The remaining promotion work
     is operational: backup/restore must copy and verify segment files, segment
-    maintenance must report and enforce resource budgets, crash recovery must
-    clean ignored physical manifests/files, and public config must stop
-    rejecting `backend = segments` only after those surfaces are covered. That
-    may reduce LSM key overhead and improve sequential IO.
+    maintenance must enforce resource budgets, crash recovery must clean ignored
+    physical manifests/files, and public config must stop rejecting
+    `backend = segments` only after those surfaces are covered. That may reduce
+    LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

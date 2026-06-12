@@ -1262,6 +1262,15 @@ const PostingSegmentRuntime = struct {
     }
 };
 
+pub const PostingSegmentMaintenanceStats = struct {
+    ran: bool = false,
+    manifest_segments: u64 = 0,
+    compacted: bool = false,
+    compactions: u64 = 0,
+    deleted_orphan_segment_files: u64 = 0,
+    deleted_temp_files: u64 = 0,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -2870,6 +2879,52 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         try runtime.store.reloadManifestData(manifest_data);
+    }
+
+    pub fn maintainPostingSegmentBackend(self: *HBCIndex) !PostingSegmentMaintenanceStats {
+        if (self.posting_segment_runtime == null) return .{};
+
+        var needs_reload_from_committed_manifest = false;
+        errdefer if (needs_reload_from_committed_manifest) self.reloadPostingSegmentRuntimeFromCommittedManifest() catch {};
+
+        var maintenance_summary = PostingSegmentMaintenanceStats{};
+        const manifest_data = blk: {
+            lockAtomic(&self.posting_segment_mu);
+            defer self.posting_segment_mu.unlock();
+
+            const runtime = try self.postingSegmentRuntime();
+            if (runtime.store.pendingEntries() != 0 or runtime.store.pendingDeltaRecords() != 0) return .{};
+
+            const maintenance = try runtime.store.maintainLoadedManifest();
+            needs_reload_from_committed_manifest = true;
+            const manifest_segments = if (maintenance.compacted)
+                maintenance.compaction.manifest.output_segments
+            else
+                maintenance.manifest.segments;
+            maintenance_summary = .{
+                .ran = true,
+                .manifest_segments = @intCast(manifest_segments),
+                .compacted = maintenance.compacted,
+                .compactions = if (maintenance.compacted) 1 else 0,
+                .deleted_orphan_segment_files = @intCast(maintenance.garbage.deleted_segment_files),
+                .deleted_temp_files = @intCast(maintenance.temporary.deleted_temp_files),
+            };
+            break :blk try runtime.store.manifestBytesAlloc(self.alloc);
+        };
+        defer self.alloc.free(manifest_data);
+
+        var txn = try self.beginRuntimeBatchTxn();
+        errdefer txn.abort();
+        try self.putNamespaced(&txn, .meta, posting_segment_manifest_meta_key, manifest_data);
+
+        const commit_start = nowNs();
+        self.beginPublishedSearchStateRefresh();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try commitTxn(&txn);
+        self.write_profile.insert_commit_ns += elapsedSince(commit_start);
+        self.finishPublishedSearchStateRefresh();
+        needs_reload_from_committed_manifest = false;
+        return maintenance_summary;
     }
 
     pub fn savePostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
@@ -10821,17 +10876,33 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         try std.testing.expectEqual(@as(u64, 2), folded.next_generation);
         try idx.finishWriteTxn(&fold_txn);
 
-        var read_txn = try idx.beginReadTxn();
-        defer read_txn.abort();
+        {
+            var read_txn = try idx.beginReadTxn();
+            defer read_txn.abort();
 
-        var base = try PostingStore.loadBase(&idx, &read_txn, posting_id, isNotFound);
-        defer base.deinit(alloc);
-        try std.testing.expectEqual(@as(u64, 2), base.generation);
-        try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, base.members);
+            var base = try PostingStore.loadBase(&idx, &read_txn, posting_id, isNotFound);
+            defer base.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 2), base.generation);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, base.members);
 
-        const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
-        defer alloc.free(materialized);
-        try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
+            const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+            defer alloc.free(materialized);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
+        }
+
+        const segment_maintenance = try idx.maintainPostingSegmentBackend();
+        try std.testing.expect(segment_maintenance.ran);
+        try std.testing.expect(segment_maintenance.compacted);
+        try std.testing.expect(segment_maintenance.compactions > 0);
+        try std.testing.expect(segment_maintenance.manifest_segments > 0);
+
+        {
+            var read_txn = try idx.beginReadTxn();
+            defer read_txn.abort();
+            const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+            defer alloc.free(materialized);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
+        }
     }
 }
 

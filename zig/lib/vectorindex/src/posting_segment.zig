@@ -555,6 +555,20 @@ pub const RuntimeDirectoryStore = struct {
         return stats;
     }
 
+    pub fn writeLoadedManifest(self: RuntimeDirectoryStore) !void {
+        const manifest_data = try self.manifestBytesAlloc(self.alloc);
+        defer self.alloc.free(manifest_data);
+        try writeManifestFileAlloc(self.alloc, self.io, self.dir, self.options.manifest_path, manifest_data);
+    }
+
+    pub fn maintainLoadedManifest(self: *RuntimeDirectoryStore) !DirectoryMaintenanceStats {
+        if (self.pendingEntries() != 0 or self.pendingDeltaRecords() != 0) return error.PostingSegmentPendingBatch;
+        try self.writeLoadedManifest();
+        const stats = try maintainDirectoryStoreAlloc(self.alloc, self.io, self.dir, self.options.maintenanceOptions());
+        try self.reloadManifest();
+        return stats;
+    }
+
     pub fn reloadManifest(self: *RuntimeDirectoryStore) !void {
         var manifest = try readManifestForCommitAlloc(self.alloc, self.io, self.dir, self.options.commitOptions());
         errdefer manifest.deinit(self.alloc);
