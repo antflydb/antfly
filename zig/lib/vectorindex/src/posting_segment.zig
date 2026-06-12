@@ -121,6 +121,27 @@ pub const CompactResult = struct {
     }
 };
 
+pub const ManifestReplacementStats = struct {
+    input_segments: usize = 0,
+    removed_segments: usize = 0,
+    added_segments: usize = 0,
+    output_segments: usize = 0,
+    next_segment_id: u64 = 0,
+};
+
+pub const ManifestReplacementResult = struct {
+    encoded: []u8,
+    stats: ManifestReplacementStats,
+
+    pub fn deinit(self: *ManifestReplacementResult, alloc: Allocator) void {
+        alloc.free(self.encoded);
+        self.* = .{
+            .encoded = &.{},
+            .stats = .{},
+        };
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -345,6 +366,65 @@ pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
     return .{
         .next_segment_id = next_segment_id,
         .segments = entries,
+    };
+}
+
+pub fn replaceManifestSegmentsAlloc(
+    alloc: Allocator,
+    manifest: Manifest,
+    remove_segment_ids: []const u64,
+    new_entries: []const ManifestEntry,
+) ![]u8 {
+    const result = try replaceManifestSegmentsWithStatsAlloc(alloc, manifest, remove_segment_ids, new_entries);
+    return result.encoded;
+}
+
+pub fn replaceManifestSegmentsWithStatsAlloc(
+    alloc: Allocator,
+    manifest: Manifest,
+    remove_segment_ids: []const u64,
+    new_entries: []const ManifestEntry,
+) !ManifestReplacementResult {
+    try validateManifest(manifest);
+    for (new_entries) |entry| try validateManifestEntry(entry);
+
+    var stats = ManifestReplacementStats{
+        .input_segments = manifest.segments.len,
+        .added_segments = new_entries.len,
+    };
+    var found_remove_count: usize = 0;
+    var output_entries = std.ArrayListUnmanaged(ManifestEntry).empty;
+    errdefer output_entries.deinit(alloc);
+    try output_entries.ensureTotalCapacity(alloc, manifest.segments.len + new_entries.len);
+
+    for (manifest.segments) |entry| {
+        if (segmentIdIn(entry.meta.segment_id, remove_segment_ids)) {
+            found_remove_count += 1;
+            continue;
+        }
+        output_entries.appendAssumeCapacity(entry);
+    }
+    if (found_remove_count != remove_segment_ids.len) return error.PostingSegmentManifestReplacementMissingSegment;
+    stats.removed_segments = found_remove_count;
+
+    for (new_entries) |entry| output_entries.appendAssumeCapacity(entry);
+    std.mem.sort(ManifestEntry, output_entries.items, {}, manifestEntryLessThan);
+
+    var next_segment_id = manifest.next_segment_id;
+    for (new_entries) |entry| {
+        next_segment_id = @max(next_segment_id, std.math.add(u64, entry.meta.segment_id, 1) catch return error.PostingSegmentManifestTooLarge);
+    }
+    stats.output_segments = output_entries.items.len;
+    stats.next_segment_id = next_segment_id;
+
+    const encoded = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = next_segment_id,
+        .segments = output_entries.items,
+    });
+    output_entries.deinit(alloc);
+    return .{
+        .encoded = encoded,
+        .stats = stats,
     };
 }
 
@@ -933,6 +1013,10 @@ fn pendingEntryLessThan(_: void, lhs: PendingEntry, rhs: PendingEntry) bool {
     return compareEntryKey(lhs.posting_id, lhs.kind, lhs.sequence, rhs.posting_id, rhs.kind, rhs.sequence) == .lt;
 }
 
+fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
+    return lhs.meta.segment_id < rhs.meta.segment_id;
+}
+
 fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
     return lhs.sequence < rhs.sequence;
 }
@@ -957,6 +1041,13 @@ fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence:
     if (lhs_sequence < rhs_sequence) return .lt;
     if (lhs_sequence > rhs_sequence) return .gt;
     return .eq;
+}
+
+fn segmentIdIn(segment_id: u64, segment_ids: []const u64) bool {
+    for (segment_ids) |candidate| {
+        if (candidate == segment_id) return true;
+    }
+    return false;
 }
 
 fn appendU16(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u16) !void {
@@ -1418,6 +1509,95 @@ pub fn testManifestCodecRejectsInvalidData() !void {
     try std.testing.expectError(error.CorruptedPostingSegmentManifest, decodeManifestAlloc(alloc, encoded[0..manifest_header_size]));
 }
 
+pub fn testManifestReplacementEncodesCompactionCommit() !void {
+    const alloc = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{
+            .meta = .{
+                .segment_id = 1,
+                .min_posting_id = 1,
+                .max_posting_id = 2,
+                .byte_len = 128,
+                .entry_count = 2,
+            },
+            .path = "postings/0000000000000001.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 2,
+                .min_posting_id = 3,
+                .max_posting_id = 4,
+                .byte_len = 256,
+                .entry_count = 3,
+            },
+            .path = "postings/0000000000000002.afps",
+        },
+        .{
+            .meta = .{
+                .segment_id = 3,
+                .min_posting_id = 5,
+                .max_posting_id = 5,
+                .byte_len = 512,
+                .entry_count = 1,
+            },
+            .path = "postings/0000000000000003.afps",
+        },
+    };
+    const replacement = [_]ManifestEntry{.{
+        .meta = .{
+            .segment_id = 4,
+            .min_posting_id = 1,
+            .max_posting_id = 4,
+            .min_delta_sequence = (@as(u64, 6) << 32) | 1,
+            .max_delta_sequence = (@as(u64, 7) << 32) | 2,
+            .byte_len = 1024,
+            .entry_count = 4,
+        },
+        .path = "postings/0000000000000004.afps",
+    }};
+    var result = try replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = 4,
+        .segments = entries[0..],
+    }, &.{ 1, 2 }, replacement[0..]);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), result.stats.input_segments);
+    try std.testing.expectEqual(@as(usize, 2), result.stats.removed_segments);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.added_segments);
+    try std.testing.expectEqual(@as(usize, 2), result.stats.output_segments);
+    try std.testing.expectEqual(@as(u64, 5), result.stats.next_segment_id);
+
+    var decoded = try decodeManifestAlloc(alloc, result.encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 5), decoded.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 2), decoded.segments.len);
+    try std.testing.expectEqual(@as(u64, 3), decoded.segments[0].meta.segment_id);
+    try std.testing.expectEqualStrings("postings/0000000000000003.afps", decoded.segments[0].path);
+    try std.testing.expectEqual(@as(u64, 4), decoded.segments[1].meta.segment_id);
+    try std.testing.expectEqual(replacement[0].meta.min_posting_id, decoded.segments[1].meta.min_posting_id);
+    try std.testing.expectEqual(replacement[0].meta.max_posting_id, decoded.segments[1].meta.max_posting_id);
+    try std.testing.expectEqualStrings(replacement[0].path, decoded.segments[1].path);
+
+    try std.testing.expectError(error.PostingSegmentManifestReplacementMissingSegment, replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = 4,
+        .segments = entries[0..],
+    }, &.{99}, replacement[0..]));
+
+    const colliding = [_]ManifestEntry{.{
+        .meta = .{
+            .segment_id = 3,
+            .min_posting_id = 6,
+            .max_posting_id = 6,
+            .byte_len = 64,
+            .entry_count = 1,
+        },
+        .path = "postings/0000000000000003-copy.afps",
+    }};
+    try std.testing.expectError(error.InvalidPostingSegmentManifest, replaceManifestSegmentsWithStatsAlloc(alloc, .{
+        .next_segment_id = 4,
+        .segments = entries[0..],
+    }, &.{1}, colliding[0..]));
+}
+
 const TestSegmentFile = struct {
     path: []const u8,
     data: []const u8,
@@ -1696,6 +1876,10 @@ test "posting segment manifest codec round trips segment metadata" {
 
 test "posting segment manifest codec rejects invalid data" {
     try testManifestCodecRejectsInvalidData();
+}
+
+test "posting segment manifest replacement encodes compaction commit" {
+    try testManifestReplacementEncodesCompactionCommit();
 }
 
 test "posting segment store validates manifest backed segments" {

@@ -92,12 +92,16 @@ pub const PostingSegmentManifestEntry = posting_segment.ManifestEntry;
 pub const PostingSegmentManifest = posting_segment.Manifest;
 pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
 pub const OwnedPostingSegmentManifest = posting_segment.OwnedManifest;
+pub const PostingSegmentManifestReplacementStats = posting_segment.ManifestReplacementStats;
+pub const PostingSegmentManifestReplacementResult = posting_segment.ManifestReplacementResult;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
 pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
 pub const compactPostingSegmentsAlloc = posting_segment.compactSegmentsAlloc;
 pub const compactPostingSegmentsWithStatsAlloc = posting_segment.compactSegmentsWithStatsAlloc;
 pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
 pub const decodePostingSegmentManifestAlloc = posting_segment.decodeManifestAlloc;
+pub const replacePostingSegmentManifestSegmentsAlloc = posting_segment.replaceManifestSegmentsAlloc;
+pub const replacePostingSegmentManifestSegmentsWithStatsAlloc = posting_segment.replaceManifestSegmentsWithStatsAlloc;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
 pub const OwnedCentroidDirectoryRecord = posting.OwnedCentroidDirectoryRecord;
 pub const CentroidDirectoryFormat = posting.CentroidDirectoryFormat;
@@ -170,6 +174,10 @@ test "posting segment manifest codec round trips segment metadata" {
 
 test "posting segment manifest codec rejects invalid data" {
     try posting_segment.testManifestCodecRejectsInvalidData();
+}
+
+test "posting segment manifest replacement encodes compaction commit" {
+    try posting_segment.testManifestReplacementEncodesCompactionCommit();
 }
 
 test "posting segment store validates manifest backed segments" {
