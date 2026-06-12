@@ -122,8 +122,10 @@ Current status:
   records segment ids, paths, and posting/delta range metadata for reopen, and
   an owned segment-store opener can rebuild a snapshot from manifest bytes plus
   caller-provided segment reads while validating each segment's actual metadata
-  against the manifest. Runtime reads/writes still use the LSM-backed
-  namespace; this segment container/catalog/snapshot/manifest/open stack is the
+  against the manifest. Segment writers can also produce a manifest-ready
+  built segment with validated metadata and a stable segment path. Runtime
+  reads/writes still use the LSM-backed namespace; this
+  segment container/catalog/snapshot/manifest/build/open stack is the
   file-format substrate for a future
   `backend = segments, format = base_delta, version = 1` mode.
 - Leaf postings now carry persisted maintenance state: mutation version,

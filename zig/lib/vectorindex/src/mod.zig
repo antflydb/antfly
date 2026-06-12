@@ -80,6 +80,7 @@ pub const PostingSegmentReader = posting_segment.Reader;
 pub const PostingSegmentEntryKind = posting_segment.EntryKind;
 pub const PostingSegmentMeta = posting_segment.SegmentMeta;
 pub const PostingSegmentBlob = posting_segment.SegmentBlob;
+pub const BuiltPostingSegment = posting_segment.BuiltSegment;
 pub const PostingSegmentCatalog = posting_segment.Catalog;
 pub const PostingSegmentSnapshot = posting_segment.Snapshot;
 pub const OwnedPostingSegmentStore = posting_segment.OwnedSegmentStore;
@@ -88,6 +89,7 @@ pub const PostingSegmentManifest = posting_segment.Manifest;
 pub const OwnedPostingSegmentManifestEntry = posting_segment.OwnedManifestEntry;
 pub const OwnedPostingSegmentManifest = posting_segment.OwnedManifest;
 pub const openPostingSegmentStoreAlloc = posting_segment.openStoreAlloc;
+pub const postingSegmentPathAlloc = posting_segment.segmentPathAlloc;
 pub const encodePostingSegmentManifestAlloc = posting_segment.encodeManifestAlloc;
 pub const decodePostingSegmentManifestAlloc = posting_segment.decodeManifestAlloc;
 pub const CentroidDirectoryRecord = posting.CentroidDirectoryRecord;
@@ -166,4 +168,8 @@ test "posting segment manifest codec rejects invalid data" {
 
 test "posting segment store validates manifest backed segments" {
     try posting_segment.testOpenStoreValidatesManifestBackedSegments();
+}
+
+test "posting segment build produces manifest ready metadata" {
+    try posting_segment.testBuildSegmentProducesManifestReadyMetadata();
 }

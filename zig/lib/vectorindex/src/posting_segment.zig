@@ -64,6 +64,26 @@ pub const SegmentBlob = struct {
     data: []const u8,
 };
 
+pub const BuiltSegment = struct {
+    meta: SegmentMeta,
+    data: []u8,
+
+    pub fn deinit(self: *BuiltSegment, alloc: Allocator) void {
+        alloc.free(self.data);
+        self.* = .{
+            .meta = .{ .segment_id = 0 },
+            .data = &.{},
+        };
+    }
+
+    pub fn blob(self: BuiltSegment) SegmentBlob {
+        return .{
+            .meta = self.meta,
+            .data = self.data,
+        };
+    }
+};
+
 pub const ManifestEntry = struct {
     meta: SegmentMeta,
     path: []const u8,
@@ -285,6 +305,10 @@ pub fn openStoreAlloc(alloc: Allocator, manifest_data: []const u8, context: anyt
     };
 }
 
+pub fn segmentPathAlloc(alloc: Allocator, segment_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "postings/{x:0>16}.afps", .{segment_id});
+}
+
 const PendingEntry = struct {
     posting_id: PostingId,
     kind: EntryKind,
@@ -387,6 +411,17 @@ pub const Writer = struct {
         try appendU16(self.alloc, &out, version);
         try out.appendSlice(self.alloc, &magic);
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn buildSegment(self: *Writer, segment_id: u64) !BuiltSegment {
+        const data = try self.build();
+        errdefer self.alloc.free(data);
+        const reader = try Reader.init(data);
+        const meta = try reader.metadata(segment_id);
+        return .{
+            .meta = meta,
+            .data = data,
+        };
     }
 };
 
@@ -1126,6 +1161,54 @@ pub fn testOpenStoreValidatesManifestBackedSegments() !void {
     try std.testing.expectError(error.InvalidPostingSegment, openStoreAlloc(alloc, stale_manifest_data, &loader, TestSegmentLoader.read));
 }
 
+pub fn testBuildSegmentProducesManifestReadyMetadata() !void {
+    const alloc = std.testing.allocator;
+    const base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 9,
+        .generation = 4,
+        .members = &.{ 100, 200 },
+    });
+    defer alloc.free(base);
+
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBase(9, base);
+
+    var built = try writer.buildSegment(42);
+    defer built.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), built.meta.segment_id);
+    try std.testing.expectEqual(@as(PostingId, 9), built.meta.min_posting_id);
+    try std.testing.expectEqual(@as(PostingId, 9), built.meta.max_posting_id);
+    try std.testing.expectEqual(built.data.len, built.meta.byte_len);
+    try std.testing.expectEqual(@as(usize, 1), built.meta.entry_count);
+
+    const path = try segmentPathAlloc(alloc, built.meta.segment_id);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("postings/000000000000002a.afps", path);
+
+    const entries = [_]ManifestEntry{.{
+        .meta = built.meta,
+        .path = path,
+    }};
+    const manifest_data = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 43,
+        .segments = entries[0..],
+    });
+    defer alloc.free(manifest_data);
+
+    const files = [_]TestSegmentFile{.{
+        .path = path,
+        .data = built.data,
+    }};
+    const loader = TestSegmentLoader{ .files = files[0..] };
+    var store = try openStoreAlloc(alloc, manifest_data, &loader, TestSegmentLoader.read);
+    defer store.deinit(alloc);
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(9)).?;
+    try std.testing.expectEqual(@as(u64, 4), header.generation);
+    try std.testing.expectEqual(@as(usize, 2), header.member_count);
+}
+
 test "posting segment stores base centroid and ordered delta values" {
     try testStoresBaseCentroidAndOrderedDeltaValues();
 }
@@ -1156,4 +1239,8 @@ test "posting segment manifest codec rejects invalid data" {
 
 test "posting segment store validates manifest backed segments" {
     try testOpenStoreValidatesManifestBackedSegments();
+}
+
+test "posting segment build produces manifest ready metadata" {
+    try testBuildSegmentProducesManifestReadyMetadata();
 }
