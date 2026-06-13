@@ -300,7 +300,7 @@ pub const PostingFormat = struct {
         if (member_count > std.math.maxInt(u32)) return error.TooLarge;
         const block_count = (member_count + base_member_default_block_size - 1) / base_member_default_block_size;
         return base_header_size +
-            try std.math.mul(usize, block_count, 11) +
+            try std.math.mul(usize, block_count, 21) +
             try std.math.mul(usize, member_count, 10);
     }
 
@@ -343,7 +343,8 @@ pub const PostingFormat = struct {
             if (self.block_count == 0) return;
             const block = self.block[0..self.block_count];
             const block_min = minVectorId(block);
-            self.total = try std.math.add(usize, self.total, 1 + varintSize(block_min));
+            const block_max = maxVectorId(block);
+            self.total = try std.math.add(usize, self.total, 1 + varintSize(block_min) + varintSize(block_max));
             for (block) |member_id| {
                 self.total = try std.math.add(usize, self.total, varintSize(member_id - block_min));
             }
@@ -466,9 +467,12 @@ pub const PostingFormat = struct {
             if (self.pos >= self.out.len) return error.BufferTooSmall;
             self.out[self.pos] = @intCast(self.block_count);
             self.pos += 1;
-            const block_min = minVectorId(self.block[0..self.block_count]);
+            const block = self.block[0..self.block_count];
+            const block_min = minVectorId(block);
+            const block_max = maxVectorId(block);
             writeVarint(self.out, &self.pos, block_min);
-            for (self.block[0..self.block_count]) |member_id| {
+            writeVarint(self.out, &self.pos, block_max);
+            for (block) |member_id| {
                 writeVarint(self.out, &self.pos, member_id - block_min);
             }
             self.block_count = 0;
@@ -486,6 +490,7 @@ pub const PostingFormat = struct {
         remaining_total: usize,
         remaining_block: usize = 0,
         block_min: VectorId = 0,
+        block_max: VectorId = 0,
 
         fn init(data: []const u8, member_count: usize) BaseMemberBlockReader {
             return .{
@@ -499,11 +504,15 @@ pub const PostingFormat = struct {
             if (self.remaining_block == 0) {
                 self.remaining_block = try readBaseBlockCount(self.data, &self.pos, self.remaining_total);
                 self.block_min = try readVarint(self.data, &self.pos);
+                self.block_max = try readVarint(self.data, &self.pos);
+                if (self.block_max < self.block_min) return error.Corrupted;
             }
             const delta = try readVarint(self.data, &self.pos);
             self.remaining_block -= 1;
             self.remaining_total -= 1;
-            return std.math.add(VectorId, self.block_min, delta) catch return error.Corrupted;
+            const member = std.math.add(VectorId, self.block_min, delta) catch return error.Corrupted;
+            if (member > self.block_max) return error.Corrupted;
+            return member;
         }
 
         fn finish(self: *const BaseMemberBlockReader) !void {
@@ -554,6 +563,12 @@ pub const PostingFormat = struct {
     fn minVectorId(members: []const VectorId) VectorId {
         var out = members[0];
         for (members[1..]) |member_id| out = @min(out, member_id);
+        return out;
+    }
+
+    fn maxVectorId(members: []const VectorId) VectorId {
+        var out = members[0];
+        for (members[1..]) |member_id| out = @max(out, member_id);
         return out;
     }
 
@@ -935,10 +950,13 @@ pub const PostingFormat = struct {
         while (remaining_members != 0) {
             const current_block_count = try readBaseBlockCount(data, &pos, remaining_members);
             const block_min = try readVarint(data, &pos);
+            const block_max = try readVarint(data, &pos);
+            if (block_max < block_min) return error.Corrupted;
             var block_index: usize = 0;
             while (block_index < current_block_count) : (block_index += 1) {
                 const delta = try readVarint(data, &pos);
-                _ = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+                const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+                if (member > block_max) return error.Corrupted;
             }
             remaining_members -= current_block_count;
             block_count += 1;
@@ -996,15 +1014,28 @@ pub const PostingFormat = struct {
         while (remaining_members != 0) {
             const current_block_count = try readBaseBlockCount(data, &pos, remaining_members);
             const block_min = try readVarint(data, &pos);
+            const block_max = try readVarint(data, &pos);
+            if (block_max < block_min) return error.Corrupted;
             if (!resolved and block_min > vector_id) {
                 if (!strict_validation) return false;
                 resolved = true;
+            }
+            if (!resolved and block_max < vector_id) {
+                var skip_index: usize = 0;
+                while (skip_index < current_block_count) : (skip_index += 1) {
+                    const delta = try readVarint(data, &pos);
+                    const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+                    if (member > block_max) return error.Corrupted;
+                }
+                remaining_members -= current_block_count;
+                continue;
             }
 
             var block_index: usize = 0;
             while (block_index < current_block_count) : (block_index += 1) {
                 const delta = try readVarint(data, &pos);
                 const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
+                if (member > block_max) return error.Corrupted;
                 if (resolved) continue;
                 if (member == vector_id) {
                     if (!strict_validation) return true;
@@ -4330,6 +4361,7 @@ test "posting base sorted membership streams without full materialization" {
     var remaining_members = members.len;
     const first_block_count = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
     _ = try PostingFormat.readVarint(encoded, &pos);
+    _ = try PostingFormat.readVarint(encoded, &pos);
     var first_block_index: usize = 0;
     while (first_block_index < first_block_count) : (first_block_index += 1) {
         _ = try PostingFormat.readVarint(encoded, &pos);
@@ -4337,10 +4369,33 @@ test "posting base sorted membership streams without full materialization" {
     remaining_members -= first_block_count;
     _ = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
     _ = try PostingFormat.readVarint(encoded, &pos);
-    const truncated_after_second_block_min = encoded[0..pos];
+    _ = try PostingFormat.readVarint(encoded, &pos);
+    const truncated_after_second_block_header = encoded[0..pos];
 
-    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_min, 165));
-    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(truncated_after_second_block_min, 165));
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_header, 165));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(truncated_after_second_block_header, 165));
+}
+
+test "posting base block max hints are validated" {
+    const alloc = std.testing.allocator;
+    const members = [_]VectorId{ 10, 20, 30 };
+    const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
+        .posting_id = 7,
+        .generation = 11,
+        .members = members[0..],
+    }, 16);
+    defer alloc.free(encoded);
+
+    const corrupt = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupt);
+    var pos: usize = PostingFormat.encoded_base_header_size;
+    _ = try PostingFormat.readBaseBlockCount(corrupt, &pos, members.len);
+    _ = try PostingFormat.readVarint(corrupt, &pos);
+    corrupt[pos] = 15;
+
+    try std.testing.expectError(error.Corrupted, PostingFormat.decodeBaseStats(corrupt));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMember(corrupt, 999));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 20));
 }
 
 test "posting delta tail round trips and overlays base members" {
