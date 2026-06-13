@@ -3496,8 +3496,10 @@ pub const HBCIndex = struct {
             };
         }
 
-        const materialized = (try snapshot.materializeMembers(self.alloc, posting_id)) orelse return error.NotFound;
-        defer self.alloc.free(materialized);
+        var scratch = vectorindex_posting.PostingStore.FoldScratch{};
+        defer scratch.deinit(self.alloc);
+        const materialized_count = (try snapshot.materializeMembersIntoScratch(self.alloc, posting_id, &scratch)) orelse return error.NotFound;
+        const materialized = scratch.member_ids[0..materialized_count];
         const next_generation = base_header.generation +| 1;
         const encoded = try self.encodePostingSegmentBase(posting_id, next_generation, materialized);
         defer self.alloc.free(encoded);
