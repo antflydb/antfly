@@ -54,12 +54,14 @@ pub const ClusterHealth = enum {
 /// Kind of external connection configured on this node.
 pub const ConnectionKind = enum {
     inference,
+    web_search,
     external_io,
     cdc,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .inference => "inference",
+            .web_search => "web_search",
             .external_io => "external_io",
             .cdc => "cdc",
         };
@@ -73,6 +75,7 @@ pub const ConnectionKind = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "inference", .inference },
+            .{ "web_search", .web_search },
             .{ "external_io", .external_io },
             .{ "cdc", .cdc },
         });
@@ -256,6 +259,41 @@ pub const ExternalIoProtocol = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const WebSearchConnection = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results this connection is configured to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Whether safe-search filtering is requested.
+    safe_search: ?bool = null,
+    /// Preferred result language.
+    language: ?[]const u8 = null,
+    /// Preferred result region.
+    region: ?[]const u8 = null,
+    /// Whether extracted content is requested when supported.
+    include_content: ?bool = null,
+    /// Whether highlighted passages are requested when supported.
+    include_highlights: ?bool = null,
+    /// Provider endpoint override when configured.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Domain allowlist when configured.
+    include_domains: ?[]const []const u8 = null,
+    /// Domain denylist when configured.
+    exclude_domains: ?[]const []const u8 = null,
+    /// True when required credentials/config are present. Secret values are never returned.
+    configured: ?bool = null,
 };
 
 pub const CdcConnection = struct {
@@ -2214,6 +2252,8 @@ pub const Connection = struct {
     name: []const u8,
     /// Optional display name for UIs.
     display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
     kind: ConnectionKind,
     status: ConnectionStatus,
     /// Failure detail when status is "error".
@@ -2223,6 +2263,7 @@ pub const Connection = struct {
     /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
     sources: ?[]const []const u8 = null,
     inference: ?InferenceConnection = null,
+    web_search: ?WebSearchConnection = null,
     external_io: ?ExternalIoConnection = null,
     cdc: ?CdcConnection = null,
 };

@@ -54,8 +54,8 @@ export interface paths {
         /**
          * List configured external connections
          * @description Enumerates public external connections configured on this node under
-         *     top-level `connections`: inference providers, external IO endpoints,
-         *     and CDC replication sources.
+         *     top-level `connections`: inference providers, web search providers,
+         *     external IO endpoints, and CDC replication sources.
          *
          *     The default response is config-derived and avoids slow provider calls.
          *     With include=models, each inference provider is queried live for its
@@ -2122,7 +2122,7 @@ export interface components {
          * @description Kind of external connection configured on this node.
          * @enum {string}
          */
-        ConnectionKind: "inference" | "external_io" | "cdc";
+        ConnectionKind: "inference" | "web_search" | "external_io" | "cdc";
         /**
          * @description Connection status. "connected" means a live probe or listing succeeded,
          *     "error" means the probe failed (see the error field), "configured" means
@@ -2184,6 +2184,40 @@ export interface components {
          * @enum {string}
          */
         ExternalIoProtocol: "s3" | "gcs" | "filesystem" | "http";
+        WebSearchConnection: {
+            /** @description Provider-specific service flavor, such as agent_search for provider vertex. */
+            service?: string;
+            /** @description Maximum ranked results this connection is configured to return. */
+            max_results?: number;
+            /** @description Provider request timeout in milliseconds. */
+            timeout_ms?: number;
+            /** @description Whether safe-search filtering is requested. */
+            safe_search?: boolean;
+            /** @description Preferred result language. */
+            language?: string;
+            /** @description Preferred result region. */
+            region?: string;
+            /** @description Whether extracted content is requested when supported. */
+            include_content?: boolean;
+            /** @description Whether highlighted passages are requested when supported. */
+            include_highlights?: boolean;
+            /** @description Provider endpoint override when configured. */
+            endpoint?: string;
+            /** @description Google Cloud project for provider vertex. */
+            project_id?: string;
+            /** @description Google Cloud location for provider vertex. */
+            location?: string;
+            /** @description Agent Search data store ID for provider vertex. */
+            data_store?: string;
+            /** @description Agent Search serving config ID for provider vertex. */
+            serving_config?: string;
+            /** @description Domain allowlist when configured. */
+            include_domains?: string[];
+            /** @description Domain denylist when configured. */
+            exclude_domains?: string[];
+            /** @description True when required credentials/config are present. Secret values are never returned. */
+            configured?: boolean;
+        };
         ExternalIoConnection: {
             protocol: components["schemas"]["ExternalIoProtocol"];
             /** @description Custom endpoint URL when configured. */
@@ -2249,6 +2283,8 @@ export interface components {
             name: string;
             /** @description Optional display name for UIs. */
             display_name?: string;
+            /** @description Provider token for connection kinds that have a provider-level service identity, such as web_search. */
+            provider?: string;
             kind: components["schemas"]["ConnectionKind"];
             status: components["schemas"]["ConnectionStatus"];
             /** @description Failure detail when status is "error". */
@@ -2261,6 +2297,7 @@ export interface components {
              */
             sources?: string[];
             inference?: components["schemas"]["InferenceConnection"];
+            web_search?: components["schemas"]["WebSearchConnection"];
             external_io?: components["schemas"]["ExternalIoConnection"];
             cdc?: components["schemas"]["CdcConnection"];
         };
@@ -7683,7 +7720,7 @@ export interface components {
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
          *     - search: Execute semantic searches (legacy, use semantic_search for retrieval)
-         *     - websearch: Search the web (requires websearch_config)
+         *     - websearch: Search the web (requires websearch_connection or websearch_config)
          *     - fetch: Fetch URL content (subject to security controls)
          *     - semantic_search: Execute semantic/vector search against an index
          *     - full_text_search: Execute full-text BM25 search against an index
@@ -7695,81 +7732,53 @@ export interface components {
         /**
          * @description The web search provider to use.
          *
-         *     - **google**: Google Custom Search API (requires CSE setup)
-         *     - **bing**: Microsoft Bing Web Search API
+         *     - **exa**: Exa neural/semantic web search API
          *     - **serper**: Serper.dev Google Search API (simpler setup)
          *     - **tavily**: Tavily AI Search API (optimized for RAG)
          *     - **brave**: Brave Search API
-         *     - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+         *     - **you**: You.com Search API for agent and research workflows
+         *     - **linkup**: Linkup Search API for web search and content retrieval
+         *     - **vertex**: Google Cloud Agent Search / Vertex AI Search
          * @enum {string}
          */
-        WebSearchProvider: "google" | "bing" | "serper" | "tavily" | "brave" | "duckduckgo";
+        WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Google Custom Search API.
+         * @description Configuration for Exa neural/semantic web search.
          *
-         *     Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console.
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
          *
          *     **Setup:**
-         *     1. Create a project at https://console.cloud.google.com
-         *     2. Enable Custom Search API
-         *     3. Create a Custom Search Engine at https://cse.google.com
-         *     4. Get API key and CSE ID
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
          *
-         *     **Docs:** https://developers.google.com/custom-search/v1/overview
+         *     **Docs:** https://docs.exa.ai
          */
-        GoogleSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Google API key (or set GOOGLE_CSE_API_KEY env var) */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description Exa API key (or set EXA_API_KEY env var) */
             api_key?: string;
-            /** @description Custom Search Engine ID (or set GOOGLE_CSE_ID env var) */
-            cse_id?: string;
             /**
-             * @description Type of search to perform
-             * @default web
+             * @description Search mode to request from Exa
+             * @default auto
              * @enum {string}
              */
-            search_type?: "web" | "image";
-            /**
-             * @description Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
-             * @example m1
-             */
-            date_restrict?: string;
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            provider: "google";
-        };
-        /**
-         * @description Configuration for Microsoft Bing Web Search API.
-         *
-         *     **Setup:**
-         *     1. Create Azure account at https://portal.azure.com
-         *     2. Create a Bing Search resource
-         *     3. Get API key from resource keys
-         *
-         *     **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
-         */
-        BingSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Bing Search API key (or set BING_SEARCH_API_KEY env var) */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description Bing API endpoint URL
-             * @default https://api.bing.microsoft.com/v7.0/search
-             */
-            endpoint?: string;
-            /**
-             * @description Filter results by freshness
-             * @enum {string}
-             */
-            freshness?: "Day" | "Week" | "Month";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "bing";
+            provider: "exa";
         };
         /**
          * @description Configuration for Serper.dev Google Search API.
@@ -7885,33 +7894,109 @@ export interface components {
             provider: "brave";
         };
         /**
-         * @description Configuration for DuckDuckGo Instant Answer API.
+         * @description Configuration for You.com Search API.
          *
-         *     DuckDuckGo provides limited free search without requiring an API key.
-         *     Best for simple queries; may not return results for all searches.
+         *     You.com is useful for agentic search and research-oriented result
+         *     retrieval.
          *
-         *     **Note:** This uses the Instant Answer API which has limitations.
-         *     For production use, consider other providers.
+         *     **Setup:**
+         *     1. Sign up for You.com API access
+         *     2. Get API key from dashboard
          *
-         *     **Docs:** https://duckduckgo.com/api
+         *     **Docs:** https://api.you.com
          */
-        DuckDuckGoSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+        YouSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description You.com API key (or set YOU_API_KEY env var) */
+            api_key?: string;
             /**
-             * @description Skip HTTP redirect for bang queries
-             * @default true
+             * Format: uri
+             * @description You.com API endpoint URL
              */
-            no_redirect?: boolean;
-            /**
-             * @description Remove HTML from results
-             * @default true
-             */
-            no_html?: boolean;
+            endpoint?: string;
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            provider: "duckduckgo";
+            provider: "you";
+        };
+        /**
+         * @description Configuration for Linkup Search API.
+         *
+         *     Linkup is useful for web search, source retrieval, and structured
+         *     research workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://linkup.so
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.linkup.so
+         */
+        LinkupSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description Linkup API key (or set LINKUP_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search depth to request from Linkup
+             * @default standard
+             * @enum {string}
+             */
+            depth?: "standard" | "deep";
+            /**
+             * @description Linkup response shape to request
+             * @default searchResults
+             * @enum {string}
+             */
+            output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
+        };
+        /**
+         * @description Configuration for Google Cloud Agent Search / Vertex AI Search.
+         *
+         *     Use this for bounded Google Cloud search over configured data stores or
+         *     verified websites. The provider token is `vertex` to match Antfly's
+         *     existing Google Cloud provider convention.
+         *
+         *     **Setup:**
+         *     1. Enable Discovery Engine API in Google Cloud
+         *     2. Create an Agent Search app/data store
+         *     3. Grant service account access to query the serving config
+         *
+         *     **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+         */
+        VertexSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /**
+             * @description Google Cloud search service flavor
+             * @default agent_search
+             * @enum {string}
+             */
+            service?: "agent_search";
+            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /**
+             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
+             * @default global
+             */
+            location?: string;
+            /** @description Agent Search data store ID. */
+            data_store?: string;
+            /**
+             * @description Agent Search serving config ID.
+             * @default default_config
+             */
+            serving_config?: string;
+            /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
+            credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         };
         /**
          * @description A unified configuration for web search providers.
@@ -7920,14 +8005,20 @@ export interface components {
          *     provider-specific config or set common options at the top level.
          *
          *     **Environment Variables (fallbacks):**
-         *     - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
-         *     - BING_SEARCH_API_KEY
+         *     - EXA_API_KEY
          *     - SERPER_API_KEY
          *     - TAVILY_API_KEY
          *     - BRAVE_API_KEY
+         *     - YOU_API_KEY
+         *     - LINKUP_API_KEY
+         *     - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
          */
         WebSearchConfig: {
             provider: components["schemas"]["WebSearchProvider"];
+            /** @description Provider API key or secret reference. Prefer named web_search connections for production use. */
+            api_key?: string;
+            /** @description Provider endpoint override when applicable */
+            endpoint?: string;
             /**
              * @description Maximum number of search results to return
              * @default 5
@@ -7953,6 +8044,16 @@ export interface components {
              * @example us
              */
             region?: string;
+            /**
+             * @description Ask the provider to return extracted page content when supported
+             * @default false
+             */
+            include_content?: boolean;
+            /**
+             * @description Ask the provider to return highlighted passages when supported
+             * @default false
+             */
+            include_highlights?: boolean;
         };
         Credentials: {
             /**
@@ -8048,10 +8149,18 @@ export interface components {
              */
             enabled_tools?: components["schemas"]["ChatToolName"][];
             /**
-             * @description Web search provider configuration. Required when websearch tool is enabled.
-             *     See specs/openapi/antfly/websearch.yaml for provider-specific options.
+             * @description Inline web search provider configuration. Prefer websearch_connection for
+             *     configured production agents; inline config remains useful for CLI/dev
+             *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
+             *     options.
              */
             websearch_config?: components["schemas"]["WebSearchConfig"];
+            /**
+             * @description Name of a configured connections.<id> resource with kind web_search.
+             *     Request-level tool options may reduce scope, but cannot expand the
+             *     connection's configured capabilities or policy.
+             */
+            websearch_connection?: string;
             /**
              * @description URL fetching configuration. See specs/openapi/antfly/websearch.yaml
              *     for available options and security controls.

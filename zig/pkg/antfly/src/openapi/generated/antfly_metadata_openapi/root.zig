@@ -19,6 +19,7 @@ pub const ConnectedModelType = types.ConnectedModelType;
 pub const ConnectedModel = types.ConnectedModel;
 pub const InferenceConnection = types.InferenceConnection;
 pub const ExternalIoProtocol = types.ExternalIoProtocol;
+pub const WebSearchConnection = types.WebSearchConnection;
 pub const ExternalIoConnection = types.ExternalIoConnection;
 pub const CdcConnection = types.CdcConnection;
 pub const Connection = types.Connection;

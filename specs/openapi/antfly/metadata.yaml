@@ -1515,6 +1515,7 @@ components:
       type: string
       enum:
         - inference
+        - web_search
         - external_io
         - cdc
       description: Kind of external connection configured on this node.
@@ -1629,6 +1630,61 @@ components:
         - filesystem
         - http
       description: External IO transport protocol.
+    WebSearchConnection:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Provider-specific service flavor, such as agent_search for provider vertex.
+        max_results:
+          type: integer
+          description: Maximum ranked results this connection is configured to return.
+        timeout_ms:
+          type: integer
+          description: Provider request timeout in milliseconds.
+        safe_search:
+          type: boolean
+          description: Whether safe-search filtering is requested.
+        language:
+          type: string
+          description: Preferred result language.
+        region:
+          type: string
+          description: Preferred result region.
+        include_content:
+          type: boolean
+          description: Whether extracted content is requested when supported.
+        include_highlights:
+          type: boolean
+          description: Whether highlighted passages are requested when supported.
+        endpoint:
+          type: string
+          description: Provider endpoint override when configured.
+        project_id:
+          type: string
+          description: Google Cloud project for provider vertex.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex.
+        include_domains:
+          type: array
+          items:
+            type: string
+          description: Domain allowlist when configured.
+        exclude_domains:
+          type: array
+          items:
+            type: string
+          description: Domain denylist when configured.
+        configured:
+          type: boolean
+          description: True when required credentials/config are present. Secret values are never returned.
     ExternalIoConnection:
       type: object
       required:
@@ -1720,6 +1776,9 @@ components:
         display_name:
           type: string
           description: Optional display name for UIs.
+        provider:
+          type: string
+          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
         kind:
           $ref: "#/components/schemas/ConnectionKind"
         status:
@@ -1741,6 +1800,8 @@ components:
             "config:embedders/openai-small" or "table:docs/index:body_vec".
         inference:
           $ref: "#/components/schemas/InferenceConnection"
+        web_search:
+          $ref: "#/components/schemas/WebSearchConnection"
         external_io:
           $ref: "#/components/schemas/ExternalIoConnection"
         cdc:
@@ -6500,8 +6561,8 @@ paths:
         - cluster_management
       description: |
         Enumerates public external connections configured on this node under
-        top-level `connections`: inference providers, external IO endpoints,
-        and CDC replication sources.
+        top-level `connections`: inference providers, web search providers,
+        external IO endpoints, and CDC replication sources.
 
         The default response is config-derived and avoids slow provider calls.
         With include=models, each inference provider is queried live for its

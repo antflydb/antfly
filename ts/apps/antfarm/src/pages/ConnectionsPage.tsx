@@ -263,6 +263,93 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
   );
 }
 
+function WebSearchCard({ connection }: { connection: Connection }) {
+  const webSearch = connection.web_search;
+  if (!webSearch) return null;
+  const label = connection.display_name ?? connection.name;
+  const provider = connection.provider ?? "web_search";
+  const capabilities = connection.capabilities ?? [];
+  const domains = [...(webSearch.include_domains ?? []), ...(webSearch.exclude_domains ?? [])];
+
+  return (
+    <div className="bg-card border border-border rounded-none p-5">
+      <div className="flex items-start gap-3">
+        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+          <Globe className="w-4.5 h-4.5 text-muted-foreground" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium truncate" title={label}>
+              {label}
+            </h3>
+            <StatusBadge connection={connection} />
+          </div>
+          <p className="text-xs text-muted-foreground truncate">
+            {provider.toUpperCase()}
+            {webSearch.service ? ` · ${webSearch.service}` : null}
+            {webSearch.location ? ` · ${webSearch.location}` : null}
+            {webSearch.max_results ? ` · ${webSearch.max_results} results` : null}
+          </p>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {webSearch.include_content && (
+              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+                content
+              </span>
+            )}
+            {webSearch.include_highlights && (
+              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+                highlights
+              </span>
+            )}
+            {webSearch.safe_search && (
+              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+                safe
+              </span>
+            )}
+            {webSearch.data_store && (
+              <span
+                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                title={webSearch.data_store}
+              >
+                {webSearch.data_store}
+              </span>
+            )}
+          </div>
+          {domains.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {domains.map((domain) => (
+                <span
+                  key={domain}
+                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                >
+                  {domain}
+                </span>
+              ))}
+            </div>
+          )}
+          {capabilities.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {capabilities.map((capability) => (
+                <span
+                  key={capability}
+                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                >
+                  {capability}
+                </span>
+              ))}
+            </div>
+          )}
+          {connection.error && (
+            <p className="text-xs text-destructive mt-2 line-clamp-2" title={connection.error}>
+              {connection.error}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CdcCard({ connection }: { connection: Connection }) {
   const cdc = connection.cdc;
   if (!cdc) return null;
@@ -333,6 +420,7 @@ export default function ConnectionsPage() {
   const { connections, supported, loading, error, retry } = useConnectionsWithModels();
 
   const providers = connections.filter((connection) => connection.kind === "inference");
+  const webSearchConnections = connections.filter((connection) => connection.kind === "web_search");
   const infrastructure = connections.filter((connection) => connection.kind === "external_io");
   const cdcConnections = connections.filter((connection) => connection.kind === "cdc");
   const connectedCount = connections.filter(
@@ -397,7 +485,7 @@ export default function ConnectionsPage() {
           <DashboardPageTitle className="font-aeonik">Connections</DashboardPageTitle>
           <DashboardPageDescription>
             External services this node is configured to use: inference providers with their live
-            model inventories, external IO endpoints, and CDC sources.
+            model inventories, web search providers, external IO endpoints, and CDC sources.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -433,6 +521,17 @@ export default function ConnectionsPage() {
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {providers.map((connection) => (
                   <ProviderCard key={connection.name} connection={connection} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {webSearchConnections.length > 0 && (
+            <section>
+              <MonoLabel className="mb-3 block">Web search</MonoLabel>
+              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                {webSearchConnections.map((connection) => (
+                  <WebSearchCard key={connection.name} connection={connection} />
                 ))}
               </div>
             </section>

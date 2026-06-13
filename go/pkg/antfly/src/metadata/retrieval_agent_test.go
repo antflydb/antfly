@@ -19,9 +19,55 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestWebSearchConfigFromConnection(t *testing.T) {
+	safeSearch := false
+	config, err := webSearchConfigFromConnection("agent-web", common.ConnectionConfig{
+		Kind:     common.ConnectionKindWebSearch,
+		Provider: "exa",
+		Capabilities: []string{
+			"web.search",
+			"agents.use",
+		},
+		WebSearch: common.WebSearchConnectionConfig{
+			ApiKey:            "${secret:exa.api_key}",
+			Endpoint:          "https://search.example.test",
+			MaxResults:        7,
+			TimeoutMs:         2500,
+			Language:          "en",
+			Region:            "us",
+			SafeSearch:        &safeSearch,
+			IncludeContent:    true,
+			IncludeHighlights: true,
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "exa", string(config.Provider))
+	assert.Equal(t, "${secret:exa.api_key}", config.ApiKey)
+	assert.Equal(t, "https://search.example.test", config.Endpoint)
+	assert.Equal(t, 7, config.MaxResults)
+	assert.Equal(t, 2500, config.TimeoutMs)
+	assert.Equal(t, "en", config.Language)
+	assert.Equal(t, "us", config.Region)
+	if assert.NotNil(t, config.SafeSearch) {
+		assert.False(t, *config.SafeSearch)
+	}
+	assert.True(t, config.IncludeContent)
+	assert.True(t, config.IncludeHighlights)
+}
+
+func TestWebSearchConfigFromConnectionRejectsWrongKind(t *testing.T) {
+	_, err := webSearchConfigFromConnection("model", common.ConnectionConfig{
+		Kind:     common.ConnectionKindInference,
+		Provider: "exa",
+	})
+	assert.ErrorContains(t, err, "expected web_search")
+}
 
 func TestResolveEffectiveGeneratorChain(t *testing.T) {
 	originalDefault := generating.GetDefaultChain()

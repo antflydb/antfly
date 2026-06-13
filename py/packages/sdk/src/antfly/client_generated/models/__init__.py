@@ -49,8 +49,6 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
-from .bing_search_config import BingSearchConfig
-from .bing_search_config_freshness import BingSearchConfigFreshness
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
@@ -128,7 +126,6 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
 )
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
-from .duck_duck_go_search_config import DuckDuckGoSearchConfig
 from .dynamic_template import DynamicTemplate
 from .dynamic_template_match_mapping_type import DynamicTemplateMatchMappingType
 from .edge import Edge
@@ -159,6 +156,8 @@ from .eval_summary import EvalSummary
 from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
+from .exa_search_config import ExaSearchConfig
+from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
 from .extraction_classification import ExtractionClassification
@@ -211,8 +210,6 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
-from .google_search_config import GoogleSearchConfig
-from .google_search_config_search_type import GoogleSearchConfigSearchType
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -368,6 +365,9 @@ from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
 from .linear_merge_result import LinearMergeResult
+from .linkup_search_config import LinkupSearchConfig
+from .linkup_search_config_depth import LinkupSearchConfigDepth
+from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_response_200 import LookupKeyResponse200
@@ -543,9 +543,13 @@ from .user_metadata_type_0 import UserMetadataType0
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
+from .vertex_search_config import VertexSearchConfig
+from .vertex_search_config_service import VertexSearchConfigService
 from .web_search_config import WebSearchConfig
+from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
 from .wildcard_query import WildcardQuery
+from .you_search_config import YouSearchConfig
 
 __all__ = (
     "AgentDecision",
@@ -597,8 +601,6 @@ __all__ = (
     "BatchResponse",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
-    "BingSearchConfig",
-    "BingSearchConfigFreshness",
     "BooleanQuery",
     "BoolFieldQuery",
     "BraveSearchConfig",
@@ -674,7 +676,6 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentSchema",
     "DocumentSchemaSchema",
-    "DuckDuckGoSearchConfig",
     "DynamicTemplate",
     "DynamicTemplateMatchMappingType",
     "Edge",
@@ -705,6 +706,8 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExaSearchConfig",
+    "ExaSearchConfigSearchType",
     "ExternalIoConnection",
     "ExternalIoProtocol",
     "ExtractionClassification",
@@ -757,8 +760,6 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
-    "GoogleSearchConfig",
-    "GoogleSearchConfigSearchType",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -914,6 +915,9 @@ __all__ = (
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
     "LinearMergeResult",
+    "LinkupSearchConfig",
+    "LinkupSearchConfigDepth",
+    "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
     "LookupKeyResponse200",
@@ -1089,7 +1093,11 @@ __all__ = (
     "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",
+    "VertexSearchConfig",
+    "VertexSearchConfigService",
     "WebSearchConfig",
+    "WebSearchConnection",
     "WebSearchProvider",
     "WildcardQuery",
+    "YouSearchConfig",
 )

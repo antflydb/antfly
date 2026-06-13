@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 
 pub const ConnectionKind = enum {
     inference,
+    web_search,
     external_io,
     cdc,
 };
@@ -70,6 +71,25 @@ pub const InferenceConnection = struct {
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
+pub const WebSearchConnection = struct {
+    service: ?[]const u8 = null,
+    max_results: ?u32 = null,
+    timeout_ms: ?u32 = null,
+    safe_search: ?bool = null,
+    language: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    include_content: ?bool = null,
+    include_highlights: ?bool = null,
+    endpoint: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    data_store: ?[]const u8 = null,
+    serving_config: ?[]const u8 = null,
+    include_domains: []const []const u8 = &.{},
+    exclude_domains: []const []const u8 = &.{},
+    configured: ?bool = null,
+};
+
 pub const ExternalIoProtocol = enum {
     s3,
     gcs,
@@ -104,12 +124,14 @@ pub const Connection = struct {
     id: []const u8,
     name: []const u8,
     display_name: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
     kind: ConnectionKind,
     status: ConnectionStatus,
     @"error": ?[]const u8 = null,
     capabilities: []const []const u8 = &.{},
     sources: []const []const u8 = &.{},
     inference: ?InferenceConnection = null,
+    web_search: ?WebSearchConnection = null,
     external_io: ?ExternalIoConnection = null,
     cdc: ?CdcConnection = null,
 };
@@ -355,6 +377,12 @@ fn appendConfiguredConnections(
                 entry.key_ptr.*,
                 cfg,
             ),
+            .web_search => try appendConfiguredWebSearchConnection(
+                arena,
+                connections,
+                entry.key_ptr.*,
+                cfg,
+            ),
             .external_io => try appendConfiguredExternalIoConnection(
                 arena,
                 connections,
@@ -421,6 +449,46 @@ fn appendConfiguredInferenceConnection(
             }
         }
     }
+
+    try connections.append(arena, connection);
+}
+
+fn appendConfiguredWebSearchConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    id: []const u8,
+    cfg: common_config.Config.ConnectionConfig,
+) !void {
+    const provider = cfg.provider orelse return error.InvalidConfig;
+    const web_search_cfg = cfg.web_search orelse return error.InvalidConfig;
+    const connection = Connection{
+        .id = id,
+        .name = id,
+        .display_name = cfg.display_name,
+        .provider = provider,
+        .kind = .web_search,
+        .status = if (isKnownWebSearchProvider(provider)) .configured else .unsupported,
+        .capabilities = cfg.capabilities,
+        .sources = try sourcesSlice(arena, "config:connections/{s}", id),
+        .web_search = .{
+            .service = web_search_cfg.service,
+            .max_results = web_search_cfg.max_results,
+            .timeout_ms = web_search_cfg.timeout_ms,
+            .safe_search = web_search_cfg.safe_search,
+            .language = web_search_cfg.language,
+            .region = web_search_cfg.region,
+            .include_content = web_search_cfg.include_content,
+            .include_highlights = web_search_cfg.include_highlights,
+            .endpoint = web_search_cfg.endpoint,
+            .project_id = web_search_cfg.project_id,
+            .location = web_search_cfg.location,
+            .data_store = web_search_cfg.data_store,
+            .serving_config = web_search_cfg.serving_config,
+            .include_domains = web_search_cfg.include_domains,
+            .exclude_domains = web_search_cfg.exclude_domains,
+            .configured = webSearchConfigured(provider, web_search_cfg),
+        },
+    };
 
     try connections.append(arena, connection);
 }
@@ -509,9 +577,24 @@ fn appendConfiguredCdcConnection(
 fn connectionKindFromConfig(kind: common_config.Config.ConnectionKind) ConnectionKind {
     return switch (kind) {
         .inference => .inference,
+        .web_search => .web_search,
         .external_io => .external_io,
         .cdc => .cdc,
     };
+}
+
+fn webSearchConfigured(provider: []const u8, cfg: common_config.Config.WebSearchConnectionConfig) bool {
+    if (std.mem.eql(u8, provider, "vertex")) {
+        return cfg.data_store != null and (cfg.credentials_path != null or cfg.project_id != null);
+    }
+    return cfg.api_key != null;
+}
+
+fn isKnownWebSearchProvider(provider: []const u8) bool {
+    inline for (&.{ "exa", "tavily", "brave", "serper", "you", "linkup", "vertex" }) |known| {
+        if (std.mem.eql(u8, provider, known)) return true;
+    }
+    return false;
 }
 
 fn externalIoProtocolFromConfig(protocol: common_config.Config.ExternalIoProtocol) ExternalIoProtocol {
@@ -954,6 +1037,73 @@ test "build response reports configured external io connections" {
         .{ .types_filter = "object_store", .probe = false },
     );
     try std.testing.expectEqual(@as(usize, 0), invalid_filter.connections.len);
+}
+
+test "build response reports configured web search connections" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "connections": {
+        \\    "agent-web": {
+        \\      "display_name": "Agent web",
+        \\      "kind": "web_search",
+        \\      "provider": "exa",
+        \\      "capabilities": ["web.search", "web.semantic_search", "web.fetch", "agents.use"],
+        \\      "web_search": {
+        \\        "max_results": 10,
+        \\        "timeout_ms": 12000,
+        \\        "safe_search": true,
+        \\        "language": "en",
+        \\        "region": "us",
+        \\        "include_content": true,
+        \\        "include_highlights": true,
+        \\        "api_key": "${secret:exa.api_key}",
+        \\        "include_domains": ["docs.example.com"]
+        \\      }
+        \\    }
+        \\  },
+        \\  "replication_factor": 1,
+        \\  "default_shards_per_table": 1,
+        \\  "max_shard_size_bytes": 1024,
+        \\  "max_shards_per_table": 4
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    const response = try buildConnectionsResponse(
+        arena,
+        .{ .node_config = &cfg },
+        null,
+        .{ .types_filter = "web_search" },
+    );
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    const connection = response.connections[0];
+    try std.testing.expectEqualStrings("agent-web", connection.id);
+    try std.testing.expectEqualStrings("Agent web", connection.display_name.?);
+    try std.testing.expectEqual(ConnectionKind.web_search, connection.kind);
+    try std.testing.expectEqualStrings("exa", connection.provider.?);
+    try std.testing.expectEqual(ConnectionStatus.configured, connection.status);
+    try std.testing.expect(containsString(connection.capabilities, "web.search"));
+    try std.testing.expect(containsString(connection.capabilities, "agents.use"));
+    try std.testing.expectEqual(@as(?u32, 10), connection.web_search.?.max_results);
+    try std.testing.expectEqual(@as(?u32, 12000), connection.web_search.?.timeout_ms);
+    try std.testing.expectEqual(true, connection.web_search.?.safe_search.?);
+    try std.testing.expectEqualStrings("en", connection.web_search.?.language.?);
+    try std.testing.expectEqualStrings("us", connection.web_search.?.region.?);
+    try std.testing.expectEqual(true, connection.web_search.?.include_content.?);
+    try std.testing.expectEqual(true, connection.web_search.?.include_highlights.?);
+    try std.testing.expectEqualStrings("docs.example.com", connection.web_search.?.include_domains[0]);
+    try std.testing.expectEqual(true, connection.web_search.?.configured.?);
 }
 
 test "build response includes cdc replication sources with generic cdc kind" {

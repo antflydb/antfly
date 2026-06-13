@@ -9,6 +9,7 @@ pub const ConnectionKind = types.ConnectionKind;
 pub const ExternalIoProtocol = types.ExternalIoProtocol;
 pub const ConnectionConfig = types.ConnectionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
+pub const WebSearchConnectionConfig = types.WebSearchConnectionConfig;
 pub const ExternalIoConnectionConfig = types.ExternalIoConnectionConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;
 pub const MetadataInfo = types.MetadataInfo;

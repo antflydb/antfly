@@ -24,6 +24,7 @@ authorization metadata.
 Top-level connection kinds are broad physical categories:
 
 - `inference`
+- `web_search`
 - `external_io`
 - `cdc`
 
@@ -34,6 +35,16 @@ Provider or protocol belongs inside the kind-specific payload:
   "kind": "inference",
   "inference": {
     "provider": "openai"
+  }
+}
+```
+
+```json
+{
+  "kind": "web_search",
+  "provider": "exa",
+  "web_search": {
+    "max_results": 10
   }
 }
 ```
@@ -57,8 +68,10 @@ Provider or protocol belongs inside the kind-specific payload:
 }
 ```
 
-Use `external_io` for configured external read/write/fetch endpoints such as S3,
-GCS, filesystem paths, and HTTP content sources. Keep the transport in
+Use `web_search` for queryable external knowledge/search providers with ranking,
+snippets, citations, freshness, and agent-tool behavior. Use `external_io` for
+configured external read/write/fetch endpoints such as S3, GCS, filesystem
+paths, and HTTP content sources. Keep the transport in
 `external_io.protocol`. Express both technical actions and workflow use cases in
 namespaced `capabilities`.
 
@@ -86,6 +99,21 @@ connections:
       provider: openai
       url: https://api.openai.com
       api_key: ${secret:openai.api_key}
+
+  agent-web:
+    display_name: Exa agent search
+    kind: web_search
+    provider: exa
+    capabilities:
+      - web.search
+      - web.semantic_search
+      - web.fetch
+      - agents.use
+    web_search:
+      max_results: 10
+      include_content: true
+      include_highlights: true
+      api_key: ${secret:exa.api_key}
 
   docs-site:
     kind: external_io
@@ -200,6 +228,52 @@ Common capabilities:
 - `models.transcribe`
 - `models.classify`
 - `models.extract`
+- `agents.use`
+- `indexing.use`
+
+### Web Search
+
+Web-search connections describe queryable external search providers. They are
+separate from `external_io` because the user-facing contract is search results,
+ranking, snippets, citations, freshness, and optional content extraction rather
+than generic HTTP access.
+
+Example:
+
+```json
+{
+  "id": "conn_agent_web",
+  "kind": "web_search",
+  "provider": "exa",
+  "capabilities": ["web.search", "web.semantic_search", "web.fetch", "agents.use"],
+  "web_search": {
+    "max_results": 10,
+    "safe_search": true,
+    "include_content": true,
+    "include_highlights": true,
+    "configured": true
+  }
+}
+```
+
+Common providers:
+
+- `exa`
+- `tavily`
+- `brave`
+- `serper`
+- `you`
+- `linkup`
+- `vertex`
+
+Common capabilities:
+
+- `web.search`
+- `web.semantic_search`
+- `web.news`
+- `web.images`
+- `web.fetch`
+- `web.answer`
 - `agents.use`
 - `indexing.use`
 
@@ -388,7 +462,7 @@ GET /db/v1/connections
 
 Query parameters:
 
-- `types`: comma-separated connection kinds, such as `inference,external_io,cdc`.
+- `types`: comma-separated connection kinds, such as `inference,web_search,external_io,cdc`.
 - `include`: comma-separated expansions. First expansion: `models`.
 - `refresh`: `true` to bypass the short server-side live-check cache.
 
@@ -460,8 +534,8 @@ That expansion should require `connection:secret_ref:read`.
 Implement now:
 
 - Configure public connection resources under top-level `connections`.
-- Use top-level kinds `inference`, `external_io`, and `cdc`.
-- Return kind-specific payloads named `inference`, `external_io`, and `cdc`.
+- Use top-level kinds `inference`, `web_search`, `external_io`, and `cdc`.
+- Return kind-specific payloads named `inference`, `web_search`, `external_io`, and `cdc`.
 - Keep `GET /db/v1/connections` config-derived and cheap by default.
 - Keep `include=models` as the explicit live inference-provider expansion.
 - Keep `refresh=true` scoped to short live-check caches.

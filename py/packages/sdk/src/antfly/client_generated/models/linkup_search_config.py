@@ -6,26 +6,26 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.serper_search_config_search_type import SerperSearchConfigSearchType
-from ..models.serper_search_config_time_period import SerperSearchConfigTimePeriod
+from ..models.linkup_search_config_depth import LinkupSearchConfigDepth
+from ..models.linkup_search_config_output_type import LinkupSearchConfigOutputType
 from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="SerperSearchConfig")
+T = TypeVar("T", bound="LinkupSearchConfig")
 
 
 @_attrs_define
-class SerperSearchConfig:
-    """Configuration for Serper.dev Google Search API.
+class LinkupSearchConfig:
+    """Configuration for Linkup Search API.
 
-    Serper provides a simpler alternative to Google Custom Search with
-    competitive pricing and easy setup.
+    Linkup is useful for web search, source retrieval, and structured
+    research workflows.
 
     **Setup:**
-    1. Sign up at https://serper.dev
+    1. Sign up at https://linkup.so
     2. Get API key from dashboard
 
-    **Docs:** https://serper.dev/docs
+    **Docs:** https://docs.linkup.so
 
         Attributes:
             provider (WebSearchProvider): The web search provider to use.
@@ -37,7 +37,7 @@ class SerperSearchConfig:
                 - **you**: You.com Search API for agent and research workflows
                 - **linkup**: Linkup Search API for web search and content retrieval
                 - **vertex**: Google Cloud Agent Search / Vertex AI Search
-            api_key (str | Unset): Serper API key (or set SERPER_API_KEY env var)
+            api_key (str | Unset): Linkup API key (or set LINKUP_API_KEY env var)
             endpoint (str | Unset): Provider endpoint override when applicable
             max_results (int | Unset): Maximum number of search results to return Default: 5.
             timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
@@ -47,9 +47,10 @@ class SerperSearchConfig:
             include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
             include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
                 False.
-            search_type (SerperSearchConfigSearchType | Unset): Type of search to perform Default:
-                SerperSearchConfigSearchType.SEARCH.
-            time_period (SerperSearchConfigTimePeriod | Unset): Time period filter: d=day, w=week, m=month, y=year
+            depth (LinkupSearchConfigDepth | Unset): Search depth to request from Linkup Default:
+                LinkupSearchConfigDepth.STANDARD.
+            output_type (LinkupSearchConfigOutputType | Unset): Linkup response shape to request Default:
+                LinkupSearchConfigOutputType.SEARCHRESULTS.
     """
 
     provider: WebSearchProvider
@@ -62,8 +63,8 @@ class SerperSearchConfig:
     region: str | Unset = UNSET
     include_content: bool | Unset = False
     include_highlights: bool | Unset = False
-    search_type: SerperSearchConfigSearchType | Unset = SerperSearchConfigSearchType.SEARCH
-    time_period: SerperSearchConfigTimePeriod | Unset = UNSET
+    depth: LinkupSearchConfigDepth | Unset = LinkupSearchConfigDepth.STANDARD
+    output_type: LinkupSearchConfigOutputType | Unset = LinkupSearchConfigOutputType.SEARCHRESULTS
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -87,13 +88,13 @@ class SerperSearchConfig:
 
         include_highlights = self.include_highlights
 
-        search_type: str | Unset = UNSET
-        if not isinstance(self.search_type, Unset):
-            search_type = self.search_type.value
+        depth: str | Unset = UNSET
+        if not isinstance(self.depth, Unset):
+            depth = self.depth.value
 
-        time_period: str | Unset = UNSET
-        if not isinstance(self.time_period, Unset):
-            time_period = self.time_period.value
+        output_type: str | Unset = UNSET
+        if not isinstance(self.output_type, Unset):
+            output_type = self.output_type.value
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -120,10 +121,10 @@ class SerperSearchConfig:
             field_dict["include_content"] = include_content
         if include_highlights is not UNSET:
             field_dict["include_highlights"] = include_highlights
-        if search_type is not UNSET:
-            field_dict["search_type"] = search_type
-        if time_period is not UNSET:
-            field_dict["time_period"] = time_period
+        if depth is not UNSET:
+            field_dict["depth"] = depth
+        if output_type is not UNSET:
+            field_dict["output_type"] = output_type
 
         return field_dict
 
@@ -150,21 +151,21 @@ class SerperSearchConfig:
 
         include_highlights = d.pop("include_highlights", UNSET)
 
-        _search_type = d.pop("search_type", UNSET)
-        search_type: SerperSearchConfigSearchType | Unset
-        if isinstance(_search_type, Unset):
-            search_type = UNSET
+        _depth = d.pop("depth", UNSET)
+        depth: LinkupSearchConfigDepth | Unset
+        if isinstance(_depth, Unset):
+            depth = UNSET
         else:
-            search_type = SerperSearchConfigSearchType(_search_type)
+            depth = LinkupSearchConfigDepth(_depth)
 
-        _time_period = d.pop("time_period", UNSET)
-        time_period: SerperSearchConfigTimePeriod | Unset
-        if isinstance(_time_period, Unset):
-            time_period = UNSET
+        _output_type = d.pop("output_type", UNSET)
+        output_type: LinkupSearchConfigOutputType | Unset
+        if isinstance(_output_type, Unset):
+            output_type = UNSET
         else:
-            time_period = SerperSearchConfigTimePeriod(_time_period)
+            output_type = LinkupSearchConfigOutputType(_output_type)
 
-        serper_search_config = cls(
+        linkup_search_config = cls(
             provider=provider,
             api_key=api_key,
             endpoint=endpoint,
@@ -175,12 +176,12 @@ class SerperSearchConfig:
             region=region,
             include_content=include_content,
             include_highlights=include_highlights,
-            search_type=search_type,
-            time_period=time_period,
+            depth=depth,
+            output_type=output_type,
         )
 
-        serper_search_config.additional_properties = d
-        return serper_search_config
+        linkup_search_config.additional_properties = d
+        return linkup_search_config
 
     @property
     def additional_keys(self) -> list[str]:

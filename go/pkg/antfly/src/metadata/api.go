@@ -36,6 +36,7 @@ import (
 	_ "github.com/antflydb/antfly/go/pkg/antfly/lib/template" // Import for side effects: registers remoteMedia, remotePDF, remoteText helpers
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata/foreign"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	client "github.com/antflydb/antfly/go/pkg/antfly/src/store/client"
@@ -75,6 +76,7 @@ var deletesPool = sync.Pool{
 type TableApi struct {
 	ln             *MetadataStore
 	tm             *tablemgr.TableManager
+	config         *common.Config
 	logger         *zap.Logger
 	pool           *workerpool.Pool
 	joinOnce       sync.Once
@@ -293,6 +295,7 @@ func NewTableApi(logger *zap.Logger, ln *MetadataStore, tm *tablemgr.TableManage
 		logger:      logger,
 		tm:          tm,
 		ln:          ln,
+		config:      ln.config,
 		pool:        ln.pool,
 		foreignPool: foreign.NewPoolManager(),
 	}

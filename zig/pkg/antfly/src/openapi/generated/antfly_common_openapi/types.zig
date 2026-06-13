@@ -27,12 +27,14 @@ pub const NamedChainLink = struct {
 /// Broad physical category for a configured connection.
 pub const ConnectionKind = enum {
     inference,
+    web_search,
     external_io,
     cdc,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .inference => "inference",
+            .web_search => "web_search",
             .external_io => "external_io",
             .cdc => "cdc",
         };
@@ -46,6 +48,7 @@ pub const ConnectionKind = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "inference", .inference },
+            .{ "web_search", .web_search },
             .{ "external_io", .external_io },
             .{ "cdc", .cdc },
         });
@@ -104,6 +107,43 @@ pub const InferenceConnectionConfig = struct {
     names: ?[]const []const u8 = null,
     /// Model types this connection is configured to serve.
     configured_model_types: ?[]const []const u8 = null,
+};
+
+pub const WebSearchConnectionConfig = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Request provider safe-search filtering.
+    safe_search: ?bool = null,
+    /// Preferred result language, such as en.
+    language: ?[]const u8 = null,
+    /// Preferred result region, such as us.
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported.
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported.
+    include_highlights: ?bool = null,
+    /// Provider API key or secret reference. Never returned by inventory APIs.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Filesystem path to provider credentials when applicable.
+    credentials_path: ?[]const u8 = null,
+    /// Only include results from these domains when provider supports it.
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains when provider supports it.
+    exclude_domains: ?[]const []const u8 = null,
 };
 
 pub const CdcConnectionConfig = struct {
@@ -205,10 +245,13 @@ pub const StorageConfig = struct {
 pub const ConnectionConfig = struct {
     /// Optional display name for UIs.
     display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
     kind: ConnectionKind,
     /// Namespaced actions and workflow uses this connection supports.
     capabilities: []const []const u8,
     inference: ?InferenceConnectionConfig = null,
+    web_search: ?WebSearchConnectionConfig = null,
     external_io: ?ExternalIoConnectionConfig = null,
     cdc: ?CdcConnectionConfig = null,
 };

@@ -81,8 +81,8 @@ def sync_detailed(
     r"""List configured external connections
 
      Enumerates public external connections configured on this node under
-    top-level `connections`: inference providers, external IO endpoints,
-    and CDC replication sources.
+    top-level `connections`: inference providers, web search providers,
+    external IO endpoints, and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -127,8 +127,8 @@ def sync(
     r"""List configured external connections
 
      Enumerates public external connections configured on this node under
-    top-level `connections`: inference providers, external IO endpoints,
-    and CDC replication sources.
+    top-level `connections`: inference providers, web search providers,
+    external IO endpoints, and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -168,8 +168,8 @@ async def asyncio_detailed(
     r"""List configured external connections
 
      Enumerates public external connections configured on this node under
-    top-level `connections`: inference providers, external IO endpoints,
-    and CDC replication sources.
+    top-level `connections`: inference providers, web search providers,
+    external IO endpoints, and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -212,8 +212,8 @@ async def asyncio(
     r"""List configured external connections
 
      Enumerates public external connections configured on this node under
-    top-level `connections`: inference providers, external IO endpoints,
-    and CDC replication sources.
+    top-level `connections`: inference providers, web search providers,
+    external IO endpoints, and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its

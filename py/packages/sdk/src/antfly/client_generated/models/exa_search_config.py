@@ -1,31 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.serper_search_config_search_type import SerperSearchConfigSearchType
-from ..models.serper_search_config_time_period import SerperSearchConfigTimePeriod
+from ..models.exa_search_config_search_type import ExaSearchConfigSearchType
 from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="SerperSearchConfig")
+T = TypeVar("T", bound="ExaSearchConfig")
 
 
 @_attrs_define
-class SerperSearchConfig:
-    """Configuration for Serper.dev Google Search API.
+class ExaSearchConfig:
+    """Configuration for Exa neural/semantic web search.
 
-    Serper provides a simpler alternative to Google Custom Search with
-    competitive pricing and easy setup.
+    Exa is optimized for semantic web search, highlights, and retrieved page
+    contents for RAG and agent workflows.
 
     **Setup:**
-    1. Sign up at https://serper.dev
+    1. Sign up at https://exa.ai
     2. Get API key from dashboard
 
-    **Docs:** https://serper.dev/docs
+    **Docs:** https://docs.exa.ai
 
         Attributes:
             provider (WebSearchProvider): The web search provider to use.
@@ -37,7 +36,7 @@ class SerperSearchConfig:
                 - **you**: You.com Search API for agent and research workflows
                 - **linkup**: Linkup Search API for web search and content retrieval
                 - **vertex**: Google Cloud Agent Search / Vertex AI Search
-            api_key (str | Unset): Serper API key (or set SERPER_API_KEY env var)
+            api_key (str | Unset): Exa API key (or set EXA_API_KEY env var)
             endpoint (str | Unset): Provider endpoint override when applicable
             max_results (int | Unset): Maximum number of search results to return Default: 5.
             timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
@@ -47,9 +46,13 @@ class SerperSearchConfig:
             include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
             include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
                 False.
-            search_type (SerperSearchConfigSearchType | Unset): Type of search to perform Default:
-                SerperSearchConfigSearchType.SEARCH.
-            time_period (SerperSearchConfigTimePeriod | Unset): Time period filter: d=day, w=week, m=month, y=year
+            search_type (ExaSearchConfigSearchType | Unset): Search mode to request from Exa Default:
+                ExaSearchConfigSearchType.AUTO.
+            num_results (int | Unset): Provider-specific result count override
+            start_published_date (str | Unset): ISO date/time lower bound for published date filtering
+            end_published_date (str | Unset): ISO date/time upper bound for published date filtering
+            include_domains (list[str] | Unset): Only include results from these domains
+            exclude_domains (list[str] | Unset): Exclude results from these domains
     """
 
     provider: WebSearchProvider
@@ -62,8 +65,12 @@ class SerperSearchConfig:
     region: str | Unset = UNSET
     include_content: bool | Unset = False
     include_highlights: bool | Unset = False
-    search_type: SerperSearchConfigSearchType | Unset = SerperSearchConfigSearchType.SEARCH
-    time_period: SerperSearchConfigTimePeriod | Unset = UNSET
+    search_type: ExaSearchConfigSearchType | Unset = ExaSearchConfigSearchType.AUTO
+    num_results: int | Unset = UNSET
+    start_published_date: str | Unset = UNSET
+    end_published_date: str | Unset = UNSET
+    include_domains: list[str] | Unset = UNSET
+    exclude_domains: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,9 +98,19 @@ class SerperSearchConfig:
         if not isinstance(self.search_type, Unset):
             search_type = self.search_type.value
 
-        time_period: str | Unset = UNSET
-        if not isinstance(self.time_period, Unset):
-            time_period = self.time_period.value
+        num_results = self.num_results
+
+        start_published_date = self.start_published_date
+
+        end_published_date = self.end_published_date
+
+        include_domains: list[str] | Unset = UNSET
+        if not isinstance(self.include_domains, Unset):
+            include_domains = self.include_domains
+
+        exclude_domains: list[str] | Unset = UNSET
+        if not isinstance(self.exclude_domains, Unset):
+            exclude_domains = self.exclude_domains
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -122,8 +139,16 @@ class SerperSearchConfig:
             field_dict["include_highlights"] = include_highlights
         if search_type is not UNSET:
             field_dict["search_type"] = search_type
-        if time_period is not UNSET:
-            field_dict["time_period"] = time_period
+        if num_results is not UNSET:
+            field_dict["num_results"] = num_results
+        if start_published_date is not UNSET:
+            field_dict["start_published_date"] = start_published_date
+        if end_published_date is not UNSET:
+            field_dict["end_published_date"] = end_published_date
+        if include_domains is not UNSET:
+            field_dict["include_domains"] = include_domains
+        if exclude_domains is not UNSET:
+            field_dict["exclude_domains"] = exclude_domains
 
         return field_dict
 
@@ -151,20 +176,23 @@ class SerperSearchConfig:
         include_highlights = d.pop("include_highlights", UNSET)
 
         _search_type = d.pop("search_type", UNSET)
-        search_type: SerperSearchConfigSearchType | Unset
+        search_type: ExaSearchConfigSearchType | Unset
         if isinstance(_search_type, Unset):
             search_type = UNSET
         else:
-            search_type = SerperSearchConfigSearchType(_search_type)
+            search_type = ExaSearchConfigSearchType(_search_type)
 
-        _time_period = d.pop("time_period", UNSET)
-        time_period: SerperSearchConfigTimePeriod | Unset
-        if isinstance(_time_period, Unset):
-            time_period = UNSET
-        else:
-            time_period = SerperSearchConfigTimePeriod(_time_period)
+        num_results = d.pop("num_results", UNSET)
 
-        serper_search_config = cls(
+        start_published_date = d.pop("start_published_date", UNSET)
+
+        end_published_date = d.pop("end_published_date", UNSET)
+
+        include_domains = cast(list[str], d.pop("include_domains", UNSET))
+
+        exclude_domains = cast(list[str], d.pop("exclude_domains", UNSET))
+
+        exa_search_config = cls(
             provider=provider,
             api_key=api_key,
             endpoint=endpoint,
@@ -176,11 +204,15 @@ class SerperSearchConfig:
             include_content=include_content,
             include_highlights=include_highlights,
             search_type=search_type,
-            time_period=time_period,
+            num_results=num_results,
+            start_published_date=start_published_date,
+            end_published_date=end_published_date,
+            include_domains=include_domains,
+            exclude_domains=exclude_domains,
         )
 
-        serper_search_config.additional_properties = d
-        return serper_search_config
+        exa_search_config.additional_properties = d
+        return exa_search_config
 
     @property
     def additional_keys(self) -> list[str]:

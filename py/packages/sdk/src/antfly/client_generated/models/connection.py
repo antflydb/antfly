@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.cdc_connection import CdcConnection
     from ..models.external_io_connection import ExternalIoConnection
     from ..models.inference_connection import InferenceConnection
+    from ..models.web_search_connection import WebSearchConnection
 
 
 T = TypeVar("T", bound="Connection")
@@ -34,10 +35,13 @@ class Connection:
         capabilities (list[str]): Namespaced actions and workflow uses this connection supports, such as models.embed,
             content.fetch, objects.read, or cdc.read_stream.
         display_name (str | Unset): Optional display name for UIs.
+        provider (str | Unset): Provider token for connection kinds that have a provider-level service identity, such as
+            web_search.
         error (str | Unset): Failure detail when status is "error".
         sources (list[str] | Unset): Where this connection was configured, e.g.
             "config:embedders/openai-small" or "table:docs/index:body_vec".
         inference (InferenceConnection | Unset):
+        web_search (WebSearchConnection | Unset):
         external_io (ExternalIoConnection | Unset):
         cdc (CdcConnection | Unset):
     """
@@ -48,9 +52,11 @@ class Connection:
     status: ConnectionStatus
     capabilities: list[str]
     display_name: str | Unset = UNSET
+    provider: str | Unset = UNSET
     error: str | Unset = UNSET
     sources: list[str] | Unset = UNSET
     inference: InferenceConnection | Unset = UNSET
+    web_search: WebSearchConnection | Unset = UNSET
     external_io: ExternalIoConnection | Unset = UNSET
     cdc: CdcConnection | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -68,6 +74,8 @@ class Connection:
 
         display_name = self.display_name
 
+        provider = self.provider
+
         error = self.error
 
         sources: list[str] | Unset = UNSET
@@ -77,6 +85,10 @@ class Connection:
         inference: dict[str, Any] | Unset = UNSET
         if not isinstance(self.inference, Unset):
             inference = self.inference.to_dict()
+
+        web_search: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.web_search, Unset):
+            web_search = self.web_search.to_dict()
 
         external_io: dict[str, Any] | Unset = UNSET
         if not isinstance(self.external_io, Unset):
@@ -99,12 +111,16 @@ class Connection:
         )
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
+        if provider is not UNSET:
+            field_dict["provider"] = provider
         if error is not UNSET:
             field_dict["error"] = error
         if sources is not UNSET:
             field_dict["sources"] = sources
         if inference is not UNSET:
             field_dict["inference"] = inference
+        if web_search is not UNSET:
+            field_dict["web_search"] = web_search
         if external_io is not UNSET:
             field_dict["external_io"] = external_io
         if cdc is not UNSET:
@@ -117,6 +133,7 @@ class Connection:
         from ..models.cdc_connection import CdcConnection
         from ..models.external_io_connection import ExternalIoConnection
         from ..models.inference_connection import InferenceConnection
+        from ..models.web_search_connection import WebSearchConnection
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -131,6 +148,8 @@ class Connection:
 
         display_name = d.pop("display_name", UNSET)
 
+        provider = d.pop("provider", UNSET)
+
         error = d.pop("error", UNSET)
 
         sources = cast(list[str], d.pop("sources", UNSET))
@@ -141,6 +160,13 @@ class Connection:
             inference = UNSET
         else:
             inference = InferenceConnection.from_dict(_inference)
+
+        _web_search = d.pop("web_search", UNSET)
+        web_search: WebSearchConnection | Unset
+        if isinstance(_web_search, Unset):
+            web_search = UNSET
+        else:
+            web_search = WebSearchConnection.from_dict(_web_search)
 
         _external_io = d.pop("external_io", UNSET)
         external_io: ExternalIoConnection | Unset
@@ -163,9 +189,11 @@ class Connection:
             status=status,
             capabilities=capabilities,
             display_name=display_name,
+            provider=provider,
             error=error,
             sources=sources,
             inference=inference,
+            web_search=web_search,
             external_io=external_io,
             cdc=cdc,
         )

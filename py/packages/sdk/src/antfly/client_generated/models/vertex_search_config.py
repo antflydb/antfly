@@ -6,26 +6,27 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.serper_search_config_search_type import SerperSearchConfigSearchType
-from ..models.serper_search_config_time_period import SerperSearchConfigTimePeriod
+from ..models.vertex_search_config_service import VertexSearchConfigService
 from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="SerperSearchConfig")
+T = TypeVar("T", bound="VertexSearchConfig")
 
 
 @_attrs_define
-class SerperSearchConfig:
-    """Configuration for Serper.dev Google Search API.
+class VertexSearchConfig:
+    """Configuration for Google Cloud Agent Search / Vertex AI Search.
 
-    Serper provides a simpler alternative to Google Custom Search with
-    competitive pricing and easy setup.
+    Use this for bounded Google Cloud search over configured data stores or
+    verified websites. The provider token is `vertex` to match Antfly's
+    existing Google Cloud provider convention.
 
     **Setup:**
-    1. Sign up at https://serper.dev
-    2. Get API key from dashboard
+    1. Enable Discovery Engine API in Google Cloud
+    2. Create an Agent Search app/data store
+    3. Grant service account access to query the serving config
 
-    **Docs:** https://serper.dev/docs
+    **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
 
         Attributes:
             provider (WebSearchProvider): The web search provider to use.
@@ -37,7 +38,8 @@ class SerperSearchConfig:
                 - **you**: You.com Search API for agent and research workflows
                 - **linkup**: Linkup Search API for web search and content retrieval
                 - **vertex**: Google Cloud Agent Search / Vertex AI Search
-            api_key (str | Unset): Serper API key (or set SERPER_API_KEY env var)
+            api_key (str | Unset): Provider API key or secret reference. Prefer named web_search connections for production
+                use.
             endpoint (str | Unset): Provider endpoint override when applicable
             max_results (int | Unset): Maximum number of search results to return Default: 5.
             timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
@@ -47,9 +49,13 @@ class SerperSearchConfig:
             include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
             include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
                 False.
-            search_type (SerperSearchConfigSearchType | Unset): Type of search to perform Default:
-                SerperSearchConfigSearchType.SEARCH.
-            time_period (SerperSearchConfigTimePeriod | Unset): Time period filter: d=day, w=week, m=month, y=year
+            service (VertexSearchConfigService | Unset): Google Cloud search service flavor Default:
+                VertexSearchConfigService.AGENT_SEARCH.
+            project_id (str | Unset): Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
+            location (str | Unset): Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. Default: 'global'.
+            data_store (str | Unset): Agent Search data store ID.
+            serving_config (str | Unset): Agent Search serving config ID. Default: 'default_config'.
+            credentials_path (str | Unset): Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
     """
 
     provider: WebSearchProvider
@@ -62,8 +68,12 @@ class SerperSearchConfig:
     region: str | Unset = UNSET
     include_content: bool | Unset = False
     include_highlights: bool | Unset = False
-    search_type: SerperSearchConfigSearchType | Unset = SerperSearchConfigSearchType.SEARCH
-    time_period: SerperSearchConfigTimePeriod | Unset = UNSET
+    service: VertexSearchConfigService | Unset = VertexSearchConfigService.AGENT_SEARCH
+    project_id: str | Unset = UNSET
+    location: str | Unset = "global"
+    data_store: str | Unset = UNSET
+    serving_config: str | Unset = "default_config"
+    credentials_path: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -87,13 +97,19 @@ class SerperSearchConfig:
 
         include_highlights = self.include_highlights
 
-        search_type: str | Unset = UNSET
-        if not isinstance(self.search_type, Unset):
-            search_type = self.search_type.value
+        service: str | Unset = UNSET
+        if not isinstance(self.service, Unset):
+            service = self.service.value
 
-        time_period: str | Unset = UNSET
-        if not isinstance(self.time_period, Unset):
-            time_period = self.time_period.value
+        project_id = self.project_id
+
+        location = self.location
+
+        data_store = self.data_store
+
+        serving_config = self.serving_config
+
+        credentials_path = self.credentials_path
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -120,10 +136,18 @@ class SerperSearchConfig:
             field_dict["include_content"] = include_content
         if include_highlights is not UNSET:
             field_dict["include_highlights"] = include_highlights
-        if search_type is not UNSET:
-            field_dict["search_type"] = search_type
-        if time_period is not UNSET:
-            field_dict["time_period"] = time_period
+        if service is not UNSET:
+            field_dict["service"] = service
+        if project_id is not UNSET:
+            field_dict["project_id"] = project_id
+        if location is not UNSET:
+            field_dict["location"] = location
+        if data_store is not UNSET:
+            field_dict["data_store"] = data_store
+        if serving_config is not UNSET:
+            field_dict["serving_config"] = serving_config
+        if credentials_path is not UNSET:
+            field_dict["credentials_path"] = credentials_path
 
         return field_dict
 
@@ -150,21 +174,24 @@ class SerperSearchConfig:
 
         include_highlights = d.pop("include_highlights", UNSET)
 
-        _search_type = d.pop("search_type", UNSET)
-        search_type: SerperSearchConfigSearchType | Unset
-        if isinstance(_search_type, Unset):
-            search_type = UNSET
+        _service = d.pop("service", UNSET)
+        service: VertexSearchConfigService | Unset
+        if isinstance(_service, Unset):
+            service = UNSET
         else:
-            search_type = SerperSearchConfigSearchType(_search_type)
+            service = VertexSearchConfigService(_service)
 
-        _time_period = d.pop("time_period", UNSET)
-        time_period: SerperSearchConfigTimePeriod | Unset
-        if isinstance(_time_period, Unset):
-            time_period = UNSET
-        else:
-            time_period = SerperSearchConfigTimePeriod(_time_period)
+        project_id = d.pop("project_id", UNSET)
 
-        serper_search_config = cls(
+        location = d.pop("location", UNSET)
+
+        data_store = d.pop("data_store", UNSET)
+
+        serving_config = d.pop("serving_config", UNSET)
+
+        credentials_path = d.pop("credentials_path", UNSET)
+
+        vertex_search_config = cls(
             provider=provider,
             api_key=api_key,
             endpoint=endpoint,
@@ -175,12 +202,16 @@ class SerperSearchConfig:
             region=region,
             include_content=include_content,
             include_highlights=include_highlights,
-            search_type=search_type,
-            time_period=time_period,
+            service=service,
+            project_id=project_id,
+            location=location,
+            data_store=data_store,
+            serving_config=serving_config,
+            credentials_path=credentials_path,
         )
 
-        serper_search_config.additional_properties = d
-        return serper_search_config
+        vertex_search_config.additional_properties = d
+        return vertex_search_config
 
     @property
     def additional_keys(self) -> list[str]:

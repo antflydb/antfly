@@ -336,8 +336,8 @@ export class AntflyClient {
 
   connections = {
     /**
-     * List configured external connections (inference providers, object
-     * stores, remote content sources). Pass `include: ["models"]` to
+     * List configured external connections (inference providers, web search,
+     * external IO, CDC sources). Pass `include: ["models"]` to
      * live-query each inference provider's model listing API.
      * Returns undefined when the server predates the endpoint.
      */

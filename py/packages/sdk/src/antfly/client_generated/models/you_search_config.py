@@ -9,51 +9,62 @@ from attrs import field as _attrs_field
 from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="DuckDuckGoSearchConfig")
+T = TypeVar("T", bound="YouSearchConfig")
 
 
 @_attrs_define
-class DuckDuckGoSearchConfig:
-    """Configuration for DuckDuckGo Instant Answer API.
+class YouSearchConfig:
+    """Configuration for You.com Search API.
 
-    DuckDuckGo provides limited free search without requiring an API key.
-    Best for simple queries; may not return results for all searches.
+    You.com is useful for agentic search and research-oriented result
+    retrieval.
 
-    **Note:** This uses the Instant Answer API which has limitations.
-    For production use, consider other providers.
+    **Setup:**
+    1. Sign up for You.com API access
+    2. Get API key from dashboard
 
-    **Docs:** https://duckduckgo.com/api
+    **Docs:** https://api.you.com
 
         Attributes:
             provider (WebSearchProvider): The web search provider to use.
 
-                - **google**: Google Custom Search API (requires CSE setup)
-                - **bing**: Microsoft Bing Web Search API
+                - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
                 - **tavily**: Tavily AI Search API (optimized for RAG)
                 - **brave**: Brave Search API
-                - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+                - **you**: You.com Search API for agent and research workflows
+                - **linkup**: Linkup Search API for web search and content retrieval
+                - **vertex**: Google Cloud Agent Search / Vertex AI Search
+            api_key (str | Unset): You.com API key (or set YOU_API_KEY env var)
+            endpoint (str | Unset): You.com API endpoint URL
             max_results (int | Unset): Maximum number of search results to return Default: 5.
             timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
             safe_search (bool | Unset): Enable safe search filtering Default: True.
             language (str | Unset): Preferred language for results (e.g., 'en', 'es', 'fr') Example: en.
             region (str | Unset): Preferred region for results (e.g., 'us', 'uk', 'de') Example: us.
-            no_redirect (bool | Unset): Skip HTTP redirect for bang queries Default: True.
-            no_html (bool | Unset): Remove HTML from results Default: True.
+            include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
+            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
+                False.
     """
 
     provider: WebSearchProvider
+    api_key: str | Unset = UNSET
+    endpoint: str | Unset = UNSET
     max_results: int | Unset = 5
     timeout_ms: int | Unset = 10000
     safe_search: bool | Unset = True
     language: str | Unset = UNSET
     region: str | Unset = UNSET
-    no_redirect: bool | Unset = True
-    no_html: bool | Unset = True
+    include_content: bool | Unset = False
+    include_highlights: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        api_key = self.api_key
+
+        endpoint = self.endpoint
 
         max_results = self.max_results
 
@@ -65,9 +76,9 @@ class DuckDuckGoSearchConfig:
 
         region = self.region
 
-        no_redirect = self.no_redirect
+        include_content = self.include_content
 
-        no_html = self.no_html
+        include_highlights = self.include_highlights
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -76,6 +87,10 @@ class DuckDuckGoSearchConfig:
                 "provider": provider,
             }
         )
+        if api_key is not UNSET:
+            field_dict["api_key"] = api_key
+        if endpoint is not UNSET:
+            field_dict["endpoint"] = endpoint
         if max_results is not UNSET:
             field_dict["max_results"] = max_results
         if timeout_ms is not UNSET:
@@ -86,10 +101,10 @@ class DuckDuckGoSearchConfig:
             field_dict["language"] = language
         if region is not UNSET:
             field_dict["region"] = region
-        if no_redirect is not UNSET:
-            field_dict["no_redirect"] = no_redirect
-        if no_html is not UNSET:
-            field_dict["no_html"] = no_html
+        if include_content is not UNSET:
+            field_dict["include_content"] = include_content
+        if include_highlights is not UNSET:
+            field_dict["include_highlights"] = include_highlights
 
         return field_dict
 
@@ -97,6 +112,10 @@ class DuckDuckGoSearchConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         provider = WebSearchProvider(d.pop("provider"))
+
+        api_key = d.pop("api_key", UNSET)
+
+        endpoint = d.pop("endpoint", UNSET)
 
         max_results = d.pop("max_results", UNSET)
 
@@ -108,23 +127,25 @@ class DuckDuckGoSearchConfig:
 
         region = d.pop("region", UNSET)
 
-        no_redirect = d.pop("no_redirect", UNSET)
+        include_content = d.pop("include_content", UNSET)
 
-        no_html = d.pop("no_html", UNSET)
+        include_highlights = d.pop("include_highlights", UNSET)
 
-        duck_duck_go_search_config = cls(
+        you_search_config = cls(
             provider=provider,
+            api_key=api_key,
+            endpoint=endpoint,
             max_results=max_results,
             timeout_ms=timeout_ms,
             safe_search=safe_search,
             language=language,
             region=region,
-            no_redirect=no_redirect,
-            no_html=no_html,
+            include_content=include_content,
+            include_highlights=include_highlights,
         )
 
-        duck_duck_go_search_config.additional_properties = d
-        return duck_duck_go_search_config
+        you_search_config.additional_properties = d
+        return you_search_config
 
     @property
     def additional_keys(self) -> list[str]:

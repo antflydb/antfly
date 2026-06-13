@@ -382,6 +382,7 @@ components:
       type: string
       enum:
         - inference
+        - web_search
         - external_io
         - cdc
       description: Broad physical category for a configured connection.
@@ -402,6 +403,9 @@ components:
         display_name:
           type: string
           description: Optional display name for UIs.
+        provider:
+          type: string
+          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
         kind:
           $ref: "#/components/schemas/ConnectionKind"
         capabilities:
@@ -411,6 +415,8 @@ components:
           description: Namespaced actions and workflow uses this connection supports.
         inference:
           $ref: "#/components/schemas/InferenceConnectionConfig"
+        web_search:
+          $ref: "#/components/schemas/WebSearchConnectionConfig"
         external_io:
           $ref: "#/components/schemas/ExternalIoConnectionConfig"
         cdc:
@@ -456,6 +462,67 @@ components:
               - reranker
               - chunker
           description: Model types this connection is configured to serve.
+    WebSearchConnectionConfig:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Provider-specific service flavor, such as agent_search for provider vertex.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Maximum ranked results to return.
+        timeout_ms:
+          type: integer
+          description: Provider request timeout in milliseconds.
+        safe_search:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Request provider safe-search filtering.
+        language:
+          type: string
+          description: Preferred result language, such as en.
+        region:
+          type: string
+          description: Preferred result region, such as us.
+        include_content:
+          type: boolean
+          description: Ask the provider to return extracted page content when supported.
+        include_highlights:
+          type: boolean
+          description: Ask the provider to return highlighted passages when supported.
+        api_key:
+          type: string
+          description: Provider API key or secret reference. Never returned by inventory APIs.
+        endpoint:
+          type: string
+          description: Provider endpoint override when applicable.
+        project_id:
+          type: string
+          description: Google Cloud project for provider vertex.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex.
+        credentials_path:
+          type: string
+          description: Filesystem path to provider credentials when applicable.
+        include_domains:
+          type: array
+          items:
+            type: string
+          description: Only include results from these domains when provider supports it.
+        exclude_domains:
+          type: array
+          items:
+            type: string
+          description: Exclude results from these domains when provider supports it.
     ExternalIoConnectionConfig:
       type: object
       required:
