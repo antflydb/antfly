@@ -691,6 +691,64 @@ pub const PostingFormat = struct {
         }
     }
 
+    pub fn applySortedCompactOpsToSortedScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_member_count: usize,
+        ids: []VectorId,
+        ops: []PostingDeltaOp,
+    ) !usize {
+        stableSortCompactOpsByVector(ids, ops);
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + ids.len);
+        const base_members = scratch.member_ids[0..base_member_count];
+        const out = overlayAppendedIds(scratch);
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var op_index: usize = 0;
+        while (base_index < base_members.len or op_index < ids.len) {
+            if (op_index >= ids.len) {
+                out[out_count] = base_members[base_index];
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = ids[op_index];
+            var last_op = ops[op_index];
+            op_index += 1;
+            while (op_index < ids.len and ids[op_index] == vector_id) : (op_index += 1) {
+                last_op = ops[op_index];
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                out[out_count] = base_members[base_index];
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) {
+                out[out_count] = vector_id;
+                out_count += 1;
+            }
+            if (present_in_base) base_index += 1;
+        }
+        try scratch.ensureMemberIdCapacity(alloc, out_count);
+        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+        return out_count;
+    }
+
+    pub fn stableSortCompactOpsByVector(ids: []VectorId, ops: []PostingDeltaOp) void {
+        var i: usize = 1;
+        while (i < ids.len) : (i += 1) {
+            const id = ids[i];
+            const op = ops[i];
+            var j = i;
+            while (j > 0 and ids[j - 1] > id) : (j -= 1) {
+                ids[j] = ids[j - 1];
+                ops[j] = ops[j - 1];
+            }
+            ids[j] = id;
+            ops[j] = op;
+        }
+    }
+
     fn streamSortedBaseWithCompactDeltaRecords(sink: anytype, base_data: []const u8, scratch: anytype) !usize {
         var base_iter = try BaseMemberIterator.init(base_data);
         var member_count: usize = 0;
@@ -1597,6 +1655,10 @@ pub const PostingStore = struct {
             return self.delta_records[0..self.delta_record_count];
         }
 
+        pub fn deltaRecordsMut(self: *FoldScratch) []PostingDeltaRecord {
+            return self.delta_records[0..self.delta_record_count];
+        }
+
         pub fn resetDeltaRecords(self: *FoldScratch) void {
             self.delta_record_count = 0;
         }
@@ -1712,18 +1774,22 @@ pub const PostingStore = struct {
             return try copyMemberIds(alloc, scratch, posting_view);
         }
 
-        if (useSegmentPostingBackend(index)) {
-            const materialized = try materializeBaseDeltaMembers(index, txn, posting_view.id, isNotFound);
-            defer index.alloc.free(materialized);
-            try scratch.ensureMemberIdCapacity(alloc, materialized.len);
-            @memcpy(scratch.member_ids[0..materialized.len], materialized);
-            notePostingOverlay(profile, 0, posting_view.members.len, 0, materialized.len);
-            return scratch.member_ids[0..materialized.len];
-        }
-
         const start = now_fn();
         const canonical_base_delta = baseDeltaIsCanonical(index);
-        const base_data = loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
+        var owned_base_data: ?[]u8 = null;
+        defer if (owned_base_data) |data| index.alloc.free(data);
+        const base_data = if (useSegmentPostingBackend(index)) base_data: {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime !@hasDecl(Index, "loadPostingBackendBaseData")) return error.UnsupportedPostingBackend;
+            owned_base_data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
+                if (isNotFound(err)) {
+                    notePostingOverlayFallback(profile);
+                    return try copyMemberIds(alloc, scratch, posting_view);
+                }
+                return err;
+            };
+            break :base_data owned_base_data.?;
+        } else loadBaseData(index, txn, posting_view.id, isNotFound) catch |err| {
             if (isNotFound(err)) {
                 notePostingOverlayFallback(profile);
                 return try copyMemberIds(alloc, scratch, posting_view);
@@ -4473,6 +4539,12 @@ const PostingPersistenceTestIndex = struct {
         return try PostingFormat.decodeBaseStats(try self.postingBackendBaseData(posting_id, is_not_found));
     }
 
+    pub fn loadPostingBackendBaseData(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]u8 {
+        _ = txn;
+        self.posting_backend_base_loads += 1;
+        return try self.alloc.dupe(u8, try self.postingBackendBaseData(posting_id, is_not_found));
+    }
+
     pub fn loadPostingBackendCentroidDirectoryRecord(self: *PostingPersistenceTestIndex, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !OwnedCentroidDirectoryRecord {
         _ = txn;
         var key_buf: [10]u8 = undefined;
@@ -5416,7 +5488,8 @@ test "posting store segment backend hooks route posting persistence" {
     );
     try std.testing.expectEqualSlices(VectorId, &.{ 20, 30 }, query_members);
     try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
-    try std.testing.expect(index.posting_backend_member_materializations >= 2);
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_member_materializations);
+    try std.testing.expectEqual(@as(u64, 2), profile.posting_delta_replay_records);
 
     const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
         .min_delta_records = 1,

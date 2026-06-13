@@ -900,8 +900,12 @@ implementations cleanly:
     HBC private-namespace snapshot plus the referenced segment files, so DB
     snapshots and restores can preserve segment-backed dense indexes through
     the public snapshot API instead of relying on external orchestration to
-    stitch HBC metadata and segment files together. That may reduce LSM key
-    overhead and improve sequential IO.
+    stitch HBC metadata and segment files together. Segment query
+    materialization now decodes the segment base into retained search scratch,
+    replays globally sequence-sorted delta records from retained scratch, and
+    uses compact sorted merge for small canonical tails instead of allocating
+    an owned materialized member slice and copying it back into query scratch.
+    That may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.

@@ -3415,6 +3415,15 @@ pub const HBCIndex = struct {
         return (try runtime.store.snapshot().loadBaseStats(self.alloc, posting_id)) orelse error.NotFound;
     }
 
+    pub fn loadPostingBackendBaseData(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) ![]u8 {
+        _ = is_not_found;
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return (try runtime.store.snapshot().loadBaseData(self.alloc, posting_id)) orelse error.NotFound;
+    }
+
     pub fn loadPostingBackendCentroidDirectoryRecord(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) !vectorindex_posting.OwnedCentroidDirectoryRecord {
         _ = is_not_found;
         try self.bindTxnLike(txn);
@@ -3453,17 +3462,14 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        const records = try runtime.store.snapshot().loadDeltaTailAfterGeneration(alloc, posting_id, base_generation);
-        defer alloc.free(records);
-
-        try scratch.ensureMemberIdCapacity(alloc, member_count.* + records.len);
-        var out = vectorindex_posting.DeltaReplayResult{};
-        for (records) |record| {
-            vectorindex_posting.PostingFormat.applyDeltaRecordToScratch(scratch, member_count, record);
-            out.records += 1;
-            out.max_sequence = @max(out.max_sequence, record.sequence);
-        }
-        return out;
+        return try runtime.store.snapshot().applyDeltaTailAfterGenerationIntoScratch(
+            alloc,
+            posting_id,
+            scratch,
+            member_count,
+            base_generation,
+            self.postingSegmentBaseMembersShouldSort(),
+        );
     }
 
     pub fn materializePostingBackendMembers(self: *HBCIndex, txn: anytype, posting_id: u64, is_not_found: fn (anyerror) bool) ![]vectorindex_posting.VectorId {

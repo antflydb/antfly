@@ -18,6 +18,7 @@ const vec = @import("antfly_vector").vector;
 const quantizer = @import("antfly_vector").quantizer;
 const types = @import("types.zig");
 const search_types = @import("search_types.zig");
+const posting = @import("posting.zig");
 
 const posting_member_cache_miss_count_limit: usize = 256;
 const posting_member_cache_reuse_admit_count: u8 = 2;
@@ -170,6 +171,8 @@ pub const SearchScratch = struct {
     posting_overlay_appended_ids: []u64 = &.{},
     posting_overlay_appended_live: []bool = &.{},
     posting_overlay_appended_count: usize = 0,
+    posting_delta_records: []posting.PostingDeltaRecord = &.{},
+    posting_delta_record_count: usize = 0,
     posting_delta_tail_cache: [posting_delta_tail_cache_slot_count]PostingDeltaTailCacheEntry = [_]PostingDeltaTailCacheEntry{.{}} ** posting_delta_tail_cache_slot_count,
     posting_delta_tail_cache_active_slot: usize = 0,
     posting_delta_tail_cache_next_slot: usize = 0,
@@ -358,6 +361,34 @@ pub const SearchScratch = struct {
         self.posting_overlay_removed_members.clearRetainingCapacity();
         self.posting_overlay_appended_positions.clearRetainingCapacity();
         self.posting_overlay_appended_count = 0;
+    }
+
+    pub fn ensureDeltaRecordCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        if (self.posting_delta_records.len < needed) {
+            self.posting_delta_records = try alloc.realloc(self.posting_delta_records, needed);
+            self.noteScratchAllocation(byteLen(self.posting_delta_records));
+        }
+    }
+
+    pub fn deltaRecordCount(self: *const SearchScratch) usize {
+        return self.posting_delta_record_count;
+    }
+
+    pub fn appendDeltaRecordAssumeCapacity(self: *SearchScratch, record: posting.PostingDeltaRecord) void {
+        self.posting_delta_records[self.posting_delta_record_count] = record;
+        self.posting_delta_record_count += 1;
+    }
+
+    pub fn deltaRecords(self: *const SearchScratch) []const posting.PostingDeltaRecord {
+        return self.posting_delta_records[0..self.posting_delta_record_count];
+    }
+
+    pub fn deltaRecordsMut(self: *SearchScratch) []posting.PostingDeltaRecord {
+        return self.posting_delta_records[0..self.posting_delta_record_count];
+    }
+
+    pub fn resetDeltaRecords(self: *SearchScratch) void {
+        self.posting_delta_record_count = 0;
     }
 
     pub fn cachedPostingDeltaTail(self: *SearchScratch, posting_id: u64) ?PostingDeltaTailCacheView {
@@ -581,6 +612,9 @@ pub const SearchScratch = struct {
         alloc.free(self.posting_overlay_appended_live);
         self.posting_overlay_appended_live = &.{};
         self.posting_overlay_appended_count = 0;
+        alloc.free(self.posting_delta_records);
+        self.posting_delta_records = &.{};
+        self.posting_delta_record_count = 0;
         trimmed = true;
         if (self.bytes() <= max_retained_bytes) return trimmed;
         alloc.free(self.query_storage);
@@ -628,6 +662,7 @@ pub const SearchScratch = struct {
             byteLen(self.query_storage) +
             byteLen(self.flags) +
             byteLen(self.distance_storage) +
+            byteLen(self.posting_delta_records) +
             posting_delta_tail_cache_bytes +
             posting_member_cache_bytes +
             posting_overlay_bytes;
@@ -655,6 +690,7 @@ pub const SearchScratch = struct {
         self.posting_overlay_appended_positions.deinit(alloc);
         alloc.free(self.posting_overlay_appended_ids);
         alloc.free(self.posting_overlay_appended_live);
+        alloc.free(self.posting_delta_records);
         for (&self.posting_delta_tail_cache) |*entry| entry.deinit(alloc);
         self.* = undefined;
     }
