@@ -82,8 +82,8 @@ def sync_detailed(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, CDC replication sources, and
-    remote content sources.
+    table embedding indexes), external IO endpoints, and CDC replication
+    sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -129,8 +129,8 @@ def sync(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, CDC replication sources, and
-    remote content sources.
+    table embedding indexes), external IO endpoints, and CDC replication
+    sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -171,8 +171,8 @@ async def asyncio_detailed(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, CDC replication sources, and
-    remote content sources.
+    table embedding indexes), external IO endpoints, and CDC replication
+    sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -216,8 +216,8 @@ async def asyncio(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, CDC replication sources, and
-    remote content sources.
+    table embedding indexes), external IO endpoints, and CDC replication
+    sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its

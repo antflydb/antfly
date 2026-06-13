@@ -159,6 +159,8 @@ from .eval_summary import EvalSummary
 from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
+from .external_io_connection import ExternalIoConnection
+from .external_io_protocol import ExternalIoProtocol
 from .extraction_classification import ExtractionClassification
 from .extraction_classification_schema import ExtractionClassificationSchema
 from .extraction_entity import ExtractionEntity
@@ -394,9 +396,6 @@ from .multi_phrase_query import MultiPhraseQuery
 from .node_filter import NodeFilter
 from .node_filter_filter_query import NodeFilterFilterQuery
 from .numeric_range_query import NumericRangeQuery
-from .object_store_connection import ObjectStoreConnection
-from .object_store_connection_backend import ObjectStoreConnectionBackend
-from .object_store_connection_purpose import ObjectStoreConnectionPurpose
 from .ollama_embedder_config import OllamaEmbedderConfig
 from .ollama_generator_config import OllamaGeneratorConfig
 from .ollama_reranker_config import OllamaRerankerConfig
@@ -442,7 +441,6 @@ from .query_result_graph_results import QueryResultGraphResults
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
-from .remote_content_connection import RemoteContentConnection
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_transform_op import ReplicationTransformOp
@@ -707,6 +705,8 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExternalIoConnection",
+    "ExternalIoProtocol",
     "ExtractionClassification",
     "ExtractionClassificationSchema",
     "ExtractionEntity",
@@ -942,9 +942,6 @@ __all__ = (
     "NodeFilter",
     "NodeFilterFilterQuery",
     "NumericRangeQuery",
-    "ObjectStoreConnection",
-    "ObjectStoreConnectionBackend",
-    "ObjectStoreConnectionPurpose",
     "OllamaEmbedderConfig",
     "OllamaGeneratorConfig",
     "OllamaRerankerConfig",
@@ -990,7 +987,6 @@ __all__ = (
     "QueryStrategy",
     "QueryStringQuery",
     "RegexpQuery",
-    "RemoteContentConnection",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
     "ReplicationTransformOp",

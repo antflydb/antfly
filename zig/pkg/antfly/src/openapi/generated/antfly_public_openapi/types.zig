@@ -55,15 +55,13 @@ pub const ClusterHealth = enum {
 /// Kind of external connection configured on this node.
 pub const ConnectionKind = enum {
     inference,
-    object_store,
-    remote_content,
+    external_io,
     cdc,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .inference => "inference",
-            .object_store => "object_store",
-            .remote_content => "remote_content",
+            .external_io => "external_io",
             .cdc => "cdc",
         };
         try jw.write(s);
@@ -76,8 +74,7 @@ pub const ConnectionKind = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "inference", .inference },
-            .{ "object_store", .object_store },
-            .{ "remote_content", .remote_content },
+            .{ "external_io", .external_io },
             .{ "cdc", .cdc },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -230,24 +227,36 @@ pub const ConnectedModel = struct {
     configured: ?bool = null,
 };
 
-pub const ObjectStoreConnection = struct {
-    /// Object store backend type.
-    backend: []const u8,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
-    buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
-    prefix: ?[]const u8 = null,
-    /// What this object store is used for.
-    purpose: ?[]const u8 = null,
-};
+/// External IO transport protocol.
+pub const ExternalIoProtocol = enum {
+    s3,
+    gcs,
+    filesystem,
+    http,
 
-pub const RemoteContentConnection = struct {
-    /// Remote content provider or protocol. Currently "http"; future providers may add new values.
-    provider: []const u8,
-    /// Hosts or base URLs this credential applies to.
-    hosts: ?[]const []const u8 = null,
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .s3 => "s3",
+            .gcs => "gcs",
+            .filesystem => "filesystem",
+            .http => "http",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "s3", .s3 },
+            .{ "gcs", .gcs },
+            .{ "filesystem", .filesystem },
+            .{ "http", .http },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const CdcConnection = struct {
@@ -1770,6 +1779,18 @@ pub const InferenceConnection = struct {
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
+pub const ExternalIoConnection = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
+};
+
 /// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
 pub const DocumentArtifactManifest = struct {
     /// Stable identity of the source document.
@@ -2289,17 +2310,22 @@ pub const Permission = struct {
 };
 
 pub const Connection = struct {
-    /// Stable identifier for this connection instance.
+    /// Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path.
+    id: []const u8,
+    /// Human-readable short name for this connection instance.
     name: []const u8,
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
     kind: ConnectionKind,
     status: ConnectionStatus,
     /// Failure detail when status is "error".
     @"error": ?[]const u8 = null,
+    /// Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream.
+    capabilities: []const []const u8,
     /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
     sources: ?[]const []const u8 = null,
     inference: ?InferenceConnection = null,
-    object_store: ?ObjectStoreConnection = null,
-    remote_content: ?RemoteContentConnection = null,
+    external_io: ?ExternalIoConnection = null,
     cdc: ?CdcConnection = null,
 };
 

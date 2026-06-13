@@ -182,9 +182,10 @@ function ProviderCard({ connection }: { connection: Connection }) {
 }
 
 function InfrastructureCard({ connection }: { connection: Connection }) {
-  const objectStore = connection.object_store;
-  const remoteContent = connection.remote_content;
-  const Icon = objectStore ? HardDrive : Globe;
+  const externalIo = connection.external_io;
+  if (!externalIo) return null;
+  const Icon = externalIo.protocol === "http" ? Globe : HardDrive;
+  const capabilities = connection.capabilities ?? [];
 
   return (
     <div className="bg-card border border-border rounded-none p-5">
@@ -197,38 +198,42 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
             <h3 className="font-medium truncate">{connection.name}</h3>
             <StatusBadge connection={connection} />
           </div>
-          {objectStore && (
-            <p className="text-xs text-muted-foreground truncate">
-              {objectStore.backend.toUpperCase()}
-              {objectStore.purpose ? ` · ${objectStore.purpose.replaceAll("_", " ")}` : null}
-              {objectStore.endpoint ? (
-                <span className="font-mono" title={objectStore.endpoint}>
-                  {" · "}
-                  {objectStore.endpoint}
-                </span>
-              ) : null}
-            </p>
-          )}
-          {remoteContent && (
-            <p className="text-xs text-muted-foreground truncate">
-              {remoteContent.provider.toUpperCase()}
-              {(remoteContent.hosts?.length ?? 0) > 0 ? (
-                <span className="font-mono" title={remoteContent.hosts?.join(", ")}>
-                  {" · "}
-                  {remoteContent.hosts?.join(", ")}
-                </span>
-              ) : null}
-            </p>
-          )}
-          {objectStore && (objectStore.buckets?.length ?? 0) > 0 && (
+          <p className="text-xs text-muted-foreground truncate">
+            {externalIo.protocol.toUpperCase()}
+            {externalIo.endpoint ? (
+              <span className="font-mono" title={externalIo.endpoint}>
+                {" · "}
+                {externalIo.endpoint}
+              </span>
+            ) : null}
+            {(externalIo.hosts?.length ?? 0) > 0 ? (
+              <span className="font-mono" title={externalIo.hosts?.join(", ")}>
+                {" · "}
+                {externalIo.hosts?.join(", ")}
+              </span>
+            ) : null}
+          </p>
+          {(externalIo.buckets?.length ?? 0) > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-2">
-              {objectStore.buckets?.map((bucket) => (
+              {externalIo.buckets?.map((bucket) => (
                 <span
                   key={bucket}
                   className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
                 >
                   {bucket}
-                  {objectStore.prefix ? `/${objectStore.prefix}` : ""}
+                  {externalIo.prefix ? `/${externalIo.prefix}` : ""}
+                </span>
+              ))}
+            </div>
+          )}
+          {capabilities.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {capabilities.map((capability) => (
+                <span
+                  key={capability}
+                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                >
+                  {capability}
                 </span>
               ))}
             </div>
@@ -311,9 +316,7 @@ export default function ConnectionsPage() {
   const { connections, supported, loading, error, retry } = useConnectionsWithModels();
 
   const providers = connections.filter((connection) => connection.kind === "inference");
-  const infrastructure = connections.filter(
-    (connection) => connection.kind === "object_store" || connection.kind === "remote_content"
-  );
+  const infrastructure = connections.filter((connection) => connection.kind === "external_io");
   const cdcConnections = connections.filter((connection) => connection.kind === "cdc");
   const connectedCount = connections.filter(
     (connection) => connection.status === "connected"
@@ -377,7 +380,7 @@ export default function ConnectionsPage() {
           <DashboardPageTitle className="font-aeonik">Connections</DashboardPageTitle>
           <DashboardPageDescription>
             External services this node is configured to use: inference providers with their live
-            model inventories, object stores, CDC sources, and remote content sources.
+            model inventories, external IO endpoints, and CDC sources.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -420,7 +423,7 @@ export default function ConnectionsPage() {
 
           {infrastructure.length > 0 && (
             <section>
-              <MonoLabel className="mb-3 block">Object stores & remote content</MonoLabel>
+              <MonoLabel className="mb-3 block">External IO</MonoLabel>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {infrastructure.map((connection) => (
                   <InfrastructureCard key={connection.name} connection={connection} />

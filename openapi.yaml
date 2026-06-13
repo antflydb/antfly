@@ -2131,9 +2131,9 @@ paths:
 
         providers (from named embedder/generator/reranker/chunker configs and
 
-        table embedding indexes), object stores, CDC replication sources, and
+        table embedding indexes), external IO endpoints, and CDC replication
 
-        remote content sources.
+        sources.
 
 
         The default response is config-derived and avoids slow provider calls.
@@ -2155,9 +2155,13 @@ paths:
           description: >
             Comma-separated list of connection kinds to include
 
-            (e.g. "inference,object_store,cdc"). Defaults to all
+            (e.g. "inference,external_io,cdc"). Defaults to all
 
-            kinds. This filters by the response "kind" field.
+            kinds. This filters by the response "kind" field. Pre-GA aliases
+
+            "object_store", "remote_content", and "remote_content_http" may be
+
+            accepted for compatibility, but responses use "external_io".
           schema:
             type: string
         - name: include
@@ -6302,8 +6306,7 @@ components:
       type: string
       enum:
         - inference
-        - object_store
-        - remote_content
+        - external_io
         - cdc
       description: Kind of external connection configured on this node.
     ConnectionStatus:
@@ -6420,18 +6423,21 @@ components:
             the provider's listing API does not classify by task. Populated
 
             only when the request includes the "models" expansion.
-    ObjectStoreConnection:
+    ExternalIoProtocol:
+      type: string
+      enum:
+        - s3
+        - gcs
+        - filesystem
+        - http
+      description: External IO transport protocol.
+    ExternalIoConnection:
       type: object
       required:
-        - backend
+        - protocol
       properties:
-        backend:
-          type: string
-          enum:
-            - s3
-            - gcs
-            - filesystem
-          description: Object store backend type.
+        protocol:
+          $ref: '#/components/schemas/ExternalIoProtocol'
         endpoint:
           type: string
           description: Custom endpoint URL when configured.
@@ -6443,28 +6449,11 @@ components:
         prefix:
           type: string
           description: Key prefix when configured.
-        purpose:
-          type: string
-          enum:
-            - storage
-            - inference_models
-            - remote_content
-          description: What this object store is used for.
-    RemoteContentConnection:
-      type: object
-      required:
-        - provider
-      properties:
-        provider:
-          type: string
-          description: Remote content provider or protocol. Currently "http"; future providers may add
-            new values.
-          example: http
         hosts:
           type: array
           items:
             type: string
-          description: Hosts or base URLs this credential applies to.
+          description: Hosts or base URLs this connection applies to.
     CdcConnection:
       type: object
       required:
@@ -6518,13 +6507,22 @@ components:
     Connection:
       type: object
       required:
+        - id
         - name
         - kind
         - status
+        - capabilities
       properties:
+        id:
+          type: string
+          description: Stable resource identifier for this connection. Config-derived connections synthesize
+            this from the source config path.
         name:
           type: string
-          description: Stable identifier for this connection instance.
+          description: Human-readable short name for this connection instance.
+        display_name:
+          type: string
+          description: Optional display name for UIs.
         kind:
           $ref: '#/components/schemas/ConnectionKind'
         status:
@@ -6532,6 +6530,12 @@ components:
         error:
           type: string
           description: Failure detail when status is "error".
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Namespaced actions and workflow uses this connection supports, such as models.embed,
+            content.fetch, objects.read, or cdc.read_stream.
         sources:
           type: array
           items:
@@ -6542,10 +6546,8 @@ components:
             "config:embedders/openai-small" or "table:docs/index:body_vec".
         inference:
           $ref: '#/components/schemas/InferenceConnection'
-        object_store:
-          $ref: '#/components/schemas/ObjectStoreConnection'
-        remote_content:
-          $ref: '#/components/schemas/RemoteContentConnection'
+        external_io:
+          $ref: '#/components/schemas/ExternalIoConnection'
         cdc:
           $ref: '#/components/schemas/CdcConnection'
     ConnectionsResponse:

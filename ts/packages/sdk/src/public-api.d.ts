@@ -55,8 +55,8 @@ export interface paths {
          * List configured external connections
          * @description Enumerates external connections configured on this node: inference
          *     providers (from named embedder/generator/reranker/chunker configs and
-         *     table embedding indexes), object stores, CDC replication sources, and
-         *     remote content sources.
+         *     table embedding indexes), external IO endpoints, and CDC replication
+         *     sources.
          *
          *     The default response is config-derived and avoids slow provider calls.
          *     With include=models, each inference provider is queried live for its
@@ -2123,7 +2123,7 @@ export interface components {
          * @description Kind of external connection configured on this node.
          * @enum {string}
          */
-        ConnectionKind: "inference" | "object_store" | "remote_content" | "cdc";
+        ConnectionKind: "inference" | "external_io" | "cdc";
         /**
          * @description Connection status. "connected" means a live probe or listing succeeded,
          *     "error" means the probe failed (see the error field), "configured" means
@@ -2180,31 +2180,20 @@ export interface components {
                 [key: string]: components["schemas"]["ConnectedModel"][];
             };
         };
-        ObjectStoreConnection: {
-            /**
-             * @description Object store backend type.
-             * @enum {string}
-             */
-            backend: "s3" | "gcs" | "filesystem";
+        /**
+         * @description External IO transport protocol.
+         * @enum {string}
+         */
+        ExternalIoProtocol: "s3" | "gcs" | "filesystem" | "http";
+        ExternalIoConnection: {
+            protocol: components["schemas"]["ExternalIoProtocol"];
             /** @description Custom endpoint URL when configured. */
             endpoint?: string;
             /** @description Buckets this connection is configured for. */
             buckets?: string[];
             /** @description Key prefix when configured. */
             prefix?: string;
-            /**
-             * @description What this object store is used for.
-             * @enum {string}
-             */
-            purpose?: "storage" | "inference_models" | "remote_content";
-        };
-        RemoteContentConnection: {
-            /**
-             * @description Remote content provider or protocol. Currently "http"; future providers may add new values.
-             * @example http
-             */
-            provider: string;
-            /** @description Hosts or base URLs this credential applies to. */
+            /** @description Hosts or base URLs this connection applies to. */
             hosts?: string[];
         };
         CdcConnection: {
@@ -2255,20 +2244,25 @@ export interface components {
             updated_at_ms?: number;
         };
         Connection: {
-            /** @description Stable identifier for this connection instance. */
+            /** @description Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path. */
+            id: string;
+            /** @description Human-readable short name for this connection instance. */
             name: string;
+            /** @description Optional display name for UIs. */
+            display_name?: string;
             kind: components["schemas"]["ConnectionKind"];
             status: components["schemas"]["ConnectionStatus"];
             /** @description Failure detail when status is "error". */
             error?: string;
+            /** @description Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream. */
+            capabilities: string[];
             /**
              * @description Where this connection was configured, e.g.
              *     "config:embedders/openai-small" or "table:docs/index:body_vec".
              */
             sources?: string[];
             inference?: components["schemas"]["InferenceConnection"];
-            object_store?: components["schemas"]["ObjectStoreConnection"];
-            remote_content?: components["schemas"]["RemoteContentConnection"];
+            external_io?: components["schemas"]["ExternalIoConnection"];
             cdc?: components["schemas"]["CdcConnection"];
         };
         ConnectionsResponse: {
@@ -10302,8 +10296,10 @@ export interface operations {
             query?: {
                 /**
                  * @description Comma-separated list of connection kinds to include
-                 *     (e.g. "inference,object_store,cdc"). Defaults to all
-                 *     kinds. This filters by the response "kind" field.
+                 *     (e.g. "inference,external_io,cdc"). Defaults to all
+                 *     kinds. This filters by the response "kind" field. Pre-GA aliases
+                 *     "object_store", "remote_content", and "remote_content_http" may be
+                 *     accepted for compatibility, but responses use "external_io".
                  */
                 types?: string;
                 /**

@@ -7,9 +7,11 @@ import { liveModelSuggestions } from "./use-connections";
 
 function providerConnection(overrides: Partial<Connection> = {}): Connection {
   return {
+    id: "openai",
     name: "openai",
     kind: "inference",
     status: "connected",
+    capabilities: ["models.embed", "models.generate"],
     inference: {
       provider: "openai",
       models: {

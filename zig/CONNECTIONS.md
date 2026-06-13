@@ -41,9 +41,9 @@ Provider or protocol belongs inside the kind-specific payload:
 ```json
 {
   "kind": "external_io",
+  "capabilities": ["content.fetch"],
   "external_io": {
-    "protocol": "http",
-    "capabilities": ["content.fetch"]
+    "protocol": "http"
   }
 }
 ```
@@ -157,7 +157,6 @@ Example:
 {
   "id": "conn_s3_backups",
   "kind": "external_io",
-  "protocol": "s3",
   "capabilities": ["objects.read", "objects.write", "backup.write", "restore.read"],
   "external_io": {
     "protocol": "s3",
@@ -174,7 +173,6 @@ HTTP remote content uses the same kind:
 {
   "id": "conn_docs_site",
   "kind": "external_io",
-  "protocol": "http",
   "capabilities": ["content.fetch", "indexing.use", "agents.use"],
   "external_io": {
     "protocol": "http",

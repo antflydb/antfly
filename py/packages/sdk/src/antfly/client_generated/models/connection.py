@@ -12,9 +12,8 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.cdc_connection import CdcConnection
+    from ..models.external_io_connection import ExternalIoConnection
     from ..models.inference_connection import InferenceConnection
-    from ..models.object_store_connection import ObjectStoreConnection
-    from ..models.remote_content_connection import RemoteContentConnection
 
 
 T = TypeVar("T", bound="Connection")
@@ -24,38 +23,50 @@ T = TypeVar("T", bound="Connection")
 class Connection:
     """
     Attributes:
-        name (str): Stable identifier for this connection instance.
+        id (str): Stable resource identifier for this connection. Config-derived connections synthesize this from the
+            source config path.
+        name (str): Human-readable short name for this connection instance.
         kind (ConnectionKind): Kind of external connection configured on this node.
         status (ConnectionStatus): Connection status. "connected" means a live probe or listing succeeded,
             "error" means the probe failed (see the error field), "configured" means
             the connection is present but was not probed, and "unsupported" means
             no probe is available for this connection kind or provider.
+        capabilities (list[str]): Namespaced actions and workflow uses this connection supports, such as models.embed,
+            content.fetch, objects.read, or cdc.read_stream.
+        display_name (str | Unset): Optional display name for UIs.
         error (str | Unset): Failure detail when status is "error".
         sources (list[str] | Unset): Where this connection was configured, e.g.
             "config:embedders/openai-small" or "table:docs/index:body_vec".
         inference (InferenceConnection | Unset):
-        object_store (ObjectStoreConnection | Unset):
-        remote_content (RemoteContentConnection | Unset):
+        external_io (ExternalIoConnection | Unset):
         cdc (CdcConnection | Unset):
     """
 
+    id: str
     name: str
     kind: ConnectionKind
     status: ConnectionStatus
+    capabilities: list[str]
+    display_name: str | Unset = UNSET
     error: str | Unset = UNSET
     sources: list[str] | Unset = UNSET
     inference: InferenceConnection | Unset = UNSET
-    object_store: ObjectStoreConnection | Unset = UNSET
-    remote_content: RemoteContentConnection | Unset = UNSET
+    external_io: ExternalIoConnection | Unset = UNSET
     cdc: CdcConnection | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        id = self.id
+
         name = self.name
 
         kind = self.kind.value
 
         status = self.status.value
+
+        capabilities = self.capabilities
+
+        display_name = self.display_name
 
         error = self.error
 
@@ -67,13 +78,9 @@ class Connection:
         if not isinstance(self.inference, Unset):
             inference = self.inference.to_dict()
 
-        object_store: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.object_store, Unset):
-            object_store = self.object_store.to_dict()
-
-        remote_content: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.remote_content, Unset):
-            remote_content = self.remote_content.to_dict()
+        external_io: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.external_io, Unset):
+            external_io = self.external_io.to_dict()
 
         cdc: dict[str, Any] | Unset = UNSET
         if not isinstance(self.cdc, Unset):
@@ -83,21 +90,23 @@ class Connection:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "id": id,
                 "name": name,
                 "kind": kind,
                 "status": status,
+                "capabilities": capabilities,
             }
         )
+        if display_name is not UNSET:
+            field_dict["display_name"] = display_name
         if error is not UNSET:
             field_dict["error"] = error
         if sources is not UNSET:
             field_dict["sources"] = sources
         if inference is not UNSET:
             field_dict["inference"] = inference
-        if object_store is not UNSET:
-            field_dict["object_store"] = object_store
-        if remote_content is not UNSET:
-            field_dict["remote_content"] = remote_content
+        if external_io is not UNSET:
+            field_dict["external_io"] = external_io
         if cdc is not UNSET:
             field_dict["cdc"] = cdc
 
@@ -106,16 +115,21 @@ class Connection:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.cdc_connection import CdcConnection
+        from ..models.external_io_connection import ExternalIoConnection
         from ..models.inference_connection import InferenceConnection
-        from ..models.object_store_connection import ObjectStoreConnection
-        from ..models.remote_content_connection import RemoteContentConnection
 
         d = dict(src_dict)
+        id = d.pop("id")
+
         name = d.pop("name")
 
         kind = ConnectionKind(d.pop("kind"))
 
         status = ConnectionStatus(d.pop("status"))
+
+        capabilities = cast(list[str], d.pop("capabilities"))
+
+        display_name = d.pop("display_name", UNSET)
 
         error = d.pop("error", UNSET)
 
@@ -128,19 +142,12 @@ class Connection:
         else:
             inference = InferenceConnection.from_dict(_inference)
 
-        _object_store = d.pop("object_store", UNSET)
-        object_store: ObjectStoreConnection | Unset
-        if isinstance(_object_store, Unset):
-            object_store = UNSET
+        _external_io = d.pop("external_io", UNSET)
+        external_io: ExternalIoConnection | Unset
+        if isinstance(_external_io, Unset):
+            external_io = UNSET
         else:
-            object_store = ObjectStoreConnection.from_dict(_object_store)
-
-        _remote_content = d.pop("remote_content", UNSET)
-        remote_content: RemoteContentConnection | Unset
-        if isinstance(_remote_content, Unset):
-            remote_content = UNSET
-        else:
-            remote_content = RemoteContentConnection.from_dict(_remote_content)
+            external_io = ExternalIoConnection.from_dict(_external_io)
 
         _cdc = d.pop("cdc", UNSET)
         cdc: CdcConnection | Unset
@@ -150,14 +157,16 @@ class Connection:
             cdc = CdcConnection.from_dict(_cdc)
 
         connection = cls(
+            id=id,
             name=name,
             kind=kind,
             status=status,
+            capabilities=capabilities,
+            display_name=display_name,
             error=error,
             sources=sources,
             inference=inference,
-            object_store=object_store,
-            remote_content=remote_content,
+            external_io=external_io,
             cdc=cdc,
         )
 

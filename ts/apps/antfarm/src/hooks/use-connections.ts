@@ -108,7 +108,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   return { connections, supported, loading, error, retry };
 }
 
-/** All configured connections (inference providers, object stores, remote content). */
+/** All configured connections (inference providers, external IO, CDC sources). */
 export function useConnections(): ConnectionsState {
   return useConnectionsInternal(false);
 }

@@ -170,8 +170,8 @@ export type InferenceProviderType = components["schemas"]["InferenceProviderType
 export type ConnectedModel = components["schemas"]["ConnectedModel"];
 export type ConnectedModelType = components["schemas"]["ConnectedModelType"];
 export type InferenceConnection = components["schemas"]["InferenceConnection"];
-export type ObjectStoreConnection = components["schemas"]["ObjectStoreConnection"];
-export type RemoteContentConnection = components["schemas"]["RemoteContentConnection"];
+export type ExternalIoProtocol = components["schemas"]["ExternalIoProtocol"];
+export type ExternalIoConnection = components["schemas"]["ExternalIoConnection"];
 export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
