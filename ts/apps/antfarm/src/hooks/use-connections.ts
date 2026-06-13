@@ -36,7 +36,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   const isMountedRef = useRef(true);
 
   const fetchConnections = useCallback(
-    async (signal?: AbortSignal) => {
+    async (signal?: AbortSignal, options?: { refresh?: boolean }) => {
       setLoading(true);
       setError(null);
       const controller = new AbortController();
@@ -49,6 +49,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       try {
         const response = await client.connections.list({
           include: includeModels ? ["models"] : undefined,
+          refresh: options?.refresh,
           signal: controller.signal,
         });
 
@@ -79,7 +80,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   );
 
   const retry = useCallback(() => {
-    fetchConnections();
+    fetchConnections(undefined, { refresh: true });
   }, [fetchConnections]);
 
   useEffect(() => {
