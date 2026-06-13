@@ -381,7 +381,7 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
     return source;
 }
 
-fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
+pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
         var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
         defer service_account.deinit(alloc);

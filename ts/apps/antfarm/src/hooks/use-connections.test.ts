@@ -22,9 +22,9 @@ function providerConnection(overrides: Partial<Connection> = {}): Connection {
 }
 
 describe("liveModelSuggestions", () => {
-  it("merges the kind bucket with the other bucket", () => {
+  it("does not merge unclassified models into embedder suggestions", () => {
     const suggestions = liveModelSuggestions([providerConnection()], "embedder");
-    expect(suggestions.openai).toEqual(["text-embedding-3-small", "gpt-4o"]);
+    expect(suggestions.openai).toEqual(["text-embedding-3-small"]);
   });
 
   it("ignores providers that are not connected", () => {
@@ -56,11 +56,7 @@ describe("liveModelSuggestions", () => {
       },
     });
     const suggestions = liveModelSuggestions([first, second], "embedder");
-    expect(suggestions.openai).toEqual([
-      "text-embedding-3-small",
-      "gpt-4o",
-      "text-embedding-3-large",
-    ]);
+    expect(suggestions.openai).toEqual(["text-embedding-3-small", "text-embedding-3-large"]);
   });
 
   it("returns generator models for the generator kind", () => {
@@ -75,5 +71,10 @@ describe("liveModelSuggestions", () => {
     });
     const suggestions = liveModelSuggestions([connection], "generator");
     expect(suggestions.anthropic).toEqual(["claude-sonnet-4-5"]);
+  });
+
+  it("merges unclassified models into generator suggestions", () => {
+    const suggestions = liveModelSuggestions([providerConnection()], "generator");
+    expect(suggestions.openai).toEqual(["gpt-4o"]);
   });
 });

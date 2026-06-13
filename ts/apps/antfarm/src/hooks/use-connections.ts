@@ -132,9 +132,11 @@ export function useConnectedModels(): ConnectedModelsState {
 /**
  * Per-provider-type live model name suggestions for a model kind.
  *
- * Providers whose listing APIs do not classify models by task (OpenAI,
- * Ollama) report them under "other", so the kind bucket is merged with the
- * "other" bucket. Only connected providers contribute.
+ * Providers whose listing APIs do not classify generator models by task
+ * (OpenAI, Ollama) report them under "other", so generator suggestions merge
+ * that bucket. Embedders/rerankers only use their explicit task bucket to avoid
+ * suggesting chat models in embedding index forms. Only connected providers
+ * contribute.
  */
 export function liveModelSuggestions(
   providers: Connection[],
@@ -146,7 +148,10 @@ export function liveModelSuggestions(
     if (!provider || connection.status !== "connected") continue;
     const models = provider.models;
     if (!models) continue;
-    const names = [...(models[`${kind}s`] ?? []), ...(models.other ?? [])]
+    const names = [
+      ...(models[`${kind}s`] ?? []),
+      ...(kind === "generator" ? (models.other ?? []) : []),
+    ]
       .map((model) => model.name)
       .filter((name) => name.length > 0);
     if (names.length === 0) continue;

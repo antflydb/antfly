@@ -109,7 +109,7 @@ pub fn listModels(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, t
     const timeout = if (timeout_ms == 0) default_timeout_ms else timeout_ms;
     return switch (ep.provider) {
         .openai => try listOpenAi(alloc, http, ep, timeout, "https://api.openai.com"),
-        .openrouter => try listOpenAi(alloc, http, ep, timeout, "https://openrouter.ai/api"),
+        .openrouter => try listOpenAi(alloc, http, ep, timeout, "https://openrouter.ai/api/v1"),
         .ollama => try listOllama(alloc, http, ep, timeout),
         .gemini => try listGemini(alloc, http, ep, timeout),
         .vertex => try listVertex(alloc, http, ep, timeout),
@@ -154,7 +154,13 @@ fn listGemini(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeo
 
 fn listVertex(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, timeout_ms: u64) !ListResult {
     const base = std.mem.trimEnd(u8, if (ep.url.len > 0) ep.url else "https://aiplatform.googleapis.com/v1beta1", "/");
-    const url = try std.fmt.allocPrint(alloc, "{s}/publishers/google/models?pageSize=100", .{base});
+    const project_id = if (ep.project_id.len > 0)
+        ep.project_id
+    else
+        (try vertex.vertexProjectIdFromConfigAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null) orelse return error.MissingVertexCredentials);
+    defer if (ep.project_id.len == 0) alloc.free(project_id);
+    const location = if (ep.location.len > 0) ep.location else "us-central1";
+    const url = try std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/publishers/google/models?pageSize=100", .{ base, project_id, location });
     defer alloc.free(url);
     const auth = try vertex.mintAuthorizationValueAlloc(alloc, if (ep.credentials_path.len > 0) ep.credentials_path else null);
     defer alloc.free(auth);
