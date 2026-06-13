@@ -15,6 +15,8 @@ BRANCHING_FACTOR="${BRANCHING_FACTOR:-8}"
 SEARCH_WIDTH="${SEARCH_WIDTH:-0}"
 STORAGE="${STORAGE:-host}"
 POSTING_BASE_MEMBER_BLOCK_SIZE="${POSTING_BASE_MEMBER_BLOCK_SIZE:-32}"
+ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP="${ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP:-0}"
+POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP="${POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP:-16 32 64}"
 OVERWRITE_HOT_KEYS="${OVERWRITE_HOT_KEYS:-32}"
 OVERWRITE_ROUNDS="${OVERWRITE_ROUNDS:-2}"
 POST_WRITE_QUERIES="${POST_WRITE_QUERIES:-8}"
@@ -543,6 +545,48 @@ run_vdbb_procedural_mutation_rows() {
   done
 }
 
+run_posting_base_block_size_write_sweep() {
+  if [[ "${ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP}" != "1" ]]; then
+    return 0
+  fi
+  local block_size
+  for block_size in ${POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP}; do
+    if [[ "${block_size}" == "${POSTING_BASE_MEMBER_BLOCK_SIZE}" ]]; then
+      continue
+    fi
+    run_bench "write_base_delta_hbc_lazy_fold_base_block_${block_size}" \
+      zig build hbc-write-bench -- \
+      "${COMMON_WRITE_ARGS[@]}" \
+      --posting-base-member-block-size "${block_size}" \
+      --posting-storage base_delta \
+      --lazy-posting-maintenance \
+      --repair-postings-after-write \
+      --repair-min-delta-records-to-fold "${REPAIR_MIN_DELTA_RECORDS_TO_FOLD}" \
+      --repair-max-delta-tail-postings "${REPAIR_MAX_DELTA_TAIL_POSTINGS}" \
+      --repair-rebalance-layout \
+      --repair-max-layout-changes "${AUTO_SPLIT_FULL_MAX_LAYOUT_CHANGES}" \
+      --defer-leaf-splits-to-posting-maintenance
+  done
+}
+
+run_posting_base_block_size_read_sweep() {
+  if [[ "${ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP}" != "1" ]]; then
+    return 0
+  fi
+  local block_size
+  for block_size in ${POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP}; do
+    if [[ "${block_size}" == "${POSTING_BASE_MEMBER_BLOCK_SIZE}" ]]; then
+      continue
+    fi
+    run_bench "read_base_delta_hbc_repaired_base_block_${block_size}" \
+      zig build hbc-read-bench -- \
+      "${COMMON_READ_ARGS[@]}" \
+      --posting-base-member-block-size "${block_size}" \
+      --posting-storage base_delta \
+      --repair-postings-after-build
+  done
+}
+
 guard_vdbb_1m_exact_recall
 
 cd "${ZIG_ROOT}"
@@ -725,6 +769,8 @@ run_bench "write_base_delta_hbc_lazy_fold" \
   --repair-rebalance-layout \
   --repair-max-layout-changes "${AUTO_SPLIT_FULL_MAX_LAYOUT_CHANGES}" \
   --defer-leaf-splits-to-posting-maintenance
+
+run_posting_base_block_size_write_sweep
 
 run_bench "write_base_delta_hbc_reassign_capacity" \
   zig build hbc-write-bench -- \
@@ -1179,6 +1225,8 @@ run_bench "read_base_delta_hbc_repaired" \
   "${COMMON_READ_ARGS[@]}" \
   --posting-storage base_delta \
   --repair-postings-after-build
+
+run_posting_base_block_size_read_sweep
 
 run_bench "read_base_delta_flat_rabitq_repaired" \
   zig build hbc-read-bench -- \

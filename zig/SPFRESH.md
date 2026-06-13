@@ -779,10 +779,14 @@ implementations cleanly:
    Sorted canonical base members make it possible to store block offsets and
    last-member ids. Query materialization, fold application, and membership
    checks could then jump to relevant blocks instead of scanning from the
-   start. Before changing the public format, add an internal bench-only
-   block-size knob for 16/32/64-member blocks and report
+   start. Before changing the public format, keep using the internal
+   bench-only block-size knob for 16/32/64-member blocks and report
    `posting_base_value_bytes_per_member` beside
-   `posting_base_decode_ns_per_member`.
+   `posting_base_decode_ns_per_member`. The comparison runner now has an
+   opt-in `ENABLE_POSTING_BASE_BLOCK_SIZE_SWEEP=1` mode that adds HBC
+   base/delta read/write arms for the configured
+   `POSTING_BASE_MEMBER_BLOCK_SIZE_SWEEP` values without changing the default
+   optimized gate.
 
    Expected win: faster large-posting negative checks, partial decode, and
    sorted merge application.
