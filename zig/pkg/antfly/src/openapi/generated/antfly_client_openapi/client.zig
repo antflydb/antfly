@@ -32,7 +32,7 @@ pub fn ApiResponse(comptime T: type) type {
 }
 
 pub const ListConnectionsParams = struct {
-    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field. Pre-GA aliases "object_store", "remote_content", and "remote_content_http" may be accepted for compatibility, but responses use "external_io".
+    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
     /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
     include: ?[]const u8 = null,

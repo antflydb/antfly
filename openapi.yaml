@@ -2127,13 +2127,11 @@ paths:
       tags:
         - cluster_management
       description: >
-        Enumerates external connections configured on this node: inference
+        Enumerates public external connections configured on this node under
 
-        providers (from named embedder/generator/reranker/chunker configs and
+        top-level `connections`: inference providers, external IO endpoints,
 
-        table embedding indexes), external IO endpoints, and CDC replication
-
-        sources.
+        and CDC replication sources.
 
 
         The default response is config-derived and avoids slow provider calls.
@@ -2157,11 +2155,7 @@ paths:
 
             (e.g. "inference,external_io,cdc"). Defaults to all
 
-            kinds. This filters by the response "kind" field. Pre-GA aliases
-
-            "object_store", "remote_content", and "remote_content_http" may be
-
-            accepted for compatibility, but responses use "external_io".
+            kinds. This filters by the response "kind" field.
           schema:
             type: string
         - name: include

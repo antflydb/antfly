@@ -80,10 +80,9 @@ def sync_detailed(
 ) -> Response[ConnectionsResponse | Error]:
     r"""List configured external connections
 
-     Enumerates external connections configured on this node: inference
-    providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), external IO endpoints, and CDC replication
-    sources.
+     Enumerates public external connections configured on this node under
+    top-level `connections`: inference providers, external IO endpoints,
+    and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -127,10 +126,9 @@ def sync(
 ) -> ConnectionsResponse | Error | None:
     r"""List configured external connections
 
-     Enumerates external connections configured on this node: inference
-    providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), external IO endpoints, and CDC replication
-    sources.
+     Enumerates public external connections configured on this node under
+    top-level `connections`: inference providers, external IO endpoints,
+    and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -169,10 +167,9 @@ async def asyncio_detailed(
 ) -> Response[ConnectionsResponse | Error]:
     r"""List configured external connections
 
-     Enumerates external connections configured on this node: inference
-    providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), external IO endpoints, and CDC replication
-    sources.
+     Enumerates public external connections configured on this node under
+    top-level `connections`: inference providers, external IO endpoints,
+    and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
@@ -214,10 +211,9 @@ async def asyncio(
 ) -> ConnectionsResponse | Error | None:
     r"""List configured external connections
 
-     Enumerates external connections configured on this node: inference
-    providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), external IO endpoints, and CDC replication
-    sources.
+     Enumerates public external connections configured on this node under
+    top-level `connections`: inference providers, external IO endpoints,
+    and CDC replication sources.
 
     The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its

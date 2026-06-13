@@ -11,7 +11,15 @@ import {
   MonoLabel,
 } from "@antfly/design-system";
 import type { ConnectedModel, Connection } from "@antfly/sdk";
-import { AlertCircle, Check, ChevronDown, Database, Globe, HardDrive, RefreshCw } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  Database,
+  Globe,
+  HardDrive,
+  RefreshCw,
+} from "lucide-react";
 import { useState } from "react";
 import { AntyEmptyState, ErrorState } from "@/components/branded-empty-state";
 import {
@@ -104,6 +112,7 @@ function ModelGroup({
 function ProviderCard({ connection }: { connection: Connection }) {
   const provider = connection.inference;
   if (!provider) return null;
+  const label = connection.display_name ?? connection.name;
   const Icon = providerTypeIcon(provider.provider);
   const models = provider.models ?? {};
 
@@ -130,7 +139,9 @@ function ProviderCard({ connection }: { connection: Connection }) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-medium truncate">{connection.name}</h3>
+            <h3 className="font-medium truncate" title={label}>
+              {label}
+            </h3>
             <StatusBadge connection={connection} />
           </div>
           <p className="text-xs text-muted-foreground truncate">
@@ -184,6 +195,7 @@ function ProviderCard({ connection }: { connection: Connection }) {
 function InfrastructureCard({ connection }: { connection: Connection }) {
   const externalIo = connection.external_io;
   if (!externalIo) return null;
+  const label = connection.display_name ?? connection.name;
   const Icon = externalIo.protocol === "http" ? Globe : HardDrive;
   const capabilities = connection.capabilities ?? [];
 
@@ -195,7 +207,9 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-medium truncate">{connection.name}</h3>
+            <h3 className="font-medium truncate" title={label}>
+              {label}
+            </h3>
             <StatusBadge connection={connection} />
           </div>
           <p className="text-xs text-muted-foreground truncate">
@@ -252,6 +266,7 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
 function CdcCard({ connection }: { connection: Connection }) {
   const cdc = connection.cdc;
   if (!cdc) return null;
+  const label = connection.display_name ?? connection.name;
 
   return (
     <div className="bg-card border border-border rounded-none p-5">
@@ -261,7 +276,9 @@ function CdcCard({ connection }: { connection: Connection }) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-medium truncate">{connection.name}</h3>
+            <h3 className="font-medium truncate" title={label}>
+              {label}
+            </h3>
             <StatusBadge connection={connection} />
           </div>
           <p className="text-xs text-muted-foreground truncate">
@@ -406,7 +423,7 @@ export default function ConnectionsPage() {
       {connections.length === 0 ? (
         <AntyEmptyState
           title="No connections configured"
-          description="Configure named embedders, generators, rerankers, or chunkers in the node config to see them here."
+          description="No public connection resources are present in the node config."
         />
       ) : (
         <div className="space-y-6">

@@ -1044,7 +1044,6 @@ pub const ApiHttpServer = struct {
 
         const node_config = self.cfg.node_config;
         const response = try connections_api.buildConnectionsResponse(arena, .{
-            .registry = if (node_config) |cfg| &cfg.registry else null,
             .node_config = node_config,
             .snapshot = if (snapshot_opt) |*snapshot| snapshot else null,
             .antfly_provider = self.antfly_provider,
@@ -8225,17 +8224,33 @@ test "api http server serves connections with partial provider failures" {
 
     const config_json =
         \\{
-        \\  "generators": { "mocked": { "provider": "mock" } },
-        \\  "embedders": {
+        \\  "connections": {
+        \\    "mocked": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate"],
+        \\      "inference": {
+        \\        "provider": "mock",
+        \\        "configured_model_types": ["generator"]
+        \\      }
+        \\    },
         \\    "broken-openai": {
-        \\      "provider": "openai",
-        \\      "model": "text-embedding-3-small",
-        \\      "url": "http://127.0.0.1:9",
-        \\      "api_key": "test-key"
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": {
+        \\        "provider": "openai",
+        \\        "url": "http://127.0.0.1:9",
+        \\        "api_key": "test-key",
+        \\        "configured_model_types": ["embedder"]
+        \\      }
+        \\    },
+        \\    "wiki": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["content.fetch", "indexing.use"],
+        \\      "external_io": {
+        \\        "protocol": "http",
+        \\        "hosts": ["https://en.wikipedia.org"]
+        \\      }
         \\    }
-        \\  },
-        \\  "remote_content": {
-        \\    "http": { "wiki": { "base_url": "https://en.wikipedia.org" } }
         \\  }
         \\}
     ;
@@ -8271,7 +8286,7 @@ test "api http server serves connections with partial provider failures" {
         if (std.mem.eql(u8, name, "mocked")) {
             saw_mock = true;
             try std.testing.expectEqualStrings("connected", conn_status);
-            const provider = connection.object.get("inference_provider").?.object;
+            const provider = connection.object.get("inference").?.object;
             const models = provider.get("models").?.object;
             try std.testing.expect(models.get("generators") != null);
         } else if (std.mem.eql(u8, name, "broken-openai")) {
@@ -8282,7 +8297,7 @@ test "api http server serves connections with partial provider failures" {
             try std.testing.expect(connection.object.get("error").? == .string);
         } else if (std.mem.eql(u8, name, "wiki")) {
             saw_wiki = true;
-            try std.testing.expectEqualStrings("remote_content_http", connection.object.get("kind").?.string);
+            try std.testing.expectEqualStrings("external_io", connection.object.get("kind").?.string);
             try std.testing.expectEqualStrings("configured", conn_status);
         }
     }
@@ -8291,7 +8306,7 @@ test "api http server serves connections with partial provider failures" {
     try std.testing.expect(saw_wiki);
 
     // The kind filter trims the response to the requested connection types.
-    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=remote_content_http" });
+    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=external_io" });
     defer filtered.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), filtered.status);
     var parsed_filtered = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, filtered.body, .{});

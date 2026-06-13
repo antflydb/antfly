@@ -14,9 +14,8 @@
 
 // GET /connections — configured external connections.
 //
-// Enumerates inference provider instances (node-config provider registry plus
-// per-table embedding index configs, deduped by provider identity), external
-// IO endpoints, and CDC sources. With the "models"
+// Enumerates configured inference providers, external IO endpoints, and CDC
+// sources from the public node-config `connections` map. With the "models"
 // expansion each inference provider's list-models API is queried live;
 // per-connection failures degrade to status "error" without failing the
 // response.
@@ -24,10 +23,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const httpx = @import("httpx");
-const embeddings = @import("antfly_embeddings");
 const objectstore = @import("objectstore");
 const platform_time = @import("../platform/time.zig");
-const provider_registry = @import("../common/provider_registry.zig");
 const common_config = @import("../common/config.zig");
 const metadata_api = @import("../metadata/api.zig");
 const list_models = @import("../inference/list_models.zig");
@@ -122,7 +119,6 @@ pub const ConnectionsResponse = struct {
 };
 
 pub const Sources = struct {
-    registry: ?*const provider_registry.Registry = null,
     node_config: ?*const common_config.Config = null,
     snapshot: ?*const metadata_api.AdminSnapshot = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -261,180 +257,11 @@ const Instance = struct {
     configured_models: std.StringArrayHashMapUnmanaged(void) = .{},
 };
 
-const Seed = struct {
-    provider_name: []const u8,
-    url: []const u8 = "",
-    api_key: ?[]const u8 = null,
-    region: []const u8 = "",
-    project_id: []const u8 = "",
-    location: []const u8 = "",
-    credentials_path: []const u8 = "",
-    model: []const u8 = "",
-};
-
-const GatherState = struct {
-    arena: Allocator,
-    instances: std.StringArrayHashMapUnmanaged(*Instance) = .{},
-
-    fn addSeed(
-        self: *GatherState,
-        seed: Seed,
-        name: ?[]const u8,
-        source: []const u8,
-        model_type: ?ConfiguredModelType,
-    ) !void {
-        const provider = std.meta.stringToEnum(list_models.ProviderTag, seed.provider_name) orelse return;
-        const key = try instanceKeyAlloc(self.arena, provider, seed);
-        const gop = try self.instances.getOrPut(self.arena, key);
-        if (!gop.found_existing) {
-            const instance = try self.arena.create(Instance);
-            instance.* = .{
-                .provider = provider,
-                .url = try self.arena.dupe(u8, seed.url),
-                .api_key = if (seed.api_key) |value| try self.arena.dupe(u8, value) else null,
-                .region = try self.arena.dupe(u8, seed.region),
-                .project_id = try self.arena.dupe(u8, seed.project_id),
-                .location = try self.arena.dupe(u8, seed.location),
-                .credentials_path = try self.arena.dupe(u8, seed.credentials_path),
-                .key = key,
-            };
-            gop.value_ptr.* = instance;
-        }
-        const instance = gop.value_ptr.*;
-        if (name) |value| {
-            if (!containsString(instance.names.items, value)) {
-                try instance.names.append(self.arena, try self.arena.dupe(u8, value));
-            }
-        }
-        try instance.sources.append(self.arena, try self.arena.dupe(u8, source));
-        if (model_type) |value| instance.model_types.insert(value);
-        if (seed.model.len > 0) {
-            const model_gop = try instance.configured_models.getOrPut(self.arena, seed.model);
-            if (!model_gop.found_existing) model_gop.key_ptr.* = try self.arena.dupe(u8, seed.model);
-        }
-    }
-};
-
 fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |value| {
         if (std.mem.eql(u8, value, needle)) return true;
     }
     return false;
-}
-
-fn instanceKeyAlloc(arena: Allocator, provider: list_models.ProviderTag, seed: Seed) ![]u8 {
-    const key_hash: u64 = if (seed.api_key) |value| std.hash.Wyhash.hash(0, value) else 0;
-    return try std.fmt.allocPrint(arena, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}", .{
-        @tagName(provider),
-        seed.url,
-        seed.region,
-        seed.project_id,
-        seed.location,
-        seed.credentials_path,
-        key_hash,
-    });
-}
-
-fn seedFromEmbedderConfig(cfg: embeddings.Config) Seed {
-    return .{
-        .provider_name = @tagName(cfg.provider),
-        .url = cfg.url,
-        .api_key = cfg.api_key,
-        .region = cfg.region,
-        .project_id = cfg.project_id,
-        .location = cfg.location,
-        .credentials_path = cfg.credentials_path,
-        .model = cfg.model,
-    };
-}
-
-fn gatherInstances(arena: Allocator, sources: Sources) !GatherState {
-    var state = GatherState{ .arena = arena };
-
-    if (sources.registry) |registry| {
-        var embedder_it = registry.embedder_configs.iterator();
-        while (embedder_it.next()) |entry| {
-            const source = try std.fmt.allocPrint(arena, "config:embedders/{s}", .{entry.key_ptr.*});
-            try state.addSeed(seedFromEmbedderConfig(entry.value_ptr.*), entry.key_ptr.*, source, .embedder);
-        }
-        var generator_it = registry.generator_configs.iterator();
-        while (generator_it.next()) |entry| {
-            const cfg = entry.value_ptr.*;
-            const source = try std.fmt.allocPrint(arena, "config:generators/{s}", .{entry.key_ptr.*});
-            try state.addSeed(.{
-                .provider_name = @tagName(cfg.provider),
-                .url = cfg.url,
-                .api_key = cfg.api_key,
-                .project_id = cfg.project_id orelse "",
-                .location = cfg.location orelse "",
-                .credentials_path = cfg.credentials_path orelse "",
-                .model = cfg.model,
-            }, entry.key_ptr.*, source, .generator);
-        }
-        var reranker_it = registry.reranker_configs.iterator();
-        while (reranker_it.next()) |entry| {
-            const cfg = entry.value_ptr.*;
-            const source = try std.fmt.allocPrint(arena, "config:rerankers/{s}", .{entry.key_ptr.*});
-            try state.addSeed(.{
-                .provider_name = @tagName(cfg.provider),
-                .url = cfg.url,
-                .api_key = cfg.api_key,
-                .project_id = cfg.project_id,
-                .credentials_path = cfg.credentials_path,
-                .model = cfg.model,
-            }, entry.key_ptr.*, source, .reranker);
-        }
-        var chunker_it = registry.chunker_configs.iterator();
-        while (chunker_it.next()) |entry| {
-            const cfg = entry.value_ptr.*;
-            const source = try std.fmt.allocPrint(arena, "config:chunkers/{s}", .{entry.key_ptr.*});
-            try state.addSeed(.{
-                .provider_name = @tagName(cfg.provider),
-                .url = cfg.api_url,
-                .model = cfg.model,
-            }, entry.key_ptr.*, source, .chunker);
-        }
-    }
-
-    if (sources.snapshot) |snapshot| {
-        for (snapshot.tables) |table| {
-            addTableEmbedderSeeds(&state, table.name, table.indexes_json) catch |err| {
-                std.log.warn("connections: skipping table index configs table={s} err={}", .{ table.name, err });
-            };
-        }
-    }
-
-    // The local/configured inference service is always a connection, even when
-    // no named config references it.
-    if (sources.antfly_provider != null or sources.inference_api_url != null) {
-        try state.addSeed(.{
-            .provider_name = "antfly",
-            .url = sources.inference_api_url orelse "",
-            .api_key = sources.inference_api_key,
-        }, null, "config:inference", null);
-    }
-
-    return state;
-}
-
-fn addTableEmbedderSeeds(state: *GatherState, table_name: []const u8, indexes_json: []const u8) !void {
-    if (indexes_json.len == 0) return;
-    var parsed = try std.json.parseFromSlice(std.json.Value, state.arena, indexes_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return;
-
-    var it = parsed.value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) continue;
-        const embedder_value = entry.value_ptr.object.get("embedder") orelse continue;
-        var cfg = embeddings.parseConfigFromValue(state.arena, embedder_value) catch |err| {
-            std.log.warn("connections: skipping embedder config table={s} index={s} err={}", .{ table_name, entry.key_ptr.*, err });
-            continue;
-        };
-        defer cfg.deinit(state.arena);
-        const source = try std.fmt.allocPrint(state.arena, "table:{s}/index:{s}", .{ table_name, entry.key_ptr.* });
-        try state.addSeed(seedFromEmbedderConfig(cfg), null, source, .embedder);
-    }
 }
 
 const ModelsOutcome = struct {
@@ -474,61 +301,9 @@ pub fn buildConnectionsResponse(
     if (opts.types_filter) |filter| kinds = parseKindFilter(filter);
 
     var connections = std.ArrayListUnmanaged(Connection).empty;
-    var used_names = std.StringArrayHashMapUnmanaged(void){};
-
-    if (kinds.contains(.inference)) {
-        var state = try gatherInstances(arena, sources);
-        const instances = state.instances.values();
-
-        var outcomes: ?[]?ModelsOutcome = null;
-        if (opts.include_models) {
-            outcomes = try resolveModels(arena, sources, cache, opts, instances);
-        }
-
-        for (instances, 0..) |instance, i| {
-            const name = try uniqueName(arena, &used_names, primaryInstanceName(instance));
-            var connection = Connection{
-                .id = name,
-                .name = name,
-                .kind = .inference,
-                .status = if (instance.provider == .mock) .connected else .configured,
-                .capabilities = try inferenceCapabilities(arena, instance.model_types),
-                .sources = instance.sources.items,
-                .inference = .{
-                    .provider = instance.provider,
-                    .url = if (instance.url.len > 0) instance.url else null,
-                    .region = if (instance.region.len > 0) instance.region else null,
-                    .project_id = if (instance.project_id.len > 0) instance.project_id else null,
-                    .location = if (instance.location.len > 0) instance.location else null,
-                    .names = instance.names.items,
-                    .configured_model_types = try configuredModelTypeNames(arena, instance.model_types),
-                },
-            };
-            if (outcomes) |values| {
-                if (values[i]) |outcome| {
-                    if (outcome.ok) {
-                        connection.status = .connected;
-                        connection.inference.?.models = try modelsMapAlloc(arena, outcome.models, instance);
-                    } else {
-                        connection.status = .@"error";
-                        connection.@"error" = outcome.err_name;
-                    }
-                }
-            }
-            try connections.append(arena, connection);
-        }
-    }
 
     if (sources.node_config) |node_config| {
-        if (kinds.contains(.external_io)) {
-            try appendExternalIoConnections(arena, &connections, &used_names, node_config, cache, opts);
-        }
-    }
-
-    if (kinds.contains(.cdc)) {
-        if (sources.snapshot) |snapshot| {
-            try appendCdcConnections(arena, &connections, &used_names, snapshot);
-        }
+        try appendConfiguredConnections(arena, &connections, sources, cache, opts, kinds, node_config);
     }
 
     return .{ .connections = connections.items };
@@ -541,16 +316,8 @@ fn parseKindFilter(filter: []const u8) std.EnumSet(ConnectionKind) {
         const trimmed = std.mem.trim(u8, raw, " \t");
         if (std.meta.stringToEnum(ConnectionKind, trimmed)) |kind| {
             kinds.insert(kind);
-        } else if (std.mem.eql(u8, trimmed, "object_store") or
-            std.mem.eql(u8, trimmed, "remote_content") or
-            std.mem.eql(u8, trimmed, "remote_content_http"))
-        {
-            kinds.insert(.external_io);
-        } else if (std.mem.eql(u8, trimmed, "inference_provider")) {
-            kinds.insert(.inference);
         }
     }
-    if (kinds.count() == 0) return std.EnumSet(ConnectionKind).initFull();
     return kinds;
 }
 
@@ -563,69 +330,235 @@ pub fn includeHasModels(include: ?[]const u8) bool {
     return false;
 }
 
-fn primaryInstanceName(instance: *const Instance) []const u8 {
-    if (instance.names.items.len > 0) return instance.names.items[0];
-    return @tagName(instance.provider);
-}
+fn appendConfiguredConnections(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    sources: Sources,
+    cache: ?*Cache,
+    opts: BuildOptions,
+    kinds: std.EnumSet(ConnectionKind),
+    node_config: *const common_config.Config,
+) !void {
+    var it = node_config.connections.iterator();
+    while (it.next()) |entry| {
+        const cfg = entry.value_ptr.*;
+        const kind = connectionKindFromConfig(cfg.kind);
+        if (!kinds.contains(kind)) continue;
 
-fn uniqueName(arena: Allocator, used: *std.StringArrayHashMapUnmanaged(void), base: []const u8) ![]const u8 {
-    var candidate: []const u8 = base;
-    var suffix: usize = 2;
-    while (used.contains(candidate)) : (suffix += 1) {
-        candidate = try std.fmt.allocPrint(arena, "{s}-{d}", .{ base, suffix });
-    }
-    try used.put(arena, candidate, {});
-    return candidate;
-}
-
-fn configuredModelTypeNames(arena: Allocator, set: std.EnumSet(ConfiguredModelType)) ![]const []const u8 {
-    var names = std.ArrayListUnmanaged([]const u8).empty;
-    inline for (@typeInfo(ConfiguredModelType).@"enum".fields) |field| {
-        if (set.contains(@field(ConfiguredModelType, field.name))) {
-            try names.append(arena, field.name);
+        switch (kind) {
+            .inference => try appendConfiguredInferenceConnection(
+                arena,
+                connections,
+                sources,
+                cache,
+                opts,
+                entry.key_ptr.*,
+                cfg,
+            ),
+            .external_io => try appendConfiguredExternalIoConnection(
+                arena,
+                connections,
+                cache,
+                opts,
+                entry.key_ptr.*,
+                cfg,
+            ),
+            .cdc => try appendConfiguredCdcConnection(
+                arena,
+                connections,
+                sources.snapshot,
+                entry.key_ptr.*,
+                cfg,
+            ),
         }
     }
-    return names.items;
 }
 
-fn inferenceCapabilities(arena: Allocator, set: std.EnumSet(ConfiguredModelType)) ![]const []const u8 {
-    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
-    if (set.contains(.generator)) {
-        try capabilities.append(arena, "models.generate");
-        try capabilities.append(arena, "agents.use");
+fn appendConfiguredInferenceConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    sources: Sources,
+    cache: ?*Cache,
+    opts: BuildOptions,
+    id: []const u8,
+    cfg: common_config.Config.ConnectionConfig,
+) !void {
+    const inference_cfg = cfg.inference orelse return error.InvalidConfig;
+    const provider = std.meta.stringToEnum(list_models.ProviderTag, inference_cfg.provider) orelse return error.InvalidConfig;
+    const model_types = try configuredModelTypeSet(inference_cfg.configured_model_types);
+    const instance = try instanceFromConnectionConfig(arena, id, provider, inference_cfg, model_types);
+
+    var connection = Connection{
+        .id = id,
+        .name = id,
+        .display_name = cfg.display_name,
+        .kind = .inference,
+        .status = if (provider == .mock) .connected else .configured,
+        .capabilities = cfg.capabilities,
+        .sources = try sourcesSlice(arena, "config:connections/{s}", id),
+        .inference = .{
+            .provider = provider,
+            .url = inference_cfg.url,
+            .region = inference_cfg.region,
+            .project_id = inference_cfg.project_id,
+            .location = inference_cfg.location,
+            .names = inference_cfg.names,
+            .configured_model_types = inference_cfg.configured_model_types,
+        },
+    };
+
+    if (opts.include_models) {
+        const instances = try arena.alloc(*Instance, 1);
+        instances[0] = instance;
+        const outcomes = try resolveModels(arena, sources, cache, opts, instances);
+        if (outcomes[0]) |outcome| {
+            if (outcome.ok) {
+                connection.status = .connected;
+                connection.inference.?.models = try modelsMapAlloc(arena, outcome.models, instance);
+            } else {
+                connection.status = .@"error";
+                connection.@"error" = outcome.err_name;
+            }
+        }
     }
-    if (set.contains(.embedder)) {
-        try capabilities.append(arena, "models.embed");
-        try capabilities.append(arena, "indexing.use");
-    }
-    if (set.contains(.reranker)) try capabilities.append(arena, "models.rerank");
-    if (set.contains(.chunker)) {
-        try capabilities.append(arena, "models.chunk");
-        try capabilities.append(arena, "indexing.use");
-    }
-    return dedupeStringsInOrder(arena, capabilities.items);
+
+    try connections.append(arena, connection);
 }
 
-fn dedupeStringsInOrder(arena: Allocator, values: []const []const u8) ![]const []const u8 {
-    var seen = std.StringArrayHashMapUnmanaged(void){};
-    var out = std.ArrayListUnmanaged([]const u8).empty;
+fn appendConfiguredExternalIoConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    cache: ?*Cache,
+    opts: BuildOptions,
+    id: []const u8,
+    cfg: common_config.Config.ConnectionConfig,
+) !void {
+    const external_cfg = cfg.external_io orelse return error.InvalidConfig;
+    var connection = Connection{
+        .id = id,
+        .name = id,
+        .display_name = cfg.display_name,
+        .kind = .external_io,
+        .status = .configured,
+        .capabilities = cfg.capabilities,
+        .sources = try sourcesSlice(arena, "config:connections/{s}", id),
+        .external_io = .{
+            .protocol = externalIoProtocolFromConfig(external_cfg.protocol),
+            .endpoint = external_cfg.endpoint,
+            .buckets = external_cfg.buckets,
+            .prefix = external_cfg.prefix,
+            .hosts = external_cfg.hosts,
+        },
+    };
+
+    if (opts.probe and external_cfg.protocol == .s3) {
+        if (try probeConfiguredExternalIoS3(arena, id, external_cfg, cache, opts)) |probe| {
+            connection.status = probe.status;
+            connection.@"error" = probe.err_name;
+        }
+    }
+
+    try connections.append(arena, connection);
+}
+
+fn appendConfiguredCdcConnection(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    snapshot: ?*const metadata_api.AdminSnapshot,
+    id: []const u8,
+    cfg: common_config.Config.ConnectionConfig,
+) !void {
+    const cdc_cfg = cfg.cdc orelse return error.InvalidConfig;
+    const table_name = cdc_cfg.table_name orelse return error.InvalidConfig;
+    const source_ordinal = cdc_cfg.source_ordinal orelse return error.InvalidConfig;
+    const status = if (snapshot) |snap| blk: {
+        const table = findTableByName(snap, table_name) orelse break :blk null;
+        break :blk findReplicationSourceStatus(snap, table.table_id, source_ordinal);
+    } else null;
+
+    var connection = Connection{
+        .id = id,
+        .name = id,
+        .display_name = cfg.display_name,
+        .kind = .cdc,
+        .status = cdcStatusFromReplicationStatus(status),
+        .capabilities = cfg.capabilities,
+        .sources = try sourcesSlice(arena, "config:connections/{s}", id),
+        .cdc = .{
+            .provider = cdc_cfg.provider,
+            .table_name = table_name,
+            .source_ordinal = source_ordinal,
+            .external_table = if (status) |record| nonEmpty(record.external_table) else cdc_cfg.external_table,
+            .slot_name = if (status) |record| nonEmpty(record.slot_name) else cdc_cfg.slot_name,
+            .publication_name = if (status) |record| nonEmpty(record.publication_name) else cdc_cfg.publication_name,
+            .phase = if (status) |record| nonEmpty(record.phase) else null,
+            .lag_records = if (status) |record| record.lag_records else null,
+            .lag_millis = if (status) |record| record.lag_millis else null,
+            .last_success_at_ms = if (status) |record| nonZero(record.last_success_at_ms) else null,
+            .last_change_applied_at_ms = if (status) |record| nonZero(record.last_change_applied_at_ms) else null,
+            .updated_at_ms = if (status) |record| nonZero(record.updated_at_ms) else null,
+        },
+    };
+    if (status) |record| {
+        if (record.last_error.len > 0) connection.@"error" = record.last_error;
+    }
+
+    try connections.append(arena, connection);
+}
+
+fn connectionKindFromConfig(kind: common_config.Config.ConnectionKind) ConnectionKind {
+    return switch (kind) {
+        .inference => .inference,
+        .external_io => .external_io,
+        .cdc => .cdc,
+    };
+}
+
+fn externalIoProtocolFromConfig(protocol: common_config.Config.ExternalIoProtocol) ExternalIoProtocol {
+    return switch (protocol) {
+        .s3 => .s3,
+        .gcs => .gcs,
+        .filesystem => .filesystem,
+        .http => .http,
+    };
+}
+
+fn configuredModelTypeSet(values: []const []const u8) !std.EnumSet(ConfiguredModelType) {
+    var set = std.EnumSet(ConfiguredModelType).initEmpty();
     for (values) |value| {
-        if (seen.contains(value)) continue;
-        try seen.put(arena, value, {});
-        try out.append(arena, value);
+        const model_type = std.meta.stringToEnum(ConfiguredModelType, value) orelse return error.InvalidConfig;
+        set.insert(model_type);
     }
-    return out.items;
+    return set;
+}
+
+fn instanceFromConnectionConfig(
+    arena: Allocator,
+    id: []const u8,
+    provider: list_models.ProviderTag,
+    cfg: common_config.Config.InferenceConnectionConfig,
+    model_types: std.EnumSet(ConfiguredModelType),
+) !*Instance {
+    const instance = try arena.create(Instance);
+    instance.* = .{
+        .provider = provider,
+        .url = if (cfg.url) |value| try arena.dupe(u8, value) else "",
+        .api_key = if (cfg.api_key) |value| try arena.dupe(u8, value) else null,
+        .region = if (cfg.region) |value| try arena.dupe(u8, value) else "",
+        .project_id = if (cfg.project_id) |value| try arena.dupe(u8, value) else "",
+        .location = if (cfg.location) |value| try arena.dupe(u8, value) else "",
+        .credentials_path = if (cfg.credentials_path) |value| try arena.dupe(u8, value) else "",
+        .key = try std.fmt.allocPrint(arena, "config:connections/{s}", .{id}),
+        .model_types = model_types,
+    };
+    for (cfg.names) |name| try instance.names.append(arena, name);
+    try instance.sources.append(arena, instance.key);
+    return instance;
 }
 
 fn sourcesSlice(arena: Allocator, comptime fmt: []const u8, name: []const u8) ![]const []const u8 {
     const out = try arena.alloc([]const u8, 1);
     out[0] = try std.fmt.allocPrint(arena, fmt, .{name});
-    return out;
-}
-
-fn cdcSourcesSlice(arena: Allocator, table_name: []const u8, source_ordinal: u32) ![]const []const u8 {
-    const out = try arena.alloc([]const u8, 1);
-    out[0] = try std.fmt.allocPrint(arena, "table:{s}/replication_sources/{d}", .{ table_name, source_ordinal });
     return out;
 }
 
@@ -638,73 +571,11 @@ fn cdcStatusFromReplicationStatus(status: ?*const table_manager.ReplicationSourc
     return .configured;
 }
 
-fn appendCdcConnections(
-    arena: Allocator,
-    connections: *std.ArrayListUnmanaged(Connection),
-    used_names: *std.StringArrayHashMapUnmanaged(void),
-    snapshot: *const metadata_api.AdminSnapshot,
-) !void {
-    for (snapshot.tables) |table| {
-        if (table.replication_sources_json.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, arena, table.replication_sources_json, .{}) catch |err| {
-            std.log.warn("connections: skipping cdc sources table={s} err={}", .{ table.name, err });
-            continue;
-        };
-        defer parsed.deinit();
-        if (parsed.value != .array) continue;
-
-        for (parsed.value.array.items, 0..) |source, source_i| {
-            if (source != .object) continue;
-            const provider = valueString(source.object.get("type")) orelse continue;
-            const source_ordinal: u32 = @intCast(source_i);
-            const status = findReplicationSourceStatus(snapshot, table.table_id, source_ordinal);
-            const external_table = if (status) |record|
-                nonEmpty(record.external_table)
-            else
-                valueString(source.object.get("postgres_table"));
-            const slot_name = if (status) |record|
-                nonEmpty(record.slot_name)
-            else
-                valueString(source.object.get("slot_name"));
-            const publication_name = if (status) |record|
-                nonEmpty(record.publication_name)
-            else
-                valueString(source.object.get("publication_name"));
-            const phase = if (status) |record| nonEmpty(record.phase) else null;
-            const name = if (external_table) |table_name|
-                try std.fmt.allocPrint(arena, "cdc-{s}-{s}", .{ table.name, table_name })
-            else
-                try std.fmt.allocPrint(arena, "cdc-{s}-{d}", .{ table.name, source_ordinal });
-
-            const unique_name = try uniqueName(arena, used_names, name);
-            var connection = Connection{
-                .id = unique_name,
-                .name = unique_name,
-                .kind = .cdc,
-                .status = cdcStatusFromReplicationStatus(status),
-                .capabilities = &.{"cdc.read_stream"},
-                .sources = try cdcSourcesSlice(arena, table.name, source_ordinal),
-                .cdc = .{
-                    .provider = provider,
-                    .table_name = table.name,
-                    .source_ordinal = source_ordinal,
-                    .external_table = external_table,
-                    .slot_name = slot_name,
-                    .publication_name = publication_name,
-                    .phase = phase,
-                    .lag_records = if (status) |record| record.lag_records else null,
-                    .lag_millis = if (status) |record| record.lag_millis else null,
-                    .last_success_at_ms = if (status) |record| nonZero(record.last_success_at_ms) else null,
-                    .last_change_applied_at_ms = if (status) |record| nonZero(record.last_change_applied_at_ms) else null,
-                    .updated_at_ms = if (status) |record| nonZero(record.updated_at_ms) else null,
-                },
-            };
-            if (status) |record| {
-                if (record.last_error.len > 0) connection.@"error" = record.last_error;
-            }
-            try connections.append(arena, connection);
-        }
+fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const table_manager.TableRecord {
+    for (snapshot.tables) |*table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table;
     }
+    return null;
 }
 
 fn findReplicationSourceStatus(
@@ -716,14 +587,6 @@ fn findReplicationSourceStatus(
         if (status.table_id == table_id and status.source_ordinal == source_ordinal) return status;
     }
     return null;
-}
-
-fn valueString(value: ?std.json.Value) ?[]const u8 {
-    const actual = value orelse return null;
-    return switch (actual) {
-        .string => |string| if (string.len > 0) string else null,
-        else => null,
-    };
 }
 
 fn nonEmpty(value: []const u8) ?[]const u8 {
@@ -883,115 +746,24 @@ fn resolveModels(
     return outcomes;
 }
 
-fn appendExternalIoConnections(
-    arena: Allocator,
-    connections: *std.ArrayListUnmanaged(Connection),
-    used_names: *std.StringArrayHashMapUnmanaged(void),
-    node_config: *const common_config.Config,
-    cache: ?*Cache,
-    opts: BuildOptions,
-) !void {
-    if (node_config.storage.s3_bucket) |bucket| {
-        const buckets = try arena.alloc([]const u8, 1);
-        buckets[0] = bucket;
-        const name = try uniqueName(arena, used_names, "storage");
-        try connections.append(arena, .{
-            .id = name,
-            .name = name,
-            .kind = .external_io,
-            .status = .configured,
-            .capabilities = &.{ "objects.read", "objects.write", "backup.write", "restore.read" },
-            .sources = try sourcesSlice(arena, "config:storage/{s}", "s3"),
-            .external_io = .{
-                .protocol = .s3,
-                .buckets = buckets,
-                .prefix = node_config.storage.s3_prefix,
-            },
-        });
-    }
-
-    if (node_config.inference.s3_credentials) |creds| {
-        const name = try uniqueName(arena, used_names, "inference-models");
-        try connections.append(arena, .{
-            .id = name,
-            .name = name,
-            .kind = .external_io,
-            .status = .configured,
-            .capabilities = &.{ "objects.read", "models.load" },
-            .sources = try sourcesSlice(arena, "config:inference/{s}", "s3_credentials"),
-            .external_io = .{
-                .protocol = .s3,
-                .endpoint = creds.endpoint,
-            },
-        });
-    }
-
-    if (node_config.remote_content) |remote_content| {
-        var it = remote_content.s3.iterator();
-        while (it.next()) |entry| {
-            const creds = entry.value_ptr.*;
-            const name = try uniqueName(arena, used_names, entry.key_ptr.*);
-            var connection = Connection{
-                .id = name,
-                .name = name,
-                .kind = .external_io,
-                .status = .configured,
-                .capabilities = &.{ "content.fetch", "objects.read", "indexing.use", "agents.use" },
-                .sources = try sourcesSlice(arena, "config:remote_content/s3/{s}", entry.key_ptr.*),
-                .external_io = .{
-                    .protocol = .s3,
-                    .endpoint = creds.endpoint,
-                    .buckets = creds.buckets orelse &.{},
-                },
-            };
-            if (opts.probe) {
-                if (try probeRemoteContentS3(arena, entry.key_ptr.*, creds, cache, opts)) |probe| {
-                    connection.status = probe.status;
-                    connection.@"error" = probe.err_name;
-                }
-            }
-            try connections.append(arena, connection);
-        }
-
-        var http_it = remote_content.http.iterator();
-        while (http_it.next()) |entry| {
-            var hosts = std.ArrayListUnmanaged([]const u8).empty;
-            if (entry.value_ptr.base_url) |base_url| try hosts.append(arena, base_url);
-            const name = try uniqueName(arena, used_names, entry.key_ptr.*);
-            try connections.append(arena, .{
-                .id = name,
-                .name = name,
-                .kind = .external_io,
-                .status = .configured,
-                .capabilities = &.{ "content.fetch", "indexing.use", "agents.use" },
-                .sources = try sourcesSlice(arena, "config:remote_content/http/{s}", entry.key_ptr.*),
-                .external_io = .{
-                    .protocol = .http,
-                    .hosts = hosts.items,
-                },
-            });
-        }
-    }
-}
-
 const ProbeResult = struct {
     status: ConnectionStatus,
     err_name: ?[]const u8 = null,
 };
 
-/// Probe a remote-content S3 connection by checking its first bucket.
+/// Probe an external-IO S3 connection by checking its first bucket.
 /// Returns null when the credentials are incomplete (no probe possible).
-fn probeRemoteContentS3(
+fn probeConfiguredExternalIoS3(
     arena: Allocator,
     name: []const u8,
-    creds: common_config.Config.S3CredentialConfig,
+    cfg: common_config.Config.ExternalIoConnectionConfig,
     cache: ?*Cache,
     opts: BuildOptions,
 ) !?ProbeResult {
-    const endpoint = creds.endpoint orelse return null;
-    const access_key_id = creds.access_key_id orelse return null;
-    const secret_access_key = creds.secret_access_key orelse return null;
-    const buckets = creds.buckets orelse return null;
+    const endpoint = cfg.endpoint orelse return null;
+    const access_key_id = cfg.access_key_id orelse return null;
+    const secret_access_key = cfg.secret_access_key orelse return null;
+    const buckets = cfg.buckets;
     if (buckets.len == 0) return null;
 
     const cache_key = try std.fmt.allocPrint(arena, "objectstore\x1f{s}\x1f{s}\x1f{s}", .{ name, endpoint, buckets[0] });
@@ -1008,7 +780,7 @@ fn probeRemoteContentS3(
     }
 
     const outcome: ProbeResult = blk: {
-        probeS3Bucket(arena, creds, endpoint, access_key_id, secret_access_key, buckets[0]) catch |err| {
+        probeS3Bucket(arena, cfg, endpoint, access_key_id, secret_access_key, buckets[0]) catch |err| {
             break :blk .{ .status = .@"error", .err_name = @errorName(err) };
         };
         break :blk .{ .status = .connected };
@@ -1028,7 +800,7 @@ fn probeRemoteContentS3(
 
 fn probeS3Bucket(
     arena: Allocator,
-    creds: common_config.Config.S3CredentialConfig,
+    cfg: common_config.Config.ExternalIoConnectionConfig,
     endpoint: []const u8,
     access_key_id: []const u8,
     secret_access_key: []const u8,
@@ -1037,10 +809,10 @@ fn probeS3Bucket(
     var s3_client = try objectstore.s3.Client.init(arena, .{
         .credentials = .{
             .endpoint = try arena.dupe(u8, endpoint),
-            .use_ssl = creds.use_ssl orelse std.mem.startsWith(u8, endpoint, "https://"),
+            .use_ssl = cfg.use_ssl orelse std.mem.startsWith(u8, endpoint, "https://"),
             .access_key_id = try arena.dupe(u8, access_key_id),
             .secret_access_key = try arena.dupe(u8, secret_access_key),
-            .session_token = if (creds.session_token) |value| try arena.dupe(u8, value) else null,
+            .session_token = if (cfg.session_token) |value| try arena.dupe(u8, value) else null,
             .region = try arena.dupe(u8, "us-east-1"),
         },
         .addressing_style = .path,
@@ -1055,104 +827,7 @@ fn probeS3Bucket(
 
 const table_manager = @import("../metadata/table_manager.zig");
 
-test "gather dedups registry instances by provider identity" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const raw =
-        \\{
-        \\  "generators": {
-        \\    "primary": { "provider": "openai", "model": "gpt-4o", "url": "https://api.openai.com", "api_key": "k1" },
-        \\    "secondary": { "provider": "openai", "model": "gpt-4o-mini", "url": "https://api.openai.com", "api_key": "k1" }
-        \\  },
-        \\  "embedders": {
-        \\    "embed": { "provider": "openai", "model": "text-embedding-3-small", "url": "https://api.openai.com", "api_key": "k1" }
-        \\  },
-        \\  "rerankers": {
-        \\    "rerank": { "provider": "cohere", "model": "rerank-v3.5", "api_key": "k2", "field": "body" }
-        \\  }
-        \\}
-    ;
-    var registry = try provider_registry.Registry.parseFromSlice(alloc, raw);
-    defer registry.deinit();
-
-    var state = try gatherInstances(arena, .{ .registry = &registry });
-    const instances = state.instances.values();
-    try std.testing.expectEqual(@as(usize, 2), instances.len);
-
-    const openai_instance = instances[0];
-    try std.testing.expectEqual(list_models.ProviderTag.openai, openai_instance.provider);
-    try std.testing.expectEqual(@as(usize, 3), openai_instance.names.items.len);
-    try std.testing.expect(openai_instance.model_types.contains(.generator));
-    try std.testing.expect(openai_instance.model_types.contains(.embedder));
-    try std.testing.expect(!openai_instance.model_types.contains(.reranker));
-    try std.testing.expect(openai_instance.configured_models.contains("gpt-4o"));
-    try std.testing.expect(openai_instance.configured_models.contains("text-embedding-3-small"));
-
-    const cohere_instance = instances[1];
-    try std.testing.expectEqual(list_models.ProviderTag.cohere, cohere_instance.provider);
-    try std.testing.expect(cohere_instance.model_types.contains(.reranker));
-}
-
-test "gather includes table embedding index configs" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tables = [_]table_manager.TableRecord{.{
-        .table_id = 1,
-        .name = "docs",
-        .indexes_json =
-        \\{"body_vec":{"type":"embeddings","field":"body","dimension":768,"embedder":{"provider":"ollama","model":"nomic-embed-text","url":"http://localhost:11434"}},"broken":{"type":"embeddings","embedder":{"provider":"unknown-provider"}},"ft":{"type":"full_text"}}
-        ,
-    }};
-    var snapshot = metadata_api.AdminSnapshot{
-        .status = undefined,
-        .tables = tables[0..],
-        .ranges = &.{},
-        .stores = &.{},
-        .placement_intents = &.{},
-        .split_transitions = &.{},
-        .merge_transitions = &.{},
-    };
-
-    var state = try gatherInstances(arena, .{ .snapshot = &snapshot });
-    const instances = state.instances.values();
-    try std.testing.expectEqual(@as(usize, 1), instances.len);
-    try std.testing.expectEqual(list_models.ProviderTag.ollama, instances[0].provider);
-    try std.testing.expectEqual(@as(usize, 1), instances[0].sources.items.len);
-    try std.testing.expectEqualStrings("table:docs/index:body_vec", instances[0].sources.items[0]);
-}
-
 test "build response reports mock connected and types filter" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const raw =
-        \\{ "generators": { "mocked": { "provider": "mock" } } }
-    ;
-    var registry = try provider_registry.Registry.parseFromSlice(alloc, raw);
-    defer registry.deinit();
-
-    const response = try buildConnectionsResponse(arena, .{ .registry = &registry }, null, .{ .include_models = true });
-    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
-    const connection = response.connections[0];
-    try std.testing.expectEqualStrings("mocked", connection.name);
-    try std.testing.expectEqual(ConnectionStatus.connected, connection.status);
-    const models = connection.inference.?.models.?;
-    try std.testing.expect(models.map.get("embedders") != null);
-    try std.testing.expect(models.map.get("generators") != null);
-
-    const filtered = try buildConnectionsResponse(arena, .{ .registry = &registry }, null, .{ .types_filter = "object_store" });
-    try std.testing.expectEqual(@as(usize, 0), filtered.connections.len);
-}
-
-test "build response reports object and remote content config as external io" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1165,20 +840,75 @@ test "build response reports object and remote content config as external io" {
         \\      "1": "http://127.0.0.1:7001"
         \\    }
         \\  },
-        \\  "storage": {
-        \\    "data": "s3",
-        \\    "s3": { "bucket": "antfly-prod", "prefix": "cluster-a/" }
+        \\  "connections": {
+        \\    "mocked": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate", "models.embed"],
+        \\      "inference": {
+        \\        "provider": "mock",
+        \\        "names": ["mocked"],
+        \\        "configured_model_types": ["generator", "embedder"]
+        \\      }
+        \\    }
         \\  },
-        \\  "remote_content": {
-        \\    "s3": {
-        \\      "docs": {
+        \\  "replication_factor": 1,
+        \\  "default_shards_per_table": 1,
+        \\  "max_shard_size_bytes": 1024,
+        \\  "max_shards_per_table": 4
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    const response = try buildConnectionsResponse(arena, .{ .node_config = &cfg }, null, .{ .include_models = true });
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    const connection = response.connections[0];
+    try std.testing.expectEqualStrings("mocked", connection.name);
+    try std.testing.expectEqual(ConnectionKind.inference, connection.kind);
+    try std.testing.expectEqual(ConnectionStatus.connected, connection.status);
+    try std.testing.expect(containsString(connection.capabilities, "models.generate"));
+    try std.testing.expect(containsString(connection.inference.?.configured_model_types, "generator"));
+    const models = connection.inference.?.models.?;
+    try std.testing.expect(models.map.get("embedders") != null);
+    try std.testing.expect(models.map.get("generators") != null);
+
+    const filtered = try buildConnectionsResponse(arena, .{ .node_config = &cfg }, null, .{ .types_filter = "external_io" });
+    try std.testing.expectEqual(@as(usize, 0), filtered.connections.len);
+
+    const invalid = try buildConnectionsResponse(arena, .{ .node_config = &cfg }, null, .{ .types_filter = "object_store" });
+    try std.testing.expectEqual(@as(usize, 0), invalid.connections.len);
+}
+
+test "build response reports configured external io connections" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "connections": {
+        \\    "backups": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["objects.read", "objects.write", "backup.write", "restore.read"],
+        \\      "external_io": {
+        \\        "protocol": "s3",
         \\        "endpoint": "s3.amazonaws.com",
-        \\        "buckets": ["docs-*"]
+        \\        "buckets": ["antfly-prod"],
+        \\        "prefix": "cluster-a/"
         \\      }
         \\    },
-        \\    "http": {
-        \\      "docs-site": {
-        \\        "base_url": "https://docs.example.com"
+        \\    "docs-site": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["content.fetch", "indexing.use", "agents.use"],
+        \\      "external_io": {
+        \\        "protocol": "http",
+        \\        "hosts": ["https://docs.example.com"]
         \\      }
         \\    }
         \\  },
@@ -1197,36 +927,33 @@ test "build response reports object and remote content config as external io" {
         null,
         .{ .types_filter = "external_io", .probe = false },
     );
-    try std.testing.expectEqual(@as(usize, 3), response.connections.len);
+    try std.testing.expectEqual(@as(usize, 2), response.connections.len);
     for (response.connections) |connection| {
         try std.testing.expectEqual(ConnectionKind.external_io, connection.kind);
         try std.testing.expect(connection.id.len > 0);
         try std.testing.expect(connection.external_io != null);
     }
 
-    const storage = response.connections[0];
-    try std.testing.expectEqual(ExternalIoProtocol.s3, storage.external_io.?.protocol);
-    try std.testing.expect(containsString(storage.capabilities, "objects.read"));
-    try std.testing.expect(containsString(storage.capabilities, "backup.write"));
+    const backups = response.connections[0];
+    try std.testing.expectEqualStrings("backups", backups.id);
+    try std.testing.expectEqual(ExternalIoProtocol.s3, backups.external_io.?.protocol);
+    try std.testing.expect(containsString(backups.capabilities, "objects.read"));
+    try std.testing.expect(containsString(backups.capabilities, "backup.write"));
+    try std.testing.expectEqualStrings("antfly-prod", backups.external_io.?.buckets[0]);
 
-    const docs_s3 = response.connections[1];
-    try std.testing.expectEqual(ExternalIoProtocol.s3, docs_s3.external_io.?.protocol);
-    try std.testing.expect(containsString(docs_s3.capabilities, "content.fetch"));
-    try std.testing.expectEqualStrings("docs-*", docs_s3.external_io.?.buckets[0]);
-
-    const docs_http = response.connections[2];
+    const docs_http = response.connections[1];
+    try std.testing.expectEqualStrings("docs-site", docs_http.id);
     try std.testing.expectEqual(ExternalIoProtocol.http, docs_http.external_io.?.protocol);
     try std.testing.expect(containsString(docs_http.capabilities, "content.fetch"));
     try std.testing.expectEqualStrings("https://docs.example.com", docs_http.external_io.?.hosts[0]);
 
-    const alias_response = try buildConnectionsResponse(
+    const invalid_filter = try buildConnectionsResponse(
         arena,
         .{ .node_config = &cfg },
         null,
         .{ .types_filter = "object_store", .probe = false },
     );
-    try std.testing.expectEqual(@as(usize, 3), alias_response.connections.len);
-    try std.testing.expectEqual(ConnectionKind.external_io, alias_response.connections[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), invalid_filter.connections.len);
 }
 
 test "build response includes cdc replication sources with generic cdc kind" {
@@ -1235,12 +962,40 @@ test "build response includes cdc replication sources with generic cdc kind" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "connections": {
+        \\    "users-pg": {
+        \\      "kind": "cdc",
+        \\      "capabilities": ["cdc.read_stream"],
+        \\      "cdc": {
+        \\        "provider": "postgres",
+        \\        "dsn": "postgres://example",
+        \\        "table_name": "users",
+        \\        "source_ordinal": 0,
+        \\        "external_table": "public.users",
+        \\        "slot_name": "slot_cfg",
+        \\        "publication_name": "pub_cfg"
+        \\      }
+        \\    }
+        \\  },
+        \\  "replication_factor": 1,
+        \\  "default_shards_per_table": 1,
+        \\  "max_shard_size_bytes": 1024,
+        \\  "max_shards_per_table": 4
+        \\}
+    ;
+    var cfg = try common_config.Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
     var tables = [_]table_manager.TableRecord{.{
         .table_id = 7,
         .name = "users",
-        .replication_sources_json =
-        \\[{"type":"postgres","dsn":"${secret:pg}","postgres_table":"public.users","slot_name":"slot_cfg","publication_name":"pub_cfg"}]
-        ,
     }};
     var statuses = [_]table_manager.ReplicationSourceStatusRecord{.{
         .table_id = 7,
@@ -1266,11 +1021,13 @@ test "build response includes cdc replication sources with generic cdc kind" {
         .replication_source_statuses = statuses[0..],
     };
 
-    const response = try buildConnectionsResponse(arena, .{ .snapshot = &snapshot }, null, .{ .types_filter = "cdc" });
+    const response = try buildConnectionsResponse(arena, .{ .node_config = &cfg, .snapshot = &snapshot }, null, .{ .types_filter = "cdc" });
     try std.testing.expectEqual(@as(usize, 1), response.connections.len);
     const connection = response.connections[0];
+    try std.testing.expectEqualStrings("users-pg", connection.id);
     try std.testing.expectEqual(ConnectionKind.cdc, connection.kind);
     try std.testing.expectEqual(ConnectionStatus.connected, connection.status);
+    try std.testing.expect(containsString(connection.capabilities, "cdc.read_stream"));
     try std.testing.expectEqualStrings("postgres", connection.cdc.?.provider);
     try std.testing.expectEqualStrings("users", connection.cdc.?.table_name);
     try std.testing.expectEqualStrings("public.users", connection.cdc.?.external_table.?);
@@ -1285,16 +1042,4 @@ test "include param parsing" {
     try std.testing.expect(!includeHasModels(null));
     try std.testing.expect(!includeHasModels(""));
     try std.testing.expect(!includeHasModels("modeling"));
-}
-
-test "unique names get numeric suffixes" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var used = std.StringArrayHashMapUnmanaged(void){};
-    try std.testing.expectEqualStrings("openai", try uniqueName(arena, &used, "openai"));
-    try std.testing.expectEqualStrings("openai-2", try uniqueName(arena, &used, "openai"));
-    try std.testing.expectEqualStrings("openai-3", try uniqueName(arena, &used, "openai"));
 }

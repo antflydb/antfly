@@ -16,8 +16,8 @@ authorization metadata.
 - Let RBAC authorize use of a connection for a specific workflow.
 - Make UI affordances explicit: a user should know which connections they can
   see, use, and administer.
-- Preserve config-derived connections during the transition to persisted
-  first-class connection resources.
+- Use the same public model in configuration and API responses before the
+  product has shipped, so users learn one connections vocabulary.
 
 ## Naming
 
@@ -68,8 +68,65 @@ input/output endpoints, while permissions describe who may use them.
 
 ## Core Model
 
-Long-run connections should have a stable ID and a display name. Config-derived
-connections may initially synthesize IDs from their source path.
+Connections are configured under one public `connections` map. The map key is
+the stable connection ID. The same ID is used by API responses, workflow
+references, future policy resources, and future persisted connection records.
+
+```yaml
+connections:
+  openai-prod:
+    display_name: OpenAI production
+    kind: inference
+    capabilities:
+      - models.generate
+      - models.embed
+      - agents.use
+      - indexing.use
+    inference:
+      provider: openai
+      url: https://api.openai.com
+      api_key: ${secret:openai.api_key}
+
+  docs-site:
+    kind: external_io
+    capabilities:
+      - content.fetch
+      - indexing.use
+      - agents.use
+    external_io:
+      protocol: http
+      hosts:
+        - https://docs.example.com
+      headers:
+        Authorization: ${secret:docs.token}
+
+  backups:
+    kind: external_io
+    capabilities:
+      - objects.read
+      - objects.write
+      - backup.write
+      - restore.read
+    external_io:
+      protocol: s3
+      endpoint: https://s3.us-east-1.amazonaws.com
+      buckets:
+        - antfly-backups
+      prefix: prod/
+      access_key_id: ${secret:aws.access_key_id}
+      secret_access_key: ${secret:aws.secret_access_key}
+
+  users-pg:
+    kind: cdc
+    capabilities:
+      - cdc.read_stream
+    cdc:
+      provider: postgres
+      table_name: users
+      source_ordinal: 0
+      external_table: public.users
+      dsn: ${secret:pg.replication_dsn}
+```
 
 ```json
 {
@@ -234,9 +291,10 @@ Example:
 }
 ```
 
-CDC inventory is derived from table replication-source config plus persisted
-replication-source status. Raw DSNs and resolved credentials must never appear
-in `/connections`.
+CDC inventory is derived from `connections` config plus persisted
+replication-source status when a configured CDC connection points at a table
+and source ordinal. Raw DSNs and resolved credentials must never appear in
+`/connections`.
 
 ## Status
 
@@ -350,8 +408,8 @@ POST   /db/v1/connections/{connectionId}/probe
 GET    /db/v1/connections/{connectionId}/status
 ```
 
-The first implementation can return config-derived connections only. The API
-shape should still reserve fields for the first-class resource model:
+The first implementation returns config-derived connections only. The API shape
+uses the first-class resource model now:
 
 - `id`
 - `display_name`
@@ -401,13 +459,14 @@ That expansion should require `connection:secret_ref:read`.
 
 Implement now:
 
+- Configure public connection resources under top-level `connections`.
 - Use top-level kinds `inference`, `external_io`, and `cdc`.
 - Return kind-specific payloads named `inference`, `external_io`, and `cdc`.
 - Keep `GET /db/v1/connections` config-derived and cheap by default.
 - Keep `include=models` as the explicit live inference-provider expansion.
 - Keep `refresh=true` scoped to short live-check caches.
-- Derive CDC connections from table `replication_sources_json` and
-  `replication_source_statuses`.
+- Derive CDC connections from `connections` config and enrich them from
+  `replication_source_statuses` when table/source status exists.
 - Surface CDC status as `connected` when a non-configured runtime phase exists,
   `error` when the status has an error/failure class, and `configured` when no
   live status exists.
@@ -421,20 +480,3 @@ Do not implement in this slice:
 - raw secret or DSN display
 - per-connection secret editing
 - cross-node connection scheduling
-
-## Migration Notes
-
-The previous draft names `inference_provider` and `remote_content_http` should
-not ship as stable public enum values. If an internal branch has generated
-clients with those names, regenerate from the current OpenAPI spec.
-
-If compatibility is needed before GA, accept old query filter aliases for a
-short period:
-
-- `inference_provider` -> `inference`
-- `object_store` -> `external_io` with `protocol: "s3"`, `protocol: "gcs"`,
-  or `protocol: "filesystem"` and object or backup capabilities
-- `remote_content_http` -> `external_io` with `protocol: "http"` and
-  `capabilities: ["content.fetch"]`
-
-Do not return old names in responses.
