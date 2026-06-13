@@ -806,9 +806,11 @@ implementations cleanly:
 
 7. Compact overlay plan storage.
 
-   The overlay plan still uses hash maps plus append arrays in some paths. For
-   small and medium tails, a sorted temporary vector of operations may use less
-   memory and run faster than hash maps.
+   The overlay plan still uses hash maps plus append arrays for large
+   churn-heavy tails, but canonical query replay now uses a sorted temporary
+   delta-record vector for medium tails before falling back to the hash-backed
+   overlay plan. That keeps small and medium sorted tails on a linear merge
+   path without allocating removal/append hash maps.
 
    Expected win: lower peak fold/query scratch and better cache locality.
 
