@@ -2497,14 +2497,20 @@ pub const IndexManager = struct {
         manifest_bytes: usize = 0,
         segment_files: usize = 0,
         segment_bytes: usize = 0,
+        segment_entries: usize = 0,
+        private_store_entries: usize = 0,
+        private_store_bytes: usize = 0,
 
         fn addCopyStats(self: *@This(), stats: anytype) void {
-            if (stats.manifest_bytes == 0 and stats.segment_files == 0) return;
+            if (stats.manifest_bytes == 0 and stats.segment_files == 0 and stats.private_store_bytes == 0) return;
             self.transferred_indexes += 1;
             self.manifest_segments = @max(self.manifest_segments, stats.manifest_segments);
             self.manifest_bytes += stats.manifest_bytes;
             self.segment_files += stats.segment_files;
             self.segment_bytes += stats.segment_bytes;
+            self.segment_entries += stats.segment_entries;
+            self.private_store_entries += stats.private_store_entries;
+            self.private_store_bytes += stats.private_store_bytes;
         }
     };
 

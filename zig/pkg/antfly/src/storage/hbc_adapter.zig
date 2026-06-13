@@ -2975,6 +2975,32 @@ pub const HBCIndex = struct {
         bytes: usize = 0,
     };
 
+    pub const PostingSegmentBackendTransferStats = struct {
+        manifest_segments: usize = 0,
+        manifest_bytes: usize = 0,
+        segment_files: usize = 0,
+        segment_bytes: usize = 0,
+        segment_entries: usize = 0,
+        private_store_entries: usize = 0,
+        private_store_bytes: usize = 0,
+
+        fn fromCopyStats(
+            copy_stats: vectorindex_posting_segment.DirectoryCopyStats,
+            private_store: ?PostingSegmentPrivateStoreSnapshotStats,
+        ) @This() {
+            const private: PostingSegmentPrivateStoreSnapshotStats = private_store orelse .{};
+            return .{
+                .manifest_segments = copy_stats.manifest_segments,
+                .manifest_bytes = copy_stats.manifest_bytes,
+                .segment_files = copy_stats.segment_files,
+                .segment_bytes = copy_stats.segment_bytes,
+                .segment_entries = copy_stats.entries,
+                .private_store_entries = private.entries,
+                .private_store_bytes = private.bytes,
+            };
+        }
+    };
+
     fn postingSegmentSnapshotNamespaceOrdinal(comptime namespace: Namespace) u8 {
         return switch (namespace) {
             .nodes => 1,
@@ -3153,7 +3179,7 @@ pub const HBCIndex = struct {
         return snapshot_stats;
     }
 
-    pub fn exportPostingSegmentBackendToDirectory(self: *HBCIndex, destination_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
+    pub fn exportPostingSegmentBackendToDirectory(self: *HBCIndex, destination_path: []const u8) !PostingSegmentBackendTransferStats {
         if (self.posting_segment_runtime == null) return .{};
 
         var txn = try self.beginReadTxn();
@@ -3169,12 +3195,12 @@ pub const HBCIndex = struct {
         try std.Io.Dir.cwd().createDirPath(io, destination_path);
         var destination_dir = try std.Io.Dir.cwd().openDir(io, destination_path, .{ .iterate = true });
         defer destination_dir.close(io);
-        _ = try self.exportPostingSegmentPrivateStoreSnapshotToDirectory(io, destination_dir);
+        const private_store = try self.exportPostingSegmentPrivateStoreSnapshotToDirectory(io, destination_dir);
 
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        return try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
+        const copied = try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
             self.alloc,
             io,
             runtime.dir,
@@ -3182,9 +3208,10 @@ pub const HBCIndex = struct {
             runtime.store.options.openOptions(),
             manifest_data,
         );
+        return PostingSegmentBackendTransferStats.fromCopyStats(copied, private_store);
     }
 
-    pub fn importPostingSegmentBackendFromDirectory(self: *HBCIndex, source_path: []const u8) !vectorindex_posting_segment.DirectoryCopyStats {
+    pub fn importPostingSegmentBackendFromDirectory(self: *HBCIndex, source_path: []const u8) !PostingSegmentBackendTransferStats {
         if (self.posting_segment_runtime == null) return .{};
 
         var io_impl = std.Io.Threaded.init(self.alloc, .{});
@@ -3203,7 +3230,7 @@ pub const HBCIndex = struct {
             else => return err,
         };
         defer source_dir.close(io);
-        _ = try self.importPostingSegmentPrivateStoreSnapshotFromDirectory(io, source_dir);
+        const private_store = try self.importPostingSegmentPrivateStoreSnapshotFromDirectory(io, source_dir);
 
         var txn = try self.beginReadTxn();
         defer txn.abort();
@@ -3220,7 +3247,7 @@ pub const HBCIndex = struct {
         defer self.alloc.free(source_manifest_data);
         if (!std.mem.eql(u8, source_manifest_data, committed_manifest_data)) return error.PostingSegmentManifestMismatch;
 
-        return try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
+        const copied = try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
             self.alloc,
             io,
             source_dir,
@@ -3228,6 +3255,7 @@ pub const HBCIndex = struct {
             open_options,
             source_manifest_data,
         );
+        return PostingSegmentBackendTransferStats.fromCopyStats(copied, private_store);
     }
 
     pub fn savePostingBackendBase(self: *HBCIndex, txn: anytype, posting_id: u64, encoded: []const u8) !void {
@@ -11213,6 +11241,8 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         const exported = try idx.exportPostingSegmentBackendToDirectory(std.mem.span(export_path));
         try std.testing.expect(exported.segment_files > 0);
         try std.testing.expect(exported.segment_bytes > 0);
+        try std.testing.expect(exported.private_store_entries > 0);
+        try std.testing.expect(exported.private_store_bytes > 0);
         try std.testing.expectEqual(segment_maintenance.manifest_segments, @as(u64, @intCast(exported.manifest_segments)));
 
         {
@@ -11239,6 +11269,8 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         const imported = try idx.importPostingSegmentBackendFromDirectory(std.mem.span(export_path));
         try std.testing.expectEqual(exported.segment_files, imported.segment_files);
         try std.testing.expectEqual(exported.segment_bytes, imported.segment_bytes);
+        try std.testing.expectEqual(exported.private_store_entries, imported.private_store_entries);
+        try std.testing.expectEqual(exported.private_store_bytes, imported.private_store_bytes);
 
         const orphan_segment_rel = try vectorindex_posting_segment.segmentPathAlloc(alloc, 0xfeed);
         defer alloc.free(orphan_segment_rel);

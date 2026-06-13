@@ -5741,6 +5741,7 @@ pub const DB = struct {
         const segment_artifacts = try self.core.index_manager.exportDensePostingSegmentArtifactsToDirectory(snapshot_root);
         total +|= @as(u64, @intCast(segment_artifacts.manifest_bytes));
         total +|= @as(u64, @intCast(segment_artifacts.segment_bytes));
+        total +|= @as(u64, @intCast(segment_artifacts.private_store_bytes));
         return total;
     }
 
@@ -5793,8 +5794,8 @@ pub const DB = struct {
         const imported = try db.importDensePostingSegmentArtifactsFromDirectory(snapshot_root);
         if (imported.transferred_indexes != 0) {
             std.log.info(
-                "restored dense posting segment artifacts path={s} indexes={d} segment_files={d} segment_bytes={d}",
-                .{ path, imported.transferred_indexes, imported.segment_files, imported.segment_bytes },
+                "restored dense posting segment artifacts path={s} indexes={d} segment_files={d} segment_bytes={d} private_store_bytes={d}",
+                .{ path, imported.transferred_indexes, imported.segment_files, imported.segment_bytes, imported.private_store_bytes },
             );
         }
     }
@@ -49906,6 +49907,8 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
         try std.testing.expectEqual(@as(usize, 1), exported.transferred_indexes);
         try std.testing.expect(exported.segment_files > 0);
         try std.testing.expect(exported.segment_bytes > 0);
+        try std.testing.expect(exported.private_store_entries > 0);
+        try std.testing.expect(exported.private_store_bytes > 0);
     }
 
     {
@@ -49942,6 +49945,8 @@ test "db segment-backed dense index is opt-in and persists across reopen" {
     try std.testing.expectEqual(@as(usize, 1), imported.transferred_indexes);
     try std.testing.expect(imported.segment_files > 0);
     try std.testing.expect(imported.segment_bytes > 0);
+    try std.testing.expect(imported.private_store_entries > 0);
+    try std.testing.expect(imported.private_store_bytes > 0);
     {
         var io_impl = threadedIo();
         defer io_impl.deinit();
@@ -49993,6 +49998,7 @@ test "db snapshot restore carries segment-backed dense posting artifacts" {
         \\}
     ;
 
+    var snapshot_size: u64 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(src_path), .{
             .primary_backend = primary_backend,
@@ -50013,7 +50019,7 @@ test "db snapshot restore carries segment-backed dense posting artifacts" {
         });
         try db.runUntilIdle();
 
-        const snapshot_size = try db.snapshot("snap1");
+        snapshot_size = try db.snapshot("snap1");
         try std.testing.expect(snapshot_size > 0);
     }
 
@@ -50042,8 +50048,11 @@ test "db snapshot restore carries segment-backed dense posting artifacts" {
     {
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        try std.Io.Dir.accessAbsolute(io_impl.io(), artifact_manifest_path, .{});
-        try std.Io.Dir.accessAbsolute(io_impl.io(), hbc_store_snapshot_path, .{});
+        const io = io_impl.io();
+        try std.Io.Dir.accessAbsolute(io, artifact_manifest_path, .{});
+        const hbc_store_stat = try std.Io.Dir.cwd().statFile(io, hbc_store_snapshot_path, .{});
+        try std.testing.expect(hbc_store_stat.size > 0);
+        try std.testing.expect(snapshot_size >= hbc_store_stat.size);
     }
 
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
