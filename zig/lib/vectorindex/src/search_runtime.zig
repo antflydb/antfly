@@ -207,8 +207,6 @@ pub const SearchScratch = struct {
         errdefer alloc.free(vector);
         const member_ids = try alloc.alloc(u64, max_leaf);
         errdefer alloc.free(member_ids);
-        const flags = try alloc.alloc(bool, max_candidates);
-        errdefer alloc.free(flags);
         const query_storage = try allocateQueryStorage(alloc, max_candidates);
         errdefer alloc.free(query_storage);
         const query_views = carveQueryStorage(query_storage, max_candidates);
@@ -225,7 +223,7 @@ pub const SearchScratch = struct {
             .query_storage = query_storage,
             .vector_ids = query_views.vector_ids,
             .metadata = query_views.metadata,
-            .flags = flags,
+            .flags = query_views.flags,
             .positions = query_views.positions,
             .lookups = query_views.lookups,
             .key_views = query_views.key_views,
@@ -244,7 +242,6 @@ pub const SearchScratch = struct {
                 centroid,
                 vector,
                 member_ids,
-                flags,
                 query_storage,
                 distance_storage,
             }),
@@ -252,7 +249,6 @@ pub const SearchScratch = struct {
                 byteLen(centroid) +
                 byteLen(vector) +
                 byteLen(member_ids) +
-                byteLen(flags) +
                 byteLen(query_storage) +
                 byteLen(distance_storage),
         };
@@ -300,6 +296,7 @@ pub const SearchScratch = struct {
             .positions = self.positions,
             .vector_ids = self.vector_ids,
             .metadata = self.metadata,
+            .flags = self.flags,
             .lookups = self.lookups,
             .key_views = self.key_views,
             .values = self.values,
@@ -311,6 +308,7 @@ pub const SearchScratch = struct {
         self.positions = views.positions;
         self.vector_ids = views.vector_ids;
         self.metadata = views.metadata;
+        self.flags = views.flags;
         self.lookups = views.lookups;
         self.key_views = views.key_views;
         self.values = views.values;
@@ -332,10 +330,6 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.flags.len < needed) {
-            self.flags = try alloc.realloc(self.flags, needed);
-            self.noteScratchAllocation(byteLen(self.flags));
-        }
         try self.ensureVectorFetchCapacity(alloc, needed);
     }
 
@@ -622,6 +616,7 @@ pub const SearchScratch = struct {
         self.positions = &.{};
         self.vector_ids = &.{};
         self.metadata = &.{};
+        self.flags = &.{};
         self.lookups = &.{};
         self.key_views = &.{};
         self.values = &.{};
@@ -634,9 +629,6 @@ pub const SearchScratch = struct {
         if (self.bytes() <= max_retained_bytes) return trimmed;
         alloc.free(self.member_ids);
         self.member_ids = &.{};
-        if (self.bytes() <= max_retained_bytes) return trimmed;
-        alloc.free(self.flags);
-        self.flags = &.{};
         return trimmed;
     }
 
@@ -660,7 +652,6 @@ pub const SearchScratch = struct {
             byteLen(self.vector_batch) +
             byteLen(self.member_ids) +
             byteLen(self.query_storage) +
-            byteLen(self.flags) +
             byteLen(self.distance_storage) +
             byteLen(self.posting_delta_records) +
             posting_delta_tail_cache_bytes +
@@ -680,7 +671,6 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_batch);
         alloc.free(self.member_ids);
         alloc.free(self.query_storage);
-        alloc.free(self.flags);
         alloc.free(self.distance_storage);
         for (self.posting_member_cache.items) |entry| alloc.free(entry.members);
         self.posting_member_cache.deinit(alloc);
@@ -700,6 +690,7 @@ const QueryStorageViews = struct {
     positions: []usize,
     vector_ids: []u64,
     metadata: []?[]const u8,
+    flags: []bool,
     lookups: []RerankLookup,
     key_views: [][]const u8,
     values: []?[]const u8,
@@ -717,6 +708,7 @@ fn queryStorageByteLen(capacity: usize) usize {
     addQueryStorageSlice(usize, &offset, capacity);
     addQueryStorageSlice(u64, &offset, capacity);
     addQueryStorageSlice(?[]const u8, &offset, capacity);
+    addQueryStorageSlice(bool, &offset, capacity);
     addQueryStorageSlice(RerankLookup, &offset, capacity);
     addQueryStorageSlice([]const u8, &offset, capacity);
     addQueryStorageSlice(?[]const u8, &offset, capacity);
@@ -737,6 +729,7 @@ fn carveQueryStorage(storage: []u64, capacity: usize) QueryStorageViews {
         .positions = carveQueryStorageSlice(usize, bytes, &offset, capacity),
         .vector_ids = carveQueryStorageSlice(u64, bytes, &offset, capacity),
         .metadata = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
+        .flags = carveQueryStorageSlice(bool, bytes, &offset, capacity),
         .lookups = carveQueryStorageSlice(RerankLookup, bytes, &offset, capacity),
         .key_views = carveQueryStorageSlice([]const u8, bytes, &offset, capacity),
         .values = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
@@ -758,6 +751,7 @@ fn copyQueryStorageViews(dst: QueryStorageViews, src: QueryStorageViews) void {
     copySlicePrefix(usize, dst.positions, src.positions);
     copySlicePrefix(u64, dst.vector_ids, src.vector_ids);
     copySlicePrefix(?[]const u8, dst.metadata, src.metadata);
+    copySlicePrefix(bool, dst.flags, src.flags);
     copySlicePrefix(RerankLookup, dst.lookups, src.lookups);
     copySlicePrefix([]const u8, dst.key_views, src.key_views);
     copySlicePrefix(?[]const u8, dst.values, src.values);

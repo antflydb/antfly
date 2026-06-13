@@ -746,10 +746,12 @@ implementations cleanly:
 
 3. Continue compacting query scratch into slabs.
 
-   `SearchScratch` still owns several arrays that tend to grow together:
-   positions, vector ids, metadata, lookups, key views, values, vector views,
-   distances, and error bounds. Grouping compatible arrays into one slab can
-   reduce allocator traffic and improve locality on hot query paths.
+   `SearchScratch` now groups the fixed query result arrays that grow together
+   into slabs: positions, vector ids, metadata, rerank flags, lookups, key
+   views, values, and vector views share `query_storage`, while distances and
+   error bounds share `distance_storage`. The remaining separate hot buffers
+   are for distinct lifetime/shape classes such as vector batches, member ids,
+   posting overlay summaries, and posting caches.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.
