@@ -3311,15 +3311,24 @@ pub const HBCIndex = struct {
             lockAtomic(&self.posting_segment_mu);
             defer self.posting_segment_mu.unlock();
             const runtime = try self.postingSegmentRuntime();
-            break :blk try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
+            const copy_stats = vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
                 self.alloc,
                 io,
                 source_dir,
                 runtime.dir,
                 open_options,
                 source_manifest_data,
-            );
+            ) catch |err| {
+                var maintenance_options = runtime.store.options.maintenanceOptions();
+                maintenance_options.compact = false;
+                _ = runtime.store.maintainLoadedManifestWithOptions(maintenance_options) catch {};
+                return err;
+            };
+            break :blk copy_stats;
         };
+        errdefer {
+            _ = self.recoverPostingSegmentBackendCrashArtifacts() catch {};
+        }
         _ = try self.importPostingSegmentPrivateStoreSnapshot(private_store_raw);
         return PostingSegmentBackendTransferStats.fromCopyStats(copied, private_store);
     }
@@ -11190,6 +11199,12 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
     var bad_export_tp: TestPath = .{};
     const bad_export_path = bad_export_tp.init();
     defer bad_export_tp.cleanup();
+    var partial_export_tp: TestPath = .{};
+    const partial_export_path = partial_export_tp.init();
+    defer partial_export_tp.cleanup();
+    var failed_import_tp: TestPath = .{};
+    const failed_import_path = failed_import_tp.init();
+    defer failed_import_tp.cleanup();
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
     defer modeled_device.deinit();
@@ -11300,6 +11315,47 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         try std.testing.expect(!capped_segment_maintenance.compacted);
         try std.testing.expectEqual(@as(u64, 0), capped_segment_maintenance.compactions);
         try std.testing.expect(capped_segment_maintenance.manifest_segments > 1);
+
+        const partial_exported = try idx.exportPostingSegmentBackendToDirectory(std.mem.span(partial_export_path));
+        try std.testing.expect(partial_exported.segment_files > 1);
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var partial_export_dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(partial_export_path), .{});
+            defer partial_export_dir.close(io);
+            const manifest_data = try partial_export_dir.readFileAlloc(
+                io,
+                vectorindex_posting_segment.default_manifest_path,
+                alloc,
+                .limited(1024 * 1024),
+            );
+            defer alloc.free(manifest_data);
+            var manifest = try vectorindex_posting_segment.decodeManifestAlloc(alloc, manifest_data);
+            defer manifest.deinit(alloc);
+            try std.testing.expect(manifest.segments.len > 1);
+            try partial_export_dir.deleteFile(io, manifest.segments[manifest.segments.len - 1].path);
+        }
+        {
+            var failed_import = try HBCIndex.openWithLsmOptions(alloc, failed_import_path, config, lsm_options);
+            defer failed_import.close();
+            try std.testing.expectError(
+                error.FileNotFound,
+                failed_import.importPostingSegmentBackendFromDirectory(std.mem.span(partial_export_path)),
+            );
+
+            const failed_postings_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(failed_import_path), vectorindex_posting_segment.segment_directory });
+            defer alloc.free(failed_postings_path);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var failed_postings_dir = try std.Io.Dir.cwd().openDir(io, failed_postings_path, .{ .iterate = true });
+            defer failed_postings_dir.close(io);
+            var iter = failed_postings_dir.iterate();
+            while (try iter.next(io)) |entry| {
+                if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".afps")) return error.TestUnexpectedResult;
+            }
+        }
 
         const segment_maintenance = try idx.maintainPostingSegmentBackend();
         try std.testing.expect(segment_maintenance.ran);
