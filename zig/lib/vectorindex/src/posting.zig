@@ -976,6 +976,16 @@ pub const PostingFormat = struct {
         return try baseContainsSortedMemberWithValidation(data, vector_id, true);
     }
 
+    pub fn baseContainsMemberStrict(data: []const u8, vector_id: VectorId) !bool {
+        var iterator = try BaseMemberIterator.init(data);
+        var found = false;
+        while (try iterator.next()) |member| {
+            if (member == vector_id) found = true;
+        }
+        try iterator.finish();
+        return found;
+    }
+
     fn baseContainsSortedMemberWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !bool {
         const header = try decodeBaseHeader(data);
         var pos: usize = base_header_size;
@@ -2158,6 +2168,31 @@ pub const PostingStore = struct {
         return try PostingFormat.decodeBaseStats(data);
     }
 
+    pub fn containsBaseDeltaMember(index: anytype, txn: anytype, posting_id: PostingId, vector_id: VectorId, is_not_found: fn (anyerror) bool) !bool {
+        if (!baseDeltaIsCanonical(index)) return error.UnsupportedPostingMode;
+        var owned_base_data: ?[]u8 = null;
+        defer if (owned_base_data) |data| index.alloc.free(data);
+        const base_data = if (useSegmentPostingBackend(index)) base_data: {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime !@hasDecl(Index, "loadPostingBackendBaseData")) return error.UnsupportedPostingBackend;
+            owned_base_data = index.loadPostingBackendBaseData(txn, posting_id, is_not_found) catch |err| {
+                if (is_not_found(err)) return error.NotFound;
+                return err;
+            };
+            break :base_data owned_base_data.?;
+        } else loadBaseData(index, txn, posting_id, is_not_found) catch |err| {
+            if (is_not_found(err)) return error.NotFound;
+            return err;
+        };
+        const base_header = try PostingFormat.decodeBaseHeader(base_data);
+        const present_in_base = if (shouldSortBaseMembers(index))
+            try PostingFormat.baseContainsSortedMemberStrict(base_data, vector_id)
+        else
+            try PostingFormat.baseContainsMemberStrict(base_data, vector_id);
+        const latest_delta_op = try latestDeltaOpAfterGenerationForMember(index, txn, posting_id, vector_id, base_header.generation);
+        return if (latest_delta_op) |op| op != .tombstone else present_in_base;
+    }
+
     pub fn deleteBaseAndCentroidRecords(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) !void {
         var base_key_buf: [10]u8 = undefined;
         index.deleteNamespaced(txn, .nodes, hbc.encodePostingBaseKey(&base_key_buf, posting_id)) catch |err| {
@@ -2311,6 +2346,45 @@ pub const PostingStore = struct {
             maybe_entry = try cursor.next();
         }
         return out;
+    }
+
+    fn latestDeltaOpAfterGenerationForMember(
+        index: anytype,
+        txn: anytype,
+        posting_id: PostingId,
+        vector_id: VectorId,
+        base_generation: u64,
+    ) !?PostingDeltaOp {
+        if (useSegmentPostingBackend(index)) {
+            const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "postingBackendLatestDeltaOpAfterGenerationForMember")) {
+                return try index.postingBackendLatestDeltaOpAfterGenerationForMember(txn, posting_id, vector_id, base_generation);
+            }
+            return error.UnsupportedPostingBackend;
+        }
+        var cursor = try openNamespacedCursor(index, txn, .nodes);
+        defer cursor.close();
+
+        var prefix_buf: [10]u8 = undefined;
+        const prefix = hbc.encodePostingDeltaPrefix(&prefix_buf, posting_id);
+        var best_sequence: u64 = 0;
+        var best_op: ?PostingDeltaOp = null;
+
+        var maybe_entry = try cursor.seekAtOrAfter(prefix);
+        while (maybe_entry) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            while (try iterator.next()) |record| {
+                if (record.vector_id != vector_id) continue;
+                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (best_op == null or record.sequence >= best_sequence) {
+                    best_sequence = record.sequence;
+                    best_op = record.op;
+                }
+            }
+            maybe_entry = try cursor.next();
+        }
+        return best_op;
     }
 
     const AdaptiveDeltaTailScan = struct {
@@ -4597,6 +4671,31 @@ const PostingPersistenceTestIndex = struct {
         return out;
     }
 
+    pub fn postingBackendLatestDeltaOpAfterGenerationForMember(
+        self: *PostingPersistenceTestIndex,
+        txn: anytype,
+        posting_id: PostingId,
+        vector_id: VectorId,
+        base_generation: u64,
+    ) !?PostingDeltaOp {
+        _ = txn;
+        var best_sequence: u64 = 0;
+        var best_op: ?PostingDeltaOp = null;
+        for (self.delta_entries.items) |entry| {
+            if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            while (try iterator.next()) |record| {
+                if (record.vector_id != vector_id) continue;
+                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (best_op == null or record.sequence >= best_sequence) {
+                    best_sequence = record.sequence;
+                    best_op = record.op;
+                }
+            }
+        }
+        return best_op;
+    }
+
     pub fn applyPostingBackendDeltaTailIntoScratch(
         self: *PostingPersistenceTestIndex,
         txn: anytype,
@@ -5474,6 +5573,10 @@ test "posting store segment backend hooks route posting persistence" {
     try std.testing.expectEqual(@as(usize, 2), stats.records);
     try std.testing.expectEqual(@as(usize, 2), stats.records_after_generation);
     try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);
+    try std.testing.expect(!try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 10, isNotFoundForPostingPersistenceTest));
+    try std.testing.expect(try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 20, isNotFoundForPostingPersistenceTest));
+    try std.testing.expect(try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 30, isNotFoundForPostingPersistenceTest));
+    try std.testing.expect(!try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 40, isNotFoundForPostingPersistenceTest));
 
     const members = try PostingStore.materializeBaseDeltaMembers(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
     defer alloc.free(members);

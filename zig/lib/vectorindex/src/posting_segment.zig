@@ -849,6 +849,47 @@ pub const LazyDirectorySnapshot = struct {
         return out;
     }
 
+    pub fn latestDeltaOpAfterGenerationForMember(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaOp {
+        var best_sequence: u64 = 0;
+        var best_op: ?posting.PostingDeltaOp = null;
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
+            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+
+            const manifest_entry = ManifestEntry{
+                .meta = entry.meta,
+                .path = entry.path,
+            };
+            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
+            defer alloc.free(index_data);
+
+            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
+                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
+                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
+                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, delta_entry);
+                defer alloc.free(value);
+                var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+                while (try iterator.next()) |record| {
+                    if (record.vector_id != vector_id) continue;
+                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                    if (best_op == null or record.sequence >= best_sequence) {
+                        best_sequence = record.sequence;
+                        best_op = record.op;
+                    }
+                }
+            }
+        }
+        return best_op;
+    }
+
     pub fn materializeMembers(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
         var base_segment_id: u64 = 0;
         var base: ?posting.OwnedPostingBase = null;

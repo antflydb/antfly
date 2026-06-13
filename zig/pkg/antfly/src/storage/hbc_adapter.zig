@@ -3449,6 +3449,20 @@ pub const HBCIndex = struct {
         return try runtime.store.snapshot().deltaTailStats(self.alloc, posting_id, base_generation);
     }
 
+    pub fn postingBackendLatestDeltaOpAfterGenerationForMember(
+        self: *HBCIndex,
+        txn: anytype,
+        posting_id: u64,
+        vector_id: u64,
+        base_generation: u64,
+    ) !?vectorindex_posting.PostingDeltaOp {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return try runtime.store.snapshot().latestDeltaOpAfterGenerationForMember(self.alloc, posting_id, vector_id, base_generation);
+    }
+
     pub fn applyPostingBackendDeltaTailIntoScratch(
         self: *HBCIndex,
         txn: anytype,

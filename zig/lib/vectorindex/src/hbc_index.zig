@@ -4680,11 +4680,29 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
 
 fn findLeafContainingMember(self: anytype, txn: anytype, node_id: u64, vector_id: u64) !?u64 {
     if (node_id == 0) return null;
-    var node = loadNode(self, txn, node_id) catch |err| {
-        if (isNotFoundGeneric(err)) return null;
-        return err;
-    };
+    var node = if (shouldUseBaseDeltaAsCanonicalPosting(self))
+        self.loadNodeFromStorage(txn, node_id) catch |err| {
+            if (isNotFoundGeneric(err)) return null;
+            return err;
+        }
+    else
+        loadNode(self, txn, node_id) catch |err| {
+            if (isNotFoundGeneric(err)) return null;
+            return err;
+        };
     defer node.deinit(self.alloc);
+
+    if (node.is_leaf and shouldUseBaseDeltaAsCanonicalPosting(self)) {
+        const contains = posting.PostingStore.containsBaseDeltaMember(self, txn, node.id, vector_id, isNotFoundGeneric) catch |err| {
+            if (!isNotFoundGeneric(err)) return err;
+            for (node.members) |member_id| {
+                if (member_id == vector_id) return node.id;
+            }
+            return null;
+        };
+        return if (contains) node.id else null;
+    }
+
     if (node.is_leaf) {
         for (node.members) |member_id| {
             if (member_id == vector_id) return node.id;

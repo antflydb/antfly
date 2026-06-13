@@ -761,9 +761,12 @@ implementations cleanly:
 
 4. Add specialized base decode modes.
 
-   Not every path needs a fully materialized member slice. Keep separate decode
-   paths for base header only, count/stat only, streaming member iteration, and
-   full materialization.
+   Not every path needs a fully materialized member slice. Base header,
+   count/stat, streaming member iteration, and full materialization paths are
+   separate. Canonical base/delta membership checks now use the sorted base
+   stream plus a focused latest-delta-op scan for one vector, so fallback
+   delete scans can avoid materializing whole postings when looking for a
+   single member.
 
    Expected win: fold decisions, backlog stats, and membership checks can avoid
    decoding or allocating full member arrays.
