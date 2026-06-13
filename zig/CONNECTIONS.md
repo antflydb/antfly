@@ -5,7 +5,7 @@ implementation target for Antfly Zig.
 
 Connections are external systems Antfly can use for inference, storage, content
 fetching, replication, agents, backups, and related workflows. They should
-become first-class resources with inventory, health, capability, purpose, and
+become first-class resources with inventory, health, capability, and
 authorization metadata.
 
 ## Goals
@@ -43,7 +43,7 @@ Provider or protocol belongs inside the kind-specific payload:
   "kind": "external_io",
   "external_io": {
     "protocol": "http",
-    "purpose": "remote_content"
+    "capabilities": ["content.fetch"]
   }
 }
 ```
@@ -59,7 +59,8 @@ Provider or protocol belongs inside the kind-specific payload:
 
 Use `external_io` for configured external read/write/fetch endpoints such as S3,
 GCS, filesystem paths, and HTTP content sources. Keep the transport in
-`external_io.protocol` and the workflow intent in `external_io.purpose`.
+`external_io.protocol`. Express both technical actions and workflow use cases in
+namespaced `capabilities`.
 
 Do not use `access` as the kind name. It collides conceptually with RBAC and
 authorization language. `external_io` is more explicit: it describes external
@@ -78,8 +79,12 @@ connections may initially synthesize IDs from their source path.
   "kind": "inference",
   "status": "connected",
   "sources": ["config:generators/primary"],
-  "capabilities": ["generate", "embed"],
-  "purposes": ["agents", "indexing"],
+  "capabilities": [
+    "models.generate",
+    "models.embed",
+    "agents.use",
+    "indexing.use"
+  ],
   "inference": {
     "provider": "openai",
     "url": "https://api.openai.com",
@@ -97,11 +102,14 @@ connections may initially synthesize IDs from their source path.
 }
 ```
 
-The distinction between `capabilities`, `purposes`, and policy matters:
+Capabilities and policy are separate concerns:
+Use one namespaced `capabilities` list for both low-level actions and
+workflow-specific uses:
 
-- `capabilities`: what the connection can technically do.
-- `purposes`: which Antfly workflows the connection is intended to serve.
 - `policy`: who may read, use, or administer it for each action.
+- technical examples: `objects.read`, `objects.write`, `content.fetch`
+- workflow examples: `backup.write`, `restore.read`, `indexing.use`,
+  `agents.use`
 
 ## Kinds
 
@@ -117,8 +125,7 @@ Example:
   "id": "conn_openai_prod",
   "kind": "inference",
   "provider": "openai",
-  "capabilities": ["generate", "embed"],
-  "purposes": ["agents", "indexing"],
+  "capabilities": ["models.generate", "models.embed", "agents.use", "indexing.use"],
   "inference": {
     "provider": "openai",
     "url": "https://api.openai.com",
@@ -129,13 +136,15 @@ Example:
 
 Common capabilities:
 
-- `generate`
-- `embed`
-- `rerank`
-- `chunk`
-- `transcribe`
-- `classify`
-- `extract`
+- `models.generate`
+- `models.embed`
+- `models.rerank`
+- `models.chunk`
+- `models.transcribe`
+- `models.classify`
+- `models.extract`
+- `agents.use`
+- `indexing.use`
 
 ### External IO
 
@@ -149,11 +158,9 @@ Example:
   "id": "conn_s3_backups",
   "kind": "external_io",
   "protocol": "s3",
-  "capabilities": ["read_objects", "write_objects"],
-  "purposes": ["backup_restore"],
+  "capabilities": ["objects.read", "objects.write", "backup.write", "restore.read"],
   "external_io": {
     "protocol": "s3",
-    "purpose": "backup_restore",
     "endpoint": "https://s3.us-east-1.amazonaws.com",
     "buckets": ["antfly-backups"],
     "prefix": "prod/"
@@ -168,11 +175,9 @@ HTTP remote content uses the same kind:
   "id": "conn_docs_site",
   "kind": "external_io",
   "protocol": "http",
-  "capabilities": ["fetch_content"],
-  "purposes": ["indexing", "agents"],
+  "capabilities": ["content.fetch", "indexing.use", "agents.use"],
   "external_io": {
     "protocol": "http",
-    "purpose": "remote_content",
     "hosts": ["https://docs.example.com"]
   }
 }
@@ -185,12 +190,17 @@ Common protocols:
 - `filesystem`
 - `http`
 
-Common purposes:
+Common capabilities:
 
-- `storage`
-- `remote_content`
-- `backup_restore`
-- `inference_models`
+- `objects.read`
+- `objects.write`
+- `content.fetch`
+- `backup.read`
+- `backup.write`
+- `restore.read`
+- `models.load`
+- `indexing.use`
+- `agents.use`
 
 Credentials and headers must not be returned by default. If the UI needs to
 show that a secret reference exists, expose a redacted secret-ref summary behind
@@ -208,8 +218,7 @@ Example:
   "kind": "cdc",
   "provider": "postgres",
   "status": "connected",
-  "capabilities": ["read_stream"],
-  "purposes": ["cdc"],
+  "capabilities": ["cdc.read_stream"],
   "cdc": {
     "provider": "postgres",
     "table_name": "users",
@@ -259,11 +268,11 @@ Policy should support both broad and action-specific permissions:
     "read": ["role:platform-admin", "role:developer"],
     "admin": ["role:platform-admin"],
     "use": ["role:developer"],
-    "use:generate": ["role:agent-user"],
-    "use:embed": ["role:index-admin"],
-    "use:read_objects": ["role:restore-admin"],
-    "use:write_objects": ["role:backup-admin"],
-    "use:read_stream": ["role:ingestion-admin"]
+    "use:models.generate": ["role:agent-user"],
+    "use:models.embed": ["role:index-admin"],
+    "use:objects.read": ["role:restore-admin"],
+    "use:objects.write": ["role:backup-admin"],
+    "use:cdc.read_stream": ["role:ingestion-admin"]
   }
 }
 ```
@@ -273,28 +282,32 @@ Recommended permission names:
 - `connection:read`
 - `connection:admin`
 - `connection:use`
-- `connection:use:generate`
-- `connection:use:embed`
-- `connection:use:rerank`
-- `connection:use:fetch_content`
-- `connection:use:read_objects`
-- `connection:use:write_objects`
-- `connection:use:read_stream`
+- `connection:use:models.generate`
+- `connection:use:models.embed`
+- `connection:use:models.rerank`
+- `connection:use:content.fetch`
+- `connection:use:objects.read`
+- `connection:use:objects.write`
+- `connection:use:backup.read`
+- `connection:use:backup.write`
+- `connection:use:restore.read`
+- `connection:use:cdc.read_stream`
 - `connection:secret_ref:read`
 
 Workflow-level checks should combine ordinary resource permissions with
 connection-use permissions. Examples:
 
 - Creating an embedding index requires table/index-admin permission and
-  `connection:use:embed` on the selected inference connection.
-- Agent generation requires agent/API permission and `connection:use:generate`.
+  `connection:use:models.embed` on the selected inference connection.
+- Agent generation requires agent/API permission and
+  `connection:use:models.generate`.
 - Backup creation requires backup-admin permission and
-  `connection:use:write_objects`.
-- Restore requires restore-admin permission and `connection:use:read_objects`.
+  `connection:use:backup.write`.
+- Restore requires restore-admin permission and `connection:use:restore.read`.
 - CDC setup requires table replication-source admin permission and
-  `connection:use:read_stream`.
+  `connection:use:cdc.read_stream`.
 - Remote URL ingestion requires ingest permission and
-  `connection:use:fetch_content`.
+  `connection:use:content.fetch`.
 
 The `/connections` response should include current-user affordances:
 
@@ -345,7 +358,6 @@ shape should still reserve fields for the first-class resource model:
 - `id`
 - `display_name`
 - `capabilities`
-- `purposes`
 - `permissions`
 - `sources`
 - kind-specific payload
@@ -423,8 +435,8 @@ short period:
 
 - `inference_provider` -> `inference`
 - `object_store` -> `external_io` with `protocol: "s3"`, `protocol: "gcs"`,
-  or `protocol: "filesystem"`
+  or `protocol: "filesystem"` and object or backup capabilities
 - `remote_content_http` -> `external_io` with `protocol: "http"` and
-  `purpose: "remote_content"`
+  `capabilities: ["content.fetch"]`
 
 Do not return old names in responses.
