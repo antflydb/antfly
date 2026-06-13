@@ -24,8 +24,7 @@ authorization metadata.
 Top-level connection kinds are broad physical categories:
 
 - `inference`
-- `object_store`
-- `remote_content`
+- `external_io`
 - `cdc`
 
 Provider or protocol belongs inside the kind-specific payload:
@@ -41,9 +40,10 @@ Provider or protocol belongs inside the kind-specific payload:
 
 ```json
 {
-  "kind": "remote_content",
-  "remote_content": {
-    "provider": "http"
+  "kind": "external_io",
+  "external_io": {
+    "protocol": "http",
+    "purpose": "remote_content"
   }
 }
 ```
@@ -57,13 +57,13 @@ Provider or protocol belongs inside the kind-specific payload:
 }
 ```
 
-Use `object_store`, not `objectstore`, in public API fields. The common product
-term is "object store", and the underscore form reads correctly next to other
-snake-case API values.
+Use `external_io` for configured external read/write/fetch endpoints such as S3,
+GCS, filesystem paths, and HTTP content sources. Keep the transport in
+`external_io.protocol` and the workflow intent in `external_io.purpose`.
 
-`remote_content` is intentionally separate from `object_store`. An S3 bucket can
-be an object store used for remote content, while HTTP is a content-fetch
-provider and not an object store.
+Do not use `access` as the kind name. It collides conceptually with RBAC and
+authorization language. `external_io` is more explicit: it describes external
+input/output endpoints, while permissions describe who may use them.
 
 ## Core Model
 
@@ -137,21 +137,23 @@ Common capabilities:
 - `classify`
 - `extract`
 
-### Object Store
+### External IO
 
-Object-store connections describe bucket/key storage systems.
+External-IO connections describe configured external read/write/fetch endpoints.
+They cover object stores and remote-content sources under one kind.
 
 Example:
 
 ```json
 {
   "id": "conn_s3_backups",
-  "kind": "object_store",
-  "provider": "s3",
+  "kind": "external_io",
+  "protocol": "s3",
   "capabilities": ["read_objects", "write_objects"],
   "purposes": ["backup_restore"],
-  "object_store": {
-    "backend": "s3",
+  "external_io": {
+    "protocol": "s3",
+    "purpose": "backup_restore",
     "endpoint": "https://s3.us-east-1.amazonaws.com",
     "buckets": ["antfly-backups"],
     "prefix": "prod/"
@@ -159,33 +161,36 @@ Example:
 }
 ```
 
-Object stores can be used for multiple purposes:
-
-- `storage`
-- `inference_models`
-- `remote_content`
-- `backup_restore`
-
-### Remote Content
-
-Remote-content connections describe URL or content-fetch providers. HTTP is the
-first provider.
-
-Example:
+HTTP remote content uses the same kind:
 
 ```json
 {
   "id": "conn_docs_site",
-  "kind": "remote_content",
-  "provider": "http",
+  "kind": "external_io",
+  "protocol": "http",
   "capabilities": ["fetch_content"],
   "purposes": ["indexing", "agents"],
-  "remote_content": {
-    "provider": "http",
+  "external_io": {
+    "protocol": "http",
+    "purpose": "remote_content",
     "hosts": ["https://docs.example.com"]
   }
 }
 ```
+
+Common protocols:
+
+- `s3`
+- `gcs`
+- `filesystem`
+- `http`
+
+Common purposes:
+
+- `storage`
+- `remote_content`
+- `backup_restore`
+- `inference_models`
 
 Credentials and headers must not be returned by default. If the UI needs to
 show that a secret reference exists, expose a redacted secret-ref summary behind
@@ -314,7 +319,7 @@ GET /db/v1/connections
 
 Query parameters:
 
-- `types`: comma-separated connection kinds, such as `inference,cdc`.
+- `types`: comma-separated connection kinds, such as `inference,external_io,cdc`.
 - `include`: comma-separated expansions. First expansion: `models`.
 - `refresh`: `true` to bypass the short server-side live-check cache.
 
@@ -386,9 +391,8 @@ That expansion should require `connection:secret_ref:read`.
 
 Implement now:
 
-- Use top-level kinds `inference`, `object_store`, `remote_content`, and `cdc`.
-- Return kind-specific payloads named `inference`, `object_store`,
-  `remote_content`, and `cdc`.
+- Use top-level kinds `inference`, `external_io`, and `cdc`.
+- Return kind-specific payloads named `inference`, `external_io`, and `cdc`.
 - Keep `GET /db/v1/connections` config-derived and cheap by default.
 - Keep `include=models` as the explicit live inference-provider expansion.
 - Keep `refresh=true` scoped to short live-check caches.
@@ -418,6 +422,9 @@ If compatibility is needed before GA, accept old query filter aliases for a
 short period:
 
 - `inference_provider` -> `inference`
-- `remote_content_http` -> `remote_content`
+- `object_store` -> `external_io` with `protocol: "s3"`, `protocol: "gcs"`,
+  or `protocol: "filesystem"`
+- `remote_content_http` -> `external_io` with `protocol: "http"` and
+  `purpose: "remote_content"`
 
 Do not return old names in responses.
