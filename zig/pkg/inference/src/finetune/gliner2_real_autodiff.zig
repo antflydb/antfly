@@ -101,6 +101,7 @@ pub const GlinerAutodiffConfig = struct {
 pub const GlinerAutodiffCtx = struct {
     config: GlinerAutodiffConfig,
     built: ?deberta_graph.DebertaGraph = null,
+    logits_node: ?NodeId = null,
 
     pub fn init(config: GlinerAutodiffConfig) GlinerAutodiffCtx {
         return .{ .config = config };
@@ -215,6 +216,11 @@ pub const GlinerAutodiffCtx = struct {
         return self.buildTokenLoss(bld, forward_output, targets);
     }
 
+    pub fn remapGraphNodes(ctx_opaque: *anyopaque, id_map: []const NodeId) anyerror!void {
+        const self: *GlinerAutodiffCtx = @ptrCast(@alignCast(ctx_opaque));
+        if (self.logits_node) |node_id| self.logits_node = id_map[node_id];
+    }
+
     // ── Task-specific head ───────────────────────────────────────────────
 
     /// Token classification head over `[B*S, H]` encoder output.
@@ -274,6 +280,7 @@ pub const GlinerAutodiffCtx = struct {
         );
 
         const logits = try bld.linear(hidden_flat, head_w, head_b, rows, H, C);
+        self.logits_node = logits;
 
         // `crossEntropyLoss` does log_softmax + one-hot NLL internally and
         // reduces to a scalar. Targets must be shape `[rows, C]`.
@@ -309,6 +316,7 @@ pub fn makeTrainerInput(
         .batch = batch,
         .seq_len = seq_len,
         .bind_arch_inputs = &GlinerAutodiffCtx.bindArchInputs,
+        .remap_graph_nodes = &GlinerAutodiffCtx.remapGraphNodes,
     };
 }
 
@@ -335,6 +343,36 @@ pub fn trainStep(
         seq_len,
     );
     return trainer.step(input);
+}
+
+pub fn tokenLogitsForBatch(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GlinerAutodiffCtx,
+    input_ids: []const i64,
+    attention_mask: []const f32,
+    batch: u32,
+    seq_len: u32,
+) ![]f32 {
+    const target_len: usize = @as(usize, @intCast(batch)) *
+        @as(usize, @intCast(seq_len)) *
+        @as(usize, @intCast(ctx.config.num_classes));
+    const targets = try allocator.alloc(f32, target_len);
+    defer allocator.free(targets);
+    @memset(targets, 0.0);
+
+    const input = makeTrainerInput(
+        ctx,
+        input_ids,
+        attention_mask,
+        targets,
+        tokenTargetsShape(batch, seq_len, ctx.config.num_classes),
+        batch,
+        seq_len,
+    );
+    try trainer.ensureGraphBuilt(input);
+    const logits_node = ctx.logits_node orelse return error.MissingLogitsNode;
+    return trainer.outputNodeAlloc(allocator, input, logits_node);
 }
 
 // ── Shape helpers ────────────────────────────────────────────────────────────

@@ -22,6 +22,9 @@ const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const api = @import("inference_api");
 const generating_api = @import("antfly_generating_openapi");
+const readers_api = @import("antfly_readers");
+const transcribing_api = @import("antfly_transcribing");
+const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
@@ -92,6 +95,7 @@ pub const BudgetOverrides = struct {
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
+    ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     keep_alive_ms: u64 = 300_000,
@@ -637,6 +641,255 @@ pub const Node = struct {
         var result = try pipeline.generate(messages, .{ .max_tokens = configured_max_tokens, .prefill_chunk_size = 256 });
         defer result.deinit();
         return try allocator.dupe(u8, result.text);
+    }
+
+    pub fn generateMessagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+    ) ![]u8 {
+        if (messages.len == 0) return error.InvalidGenerationRequest;
+
+        const configured_max_tokens: i32 = 256;
+        const queue_units = self.estimateGenerateQueueUnits(messages, configured_max_tokens);
+        try self.request_queue.acquireUnits(queue_units);
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("generate.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
+        const model = try self.model_manager.loadFromDir(model_path);
+        const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
+        const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
+        };
+        const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+
+        var kv_manager = runtime.kv.manager.KvManager.init(allocator);
+        defer kv_manager.deinit();
+        var cb = try session_factory.getComputeBackend(model.session, allocator);
+        defer cb.deinit();
+
+        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
+            null
+        else if (gpt_config.sliding_window > 0)
+            gpt_config.sliding_window
+        else if (gpt_config.max_position_embeddings > 0)
+            gpt_config.max_position_embeddings
+        else
+            null;
+        const pool_id = try kv_manager.addPool(.{
+            .backend = backend_kind,
+            .dtype = kv_dtype,
+            .page_size_tokens = 16,
+            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
+            .num_kv_heads = gpt_config.maxKvHeads(),
+            .head_dim = gpt_config.maxHeadDim(),
+            .sliding_window_size = sliding_window_size,
+        });
+        var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
+        defer decode_state.deinit();
+
+        var pipeline = generation.NativeGenerationPipeline{
+            .allocator = allocator,
+            .io = io,
+            .cb = cb,
+            .gpt_config = gpt_config,
+            .tokenizer = model.getTokenizer(),
+            .add_bos_token = model.manifest.add_bos_token,
+            .bos_token = model.manifest.bos_token,
+            .chat_template = model.chat_tmpl,
+            .model_dir = model_path,
+            .gguf_projector_path = model.manifest.gguf_projector_path,
+            .decode_state = &decode_state,
+        };
+        var result = try pipeline.generate(messages, .{ .max_tokens = configured_max_tokens, .prefill_chunk_size = 256 });
+        defer result.deinit();
+        return try allocator.dupe(u8, result.text);
+    }
+
+    pub fn embedDenseJsonInputDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("embed.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        var parsed = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
+        defer parsed.deinit(allocator);
+        if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
+
+        try model.ensureEmbeddingAssets(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
+        var pipeline = model.embeddingPipeline(allocator);
+        return try embedDenseInputs(allocator, &pipeline, &parsed);
+    }
+
+    pub fn readImagesDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.Request,
+    ) ![]readers_api.Result {
+        if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("read.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
+        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        defer reader.deinit();
+
+        const out = try allocator.alloc(readers_api.Result, request.images.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+            allocator.free(out);
+        }
+
+        for (request.images, 0..) |image_url, i| {
+            var downloaded = try downloadRemoteContent(self, allocator, image_url);
+            defer downloaded.deinit(allocator);
+            var result = try reader.read(downloaded.data, .{
+                .prompt = request.prompt,
+                .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            });
+            defer result.deinit();
+            out[i] = .{
+                .text = try allocator.dupe(u8, result.text),
+                .fields_json = try readerFieldsJsonAlloc(allocator, result.fields),
+                .regions_json = try readerRegionsJsonAlloc(allocator, result.regions),
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    pub fn transcribeAudioDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: transcribing_api.Request,
+    ) !transcribing_api.Response {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("transcribe.local");
+        defer self.metrics.decActive();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+        const model = try self.model_manager.loadFromDir(model_path);
+        if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
+
+        const transcription = @import("../pipelines/transcription.zig");
+        var pipeline = transcription.TranscriptionPipeline.init(
+            allocator,
+            model.session,
+            model.session,
+            model.getTokenizer(),
+            .{ .language = request.language },
+        );
+
+        var downloaded = try downloadRemoteContent(self, allocator, request.url);
+        defer downloaded.deinit(allocator);
+        const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
+        if (!audio_mod.canDecodeWithOptions(downloaded.data, decode_options)) return error.UnsupportedAudioInput;
+
+        var result = try pipeline.transcribeWithOptions(downloaded.data, decode_options);
+        defer result.deinit();
+        return .{
+            .text = try allocator.dupe(u8, result.text),
+            .language = if (result.language) |language| try allocator.dupe(u8, language) else null,
+        };
+    }
+
+    pub fn extractDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: extracting_api.Request,
+    ) !extracting_api.Response {
+        try self.request_queue.acquire();
+        defer self.releaseSlot();
+        self.metrics.incRequest("extract.local");
+        defer self.metrics.decActive();
+
+        var schema_parsed = try std.json.parseFromSlice(std.json.ArrayHashMap([]const []const u8), allocator, request.schema_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer schema_parsed.deinit();
+        const schemas = try extraction_mod.parseSchemas(allocator, &schema_parsed.value);
+        defer {
+            for (schemas) |*schema| schema.deinit(allocator);
+            allocator.free(schemas);
+        }
+
+        var options = try parseExtractionOptionsJson(allocator, request.options_json);
+        defer options.deinit();
+        const config = extraction_mod.ExtractionConfig{
+            .threshold = options.threshold orelse 0.3,
+            .flat_ner = options.flat_ner orelse true,
+            .include_confidence = options.include_confidence orelse false,
+            .include_spans = options.include_spans orelse false,
+        };
+
+        var parsed_inputs = try parseDirectExtractionInputs(self, allocator, request.inputs, options.prompt, options.max_tokens);
+        defer parsed_inputs.deinit();
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+
+        const extractor_ctx = extractors_mod.Context{
+            .allocator = allocator,
+            .io = io_impl.io(),
+            .models_dir = self.config.models_dir,
+            .session_manager = &self.session_manager,
+            .model_manager = &self.model_manager,
+        };
+        var extractor = try extractors_mod.resolve(extractor_ctx, model_name, parsed_inputs.images.items.len > 0);
+        defer extractor.deinit(allocator);
+
+        const results = if (parsed_inputs.images.items.len > 0)
+            try extractor.extractImages(extractor_ctx, schemas, config, parsed_inputs.images.items, .{
+                .prompt = parsed_inputs.prompt,
+                .max_tokens = parsed_inputs.max_tokens,
+            })
+        else
+            try extractor.extractText(extractor_ctx, schemas, config, parsed_inputs.texts.items);
+        defer {
+            for (results) |*result| result.deinit(allocator);
+            allocator.free(results);
+        }
+
+        return .{
+            .allocator = allocator,
+            .json = try extractionResponseJsonAlloc(allocator, model_name, results),
+        };
     }
 
     /// Resolve a model name to a directory path.
@@ -4126,10 +4379,8 @@ pub const Node = struct {
     }
 
     fn discoverPredictors(self: *Node, ctx: *httpx.Context) !void {
-        const base_dir = try std.fs.path.join(ctx.allocator, &.{ self.config.models_dir, "ml" });
-        defer ctx.allocator.free(base_dir);
-        _ = tabular_mod.discovery.seedBuiltins(ctx.io, base_dir) catch {};
-        _ = tabular_mod.discovery.discover(ctx.io, ctx.allocator, &self.tabular_registry, base_dir) catch {};
+        _ = tabular_mod.discovery.seedBuiltins(ctx.io, self.config.ml_dir) catch {};
+        _ = tabular_mod.discovery.discover(ctx.io, ctx.allocator, &self.tabular_registry, self.config.ml_dir) catch {};
     }
 
     pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -4333,6 +4584,263 @@ fn buildExtractionResponse(
         .model = model_name,
         .usage = tokenUsage(prompt_tokens, 0),
     });
+}
+
+fn extractionResponseJsonAlloc(
+    allocator: std.mem.Allocator,
+    model_name: []const u8,
+    all_results: []const extraction_mod.ExtractionResult,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const data = try alloc.alloc(api.ExtractObject, all_results.len);
+    for (all_results, 0..) |result, result_index| {
+        var structures_map: std.json.ArrayHashMap([]const std.json.Value) = .{};
+        try structures_map.map.ensureTotalCapacity(alloc, result.structures.len);
+        for (result.structures) |structure| {
+            const instances = try alloc.alloc(std.json.Value, structure.instances.len);
+            for (structure.instances, 0..) |instance, instance_index| {
+                var instance_obj: std.json.ObjectMap = .empty;
+                try instance_obj.ensureTotalCapacity(alloc, instance.fields.len);
+                for (instance.fields) |field| {
+                    try instance_obj.put(alloc, field.name, try extractedFieldToValue(alloc, field.value));
+                }
+                instances[instance_index] = .{ .object = instance_obj };
+            }
+            structures_map.map.putAssumeCapacity(structure.name, instances);
+        }
+        data[result_index] = .{
+            .object = "extraction",
+            .index = @intCast(result_index),
+            .results = structures_map,
+        };
+    }
+
+    return try std.json.Stringify.valueAlloc(allocator, api.ExtractResponse{
+        .object = "list",
+        .data = data,
+        .model = model_name,
+        .usage = tokenUsage(0, 0),
+    }, .{});
+}
+
+fn readerFieldsJsonAlloc(allocator: std.mem.Allocator, fields: []const readers_mod.Field) !?[]const u8 {
+    if (fields.len == 0) return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var obj: std.json.ObjectMap = .empty;
+    try obj.ensureTotalCapacity(alloc, fields.len);
+    for (fields) |field| {
+        try obj.put(alloc, field.name, .{ .string = field.value });
+    }
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = obj }, .{});
+}
+
+fn readerRegionsJsonAlloc(allocator: std.mem.Allocator, regions: []const readers_mod.Region) !?[]const u8 {
+    if (regions.len == 0) return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var arr = std.json.Array.init(alloc);
+    try arr.ensureTotalCapacity(regions.len);
+    for (regions) |region| {
+        var obj: std.json.ObjectMap = .empty;
+        try obj.ensureTotalCapacity(alloc, 4);
+        try obj.put(alloc, "text", .{ .string = region.text });
+        var bbox = std.json.Array.init(alloc);
+        try bbox.ensureTotalCapacity(region.bbox.len);
+        for (region.bbox) |coord| bbox.appendAssumeCapacity(.{ .float = coord });
+        try obj.put(alloc, "bbox", .{ .array = bbox });
+        if (region.confidence) |confidence| try obj.put(alloc, "confidence", .{ .float = confidence });
+        if (region.label) |label| try obj.put(alloc, "label", .{ .string = label });
+        arr.appendAssumeCapacity(.{ .object = obj });
+    }
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .array = arr }, .{});
+}
+
+const DirectExtractionOptions = struct {
+    allocator: std.mem.Allocator,
+    threshold: ?f32 = null,
+    flat_ner: ?bool = null,
+    include_confidence: ?bool = null,
+    include_spans: ?bool = null,
+    prompt: ?[]u8 = null,
+    max_tokens: ?usize = null,
+
+    fn deinit(self: *@This()) void {
+        if (self.prompt) |prompt| self.allocator.free(prompt);
+        self.* = undefined;
+    }
+};
+
+fn parseExtractionOptionsJson(allocator: std.mem.Allocator, raw: []const u8) !DirectExtractionOptions {
+    var out = DirectExtractionOptions{ .allocator = allocator };
+    errdefer out.deinit();
+    if (raw.len == 0) return out;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return out;
+    const obj = parsed.value.object;
+    out.threshold = jsonFloatField(obj, "threshold");
+    out.flat_ner = jsonBoolField(obj, "flat_ner");
+    out.include_confidence = jsonBoolField(obj, "include_confidence");
+    out.include_spans = jsonBoolField(obj, "include_spans");
+    if (jsonStringField(obj, "prompt")) |prompt| out.prompt = try allocator.dupe(u8, prompt);
+    out.max_tokens = jsonUsizeField(obj, "max_tokens");
+    return out;
+}
+
+const DirectExtractionInputs = struct {
+    allocator: std.mem.Allocator,
+    texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    images: std.ArrayListUnmanaged([]const u8) = .empty,
+    prompt: ?[]u8 = null,
+    max_tokens: ?usize = null,
+
+    fn deinit(self: *@This()) void {
+        for (self.texts.items) |text| self.allocator.free(@constCast(text));
+        self.texts.deinit(self.allocator);
+        for (self.images.items) |image| self.allocator.free(@constCast(image));
+        self.images.deinit(self.allocator);
+        if (self.prompt) |prompt| self.allocator.free(prompt);
+        self.* = undefined;
+    }
+};
+
+fn parseDirectExtractionInputs(
+    node: *Node,
+    allocator: std.mem.Allocator,
+    inputs: []const extracting_api.Input,
+    prompt: ?[]const u8,
+    max_tokens: ?usize,
+) !DirectExtractionInputs {
+    var out = DirectExtractionInputs{
+        .allocator = allocator,
+        .prompt = if (prompt) |value| try allocator.dupe(u8, value) else null,
+        .max_tokens = max_tokens,
+    };
+    errdefer out.deinit();
+
+    for (inputs) |input| {
+        try appendDirectExtractionContent(node, allocator, &out, input.content_json);
+    }
+    if (out.texts.items.len > 0 and out.images.items.len > 0) return error.UnsupportedInput;
+    if (out.texts.items.len == 0 and out.images.items.len == 0) return error.UnsupportedInput;
+    return out;
+}
+
+fn appendDirectExtractionContent(
+    node: *Node,
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    content_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .string => |text| try out.texts.append(allocator, try allocator.dupe(u8, text)),
+        .array => |parts| {
+            var text_buf = std.ArrayListUnmanaged(u8).empty;
+            defer text_buf.deinit(allocator);
+            var saw_media = false;
+            for (parts.items) |part| {
+                if (part != .object) continue;
+                const type_value = part.object.get("type") orelse continue;
+                if (type_value != .string) continue;
+                if (std.mem.eql(u8, type_value.string, "text")) {
+                    const text_value = part.object.get("text") orelse continue;
+                    if (text_value != .string) continue;
+                    if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
+                    try text_buf.appendSlice(allocator, text_value.string);
+                } else if (std.mem.eql(u8, type_value.string, "image_url")) {
+                    const image_url = part.object.get("image_url") orelse continue;
+                    const url = if (image_url == .object)
+                        if (image_url.object.get("url")) |url_value| (if (url_value == .string) url_value.string else null) else null
+                    else if (image_url == .string)
+                        image_url.string
+                    else
+                        null;
+                    if (url) |value| {
+                        try appendDownloadedExtractionImage(node, allocator, out, value);
+                        saw_media = true;
+                    }
+                } else if (std.mem.eql(u8, type_value.string, "media")) {
+                    if (part.object.get("url")) |url_value| {
+                        if (url_value == .string) {
+                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string);
+                            saw_media = true;
+                        }
+                    } else if (part.object.get("data")) |data_value| {
+                        if (data_value == .string) {
+                            const decoded = try decodeMediaData(allocator, data_value.string);
+                            var owns_decoded = true;
+                            errdefer if (owns_decoded) allocator.free(decoded.data);
+                            if (decoded.mime_type) |mime| {
+                                if (!std.mem.startsWith(u8, mime, "image/")) return error.UnsupportedInput;
+                            }
+                            try out.images.append(allocator, decoded.data);
+                            owns_decoded = false;
+                            saw_media = true;
+                        }
+                    }
+                }
+            }
+            if (saw_media) {
+                if (out.prompt == null and text_buf.items.len > 0) out.prompt = try text_buf.toOwnedSlice(allocator);
+            } else if (text_buf.items.len > 0) {
+                try out.texts.append(allocator, try text_buf.toOwnedSlice(allocator));
+            }
+        },
+        else => {
+            const text = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+            try out.texts.append(allocator, text);
+        },
+    }
+}
+
+fn appendDownloadedExtractionImage(
+    node: *Node,
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    url: []const u8,
+) !void {
+    var downloaded = try downloadRemoteContent(node, allocator, url);
+    defer downloaded.deinit(allocator);
+    if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
+    try out.images.append(allocator, try allocator.dupe(u8, downloaded.data));
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = obj.get(name) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn jsonBoolField(obj: std.json.ObjectMap, name: []const u8) ?bool {
+    const value = obj.get(name) orelse return null;
+    return if (value == .bool) value.bool else null;
+}
+
+fn jsonFloatField(obj: std.json.ObjectMap, name: []const u8) ?f32 {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .float => |number| @floatCast(number),
+        .integer => |number| @floatFromInt(number),
+        .number_string => |raw| std.fmt.parseFloat(f32, raw) catch null,
+        else => null,
+    };
+}
+
+fn jsonUsizeField(obj: std.json.ObjectMap, name: []const u8) ?usize {
+    const value = obj.get(name) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        .number_string => |raw| std.fmt.parseInt(usize, raw, 10) catch null,
+        else => null,
+    };
 }
 
 fn extractedFieldToValue(

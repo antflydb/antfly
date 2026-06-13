@@ -30281,6 +30281,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
         .sync_level = .write,
     });
     try db.runUntilIdle();
+    try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
 
