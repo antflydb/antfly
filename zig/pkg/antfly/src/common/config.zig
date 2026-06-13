@@ -1358,7 +1358,7 @@ test "common config parses public connections map" {
         \\        "safe_search": true,
         \\        "include_content": true,
         \\        "include_highlights": true,
-        \\        "api_key": "${secret:exa.api_key}",
+        \\        "api_key": "exa-test-key",
         \\        "include_domains": ["docs.example.com"]
         \\      }
         \\    },
@@ -1406,7 +1406,7 @@ test "common config parses public connections map" {
     try std.testing.expectEqual(@as(?u32, 10), web_search.web_search.?.max_results);
     try std.testing.expectEqual(true, web_search.web_search.?.safe_search.?);
     try std.testing.expectEqual(true, web_search.web_search.?.include_content.?);
-    try std.testing.expectEqualStrings("${secret:exa.api_key}", web_search.web_search.?.api_key.?);
+    try std.testing.expectEqualStrings("exa-test-key", web_search.web_search.?.api_key.?);
     try std.testing.expectEqualStrings("docs.example.com", web_search.web_search.?.include_domains[0]);
 
     const cdc = cfg.connections.get("users-pg").?;
