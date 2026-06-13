@@ -2098,12 +2098,9 @@ pub const DirectoryBatchWriter = struct {
     }
 
     pub fn appendPostingDeltaRecords(self: *DirectoryBatchWriter, posting_id: PostingId, records: []const posting.PostingDeltaRecord) !void {
-        if (records.len == 0) return;
-        var min_sequence = records[0].sequence;
-        for (records[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
-        const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, records);
-        defer self.alloc.free(encoded);
-        try self.appendDelta(posting_id, min_sequence, encoded);
+        for (records) |record| {
+            try self.appendDeltaRecord(posting_id, record);
+        }
     }
 
     pub fn appendDeltaRecord(self: *DirectoryBatchWriter, posting_id: PostingId, record: posting.PostingDeltaRecord) !void {
@@ -3768,11 +3765,17 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
     try batcher.appendDeltaRecord(7, .{ .sequence = live_delta_sequence, .op = .tombstone, .vector_id = 20 });
     try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
     try std.testing.expectEqual(@as(usize, 2), batcher.pendingDeltaRecords());
+    try batcher.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = (@as(u64, 4) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 5) << 32) | 1, .op = .tombstone, .vector_id = 30 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
+    try std.testing.expectEqual(@as(usize, 4), batcher.pendingDeltaRecords());
 
     try batcher.appendCentroidDirectory(7, centroid);
     try std.testing.expectEqual(@as(usize, 1), batcher.stats.flushed_segments);
     try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_entries);
-    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_delta_records);
+    try std.testing.expectEqual(@as(usize, 4), batcher.stats.committed_delta_records);
     try std.testing.expectEqual(@as(usize, 1), batcher.pendingEntries());
     const final_flush = (try batcher.flush()).?;
     try std.testing.expectEqual(@as(u64, 2), final_flush.segment_id);
@@ -3793,9 +3796,11 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
     try std.testing.expectEqual(@as(u64, 1), header.generation);
     const records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
     defer alloc.free(records);
-    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(@as(usize, 4), records.len);
     try std.testing.expectEqual(stale_delta_sequence, records[0].sequence);
     try std.testing.expectEqual(live_delta_sequence, records[1].sequence);
+    try std.testing.expectEqual((@as(u64, 4) << 32) | 1, records[2].sequence);
+    try std.testing.expectEqual((@as(u64, 5) << 32) | 1, records[3].sequence);
     var loaded_centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
     defer loaded_centroid.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), loaded_centroid.mutation_version);
