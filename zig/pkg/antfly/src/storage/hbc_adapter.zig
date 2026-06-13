@@ -75,6 +75,7 @@ const posting_segment_hbc_store_snapshot_path = "hbc-store.afhs";
 const posting_segment_hbc_store_snapshot_magic = "AFHSSNAP";
 const posting_segment_hbc_store_snapshot_version: u32 = 1;
 const posting_segment_hbc_store_snapshot_max_bytes: usize = 1024 * 1024 * 1024;
+const posting_segment_hbc_store_snapshot_checksum_size: usize = @sizeOf(u32);
 const default_deferred_hbc_leaf_splits_per_publish: usize = 256;
 const default_bulk_split_vector_workspace_budget_bytes: u64 = 256 * 1024 * 1024;
 
@@ -3026,6 +3027,10 @@ pub const HBCIndex = struct {
         try out.appendSlice(alloc, &buf);
     }
 
+    fn postingSegmentPrivateStoreSnapshotChecksum(data: []const u8) u32 {
+        return std.hash.Crc32.hash(data);
+    }
+
     fn appendPostingSegmentPrivateStoreNamespaceSnapshot(
         self: *HBCIndex,
         alloc: Allocator,
@@ -3087,6 +3092,11 @@ pub const HBCIndex = struct {
         try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .quant, &encoded, &entry_count);
         try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .vecs, &encoded, &entry_count);
         std.mem.writeInt(u64, encoded.items[count_offset..][0..8], entry_count, .little);
+        try appendPostingSegmentSnapshotInt(
+            &encoded,
+            postingSegmentPrivateStoreSnapshotChecksum(encoded.items),
+            self.alloc,
+        );
 
         try self.writePostingSegmentPrivateStoreSnapshotAtomically(io, destination_dir, encoded.items);
         return .{
@@ -3096,8 +3106,13 @@ pub const HBCIndex = struct {
     }
 
     fn validatePostingSegmentPrivateStoreSnapshot(raw: []const u8) !PostingSegmentPrivateStoreSnapshotStats {
-        if (raw.len < posting_segment_hbc_store_snapshot_magic.len + @sizeOf(u32) + @sizeOf(u64)) {
+        if (raw.len < posting_segment_hbc_store_snapshot_magic.len + @sizeOf(u32) + @sizeOf(u64) + posting_segment_hbc_store_snapshot_checksum_size) {
             return error.InvalidPostingSegmentPrivateStoreSnapshot;
+        }
+        const checksum_offset = raw.len - posting_segment_hbc_store_snapshot_checksum_size;
+        const stored_checksum = std.mem.readInt(u32, raw[checksum_offset..][0..4], .little);
+        if (postingSegmentPrivateStoreSnapshotChecksum(raw[0..checksum_offset]) != stored_checksum) {
+            return error.BadPostingSegmentPrivateStoreSnapshotChecksum;
         }
         if (!std.mem.eql(u8, raw[0..posting_segment_hbc_store_snapshot_magic.len], posting_segment_hbc_store_snapshot_magic)) {
             return error.InvalidPostingSegmentPrivateStoreSnapshot;
@@ -3123,7 +3138,7 @@ pub const HBCIndex = struct {
             if (value_len > raw.len - cursor) return error.InvalidPostingSegmentPrivateStoreSnapshot;
             cursor += value_len;
         }
-        if (cursor != raw.len) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+        if (cursor != checksum_offset) return error.InvalidPostingSegmentPrivateStoreSnapshot;
         return .{
             .entries = @intCast(entry_count),
             .bytes = raw.len,
@@ -11317,6 +11332,39 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
             defer alloc.free(exported_materialized);
             try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, exported_materialized);
         }
+
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var bad_export_dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(bad_export_path), .{});
+            defer bad_export_dir.close(io);
+            const raw = try bad_export_dir.readFileAlloc(
+                io,
+                posting_segment_hbc_store_snapshot_path,
+                alloc,
+                .limited(posting_segment_hbc_store_snapshot_max_bytes),
+            );
+            defer alloc.free(raw);
+            raw[raw.len - 1] ^= 0xff;
+            try bad_export_dir.writeFile(io, .{
+                .sub_path = posting_segment_hbc_store_snapshot_path,
+                .data = raw,
+            });
+        }
+        try std.testing.expectError(
+            error.BadPostingSegmentPrivateStoreSnapshotChecksum,
+            idx.importPostingSegmentBackendFromDirectory(std.mem.span(bad_export_path)),
+        );
+        {
+            var read_txn = try idx.beginReadTxn();
+            defer read_txn.abort();
+            const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+            defer alloc.free(materialized);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, materialized);
+        }
+
+        _ = try idx.exportPostingSegmentBackendToDirectory(std.mem.span(bad_export_path));
 
         {
             var extra_txn = try idx.beginWriteTxn();

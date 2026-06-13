@@ -212,11 +212,12 @@ Current status:
   self-contained segment-backed posting bundle through a standalone directory:
   the bundle contains a versioned snapshot of the HBC private namespaces plus
   the segment artifacts referenced by the committed manifest marker. The
-  private namespace sidecar is written through a temporary file and renamed
-  into place, matching the segment manifest publication shape. Import validates
-  the private namespace snapshot and its committed manifest marker before
-  mutating HBC namespaces, validates each referenced segment, writes the
-  physical manifest last, then publishes the restored HBC metadata. Imports
+  private namespace sidecar includes a CRC32 trailer and is written through a
+  temporary file and renamed into place, matching the segment manifest
+  publication shape. Import validates the private namespace snapshot checksum
+  and its committed manifest marker before mutating HBC namespaces, validates
+  each referenced segment, writes the physical manifest last, then publishes
+  the restored HBC metadata. Imports
   whose segment manifest does not match the bundled committed marker fail
   without rolling the live index back to the private snapshot. Dense
   maintenance now runs
@@ -867,10 +868,10 @@ implementations cleanly:
     compaction, delete, and manifest-size counters. HBC also has a
     committed-manifest export/import primitive that copies and verifies only
     referenced segment files, publishes manifests last, writes the HBC
-    private-store sidecar through temp+rename, and validates the bundled
-    private-store manifest marker before mutating HBC namespaces. Bad bundles
-    therefore fail without rolling the live index back to the bundled HBC
-    snapshot. Segment
+    private-store sidecar with a CRC32 trailer through temp+rename, and
+    validates the bundled private-store checksum and manifest marker before
+    mutating HBC namespaces. Bad bundles therefore fail without rolling the live
+    index back to the bundled HBC snapshot. Segment
     maintenance compaction now runs under the dense posting maintenance
     working-set reservation and caps selected compaction input bytes from that
     reservation, so physical segment compaction cannot bypass resource pressure.
