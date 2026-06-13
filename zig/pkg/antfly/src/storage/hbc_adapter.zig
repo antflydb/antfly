@@ -3422,18 +3422,7 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        const records = try runtime.store.snapshot().loadDeltaTail(self.alloc, posting_id);
-        defer self.alloc.free(records);
-
-        var out = vectorindex_posting.PostingDeltaTailStats{};
-        out.records = records.len;
-        for (records) |record| {
-            if (vectorindex_posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-            out.records_after_generation += 1;
-            if (record.op == .tombstone) out.tombstones_after_generation += 1;
-            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, record.sequence);
-        }
-        return out;
+        return try runtime.store.snapshot().deltaTailStats(self.alloc, posting_id, base_generation);
     }
 
     pub fn applyPostingBackendDeltaTailIntoScratch(
@@ -3485,16 +3474,7 @@ pub const HBCIndex = struct {
         const runtime = try self.postingSegmentRuntime();
         const snapshot = runtime.store.snapshot();
         const base_header = (try snapshot.loadBaseHeader(self.alloc, posting_id)) orelse return error.NotFound;
-        const records = try snapshot.loadDeltaTail(self.alloc, posting_id);
-        defer self.alloc.free(records);
-
-        var tail_stats = vectorindex_posting.PostingDeltaTailStats{ .records = records.len };
-        for (records) |record| {
-            if (vectorindex_posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_header.generation) continue;
-            tail_stats.records_after_generation += 1;
-            if (record.op == .tombstone) tail_stats.tombstones_after_generation += 1;
-            tail_stats.max_sequence_after_generation = @max(tail_stats.max_sequence_after_generation, record.sequence);
-        }
+        const tail_stats = try snapshot.deltaTailStats(self.alloc, posting_id, base_header.generation);
         if (!postingSegmentTailShouldFold(base_header.member_count, tail_stats, options) or
             postingSegmentTailExceedsMaterializedLimit(base_header.member_count, tail_stats, options))
         {

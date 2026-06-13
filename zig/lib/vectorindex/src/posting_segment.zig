@@ -733,6 +733,22 @@ pub const LazyDirectorySnapshot = struct {
         return try self.loadDeltaTailFilteredAlloc(alloc, posting_id, generation);
     }
 
+    pub fn deltaTailStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+        var out = posting.PostingDeltaTailStats{};
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
+
+            const stats = try self.readDeltaTailStatsAlloc(alloc, entry, posting_id, base_generation);
+            out.records += stats.records;
+            out.records_after_generation += stats.records_after_generation;
+            out.tombstones_after_generation += stats.tombstones_after_generation;
+            out.encoded_value_bytes += stats.encoded_value_bytes;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
+        }
+        return out;
+    }
+
     pub fn materializeMembers(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
         var base_segment_id: u64 = 0;
         var base: ?posting.OwnedPostingBase = null;
@@ -842,6 +858,14 @@ pub const LazyDirectorySnapshot = struct {
             .meta = entry.meta,
             .path = entry.path,
         }, posting_id, min_generation);
+    }
+
+    fn readDeltaTailStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        return try readSegmentDeltaTailStatsAlloc(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id, base_generation);
     }
 };
 
@@ -1613,6 +1637,28 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     }
 
     return try records.toOwnedSlice(alloc);
+}
+
+pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    var out = posting.PostingDeltaTailStats{};
+    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+    while (index < entry.meta.entry_count) : (index += 1) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+
+        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+        defer alloc.free(value);
+        const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(value, base_generation);
+        out.records += stats.records;
+        out.records_after_generation += stats.records_after_generation;
+        out.tombstones_after_generation += stats.tombstones_after_generation;
+        out.encoded_value_bytes += stats.encoded_value_bytes;
+        out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
+    }
+    return out;
 }
 
 fn commitBuiltSegmentToDirectoryWithManifestAlloc(
@@ -4436,11 +4482,21 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqual(@as(usize, 2), all_records.len);
     try std.testing.expectEqual(stale_sequence, all_records[0].sequence);
     try std.testing.expectEqual(live_sequence, all_records[1].sequence);
+    const all_stats = try snapshot.deltaTailStats(alloc, 7, 0);
+    try std.testing.expectEqual(@as(usize, 2), all_stats.records);
+    try std.testing.expectEqual(@as(usize, 2), all_stats.records_after_generation);
+    try std.testing.expectEqual(delta.len, all_stats.encoded_value_bytes);
+    try std.testing.expectEqual(live_sequence, all_stats.max_sequence_after_generation);
 
     const current_records = try snapshot.loadDeltaTailAfterGeneration(alloc, 7, 1);
     defer alloc.free(current_records);
     try std.testing.expectEqual(@as(usize, 1), current_records.len);
     try std.testing.expectEqual(live_sequence, current_records[0].sequence);
+    const current_stats = try snapshot.deltaTailStats(alloc, 7, 1);
+    try std.testing.expectEqual(@as(usize, 2), current_stats.records);
+    try std.testing.expectEqual(@as(usize, 1), current_stats.records_after_generation);
+    try std.testing.expectEqual(delta.len, current_stats.encoded_value_bytes);
+    try std.testing.expectEqual(live_sequence, current_stats.max_sequence_after_generation);
 }
 
 pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
