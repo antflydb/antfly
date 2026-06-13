@@ -3048,6 +3048,24 @@ pub const HBCIndex = struct {
         }
     }
 
+    fn writePostingSegmentPrivateStoreSnapshotAtomically(
+        self: *HBCIndex,
+        io: std.Io,
+        destination_dir: std.Io.Dir,
+        data: []const u8,
+    ) !void {
+        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{posting_segment_hbc_store_snapshot_path});
+        defer self.alloc.free(tmp_path);
+        try destination_dir.writeFile(io, .{
+            .sub_path = tmp_path,
+            .data = data,
+        });
+        std.Io.Dir.rename(destination_dir, tmp_path, destination_dir, posting_segment_hbc_store_snapshot_path, io) catch |err| {
+            destination_dir.deleteFile(io, tmp_path) catch {};
+            return err;
+        };
+    }
+
     fn exportPostingSegmentPrivateStoreSnapshotToDirectory(
         self: *HBCIndex,
         io: std.Io,
@@ -3070,10 +3088,7 @@ pub const HBCIndex = struct {
         try self.appendPostingSegmentPrivateStoreNamespaceSnapshot(self.alloc, &txn, .vecs, &encoded, &entry_count);
         std.mem.writeInt(u64, encoded.items[count_offset..][0..8], entry_count, .little);
 
-        try destination_dir.writeFile(io, .{
-            .sub_path = posting_segment_hbc_store_snapshot_path,
-            .data = encoded.items,
-        });
+        try self.writePostingSegmentPrivateStoreSnapshotAtomically(io, destination_dir, encoded.items);
         return .{
             .entries = @intCast(entry_count),
             .bytes = encoded.items.len,
@@ -11292,6 +11307,10 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
             const io = io_impl.io();
             var export_dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(export_path), .{ .iterate = true });
             defer export_dir.close(io);
+            try export_dir.access(io, posting_segment_hbc_store_snapshot_path, .{});
+            const private_store_tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{posting_segment_hbc_store_snapshot_path});
+            defer alloc.free(private_store_tmp_path);
+            try std.testing.expectError(error.FileNotFound, export_dir.access(io, private_store_tmp_path, .{}));
             var exported_store = try vectorindex_posting_segment.openLazyStoreFromDirectoryAlloc(alloc, io, export_dir, .{});
             defer exported_store.deinit(alloc);
             const exported_materialized = (try exported_store.snapshot().materializeMembers(alloc, posting_id)) orelse return error.TestExpectedEqual;
