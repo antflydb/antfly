@@ -2817,25 +2817,39 @@ pub const HBCIndex = struct {
         return best_size;
     }
 
-    fn encodePostingSegmentBase(self: *HBCIndex, posting_id: u64, generation: u64, members: []const vectorindex_posting.VectorId) ![]u8 {
-        if (!self.postingSegmentBaseMembersShouldSort()) {
-            const block_size = vectorindex_posting.PostingFormat.normalizeBaseMemberBlockSize(self.config.posting_base_member_block_size);
-            return try vectorindex_posting.PostingFormat.encodeBaseWithBlockSize(self.alloc, .{
-                .posting_id = posting_id,
-                .generation = generation,
-                .members = members,
-            }, block_size);
-        }
+    fn encodePostingSegmentBaseIntoScratch(
+        self: *HBCIndex,
+        scratch: *vectorindex_posting.PostingStore.FoldScratch,
+        posting_id: u64,
+        generation: u64,
+        members: []const vectorindex_posting.VectorId,
+    ) !vectorindex_posting.PostingFormat.EncodedBaseResult {
+        const encoded_members = if (self.postingSegmentBaseMembersShouldSort()) blk: {
+            try scratch.ensureCompactDeltaCapacity(self.alloc, members.len);
+            @memcpy(scratch.compact_delta_ids[0..members.len], members);
+            std.mem.sort(
+                vectorindex_posting.VectorId,
+                scratch.compact_delta_ids[0..members.len],
+                {},
+                comptime std.sort.asc(vectorindex_posting.VectorId),
+            );
+            break :blk scratch.compact_delta_ids[0..members.len];
+        } else members;
 
-        const sorted_members = try self.alloc.dupe(vectorindex_posting.VectorId, members);
-        defer self.alloc.free(sorted_members);
-        std.mem.sort(vectorindex_posting.VectorId, sorted_members, {}, comptime std.sort.asc(vectorindex_posting.VectorId));
-        const block_size = try self.postingSegmentSelectedBaseBlockSize(sorted_members);
-        return try vectorindex_posting.PostingFormat.encodeBaseWithBlockSize(self.alloc, .{
-            .posting_id = posting_id,
-            .generation = generation,
-            .members = sorted_members,
-        }, block_size);
+        const block_size = try self.postingSegmentSelectedBaseBlockSize(encoded_members);
+        const encoded_len = try vectorindex_posting.PostingFormat.encodedBaseSizeForMembersWithBlockSize(encoded_members, block_size);
+        try scratch.ensureEncodedBaseCapacity(self.alloc, encoded_len);
+        return .{
+            .encoded = try vectorindex_posting.PostingFormat.encodeBaseMembersKnownSizeIntoWithBlockSize(
+                scratch.encoded_base,
+                posting_id,
+                generation,
+                encoded_members,
+                block_size,
+            ),
+            .encoded_len = encoded_len,
+            .member_count = encoded_members.len,
+        };
     }
 
     fn postingSegmentTailShouldFold(base_member_count: usize, tail_stats: vectorindex_posting.PostingDeltaTailStats, options: vectorindex_posting.FoldDeltaTailOptions) bool {
@@ -3469,6 +3483,8 @@ pub const HBCIndex = struct {
     ) !vectorindex_posting.FoldDeltaTailResult {
         _ = is_not_found;
         try self.bindPostingSegmentWriteTxn(txn);
+        var scratch = try self.acquirePostingFoldScratch();
+        defer self.releasePostingFoldScratch(&scratch);
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
@@ -3496,19 +3512,16 @@ pub const HBCIndex = struct {
             };
         }
 
-        var scratch = vectorindex_posting.PostingStore.FoldScratch{};
-        defer scratch.deinit(self.alloc);
         const materialized_count = (try snapshot.materializeMembersIntoScratch(self.alloc, posting_id, &scratch)) orelse return error.NotFound;
         const materialized = scratch.member_ids[0..materialized_count];
         const next_generation = base_header.generation +| 1;
-        const encoded = try self.encodePostingSegmentBase(posting_id, next_generation, materialized);
-        defer self.alloc.free(encoded);
-        try runtime.store.appendBase(posting_id, encoded);
+        const encoded = try self.encodePostingSegmentBaseIntoScratch(&scratch, posting_id, next_generation, materialized);
+        try runtime.store.appendBase(posting_id, encoded.encoded);
         return .{
             .delta_records = tail_stats.records,
             .base_member_count = base_header.member_count,
             .materialized_member_count = materialized.len,
-            .written_base_value_bytes = encoded.len,
+            .written_base_value_bytes = encoded.encoded_len,
             .next_generation = next_generation,
         };
     }

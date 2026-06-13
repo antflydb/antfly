@@ -190,9 +190,10 @@ Current status:
   the existing atomic segment+manifest commit path, including coalescing
   individual and multi-record posting delta appends into one encoded delta-tail
   value per posting, which gives the future runtime backend an explicit
-  micro-batch append primitive. Segment folds can now materialize directly into
-  fold scratch, avoiding a separate owned materialized-member allocation before
-  base re-encoding. A runtime-facing directory store adapter now owns the lazy
+  micro-batch append primitive. Segment folds can now materialize and re-encode
+  directly through retained fold scratch, avoiding separate owned
+  materialized-member and encoded-base allocations before publishing the folded
+  base. A runtime-facing directory store adapter now owns the lazy
   manifest snapshot plus the bounded batch writer, making flushed
   base/delta/centroid appends visible through refreshed lazy snapshots and
   refreshing again after bounded directory maintenance. A
