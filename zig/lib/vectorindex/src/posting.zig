@@ -300,7 +300,7 @@ pub const PostingFormat = struct {
         if (member_count > std.math.maxInt(u32)) return error.TooLarge;
         const block_count = (member_count + base_member_default_block_size - 1) / base_member_default_block_size;
         return base_header_size +
-            try std.math.mul(usize, block_count, 21) +
+            try std.math.mul(usize, block_count, 31) +
             try std.math.mul(usize, member_count, 10);
     }
 
@@ -344,10 +344,15 @@ pub const PostingFormat = struct {
             const block = self.block[0..self.block_count];
             const block_min = minVectorId(block);
             const block_max = maxVectorId(block);
-            self.total = try std.math.add(usize, self.total, 1 + varintSize(block_min) + varintSize(block_max));
+            var payload_bytes: usize = 0;
             for (block) |member_id| {
-                self.total = try std.math.add(usize, self.total, varintSize(member_id - block_min));
+                payload_bytes = try std.math.add(usize, payload_bytes, varintSize(member_id - block_min));
             }
+            self.total = try std.math.add(
+                usize,
+                self.total,
+                1 + varintSize(block_min) + varintSize(block_max) + varintSize(payload_bytes) + payload_bytes,
+            );
             self.block_count = 0;
         }
 
@@ -470,8 +475,13 @@ pub const PostingFormat = struct {
             const block = self.block[0..self.block_count];
             const block_min = minVectorId(block);
             const block_max = maxVectorId(block);
+            var payload_bytes: usize = 0;
+            for (block) |member_id| {
+                payload_bytes = try std.math.add(usize, payload_bytes, varintSize(member_id - block_min));
+            }
             writeVarint(self.out, &self.pos, block_min);
             writeVarint(self.out, &self.pos, block_max);
+            writeVarint(self.out, &self.pos, payload_bytes);
             for (block) |member_id| {
                 writeVarint(self.out, &self.pos, member_id - block_min);
             }
@@ -491,6 +501,7 @@ pub const PostingFormat = struct {
         remaining_block: usize = 0,
         block_min: VectorId = 0,
         block_max: VectorId = 0,
+        block_payload_end: usize = base_header_size,
 
         fn init(data: []const u8, member_count: usize) BaseMemberBlockReader {
             return .{
@@ -506,12 +517,19 @@ pub const PostingFormat = struct {
                 self.block_min = try readVarint(self.data, &self.pos);
                 self.block_max = try readVarint(self.data, &self.pos);
                 if (self.block_max < self.block_min) return error.Corrupted;
+                const payload_bytes_raw = try readVarint(self.data, &self.pos);
+                if (payload_bytes_raw > std.math.maxInt(usize)) return error.Corrupted;
+                const payload_bytes: usize = @intCast(payload_bytes_raw);
+                self.block_payload_end = std.math.add(usize, self.pos, payload_bytes) catch return error.Corrupted;
+                if (self.block_payload_end > self.data.len) return error.Corrupted;
             }
             const delta = try readVarint(self.data, &self.pos);
+            if (self.pos > self.block_payload_end) return error.Corrupted;
             self.remaining_block -= 1;
             self.remaining_total -= 1;
             const member = std.math.add(VectorId, self.block_min, delta) catch return error.Corrupted;
             if (member > self.block_max) return error.Corrupted;
+            if (self.remaining_block == 0 and self.pos != self.block_payload_end) return error.Corrupted;
             return member;
         }
 
@@ -551,6 +569,15 @@ pub const PostingFormat = struct {
         pos.* += 1;
         if (block_count == 0 or block_count > base_member_max_block_size or block_count > remaining_members) return error.Corrupted;
         return block_count;
+    }
+
+    fn readBaseBlockPayloadEnd(data: []const u8, pos: *usize) !usize {
+        const payload_bytes_raw = try readVarint(data, pos);
+        if (payload_bytes_raw > std.math.maxInt(usize)) return error.Corrupted;
+        const payload_bytes: usize = @intCast(payload_bytes_raw);
+        const block_payload_end = std.math.add(usize, pos.*, payload_bytes) catch return error.Corrupted;
+        if (block_payload_end > data.len) return error.Corrupted;
+        return block_payload_end;
     }
 
     pub fn normalizeBaseMemberBlockSize(block_size: usize) usize {
@@ -952,12 +979,15 @@ pub const PostingFormat = struct {
             const block_min = try readVarint(data, &pos);
             const block_max = try readVarint(data, &pos);
             if (block_max < block_min) return error.Corrupted;
+            const block_payload_end = try readBaseBlockPayloadEnd(data, &pos);
             var block_index: usize = 0;
             while (block_index < current_block_count) : (block_index += 1) {
                 const delta = try readVarint(data, &pos);
+                if (pos > block_payload_end) return error.Corrupted;
                 const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
                 if (member > block_max) return error.Corrupted;
             }
+            if (pos != block_payload_end) return error.Corrupted;
             remaining_members -= current_block_count;
             block_count += 1;
         }
@@ -1020,13 +1050,21 @@ pub const PostingFormat = struct {
                 if (!strict_validation) return false;
                 resolved = true;
             }
+            const block_payload_end = try readBaseBlockPayloadEnd(data, &pos);
             if (!resolved and block_max < vector_id) {
+                if (!strict_validation) {
+                    pos = block_payload_end;
+                    remaining_members -= current_block_count;
+                    continue;
+                }
                 var skip_index: usize = 0;
                 while (skip_index < current_block_count) : (skip_index += 1) {
                     const delta = try readVarint(data, &pos);
+                    if (pos > block_payload_end) return error.Corrupted;
                     const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
                     if (member > block_max) return error.Corrupted;
                 }
+                if (pos != block_payload_end) return error.Corrupted;
                 remaining_members -= current_block_count;
                 continue;
             }
@@ -1034,6 +1072,7 @@ pub const PostingFormat = struct {
             var block_index: usize = 0;
             while (block_index < current_block_count) : (block_index += 1) {
                 const delta = try readVarint(data, &pos);
+                if (pos > block_payload_end) return error.Corrupted;
                 const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
                 if (member > block_max) return error.Corrupted;
                 if (resolved) continue;
@@ -1046,6 +1085,7 @@ pub const PostingFormat = struct {
                     resolved = true;
                 }
             }
+            if (pos != block_payload_end) return error.Corrupted;
             remaining_members -= current_block_count;
         }
         if (pos != data.len) return error.Corrupted;
@@ -4362,6 +4402,7 @@ test "posting base sorted membership streams without full materialization" {
     const first_block_count = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
     _ = try PostingFormat.readVarint(encoded, &pos);
     _ = try PostingFormat.readVarint(encoded, &pos);
+    _ = try PostingFormat.readBaseBlockPayloadEnd(encoded, &pos);
     var first_block_index: usize = 0;
     while (first_block_index < first_block_count) : (first_block_index += 1) {
         _ = try PostingFormat.readVarint(encoded, &pos);
@@ -4370,6 +4411,7 @@ test "posting base sorted membership streams without full materialization" {
     _ = try PostingFormat.readBaseBlockCount(encoded, &pos, remaining_members);
     _ = try PostingFormat.readVarint(encoded, &pos);
     _ = try PostingFormat.readVarint(encoded, &pos);
+    _ = try PostingFormat.readBaseBlockPayloadEnd(encoded, &pos);
     const truncated_after_second_block_header = encoded[0..pos];
 
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(truncated_after_second_block_header, 165));
@@ -4393,9 +4435,33 @@ test "posting base block max hints are validated" {
     _ = try PostingFormat.readVarint(corrupt, &pos);
     corrupt[pos] = 15;
 
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(corrupt, 999));
     try std.testing.expectError(error.Corrupted, PostingFormat.decodeBaseStats(corrupt));
-    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMember(corrupt, 999));
     try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 20));
+}
+
+test "posting base sorted membership skips whole blocks by payload length" {
+    const alloc = std.testing.allocator;
+    const members = [_]VectorId{ 10, 20, 30 };
+    const encoded = try PostingFormat.encodeBaseWithBlockSize(alloc, .{
+        .posting_id = 7,
+        .generation = 11,
+        .members = members[0..],
+    }, 16);
+    defer alloc.free(encoded);
+
+    const corrupt = try alloc.dupe(u8, encoded);
+    defer alloc.free(corrupt);
+    var pos: usize = PostingFormat.encoded_base_header_size;
+    _ = try PostingFormat.readBaseBlockCount(corrupt, &pos, members.len);
+    _ = try PostingFormat.readVarint(corrupt, &pos);
+    _ = try PostingFormat.readVarint(corrupt, &pos);
+    _ = try PostingFormat.readBaseBlockPayloadEnd(corrupt, &pos);
+    corrupt[pos] = 40;
+
+    try std.testing.expect(!try PostingFormat.baseContainsSortedMember(corrupt, 999));
+    try std.testing.expectError(error.Corrupted, PostingFormat.decodeBaseStats(corrupt));
+    try std.testing.expectError(error.Corrupted, PostingFormat.baseContainsSortedMemberStrict(corrupt, 999));
 }
 
 test "posting delta tail round trips and overlays base members" {

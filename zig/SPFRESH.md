@@ -778,12 +778,13 @@ implementations cleanly:
 
    Sorted canonical base members make it possible to store block offsets and
    last-member ids. Base blocks now store a max-member hint alongside the
-   block min, and validation checks that decoded members stay inside that
-   range. Sorted membership checks can use the max hint to resolve
-   after-block negative lookups without comparing each decoded member. Query
-   materialization and fold application could later use block offsets to jump
-   to relevant blocks instead of scanning from the start. Before changing the
-   public format again, keep using the internal
+   block min plus the encoded payload byte length, and validation checks that
+   decoded members stay inside that range and consume exactly the advertised
+   payload bytes. Sorted membership checks can use the max hint and payload
+   length to skip whole blocks for after-block negative lookups without
+   decoding each member. Query materialization and fold application could
+   later use block offsets to jump to relevant blocks instead of scanning from
+   the start. Before changing the public format again, keep using the internal
    bench-only block-size knob for 16/32/64-member blocks and report
    `posting_base_value_bytes_per_member` beside
    `posting_base_decode_ns_per_member`. The comparison runner now has an
@@ -853,10 +854,11 @@ implementations cleanly:
 10. Add membership hints for large postings.
 
    The first hint is now in the base block itself: every block stores min and
-   max member ids, so sorted membership checks can skip comparisons for target
-   ids that fall after a block. For delete/update and some validation paths,
-   compact per-base bloom filters or richer block hints could further avoid
-   full decode on negative membership tests.
+   max member ids plus payload length, so sorted membership checks can skip
+   whole encoded blocks for target ids that fall after a block. For
+   delete/update and some validation paths, compact per-base bloom filters or
+   richer block hints could further avoid full decode on negative membership
+   tests.
 
    Expected win: faster tombstone and reassignment checks on large postings.
 
