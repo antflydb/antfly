@@ -50157,6 +50157,81 @@ test "db snapshot restore rejects corrupt segment-backed dense sidecar" {
     );
 }
 
+test "db snapshot restore rejects missing segment-backed dense sidecar" {
+    const alloc = std.testing.allocator;
+
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    const dense_config =
+        \\{
+        \\  "field": "embedding",
+        \\  "dims": 2,
+        \\  "metric": "l2_squared",
+        \\  "backend": "segments",
+        \\  "format": "base_delta",
+        \\  "version": 1
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_segments",
+            .kind = .dense_vector,
+            .config_json = dense_config,
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"embedding\":[0,0]}" },
+                .{ .key = "doc:b", .value = "{\"embedding\":[10,0]}" },
+            },
+            .sync_level = .full_index,
+        });
+        try db.runUntilIdle();
+        _ = try db.snapshot("snap1");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var io_impl = threadedIo();
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshots) catch {};
+        } else |_| {}
+    }
+    const hbc_store_snapshot_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/dense-posting-segments/dv_segments/hbc-store.afhs",
+        .{snapshot_root},
+    );
+    defer alloc.free(hbc_store_snapshot_path);
+    {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        try std.Io.Dir.cwd().deleteFile(io_impl.io(), hbc_store_snapshot_path);
+    }
+
+    try std.testing.expectError(
+        error.InvalidPostingSegmentPrivateStoreSnapshot,
+        DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+        }),
+    );
+}
+
 test "db snapshot restore rejects missing segment-backed dense artifact" {
     const alloc = std.testing.allocator;
 
