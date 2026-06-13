@@ -12,13 +12,32 @@ const dirname =
 // Backend proxy target — override at startup with ANTFARM_API_PROXY_TARGET
 // to point Antfarm at a different Antfly backend (e.g. one preloaded with
 // fixture data on a non-default port).
-const apiProxyTarget = process.env.ANTFARM_API_PROXY_TARGET ?? "http://localhost:8080";
+const apiProxyTarget = process.env.ANTFARM_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
 
 // More info at: https://storybook.js.org/docs/next/writing-tests/integrations/vitest-addon
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  define: {
+    "import.meta.env.VITE_ANTFARM_API_PROXY_TARGET": JSON.stringify(apiProxyTarget),
+  },
   server: {
     proxy: {
+      "/db": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      "/auth": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      "/ai": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
+      "/healthz": {
+        target: apiProxyTarget,
+        changeOrigin: true,
+      },
       "/api": {
         target: apiProxyTarget,
         changeOrigin: true,

@@ -12,23 +12,33 @@ import {
 import { InferenceClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
+  Bot,
   ClipboardCheck,
+  FileInput,
   HelpCircle,
+  KeyRound,
   Library,
   Loader2,
-  MessageSquare,
+  Mic,
   Moon,
   Network,
   Plus,
   Repeat2,
+  ScanLine,
   Scissors,
+  Search,
+  Shield,
   Sun,
   Table,
   Tag,
+  Upload,
   Users,
+  Waypoints,
 } from "lucide-react";
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
+import { isProductEnabled, type ProductId } from "@/config/products";
+import { useAuth } from "@/hooks/use-auth";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
@@ -40,12 +50,22 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   Plus,
   Library,
   Users,
+  FileInput,
+  Shield,
+  KeyRound,
   Scissors,
   Tag,
   HelpCircle,
   Network,
   ClipboardCheck,
-  MessageSquare,
+  Bot,
+  Search,
+  Upload,
+  Waypoints,
+  ArrowUpDown,
+  Repeat2,
+  ScanLine,
+  Mic,
   Moon,
   Sun,
 };
@@ -58,6 +78,38 @@ interface CommandPaletteContextType {
 
 const CommandPaletteContext = React.createContext<CommandPaletteContextType | undefined>(undefined);
 
+interface PaletteCommand {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  href?: string;
+  action?: string;
+  product?: ProductId;
+  adminOnly?: boolean;
+}
+
+function productForHref(href?: string): ProductId | undefined {
+  if (!href) return undefined;
+  if (href.startsWith("/inference")) return "inference";
+  if (
+    href === "/" ||
+    href.startsWith("/create") ||
+    href.startsWith("/tables") ||
+    href.startsWith("/retrieval") ||
+    href.startsWith("/ingest") ||
+    href.startsWith("/data/playground") ||
+    href === "/cluster" ||
+    href === "/users" ||
+    href === "/secrets"
+  ) {
+    return "antfly";
+  }
+  return undefined;
+}
+
+function isAdminHref(href?: string) {
+  return href === "/users" || href === "/secrets";
+}
+
 export function CommandPaletteProvider({ children }: { children: React.ReactNode }) {
   const [isOpen, setIsOpen] = React.useState(false);
   const [mounted, setMounted] = React.useState(false);
@@ -66,9 +118,11 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const [isSearching, setIsSearching] = React.useState(false);
   const navigate = useNavigate();
 
+  const { hasPermission } = useAuth();
   const { theme, setTheme } = useTheme();
   const { inferenceApiUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
+  const showAdmin = showLocalAdminRoutes && hasPermission("*", "*", "admin");
 
   // Create InferenceClient for semantic search
   const inferenceClient = React.useMemo(
@@ -77,13 +131,17 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   );
 
   const isCommandAvailable = React.useCallback(
-    (item: { href?: string }) => {
-      if (showLocalAdminRoutes) {
-        return true;
+    (item: { href?: string; product?: ProductId; adminOnly?: boolean }) => {
+      const product = item.product ?? productForHref(item.href);
+      if (product && !isProductEnabled(product)) {
+        return false;
       }
-      return item.href !== "/users" && item.href !== "/secrets";
+      if ((item.adminOnly || isAdminHref(item.href)) && !showAdmin) {
+        return false;
+      }
+      return true;
     },
-    [showLocalAdminRoutes]
+    [showAdmin]
   );
 
   React.useEffect(() => {
@@ -108,33 +166,75 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   }, [toggle]);
 
   const navigationCommands = React.useMemo(() => {
-    const commands = [
-      { icon: Table, label: "Tables", href: "/" },
-      { icon: Plus, label: "Create Table", href: "/create" },
-      { icon: Library, label: "Models & Runtime", href: "/inference/models" },
+    const commands: PaletteCommand[] = [
+      { icon: Table, label: "Tables", href: "/", product: "antfly" },
+      { icon: Plus, label: "Create Table", href: "/create", product: "antfly" },
+      { icon: Search, label: "Search", href: "/retrieval/search", product: "antfly" },
+      { icon: Bot, label: "Ask Questions", href: "/retrieval/ask", product: "antfly" },
+      {
+        icon: ClipboardCheck,
+        label: "Evaluate Retrieval",
+        href: "/retrieval/evaluate",
+        product: "antfly",
+      },
+      { icon: Upload, label: "Upload Data", href: "/ingest/upload", product: "antfly" },
+      { icon: Library, label: "Models", href: "/inference/models", product: "inference" },
+      { icon: Network, label: "Cluster", href: "/cluster", product: "antfly" },
+      { icon: Users, label: "Users", href: "/users", product: "antfly", adminOnly: true },
+      { icon: KeyRound, label: "Secrets", href: "/secrets", product: "antfly", adminOnly: true },
     ];
-    if (showLocalAdminRoutes) {
-      commands.push({ icon: Users, label: "Users", href: "/users" });
-    }
-    return commands;
-  }, [showLocalAdminRoutes]);
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
-  const playgroundCommands = React.useMemo(
-    () => [
-      { icon: Scissors, label: "Data Chunking Playground", href: "/data/playground/chunk" },
-      { icon: ClipboardCheck, label: "Data Evals", href: "/data/playground/evals" },
+  const toolCommands = React.useMemo(() => {
+    const commands: PaletteCommand[] = [
+      { icon: Network, label: "Graph Retrieval", href: "/retrieval/graph", product: "antfly" },
       {
         icon: Scissors,
-        label: "Antfly Inference Chunking Playground",
+        label: "Chunk Text",
         href: "/inference/playground/chunk",
+        product: "inference",
       },
-      { icon: Tag, label: "Extraction Playground", href: "/inference/playground/extract" },
-      { icon: Repeat2, label: "Rewriting Playground", href: "/inference/playground/rewrite" },
-      { icon: ArrowUpDown, label: "Reranking Playground", href: "/inference/playground/rerank" },
-      { icon: Network, label: "Knowledge Graph", href: "/inference/playground/kg" },
-    ],
-    []
-  );
+      {
+        icon: Tag,
+        label: "Extract Structured Data",
+        href: "/inference/playground/extract",
+        product: "inference",
+      },
+      {
+        icon: Repeat2,
+        label: "Rewrite Text",
+        href: "/inference/playground/rewrite",
+        product: "inference",
+      },
+      {
+        icon: ArrowUpDown,
+        label: "Rerank Text",
+        href: "/inference/playground/rerank",
+        product: "inference",
+      },
+      {
+        icon: Waypoints,
+        label: "Embed Text",
+        href: "/inference/playground/embed",
+        product: "inference",
+      },
+      {
+        icon: ScanLine,
+        label: "Read Image",
+        href: "/inference/playground/read",
+        product: "inference",
+      },
+      {
+        icon: Mic,
+        label: "Transcribe Audio",
+        href: "/inference/playground/transcribe",
+        product: "inference",
+      },
+      { icon: FileInput, label: "Manual Entry", href: "/ingest/manual", product: "antfly" },
+    ];
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
   const quickActionCommands = React.useMemo(
     () => [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }],
@@ -145,10 +245,10 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const allItems = React.useMemo(
     () => [
       ...navigationCommands.map((c) => c.label),
-      ...playgroundCommands.map((c) => c.label),
+      ...toolCommands.map((c) => c.label),
       ...quickActionCommands.map((c) => c.label),
     ],
-    [navigationCommands, playgroundCommands, quickActionCommands]
+    [navigationCommands, toolCommands, quickActionCommands]
   );
 
   // Check if cmdk's string filter would find any matches
@@ -296,9 +396,9 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
           <CommandSeparator />
 
-          {/* Playgrounds */}
-          <CommandGroup heading="Playgrounds">
-            {playgroundCommands.map((command) => (
+          {/* Tools */}
+          <CommandGroup heading="Tools">
+            {toolCommands.map((command) => (
               <CommandItem
                 key={command.href}
                 onSelect={() => handleSelect(command.href)}

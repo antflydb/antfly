@@ -51,7 +51,7 @@ import type { Table as AntflyTable, IndexStatus, QueryRequest, QueryResult } fro
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, type TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
@@ -220,6 +220,7 @@ interface TableDetailsPageProps {
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "indexes" }) => {
   const theme = localStorage.getItem("theme") || "light";
   const { tableName } = useParams<{ tableName: string }>();
+  const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
   const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
@@ -473,6 +474,13 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
     embeddings: "Vector Indexes",
     full_text: "Full Text Index",
   };
+  const vectorIndexCount = indexes.filter((idx) => idx.config.type === "embeddings").length;
+  const fullTextIndexCount = indexes.filter((idx) => idx.config.type === "full_text").length;
+  const schemaCount = tableSchema?.document_schemas
+    ? Object.keys(tableSchema.document_schemas).length
+    : 0;
+  const tableSectionPath = (section: string) =>
+    `/tables/${encodeURIComponent(tableName || "")}?section=${encodeURIComponent(section)}`;
 
   const handleFieldInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     setFieldInput(event.target.value);
@@ -584,13 +592,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
   }, [tableSchema]);
 
   const sectionLabels: Record<string, string> = {
+    overview: "Overview",
     indexes: "Indexes",
     schema: "Schema",
     semantic: "Search",
-    graph: "Graph Explorer",
+    graph: "Graph",
     faceted: "Component Builder",
     bulk: "Upload",
-    "document-builder": "Document Builder",
+    "document-builder": "Manual Entry",
   };
 
   return (
@@ -619,7 +628,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
         <div>
           <DashboardPageTitle>{tableName}</DashboardPageTitle>
           <DashboardPageDescription>
-            {sectionLabels[currentSection] ?? currentSection} for this table.
+            {currentSection === "overview"
+              ? "Table health, setup status, and next actions."
+              : `${sectionLabels[currentSection] ?? currentSection} for this table.`}
           </DashboardPageDescription>
         </div>
         {currentSection === "indexes" && (
@@ -647,6 +658,164 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
         </Alert>
       )}
       <div className="space-y-6">
+        {/* Overview Section */}
+        {currentSection === "overview" && (
+          <div className="space-y-6">
+            <div className="grid gap-3 md:grid-cols-4">
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-muted-foreground">Schema</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{schemaCount}</div>
+                  <p className="text-xs text-muted-foreground">document schemas</p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-muted-foreground">Indexes</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{indexes.length}</div>
+                  <p className="text-xs text-muted-foreground">
+                    {vectorIndexCount} vector, {fullTextIndexCount} full-text
+                  </p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-muted-foreground">Migration</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{migration ? "Active" : "Idle"}</div>
+                  <p className="text-xs text-muted-foreground">
+                    {migration ? "schema rebuild in progress" : "no rebuild running"}
+                  </p>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-muted-foreground">Retrieval</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">
+                    {indexes.length > 0 ? "Ready" : "Setup"}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {indexes.length > 0 ? "search surfaces available" : "create an index first"}
+                  </p>
+                </CardContent>
+              </Card>
+            </div>
+
+            <DashboardToolbar className="flex-row flex-wrap items-center gap-2 md:items-center">
+              <Button onClick={() => navigate(tableSectionPath("bulk"))}>Upload data</Button>
+              <Button variant="outline" onClick={handleOpenCreateDialog}>
+                Create index
+              </Button>
+              <Button variant="outline" onClick={() => navigate(tableSectionPath("semantic"))}>
+                Search
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() =>
+                  navigate(
+                    `/data/playground/chat?table=${encodeURIComponent(tableName || "")}`
+                  )
+                }
+              >
+                Ask
+              </Button>
+            </DashboardToolbar>
+
+            <div className="grid gap-4 lg:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Table Setup</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Schema</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("schema"))}
+                    >
+                      {schemaCount > 0 ? "View schema" : "Define schema"}
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Indexes</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("indexes"))}
+                    >
+                      {indexes.length > 0 ? "Manage indexes" : "Create index"}
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Data</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("bulk"))}
+                    >
+                      Upload data
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Retrieval</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Search ranked documents</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("semantic"))}
+                    >
+                      Search
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Ask questions over this table</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        navigate(
+                          `/data/playground/chat?table=${encodeURIComponent(tableName || "")}`
+                        )
+                      }
+                    >
+                      Ask
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Measure retrieval quality</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        navigate(
+                          `/data/playground/evals?table=${encodeURIComponent(tableName || "")}`
+                        )
+                      }
+                    >
+                      Evaluate
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        )}
+
         {/* Indexes Section */}
         {currentSection === "indexes" && (
           <div className="flex flex-col gap-6">

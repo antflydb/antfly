@@ -142,8 +142,8 @@
     {
       "id": "nav-models",
       "type": "navigation",
-      "label": "Models & Runtime",
-      "description": "View Antfly inference models and runtime status",
+      "label": "Models",
+      "description": "View model runtime status and tools",
       "href": "/inference/models",
       "icon": "Library",
       "embedding": [
@@ -280,9 +280,9 @@
     {
       "id": "play-chunking",
       "type": "navigation",
-      "label": "Data Chunking Playground",
-      "description": "Test document chunking strategies for RAG",
-      "href": "/data/playground/chunk",
+      "label": "Chunk Text",
+      "description": "Split text into chunks for retrieval workflows",
+      "href": "/inference/playground/chunk",
       "icon": "Scissors",
       "embedding": [
         -0.06970131, 0.09474816, 0.057795558, -0.011022197, 0.00977627, -0.09604803, -0.007939067,
@@ -348,7 +348,7 @@
     {
       "id": "play-extraction",
       "type": "navigation",
-      "label": "Extraction Playground",
+      "label": "Extract Structured Data",
       "description": "Named entity recognition and extraction",
       "href": "/inference/playground/extract",
       "icon": "Tag",
@@ -416,8 +416,8 @@
     {
       "id": "play-question",
       "type": "navigation",
-      "label": "Rewriting Playground",
-      "description": "Generate questions from documents for evaluation",
+      "label": "Rewrite Text",
+      "description": "Rewrite text with a model",
       "href": "/inference/playground/rewrite",
       "icon": "HelpCircle",
       "embedding": [
@@ -484,9 +484,9 @@
     {
       "id": "play-kg",
       "type": "navigation",
-      "label": "Knowledge Graph",
-      "description": "Build and visualize knowledge graphs",
-      "href": "/inference/playground/kg",
+      "label": "Graph Retrieval",
+      "description": "Explore graph relationships for the selected table",
+      "href": "/retrieval/graph",
       "icon": "Network",
       "embedding": [
         0.053930108, -0.013544671, -0.044834528, 0.0062742783, 0.019840378, -0.07216902,
@@ -552,9 +552,9 @@
     {
       "id": "play-evals",
       "type": "navigation",
-      "label": "Evals",
-      "description": "Run RAG evaluations and benchmarks",
-      "href": "/data/playground/evals",
+      "label": "Evaluate Retrieval",
+      "description": "Run retrieval evaluations and benchmarks",
+      "href": "/retrieval/evaluate",
       "icon": "ClipboardCheck",
       "embedding": [
         -0.09651942, 0.057518497, -0.052242387, 0.011058676, -0.06290196, -0.10746886, -0.01275608,
@@ -621,10 +621,10 @@
     {
       "id": "play-rag",
       "type": "navigation",
-      "label": "RAG Playground",
-      "description": "Test retrieval-augmented generation pipelines",
-      "href": "/data/playground/rag",
-      "icon": "MessageSquare",
+      "label": "Ask Questions",
+      "description": "Ask questions over selected table data",
+      "href": "/retrieval/ask",
+      "icon": "Bot",
       "embedding": [
         -0.08185645, -0.024673104, -0.02928956, 0.009039619, 0.014073962, -0.03198563, -0.019658372,
         -0.007545316, -0.07873625, -0.070511855, 0.035428032, -0.117347546, 0.038478177,
