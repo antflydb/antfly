@@ -3115,6 +3115,33 @@ pub const HBCIndex = struct {
         };
     }
 
+    fn postingSegmentPrivateStoreSnapshotManifest(raw: []const u8) ![]const u8 {
+        _ = try validatePostingSegmentPrivateStoreSnapshot(raw);
+        var cursor: usize = posting_segment_hbc_store_snapshot_magic.len + @sizeOf(u32);
+        const entry_count = std.mem.readInt(u64, raw[cursor..][0..8], .little);
+        cursor += 8;
+
+        var manifest: ?[]const u8 = null;
+        var entries_seen: u64 = 0;
+        while (entries_seen < entry_count) : (entries_seen += 1) {
+            const namespace = try postingSegmentSnapshotNamespaceFromOrdinal(raw[cursor]);
+            cursor += 1;
+            const key_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            const value_len: usize = @intCast(std.mem.readInt(u64, raw[cursor..][0..8], .little));
+            cursor += 8;
+            const key = raw[cursor .. cursor + key_len];
+            cursor += key_len;
+            const value = raw[cursor .. cursor + value_len];
+            cursor += value_len;
+            if (namespace == .meta and std.mem.eql(u8, key, posting_segment_manifest_meta_key)) {
+                if (manifest != null) return error.InvalidPostingSegmentPrivateStoreSnapshot;
+                manifest = value;
+            }
+        }
+        return manifest orelse error.PostingSegmentManifestMismatch;
+    }
+
     fn putPostingSegmentSnapshotEntry(self: *HBCIndex, txn: anytype, namespace: Namespace, key: []const u8, value: []const u8) !void {
         switch (namespace) {
             .nodes => try self.putNamespaced(txn, .nodes, key, value),
@@ -3133,21 +3160,26 @@ pub const HBCIndex = struct {
         try self.reloadPostingSegmentRuntimeFromCommittedManifest();
     }
 
-    fn importPostingSegmentPrivateStoreSnapshotFromDirectory(
+    fn readPostingSegmentPrivateStoreSnapshotFromDirectoryAlloc(
         self: *HBCIndex,
         io: std.Io,
         source_dir: std.Io.Dir,
-    ) !?PostingSegmentPrivateStoreSnapshotStats {
-        const raw = source_dir.readFileAlloc(
+    ) ![]u8 {
+        return source_dir.readFileAlloc(
             io,
             posting_segment_hbc_store_snapshot_path,
             self.alloc,
             .limited(posting_segment_hbc_store_snapshot_max_bytes),
         ) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound => return error.InvalidPostingSegmentPrivateStoreSnapshot,
             else => return err,
         };
-        defer self.alloc.free(raw);
+    }
+
+    fn importPostingSegmentPrivateStoreSnapshot(
+        self: *HBCIndex,
+        raw: []const u8,
+    ) !PostingSegmentPrivateStoreSnapshotStats {
         const snapshot_stats = try validatePostingSegmentPrivateStoreSnapshot(raw);
 
         var txn = try self.beginRuntimeBatchTxn();
@@ -3230,31 +3262,35 @@ pub const HBCIndex = struct {
             else => return err,
         };
         defer source_dir.close(io);
-        const private_store = try self.importPostingSegmentPrivateStoreSnapshotFromDirectory(io, source_dir);
+        const private_store_raw = try self.readPostingSegmentPrivateStoreSnapshotFromDirectoryAlloc(io, source_dir);
+        defer self.alloc.free(private_store_raw);
+        const private_store = try validatePostingSegmentPrivateStoreSnapshot(private_store_raw);
+        const snapshot_manifest_data = try postingSegmentPrivateStoreSnapshotManifest(private_store_raw);
 
-        var txn = try self.beginReadTxn();
-        defer txn.abort();
-        const committed_manifest_data = self.getNamespaced(&txn, .meta, posting_segment_manifest_meta_key) catch |err| switch (err) {
-            error.NotFound => return .{},
-            else => return err,
+        const open_options = blk: {
+            lockAtomic(&self.posting_segment_mu);
+            defer self.posting_segment_mu.unlock();
+            const runtime = try self.postingSegmentRuntime();
+            break :blk runtime.store.options.openOptions();
         };
-
-        lockAtomic(&self.posting_segment_mu);
-        defer self.posting_segment_mu.unlock();
-        const runtime = try self.postingSegmentRuntime();
-        const open_options = runtime.store.options.openOptions();
         const source_manifest_data = try source_dir.readFileAlloc(io, open_options.manifest_path, self.alloc, .limited(open_options.max_manifest_bytes));
         defer self.alloc.free(source_manifest_data);
-        if (!std.mem.eql(u8, source_manifest_data, committed_manifest_data)) return error.PostingSegmentManifestMismatch;
+        if (!std.mem.eql(u8, source_manifest_data, snapshot_manifest_data)) return error.PostingSegmentManifestMismatch;
 
-        const copied = try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
-            self.alloc,
-            io,
-            source_dir,
-            runtime.dir,
-            open_options,
-            source_manifest_data,
-        );
+        const copied = blk: {
+            lockAtomic(&self.posting_segment_mu);
+            defer self.posting_segment_mu.unlock();
+            const runtime = try self.postingSegmentRuntime();
+            break :blk try vectorindex_posting_segment.copyDirectoryStoreManifestDataAlloc(
+                self.alloc,
+                io,
+                source_dir,
+                runtime.dir,
+                open_options,
+                source_manifest_data,
+            );
+        };
+        _ = try self.importPostingSegmentPrivateStoreSnapshot(private_store_raw);
         return PostingSegmentBackendTransferStats.fromCopyStats(copied, private_store);
     }
 
@@ -11121,6 +11157,9 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
     var export_tp: TestPath = .{};
     const export_path = export_tp.init();
     defer export_tp.cleanup();
+    var bad_export_tp: TestPath = .{};
+    const bad_export_path = bad_export_tp.init();
+    defer bad_export_tp.cleanup();
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
     defer modeled_device.deinit();
@@ -11245,6 +11284,8 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         try std.testing.expect(exported.private_store_bytes > 0);
         try std.testing.expectEqual(segment_maintenance.manifest_segments, @as(u64, @intCast(exported.manifest_segments)));
 
+        _ = try idx.exportPostingSegmentBackendToDirectory(std.mem.span(bad_export_path));
+
         {
             var io_impl = std.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
@@ -11256,6 +11297,38 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
             const exported_materialized = (try exported_store.snapshot().materializeMembers(alloc, posting_id)) orelse return error.TestExpectedEqual;
             defer alloc.free(exported_materialized);
             try std.testing.expectEqualSlices(u64, &.{ 20, 30 }, exported_materialized);
+        }
+
+        {
+            var extra_txn = try idx.beginWriteTxn();
+            errdefer extra_txn.abort();
+            try PostingStore.appendDeltaRecords(&idx, &extra_txn, posting_id, &.{
+                .{ .sequence = (@as(u64, 3) << 32) | 1, .op = .insert, .vector_id = 40 },
+            });
+            try idx.finishWriteTxn(&extra_txn);
+        }
+
+        {
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var bad_export_dir = try std.Io.Dir.cwd().openDir(io, std.mem.span(bad_export_path), .{});
+            defer bad_export_dir.close(io);
+            try bad_export_dir.writeFile(io, .{
+                .sub_path = vectorindex_posting_segment.default_manifest_path,
+                .data = "corrupt manifest",
+            });
+        }
+        try std.testing.expectError(
+            error.PostingSegmentManifestMismatch,
+            idx.importPostingSegmentBackendFromDirectory(std.mem.span(bad_export_path)),
+        );
+        {
+            var read_txn = try idx.beginReadTxn();
+            defer read_txn.abort();
+            const materialized = try PostingStore.materializeBaseDeltaMembers(&idx, &read_txn, posting_id, isNotFound);
+            defer alloc.free(materialized);
+            try std.testing.expectEqualSlices(u64, &.{ 20, 30, 40 }, materialized);
         }
 
         {

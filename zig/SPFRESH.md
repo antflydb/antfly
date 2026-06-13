@@ -212,9 +212,12 @@ Current status:
   self-contained segment-backed posting bundle through a standalone directory:
   the bundle contains a versioned snapshot of the HBC private namespaces plus
   the segment artifacts referenced by the committed manifest marker. Import
-  restores the private namespace snapshot first, validates each referenced
-  segment, writes the manifest last, and rejects imports whose manifest does
-  not match the restored committed marker. Dense maintenance now runs
+  validates the private namespace snapshot and its committed manifest marker
+  before mutating HBC namespaces, validates each referenced segment, writes the
+  physical manifest last, then publishes the restored HBC metadata. Imports
+  whose segment manifest does not match the bundled committed marker fail
+  without rolling the live index back to the private snapshot. Dense
+  maintenance now runs
   segment compaction under the existing dense posting maintenance working-set
   reservation, passing that reservation through as a cap on selected compaction
   input bytes. HBC segment recovery can reload from the committed manifest
@@ -861,8 +864,10 @@ implementations cleanly:
     the replacement manifest transactionally, and report segment run,
     compaction, delete, and manifest-size counters. HBC also has a
     committed-manifest export/import primitive that copies and verifies only
-    referenced segment files, publishes manifests last, and rejects imports with
-    a manifest that does not match the restored HBC metadata marker. Segment
+    referenced segment files, publishes manifests last, and validates the
+    bundled private-store manifest marker before mutating HBC namespaces. Bad
+    bundles therefore fail without rolling the live index back to the bundled
+    HBC snapshot. Segment
     maintenance compaction now runs under the dense posting maintenance
     working-set reservation and caps selected compaction input bytes from that
     reservation, so physical segment compaction cannot bypass resource pressure.
