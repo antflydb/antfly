@@ -804,11 +804,11 @@ pub const LazyDirectorySnapshot = struct {
             };
             const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, location.entry);
             defer alloc.free(value);
-            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, value);
-            defer alloc.free(decoded);
-            for (decoded) |record| {
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= found_base.generation) continue;
-                try records.append(alloc, record);
+                records.appendAssumeCapacity(record);
             }
         }
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
@@ -903,9 +903,11 @@ pub const Snapshot = struct {
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
         for (delta_values) |delta_value| {
-            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
-            defer alloc.free(decoded);
-            try records.appendSlice(alloc, decoded);
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            while (try iterator.next()) |record| {
+                records.appendAssumeCapacity(record);
+            }
         }
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
         return try records.toOwnedSlice(alloc);
@@ -918,11 +920,11 @@ pub const Snapshot = struct {
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
         for (delta_values) |delta_value| {
-            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, delta_value.value);
-            defer alloc.free(decoded);
-            for (decoded) |record| {
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                try records.append(alloc, record);
+                records.appendAssumeCapacity(record);
             }
         }
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
@@ -1626,13 +1628,13 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
 
         const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
         defer alloc.free(value);
-        const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, value);
-        defer alloc.free(decoded);
-        for (decoded) |record| {
+        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+        while (try iterator.next()) |record| {
             if (min_generation) |generation| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
             }
-            try records.append(alloc, record);
+            records.appendAssumeCapacity(record);
         }
     }
 
@@ -1806,10 +1808,9 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
                 (try posting.PostingFormat.decodeBaseHeader(base.value)).generation
             else
                 null;
-            const decoded = try posting.PostingFormat.decodeDeltaTail(alloc, entry.value);
-            defer alloc.free(decoded);
-            stats.input_delta_records += decoded.len;
-            for (decoded) |record| {
+            var delta_iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
+            stats.input_delta_records += delta_iterator.recordCount();
+            while (try delta_iterator.next()) |record| {
                 if (base_generation) |generation| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) {
                         stats.dropped_stale_delta_records += 1;
