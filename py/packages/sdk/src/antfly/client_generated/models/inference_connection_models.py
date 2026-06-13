@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from ..models.connected_model import ConnectedModel
 
 
-T = TypeVar("T", bound="InferenceProviderConnectionModels")
+T = TypeVar("T", bound="InferenceConnectionModels")
 
 
 @_attrs_define
-class InferenceProviderConnectionModels:
+class InferenceConnectionModels:
     """Models reported by the provider, grouped by model type. Keys are
     pluralized ConnectedModelType values ("embedders", "generators",
     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
@@ -42,7 +42,7 @@ class InferenceProviderConnectionModels:
         from ..models.connected_model import ConnectedModel
 
         d = dict(src_dict)
-        inference_provider_connection_models = cls()
+        inference_connection_models = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -55,8 +55,8 @@ class InferenceProviderConnectionModels:
 
             additional_properties[prop_name] = additional_property
 
-        inference_provider_connection_models.additional_properties = additional_properties
-        return inference_provider_connection_models
+        inference_connection_models.additional_properties = additional_properties
+        return inference_connection_models
 
     @property
     def additional_keys(self) -> list[str]:

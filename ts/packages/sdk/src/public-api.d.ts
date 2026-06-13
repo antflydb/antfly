@@ -55,11 +55,15 @@ export interface paths {
          * List configured external connections
          * @description Enumerates external connections configured on this node: inference
          *     providers (from named embedder/generator/reranker/chunker configs and
-         *     table embedding indexes), object stores, and remote content sources.
+         *     table embedding indexes), object stores, CDC replication sources, and
+         *     remote content sources.
+         *
+         *     The default response is config-derived and avoids slow provider calls.
          *     With include=models, each inference provider is queried live for its
          *     available models where the provider exposes a listing API. Connections
          *     that fail to respond are reported with status "error" instead of
-         *     failing the whole response.
+         *     failing the whole response. A status of "configured" means the
+         *     connection exists but was not live-probed in this response.
          */
         get: operations["listConnections"];
         put?: never;
@@ -2119,7 +2123,7 @@ export interface components {
          * @description Kind of external connection configured on this node.
          * @enum {string}
          */
-        ConnectionKind: "inference_provider" | "object_store" | "remote_content_http";
+        ConnectionKind: "inference" | "object_store" | "remote_content" | "cdc";
         /**
          * @description Connection status. "connected" means a live probe or listing succeeded,
          *     "error" means the probe failed (see the error field), "configured" means
@@ -2132,7 +2136,7 @@ export interface components {
          * @description Inference provider type for a connection.
          * @enum {string}
          */
-        ConnectionProviderType: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "anthropic" | "antfly" | "mock";
+        InferenceProviderType: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "anthropic" | "antfly" | "mock";
         /**
          * @description Model task type. Mirrors the inference registry taxonomy; "other" is
          *     used for models whose task type the provider's listing API does not
@@ -2150,8 +2154,8 @@ export interface components {
             /** @description True when this model is referenced by a configured embedder, generator, reranker, or chunker. */
             configured?: boolean;
         };
-        InferenceProviderConnection: {
-            provider: components["schemas"]["ConnectionProviderType"];
+        InferenceConnection: {
+            provider: components["schemas"]["InferenceProviderType"];
             /** @description Resolved endpoint URL when applicable. */
             url?: string;
             /** @description Cloud region (Bedrock). */
@@ -2194,9 +2198,61 @@ export interface components {
              */
             purpose?: "storage" | "inference_models" | "remote_content";
         };
-        RemoteContentHttpConnection: {
+        RemoteContentConnection: {
+            /**
+             * @description Remote content provider or protocol. Currently "http"; future providers may add new values.
+             * @example http
+             */
+            provider: string;
             /** @description Hosts or base URLs this credential applies to. */
             hosts?: string[];
+        };
+        CdcConnection: {
+            /**
+             * @description CDC provider type. Currently "postgres"; future CDC providers may add new values.
+             * @example postgres
+             */
+            provider: string;
+            /** @description Antfly table receiving changes from this CDC source. */
+            table_name: string;
+            /**
+             * Format: uint32
+             * @description Zero-based ordinal of the replication source within the table config.
+             */
+            source_ordinal: number;
+            /** @description Source-side table or stream name when reported by the provider. */
+            external_table?: string;
+            /** @description Provider replication cursor or slot name when applicable. */
+            slot_name?: string;
+            /** @description Provider publication or stream grouping name when applicable. */
+            publication_name?: string;
+            /** @description Runtime CDC phase such as snapshot, streaming, configured, or failed. */
+            phase?: string;
+            /**
+             * Format: uint64
+             * @description Source records behind, when reported by the runtime.
+             */
+            lag_records?: number;
+            /**
+             * Format: uint64
+             * @description Source commit lag in milliseconds, when reported by the runtime.
+             */
+            lag_millis?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+             */
+            last_success_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp of the last applied source change, in milliseconds.
+             */
+            last_change_applied_at_ms?: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+             */
+            updated_at_ms?: number;
         };
         Connection: {
             /** @description Stable identifier for this connection instance. */
@@ -2210,9 +2266,10 @@ export interface components {
              *     "config:embedders/openai-small" or "table:docs/index:body_vec".
              */
             sources?: string[];
-            inference_provider?: components["schemas"]["InferenceProviderConnection"];
+            inference?: components["schemas"]["InferenceConnection"];
             object_store?: components["schemas"]["ObjectStoreConnection"];
-            remote_content_http?: components["schemas"]["RemoteContentHttpConnection"];
+            remote_content?: components["schemas"]["RemoteContentConnection"];
+            cdc?: components["schemas"]["CdcConnection"];
         };
         ConnectionsResponse: {
             connections: components["schemas"]["Connection"][];
@@ -10245,7 +10302,8 @@ export interface operations {
             query?: {
                 /**
                  * @description Comma-separated list of connection kinds to include
-                 *     (e.g. "inference_provider,object_store"). Defaults to all kinds.
+                 *     (e.g. "inference,object_store,cdc"). Defaults to all
+                 *     kinds. This filters by the response "kind" field.
                  */
                 types?: string;
                 /**
@@ -10253,7 +10311,11 @@ export interface operations {
                  *     live-query each inference provider's model listing API.
                  */
                 include?: string;
-                /** @description Set to "true" to bypass the server-side cache. */
+                /**
+                 * @description Set to "true" to bypass the short server-side cache for live
+                 *     provider model listings and probes. This does not force a node
+                 *     config or metadata reload.
+                 */
                 refresh?: string;
             };
             header?: never;

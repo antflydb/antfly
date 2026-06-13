@@ -82,11 +82,15 @@ def sync_detailed(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, and remote content sources.
+    table embedding indexes), object stores, CDC replication sources, and
+    remote content sources.
+
+    The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
     available models where the provider exposes a listing API. Connections
     that fail to respond are reported with status \"error\" instead of
-    failing the whole response.
+    failing the whole response. A status of \"configured\" means the
+    connection exists but was not live-probed in this response.
 
     Args:
         types (str | Unset):
@@ -125,11 +129,15 @@ def sync(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, and remote content sources.
+    table embedding indexes), object stores, CDC replication sources, and
+    remote content sources.
+
+    The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
     available models where the provider exposes a listing API. Connections
     that fail to respond are reported with status \"error\" instead of
-    failing the whole response.
+    failing the whole response. A status of \"configured\" means the
+    connection exists but was not live-probed in this response.
 
     Args:
         types (str | Unset):
@@ -163,11 +171,15 @@ async def asyncio_detailed(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, and remote content sources.
+    table embedding indexes), object stores, CDC replication sources, and
+    remote content sources.
+
+    The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
     available models where the provider exposes a listing API. Connections
     that fail to respond are reported with status \"error\" instead of
-    failing the whole response.
+    failing the whole response. A status of \"configured\" means the
+    connection exists but was not live-probed in this response.
 
     Args:
         types (str | Unset):
@@ -204,11 +216,15 @@ async def asyncio(
 
      Enumerates external connections configured on this node: inference
     providers (from named embedder/generator/reranker/chunker configs and
-    table embedding indexes), object stores, and remote content sources.
+    table embedding indexes), object stores, CDC replication sources, and
+    remote content sources.
+
+    The default response is config-derived and avoids slow provider calls.
     With include=models, each inference provider is queried live for its
     available models where the provider exposes a listing API. Connections
     that fail to respond are reported with status \"error\" instead of
-    failing the whole response.
+    failing the whole response. A status of \"configured\" means the
+    connection exists but was not live-probed in this response.
 
     Args:
         types (str | Unset):

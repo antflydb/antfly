@@ -166,12 +166,13 @@ export type ConnectionsResponse = components["schemas"]["ConnectionsResponse"];
 export type Connection = components["schemas"]["Connection"];
 export type ConnectionKind = components["schemas"]["ConnectionKind"];
 export type ConnectionStatus = components["schemas"]["ConnectionStatus"];
-export type ConnectionProviderType = components["schemas"]["ConnectionProviderType"];
+export type InferenceProviderType = components["schemas"]["InferenceProviderType"];
 export type ConnectedModel = components["schemas"]["ConnectedModel"];
 export type ConnectedModelType = components["schemas"]["ConnectedModelType"];
-export type InferenceProviderConnection = components["schemas"]["InferenceProviderConnection"];
+export type InferenceConnection = components["schemas"]["InferenceConnection"];
 export type ObjectStoreConnection = components["schemas"]["ObjectStoreConnection"];
-export type RemoteContentHttpConnection = components["schemas"]["RemoteContentHttpConnection"];
+export type RemoteContentConnection = components["schemas"]["RemoteContentConnection"];
+export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
 export type EmbedderConfig = components["schemas"]["EmbedderConfig"];

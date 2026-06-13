@@ -2131,7 +2131,12 @@ paths:
 
         providers (from named embedder/generator/reranker/chunker configs and
 
-        table embedding indexes), object stores, and remote content sources.
+        table embedding indexes), object stores, CDC replication sources, and
+
+        remote content sources.
+
+
+        The default response is config-derived and avoids slow provider calls.
 
         With include=models, each inference provider is queried live for its
 
@@ -2139,7 +2144,9 @@ paths:
 
         that fail to respond are reported with status "error" instead of
 
-        failing the whole response.
+        failing the whole response. A status of "configured" means the
+
+        connection exists but was not live-probed in this response.
       operationId: listConnections
       parameters:
         - name: types
@@ -2148,7 +2155,9 @@ paths:
           description: >
             Comma-separated list of connection kinds to include
 
-            (e.g. "inference_provider,object_store"). Defaults to all kinds.
+            (e.g. "inference,object_store,cdc"). Defaults to all
+
+            kinds. This filters by the response "kind" field.
           schema:
             type: string
         - name: include
@@ -2163,7 +2172,12 @@ paths:
         - name: refresh
           in: query
           required: false
-          description: Set to "true" to bypass the server-side cache.
+          description: >
+            Set to "true" to bypass the short server-side cache for live
+
+            provider model listings and probes. This does not force a node
+
+            config or metadata reload.
           schema:
             type: string
       responses:
@@ -6287,9 +6301,10 @@ components:
     ConnectionKind:
       type: string
       enum:
-        - inference_provider
+        - inference
         - object_store
-        - remote_content_http
+        - remote_content
+        - cdc
       description: Kind of external connection configured on this node.
     ConnectionStatus:
       type: string
@@ -6306,7 +6321,7 @@ components:
         the connection is present but was not probed, and "unsupported" means
 
         no probe is available for this connection kind or provider.
-    ConnectionProviderType:
+    InferenceProviderType:
       type: string
       enum:
         - gemini
@@ -6358,13 +6373,13 @@ components:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker,
             or chunker.
-    InferenceProviderConnection:
+    InferenceConnection:
       type: object
       required:
         - provider
       properties:
         provider:
-          $ref: '#/components/schemas/ConnectionProviderType'
+          $ref: '#/components/schemas/InferenceProviderType'
         url:
           type: string
           description: Resolved endpoint URL when applicable.
@@ -6435,14 +6450,71 @@ components:
             - inference_models
             - remote_content
           description: What this object store is used for.
-    RemoteContentHttpConnection:
+    RemoteContentConnection:
       type: object
+      required:
+        - provider
       properties:
+        provider:
+          type: string
+          description: Remote content provider or protocol. Currently "http"; future providers may add
+            new values.
+          example: http
         hosts:
           type: array
           items:
             type: string
           description: Hosts or base URLs this credential applies to.
+    CdcConnection:
+      type: object
+      required:
+        - provider
+        - table_name
+        - source_ordinal
+      properties:
+        provider:
+          type: string
+          description: CDC provider type. Currently "postgres"; future CDC providers may add new values.
+          example: postgres
+        table_name:
+          type: string
+          description: Antfly table receiving changes from this CDC source.
+        source_ordinal:
+          type: integer
+          format: uint32
+          description: Zero-based ordinal of the replication source within the table config.
+        external_table:
+          type: string
+          description: Source-side table or stream name when reported by the provider.
+        slot_name:
+          type: string
+          description: Provider replication cursor or slot name when applicable.
+        publication_name:
+          type: string
+          description: Provider publication or stream grouping name when applicable.
+        phase:
+          type: string
+          description: Runtime CDC phase such as snapshot, streaming, configured, or failed.
+        lag_records:
+          type: integer
+          format: uint64
+          description: Source records behind, when reported by the runtime.
+        lag_millis:
+          type: integer
+          format: uint64
+          description: Source commit lag in milliseconds, when reported by the runtime.
+        last_success_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+        last_change_applied_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last applied source change, in milliseconds.
+        updated_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp when this CDC status was last updated, in milliseconds.
     Connection:
       type: object
       required:
@@ -6468,12 +6540,14 @@ components:
             Where this connection was configured, e.g.
 
             "config:embedders/openai-small" or "table:docs/index:body_vec".
-        inference_provider:
-          $ref: '#/components/schemas/InferenceProviderConnection'
+        inference:
+          $ref: '#/components/schemas/InferenceConnection'
         object_store:
           $ref: '#/components/schemas/ObjectStoreConnection'
-        remote_content_http:
-          $ref: '#/components/schemas/RemoteContentHttpConnection'
+        remote_content:
+          $ref: '#/components/schemas/RemoteContentConnection'
+        cdc:
+          $ref: '#/components/schemas/CdcConnection'
     ConnectionsResponse:
       type: object
       required:

@@ -56,6 +56,7 @@ from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
+from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
 from .chat_message import ChatMessage
@@ -95,7 +96,6 @@ from .connected_model import ConnectedModel
 from .connected_model_type import ConnectedModelType
 from .connection import Connection
 from .connection_kind import ConnectionKind
-from .connection_provider_type import ConnectionProviderType
 from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
@@ -249,6 +249,8 @@ from .inference_chunk_response_object import InferenceChunkResponseObject
 from .inference_config import InferenceConfig
 from .inference_config_model_strategies import InferenceConfigModelStrategies
 from .inference_config_model_strategies_additional_property import InferenceConfigModelStrategiesAdditionalProperty
+from .inference_connection import InferenceConnection
+from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
@@ -310,8 +312,7 @@ from .inference_predictor_task import InferencePredictorTask
 from .inference_predictors_response import InferencePredictorsResponse
 from .inference_predictors_response_object import InferencePredictorsResponseObject
 from .inference_predictors_response_predictors import InferencePredictorsResponsePredictors
-from .inference_provider_connection import InferenceProviderConnection
-from .inference_provider_connection_models import InferenceProviderConnectionModels
+from .inference_provider_type import InferenceProviderType
 from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
@@ -441,7 +442,7 @@ from .query_result_graph_results import QueryResultGraphResults
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
-from .remote_content_http_connection import RemoteContentHttpConnection
+from .remote_content_connection import RemoteContentConnection
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_transform_op import ReplicationTransformOp
@@ -605,6 +606,7 @@ __all__ = (
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "CalendarInterval",
+    "CdcConnection",
     "ChainCondition",
     "ChainLink",
     "ChatMessage",
@@ -644,7 +646,6 @@ __all__ = (
     "ConnectedModelType",
     "Connection",
     "ConnectionKind",
-    "ConnectionProviderType",
     "ConnectionsResponse",
     "ConnectionStatus",
     "CreateApiKeyRequest",
@@ -796,6 +797,8 @@ __all__ = (
     "InferenceConfig",
     "InferenceConfigModelStrategies",
     "InferenceConfigModelStrategiesAdditionalProperty",
+    "InferenceConnection",
+    "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
     "InferenceEmbeddingObject",
@@ -857,8 +860,7 @@ __all__ = (
     "InferencePredictorTask",
     "InferencePredictRequest",
     "InferencePredictResponse",
-    "InferenceProviderConnection",
-    "InferenceProviderConnectionModels",
+    "InferenceProviderType",
     "InferenceReadObject",
     "InferenceReadObjectObject",
     "InferenceReadRequest",
@@ -988,7 +990,7 @@ __all__ = (
     "QueryStrategy",
     "QueryStringQuery",
     "RegexpQuery",
-    "RemoteContentHttpConnection",
+    "RemoteContentConnection",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
     "ReplicationTransformOp",

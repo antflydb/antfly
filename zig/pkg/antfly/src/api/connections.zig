@@ -16,9 +16,10 @@
 //
 // Enumerates inference provider instances (node-config provider registry plus
 // per-table embedding index configs, deduped by provider identity), object
-// stores, and remote content sources. With the "models" expansion each
-// inference provider's list-models API is queried live; per-connection
-// failures degrade to status "error" without failing the response.
+// stores, CDC sources, and remote content sources. With the "models"
+// expansion each inference provider's list-models API is queried live;
+// per-connection failures degrade to status "error" without failing the
+// response.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,9 +36,10 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ConnectionKind = enum {
-    inference_provider,
+    inference,
     object_store,
-    remote_content_http,
+    remote_content,
+    cdc,
 };
 
 pub const ConnectionStatus = enum {
@@ -61,7 +63,7 @@ pub const ConnectedModel = struct {
     configured: ?bool = null,
 };
 
-pub const InferenceProviderConnection = struct {
+pub const InferenceConnection = struct {
     provider: list_models.ProviderTag,
     url: ?[]const u8 = null,
     region: ?[]const u8 = null,
@@ -92,8 +94,24 @@ pub const ObjectStoreConnection = struct {
     purpose: ObjectStorePurpose,
 };
 
-pub const RemoteContentHttpConnection = struct {
+pub const RemoteContentConnection = struct {
+    provider: []const u8,
     hosts: []const []const u8 = &.{},
+};
+
+pub const CdcConnection = struct {
+    provider: []const u8,
+    table_name: []const u8,
+    source_ordinal: u32,
+    external_table: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    publication_name: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    lag_records: ?u64 = null,
+    lag_millis: ?u64 = null,
+    last_success_at_ms: ?u64 = null,
+    last_change_applied_at_ms: ?u64 = null,
+    updated_at_ms: ?u64 = null,
 };
 
 pub const Connection = struct {
@@ -102,9 +120,10 @@ pub const Connection = struct {
     status: ConnectionStatus,
     @"error": ?[]const u8 = null,
     sources: []const []const u8 = &.{},
-    inference_provider: ?InferenceProviderConnection = null,
+    inference: ?InferenceConnection = null,
     object_store: ?ObjectStoreConnection = null,
-    remote_content_http: ?RemoteContentHttpConnection = null,
+    remote_content: ?RemoteContentConnection = null,
+    cdc: ?CdcConnection = null,
 };
 
 pub const ConnectionsResponse = struct {
@@ -466,7 +485,7 @@ pub fn buildConnectionsResponse(
     var connections = std.ArrayListUnmanaged(Connection).empty;
     var used_names = std.StringArrayHashMapUnmanaged(void){};
 
-    if (kinds.contains(.inference_provider)) {
+    if (kinds.contains(.inference)) {
         var state = try gatherInstances(arena, sources);
         const instances = state.instances.values();
 
@@ -478,10 +497,10 @@ pub fn buildConnectionsResponse(
         for (instances, 0..) |instance, i| {
             var connection = Connection{
                 .name = try uniqueName(arena, &used_names, primaryInstanceName(instance)),
-                .kind = .inference_provider,
+                .kind = .inference,
                 .status = if (instance.provider == .mock) .connected else .configured,
                 .sources = instance.sources.items,
-                .inference_provider = .{
+                .inference = .{
                     .provider = instance.provider,
                     .url = if (instance.url.len > 0) instance.url else null,
                     .region = if (instance.region.len > 0) instance.region else null,
@@ -495,7 +514,7 @@ pub fn buildConnectionsResponse(
                 if (values[i]) |outcome| {
                     if (outcome.ok) {
                         connection.status = .connected;
-                        connection.inference_provider.?.models = try modelsMapAlloc(arena, outcome.models, instance);
+                        connection.inference.?.models = try modelsMapAlloc(arena, outcome.models, instance);
                     } else {
                         connection.status = .@"error";
                         connection.@"error" = outcome.err_name;
@@ -510,7 +529,7 @@ pub fn buildConnectionsResponse(
         if (kinds.contains(.object_store)) {
             try appendObjectStores(arena, &connections, &used_names, node_config, cache, opts);
         }
-        if (kinds.contains(.remote_content_http)) {
+        if (kinds.contains(.remote_content)) {
             if (node_config.remote_content) |remote_content| {
                 var it = remote_content.http.iterator();
                 while (it.next()) |entry| {
@@ -518,13 +537,19 @@ pub fn buildConnectionsResponse(
                     if (entry.value_ptr.base_url) |base_url| try hosts.append(arena, base_url);
                     try connections.append(arena, .{
                         .name = try uniqueName(arena, &used_names, entry.key_ptr.*),
-                        .kind = .remote_content_http,
+                        .kind = .remote_content,
                         .status = .configured,
                         .sources = try sourcesSlice(arena, "config:remote_content/http/{s}", entry.key_ptr.*),
-                        .remote_content_http = .{ .hosts = hosts.items },
+                        .remote_content = .{ .provider = "http", .hosts = hosts.items },
                     });
                 }
             }
+        }
+    }
+
+    if (kinds.contains(.cdc)) {
+        if (sources.snapshot) |snapshot| {
+            try appendCdcConnections(arena, &connections, &used_names, snapshot);
         }
     }
 
@@ -580,6 +605,114 @@ fn sourcesSlice(arena: Allocator, comptime fmt: []const u8, name: []const u8) ![
     const out = try arena.alloc([]const u8, 1);
     out[0] = try std.fmt.allocPrint(arena, fmt, .{name});
     return out;
+}
+
+fn cdcSourcesSlice(arena: Allocator, table_name: []const u8, source_ordinal: u32) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = try std.fmt.allocPrint(arena, "table:{s}/replication_sources/{d}", .{ table_name, source_ordinal });
+    return out;
+}
+
+fn cdcStatusFromReplicationStatus(status: ?*const table_manager.ReplicationSourceStatusRecord) ConnectionStatus {
+    const record = status orelse return .configured;
+    if (record.last_error.len > 0 or record.failure_class.len > 0 or std.mem.eql(u8, record.phase, "failed")) {
+        return .@"error";
+    }
+    if (record.phase.len > 0 and !std.mem.eql(u8, record.phase, "configured")) return .connected;
+    return .configured;
+}
+
+fn appendCdcConnections(
+    arena: Allocator,
+    connections: *std.ArrayListUnmanaged(Connection),
+    used_names: *std.StringArrayHashMapUnmanaged(void),
+    snapshot: *const metadata_api.AdminSnapshot,
+) !void {
+    for (snapshot.tables) |table| {
+        if (table.replication_sources_json.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, arena, table.replication_sources_json, .{}) catch |err| {
+            std.log.warn("connections: skipping cdc sources table={s} err={}", .{ table.name, err });
+            continue;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .array) continue;
+
+        for (parsed.value.array.items, 0..) |source, source_i| {
+            if (source != .object) continue;
+            const provider = valueString(source.object.get("type")) orelse continue;
+            const source_ordinal: u32 = @intCast(source_i);
+            const status = findReplicationSourceStatus(snapshot, table.table_id, source_ordinal);
+            const external_table = if (status) |record|
+                nonEmpty(record.external_table)
+            else
+                valueString(source.object.get("postgres_table"));
+            const slot_name = if (status) |record|
+                nonEmpty(record.slot_name)
+            else
+                valueString(source.object.get("slot_name"));
+            const publication_name = if (status) |record|
+                nonEmpty(record.publication_name)
+            else
+                valueString(source.object.get("publication_name"));
+            const phase = if (status) |record| nonEmpty(record.phase) else null;
+            const name = if (external_table) |table_name|
+                try std.fmt.allocPrint(arena, "cdc-{s}-{s}", .{ table.name, table_name })
+            else
+                try std.fmt.allocPrint(arena, "cdc-{s}-{d}", .{ table.name, source_ordinal });
+
+            var connection = Connection{
+                .name = try uniqueName(arena, used_names, name),
+                .kind = .cdc,
+                .status = cdcStatusFromReplicationStatus(status),
+                .sources = try cdcSourcesSlice(arena, table.name, source_ordinal),
+                .cdc = .{
+                    .provider = provider,
+                    .table_name = table.name,
+                    .source_ordinal = source_ordinal,
+                    .external_table = external_table,
+                    .slot_name = slot_name,
+                    .publication_name = publication_name,
+                    .phase = phase,
+                    .lag_records = if (status) |record| record.lag_records else null,
+                    .lag_millis = if (status) |record| record.lag_millis else null,
+                    .last_success_at_ms = if (status) |record| nonZero(record.last_success_at_ms) else null,
+                    .last_change_applied_at_ms = if (status) |record| nonZero(record.last_change_applied_at_ms) else null,
+                    .updated_at_ms = if (status) |record| nonZero(record.updated_at_ms) else null,
+                },
+            };
+            if (status) |record| {
+                if (record.last_error.len > 0) connection.@"error" = record.last_error;
+            }
+            try connections.append(arena, connection);
+        }
+    }
+}
+
+fn findReplicationSourceStatus(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_id: u64,
+    source_ordinal: u32,
+) ?*const table_manager.ReplicationSourceStatusRecord {
+    for (snapshot.replication_source_statuses) |*status| {
+        if (status.table_id == table_id and status.source_ordinal == source_ordinal) return status;
+    }
+    return null;
+}
+
+fn valueString(value: ?std.json.Value) ?[]const u8 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .string => |string| if (string.len > 0) string else null,
+        else => null,
+    };
+}
+
+fn nonEmpty(value: []const u8) ?[]const u8 {
+    return if (value.len > 0) value else null;
+}
+
+fn nonZero(value: u64) ?u64 {
+    return if (value == 0) null else value;
 }
 
 /// Group listed models by task type into the wire map, marking models that a
@@ -967,12 +1100,61 @@ test "build response reports mock connected and types filter" {
     const connection = response.connections[0];
     try std.testing.expectEqualStrings("mocked", connection.name);
     try std.testing.expectEqual(ConnectionStatus.connected, connection.status);
-    const models = connection.inference_provider.?.models.?;
+    const models = connection.inference.?.models.?;
     try std.testing.expect(models.map.get("embedders") != null);
     try std.testing.expect(models.map.get("generators") != null);
 
     const filtered = try buildConnectionsResponse(arena, .{ .registry = &registry }, null, .{ .types_filter = "object_store" });
     try std.testing.expectEqual(@as(usize, 0), filtered.connections.len);
+}
+
+test "build response includes cdc replication sources with generic cdc kind" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tables = [_]table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "users",
+        .replication_sources_json =
+        \\[{"type":"postgres","dsn":"${secret:pg}","postgres_table":"public.users","slot_name":"slot_cfg","publication_name":"pub_cfg"}]
+        ,
+    }};
+    var statuses = [_]table_manager.ReplicationSourceStatusRecord{.{
+        .table_id = 7,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "public.users",
+        .slot_name = "slot_live",
+        .publication_name = "pub_live",
+        .phase = "streaming",
+        .lag_records = 2,
+        .lag_millis = 34,
+        .last_success_at_ms = 1000,
+        .updated_at_ms = 1100,
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = undefined,
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+        .replication_source_statuses = statuses[0..],
+    };
+
+    const response = try buildConnectionsResponse(arena, .{ .snapshot = &snapshot }, null, .{ .types_filter = "cdc" });
+    try std.testing.expectEqual(@as(usize, 1), response.connections.len);
+    const connection = response.connections[0];
+    try std.testing.expectEqual(ConnectionKind.cdc, connection.kind);
+    try std.testing.expectEqual(ConnectionStatus.connected, connection.status);
+    try std.testing.expectEqualStrings("postgres", connection.cdc.?.provider);
+    try std.testing.expectEqualStrings("users", connection.cdc.?.table_name);
+    try std.testing.expectEqualStrings("public.users", connection.cdc.?.external_table.?);
+    try std.testing.expectEqualStrings("slot_live", connection.cdc.?.slot_name.?);
+    try std.testing.expectEqual(@as(u64, 34), connection.cdc.?.lag_millis.?);
 }
 
 test "include param parsing" {

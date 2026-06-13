@@ -122,7 +122,7 @@ export function useConnectionsWithModels(): ConnectionsState {
 export function useConnectedModels(): ConnectedModelsState {
   const state = useConnectionsInternal(true);
   return {
-    providers: state.connections.filter((connection) => connection.kind === "inference_provider"),
+    providers: state.connections.filter((connection) => connection.kind === "inference"),
     supported: state.supported,
     loading: state.loading,
     error: state.error,
@@ -145,7 +145,7 @@ export function liveModelSuggestions(
 ): Record<string, string[]> {
   const suggestions: Record<string, string[]> = {};
   for (const connection of providers) {
-    const provider = connection.inference_provider;
+    const provider = connection.inference;
     if (!provider || connection.status !== "connected") continue;
     const models = provider.models;
     if (!models) continue;

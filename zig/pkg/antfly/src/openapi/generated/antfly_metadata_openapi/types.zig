@@ -53,15 +53,17 @@ pub const ClusterHealth = enum {
 
 /// Kind of external connection configured on this node.
 pub const ConnectionKind = enum {
-    inference_provider,
+    inference,
     object_store,
-    remote_content_http,
+    remote_content,
+    cdc,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .inference_provider => "inference_provider",
+            .inference => "inference",
             .object_store => "object_store",
-            .remote_content_http => "remote_content_http",
+            .remote_content => "remote_content",
+            .cdc => "cdc",
         };
         try jw.write(s);
     }
@@ -72,9 +74,10 @@ pub const ConnectionKind = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "inference_provider", .inference_provider },
+            .{ "inference", .inference },
             .{ "object_store", .object_store },
-            .{ "remote_content_http", .remote_content_http },
+            .{ "remote_content", .remote_content },
+            .{ "cdc", .cdc },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -113,7 +116,7 @@ pub const ConnectionStatus = enum {
 };
 
 /// Inference provider type for a connection.
-pub const ConnectionProviderType = enum {
+pub const InferenceProviderType = enum {
     gemini,
     vertex,
     ollama,
@@ -239,9 +242,38 @@ pub const ObjectStoreConnection = struct {
     purpose: ?[]const u8 = null,
 };
 
-pub const RemoteContentHttpConnection = struct {
+pub const RemoteContentConnection = struct {
+    /// Remote content provider or protocol. Currently "http"; future providers may add new values.
+    provider: []const u8,
     /// Hosts or base URLs this credential applies to.
     hosts: ?[]const []const u8 = null,
+};
+
+pub const CdcConnection = struct {
+    /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
+    provider: []const u8,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: []const u8,
+    /// Zero-based ordinal of the replication source within the table config.
+    source_ordinal: i64,
+    /// Source-side table or stream name when reported by the provider.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+    /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
+    phase: ?[]const u8 = null,
+    /// Source records behind, when reported by the runtime.
+    lag_records: ?i64 = null,
+    /// Source commit lag in milliseconds, when reported by the runtime.
+    lag_millis: ?i64 = null,
+    /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+    last_success_at_ms: ?i64 = null,
+    /// Wall-clock timestamp of the last applied source change, in milliseconds.
+    last_change_applied_at_ms: ?i64 = null,
+    /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+    updated_at_ms: ?i64 = null,
 };
 
 /// Parsed child-range descriptor from a derived document artifact manifest.
@@ -1625,8 +1657,8 @@ pub const ReplicationTransformOp = struct {
     value: ?std.json.Value = null,
 };
 
-pub const InferenceProviderConnection = struct {
-    provider: ConnectionProviderType,
+pub const InferenceConnection = struct {
+    provider: InferenceProviderType,
     /// Resolved endpoint URL when applicable.
     url: ?[]const u8 = null,
     /// Cloud region (Bedrock).
@@ -2163,9 +2195,10 @@ pub const Connection = struct {
     @"error": ?[]const u8 = null,
     /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
     sources: ?[]const []const u8 = null,
-    inference_provider: ?InferenceProviderConnection = null,
+    inference: ?InferenceConnection = null,
     object_store: ?ObjectStoreConnection = null,
-    remote_content_http: ?RemoteContentHttpConnection = null,
+    remote_content: ?RemoteContentConnection = null,
+    cdc: ?CdcConnection = null,
 };
 
 /// Available derived document artifact manifests for a source document.

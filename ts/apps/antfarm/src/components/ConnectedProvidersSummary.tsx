@@ -8,7 +8,7 @@ import { useConnectedModels } from "@/hooks/use-connections";
 import { cn } from "@/lib/utils";
 
 function modelCount(connection: Connection): number {
-  const models = connection.inference_provider?.models;
+  const models = connection.inference?.models;
   if (!models) return 0;
   return Object.values(models).reduce((total, group) => total + (group?.length ?? 0), 0);
 }
@@ -47,7 +47,7 @@ export function ConnectedProvidersSummary() {
             key={connection.name}
             type="button"
             onClick={() => navigate("/connections")}
-            title={`${providerTypeLabel(connection.inference_provider?.provider ?? "")}${
+            title={`${providerTypeLabel(connection.inference?.provider ?? "")}${
               connection.error ? ` — ${connection.error}` : ""
             }`}
             className="inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border bg-muted text-muted-foreground hover:text-foreground transition-colors"

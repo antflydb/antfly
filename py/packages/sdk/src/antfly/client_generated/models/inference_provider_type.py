@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class ConnectionProviderType(str, Enum):
+class InferenceProviderType(str, Enum):
     ANTFLY = "antfly"
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"

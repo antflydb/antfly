@@ -7,29 +7,28 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.connected_model_type import ConnectedModelType
-from ..models.connection_provider_type import ConnectionProviderType
+from ..models.inference_provider_type import InferenceProviderType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_provider_connection_models import InferenceProviderConnectionModels
+    from ..models.inference_connection_models import InferenceConnectionModels
 
 
-T = TypeVar("T", bound="InferenceProviderConnection")
+T = TypeVar("T", bound="InferenceConnection")
 
 
 @_attrs_define
-class InferenceProviderConnection:
+class InferenceConnection:
     """
     Attributes:
-        provider (ConnectionProviderType): Inference provider type for a connection.
+        provider (InferenceProviderType): Inference provider type for a connection.
         url (str | Unset): Resolved endpoint URL when applicable.
         region (str | Unset): Cloud region (Bedrock).
         project_id (str | Unset): Google Cloud project (Vertex).
         location (str | Unset): Google Cloud location (Vertex).
         names (list[str] | Unset): Named registry entries from node config that resolve to this provider instance.
         configured_model_types (list[ConnectedModelType] | Unset): Model types this instance is configured for.
-        models (InferenceProviderConnectionModels | Unset): Models reported by the provider, grouped by model type. Keys
-            are
+        models (InferenceConnectionModels | Unset): Models reported by the provider, grouped by model type. Keys are
             pluralized ConnectedModelType values ("embedders", "generators",
             "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
             "readers", "transcribers", "extractors") plus "other" for models
@@ -37,14 +36,14 @@ class InferenceProviderConnection:
             only when the request includes the "models" expansion.
     """
 
-    provider: ConnectionProviderType
+    provider: InferenceProviderType
     url: str | Unset = UNSET
     region: str | Unset = UNSET
     project_id: str | Unset = UNSET
     location: str | Unset = UNSET
     names: list[str] | Unset = UNSET
     configured_model_types: list[ConnectedModelType] | Unset = UNSET
-    models: InferenceProviderConnectionModels | Unset = UNSET
+    models: InferenceConnectionModels | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -99,10 +98,10 @@ class InferenceProviderConnection:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_provider_connection_models import InferenceProviderConnectionModels
+        from ..models.inference_connection_models import InferenceConnectionModels
 
         d = dict(src_dict)
-        provider = ConnectionProviderType(d.pop("provider"))
+        provider = InferenceProviderType(d.pop("provider"))
 
         url = d.pop("url", UNSET)
 
@@ -124,13 +123,13 @@ class InferenceProviderConnection:
                 configured_model_types.append(configured_model_types_item)
 
         _models = d.pop("models", UNSET)
-        models: InferenceProviderConnectionModels | Unset
+        models: InferenceConnectionModels | Unset
         if isinstance(_models, Unset):
             models = UNSET
         else:
-            models = InferenceProviderConnectionModels.from_dict(_models)
+            models = InferenceConnectionModels.from_dict(_models)
 
-        inference_provider_connection = cls(
+        inference_connection = cls(
             provider=provider,
             url=url,
             region=region,
@@ -141,8 +140,8 @@ class InferenceProviderConnection:
             models=models,
         )
 
-        inference_provider_connection.additional_properties = d
-        return inference_provider_connection
+        inference_connection.additional_properties = d
+        return inference_connection
 
     @property
     def additional_keys(self) -> list[str]:

@@ -11,9 +11,10 @@ from ..models.connection_status import ConnectionStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.inference_provider_connection import InferenceProviderConnection
+    from ..models.cdc_connection import CdcConnection
+    from ..models.inference_connection import InferenceConnection
     from ..models.object_store_connection import ObjectStoreConnection
-    from ..models.remote_content_http_connection import RemoteContentHttpConnection
+    from ..models.remote_content_connection import RemoteContentConnection
 
 
 T = TypeVar("T", bound="Connection")
@@ -32,9 +33,10 @@ class Connection:
         error (str | Unset): Failure detail when status is "error".
         sources (list[str] | Unset): Where this connection was configured, e.g.
             "config:embedders/openai-small" or "table:docs/index:body_vec".
-        inference_provider (InferenceProviderConnection | Unset):
+        inference (InferenceConnection | Unset):
         object_store (ObjectStoreConnection | Unset):
-        remote_content_http (RemoteContentHttpConnection | Unset):
+        remote_content (RemoteContentConnection | Unset):
+        cdc (CdcConnection | Unset):
     """
 
     name: str
@@ -42,9 +44,10 @@ class Connection:
     status: ConnectionStatus
     error: str | Unset = UNSET
     sources: list[str] | Unset = UNSET
-    inference_provider: InferenceProviderConnection | Unset = UNSET
+    inference: InferenceConnection | Unset = UNSET
     object_store: ObjectStoreConnection | Unset = UNSET
-    remote_content_http: RemoteContentHttpConnection | Unset = UNSET
+    remote_content: RemoteContentConnection | Unset = UNSET
+    cdc: CdcConnection | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,17 +63,21 @@ class Connection:
         if not isinstance(self.sources, Unset):
             sources = self.sources
 
-        inference_provider: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.inference_provider, Unset):
-            inference_provider = self.inference_provider.to_dict()
+        inference: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.inference, Unset):
+            inference = self.inference.to_dict()
 
         object_store: dict[str, Any] | Unset = UNSET
         if not isinstance(self.object_store, Unset):
             object_store = self.object_store.to_dict()
 
-        remote_content_http: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.remote_content_http, Unset):
-            remote_content_http = self.remote_content_http.to_dict()
+        remote_content: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.remote_content, Unset):
+            remote_content = self.remote_content.to_dict()
+
+        cdc: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.cdc, Unset):
+            cdc = self.cdc.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -85,20 +92,23 @@ class Connection:
             field_dict["error"] = error
         if sources is not UNSET:
             field_dict["sources"] = sources
-        if inference_provider is not UNSET:
-            field_dict["inference_provider"] = inference_provider
+        if inference is not UNSET:
+            field_dict["inference"] = inference
         if object_store is not UNSET:
             field_dict["object_store"] = object_store
-        if remote_content_http is not UNSET:
-            field_dict["remote_content_http"] = remote_content_http
+        if remote_content is not UNSET:
+            field_dict["remote_content"] = remote_content
+        if cdc is not UNSET:
+            field_dict["cdc"] = cdc
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inference_provider_connection import InferenceProviderConnection
+        from ..models.cdc_connection import CdcConnection
+        from ..models.inference_connection import InferenceConnection
         from ..models.object_store_connection import ObjectStoreConnection
-        from ..models.remote_content_http_connection import RemoteContentHttpConnection
+        from ..models.remote_content_connection import RemoteContentConnection
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -111,12 +121,12 @@ class Connection:
 
         sources = cast(list[str], d.pop("sources", UNSET))
 
-        _inference_provider = d.pop("inference_provider", UNSET)
-        inference_provider: InferenceProviderConnection | Unset
-        if isinstance(_inference_provider, Unset):
-            inference_provider = UNSET
+        _inference = d.pop("inference", UNSET)
+        inference: InferenceConnection | Unset
+        if isinstance(_inference, Unset):
+            inference = UNSET
         else:
-            inference_provider = InferenceProviderConnection.from_dict(_inference_provider)
+            inference = InferenceConnection.from_dict(_inference)
 
         _object_store = d.pop("object_store", UNSET)
         object_store: ObjectStoreConnection | Unset
@@ -125,12 +135,19 @@ class Connection:
         else:
             object_store = ObjectStoreConnection.from_dict(_object_store)
 
-        _remote_content_http = d.pop("remote_content_http", UNSET)
-        remote_content_http: RemoteContentHttpConnection | Unset
-        if isinstance(_remote_content_http, Unset):
-            remote_content_http = UNSET
+        _remote_content = d.pop("remote_content", UNSET)
+        remote_content: RemoteContentConnection | Unset
+        if isinstance(_remote_content, Unset):
+            remote_content = UNSET
         else:
-            remote_content_http = RemoteContentHttpConnection.from_dict(_remote_content_http)
+            remote_content = RemoteContentConnection.from_dict(_remote_content)
+
+        _cdc = d.pop("cdc", UNSET)
+        cdc: CdcConnection | Unset
+        if isinstance(_cdc, Unset):
+            cdc = UNSET
+        else:
+            cdc = CdcConnection.from_dict(_cdc)
 
         connection = cls(
             name=name,
@@ -138,9 +155,10 @@ class Connection:
             status=status,
             error=error,
             sources=sources,
-            inference_provider=inference_provider,
+            inference=inference,
             object_store=object_store,
-            remote_content_http=remote_content_http,
+            remote_content=remote_content,
+            cdc=cdc,
         )
 
         connection.additional_properties = d

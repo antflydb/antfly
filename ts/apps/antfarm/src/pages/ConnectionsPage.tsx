@@ -11,7 +11,7 @@ import {
   MonoLabel,
 } from "@antfly/design-system";
 import type { ConnectedModel, Connection } from "@antfly/sdk";
-import { AlertCircle, Check, ChevronDown, Globe, HardDrive, RefreshCw } from "lucide-react";
+import { AlertCircle, Check, ChevronDown, Database, Globe, HardDrive, RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { AntyEmptyState, ErrorState } from "@/components/branded-empty-state";
 import {
@@ -102,7 +102,7 @@ function ModelGroup({
 }
 
 function ProviderCard({ connection }: { connection: Connection }) {
-  const provider = connection.inference_provider;
+  const provider = connection.inference;
   if (!provider) return null;
   const Icon = providerTypeIcon(provider.provider);
   const models = provider.models ?? {};
@@ -183,7 +183,7 @@ function ProviderCard({ connection }: { connection: Connection }) {
 
 function InfrastructureCard({ connection }: { connection: Connection }) {
   const objectStore = connection.object_store;
-  const http = connection.remote_content_http;
+  const remoteContent = connection.remote_content;
   const Icon = objectStore ? HardDrive : Globe;
 
   return (
@@ -209,9 +209,15 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
               ) : null}
             </p>
           )}
-          {http && (http.hosts?.length ?? 0) > 0 && (
-            <p className="text-xs text-muted-foreground font-mono truncate">
-              {http.hosts?.join(", ")}
+          {remoteContent && (
+            <p className="text-xs text-muted-foreground truncate">
+              {remoteContent.provider.toUpperCase()}
+              {(remoteContent.hosts?.length ?? 0) > 0 ? (
+                <span className="font-mono" title={remoteContent.hosts?.join(", ")}>
+                  {" · "}
+                  {remoteContent.hosts?.join(", ")}
+                </span>
+              ) : null}
             </p>
           )}
           {objectStore && (objectStore.buckets?.length ?? 0) > 0 && (
@@ -238,13 +244,77 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
   );
 }
 
+function CdcCard({ connection }: { connection: Connection }) {
+  const cdc = connection.cdc;
+  if (!cdc) return null;
+
+  return (
+    <div className="bg-card border border-border rounded-none p-5">
+      <div className="flex items-start gap-3">
+        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+          <Database className="w-4.5 h-4.5 text-muted-foreground" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium truncate">{connection.name}</h3>
+            <StatusBadge connection={connection} />
+          </div>
+          <p className="text-xs text-muted-foreground truncate">
+            {cdc.provider.toUpperCase()} · {cdc.table_name}
+            {cdc.external_table ? (
+              <span className="font-mono" title={cdc.external_table}>
+                {" <- "}
+                {cdc.external_table}
+              </span>
+            ) : null}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {cdc.phase && (
+              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+                {cdc.phase}
+              </span>
+            )}
+            {cdc.lag_millis !== undefined && (
+              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+                lag {cdc.lag_millis}ms
+              </span>
+            )}
+            {cdc.slot_name && (
+              <span
+                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                title={cdc.slot_name}
+              >
+                slot {cdc.slot_name}
+              </span>
+            )}
+            {cdc.publication_name && (
+              <span
+                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                title={cdc.publication_name}
+              >
+                pub {cdc.publication_name}
+              </span>
+            )}
+          </div>
+          {connection.error && (
+            <p className="text-xs text-destructive mt-2 line-clamp-2" title={connection.error}>
+              {connection.error}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ConnectionsPage() {
   const { connections, supported, loading, error, retry } = useConnectionsWithModels();
 
-  const providers = connections.filter((connection) => connection.kind === "inference_provider");
+  const providers = connections.filter((connection) => connection.kind === "inference");
   const infrastructure = connections.filter(
-    (connection) => connection.kind !== "inference_provider"
+    (connection) => connection.kind === "object_store" || connection.kind === "remote_content"
   );
+  const cdcConnections = connections.filter((connection) => connection.kind === "cdc");
   const connectedCount = connections.filter(
     (connection) => connection.status === "connected"
   ).length;
@@ -307,7 +377,7 @@ export default function ConnectionsPage() {
           <DashboardPageTitle className="font-aeonik">Connections</DashboardPageTitle>
           <DashboardPageDescription>
             External services this node is configured to use: inference providers with their live
-            model inventories, object stores, and remote content sources.
+            model inventories, object stores, CDC sources, and remote content sources.
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -354,6 +424,17 @@ export default function ConnectionsPage() {
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {infrastructure.map((connection) => (
                   <InfrastructureCard key={connection.name} connection={connection} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {cdcConnections.length > 0 && (
+            <section>
+              <MonoLabel className="mb-3 block">CDC sources</MonoLabel>
+              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                {cdcConnections.map((connection) => (
+                  <CdcCard key={connection.name} connection={connection} />
                 ))}
               </div>
             </section>

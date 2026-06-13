@@ -8,27 +8,36 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="RemoteContentHttpConnection")
+T = TypeVar("T", bound="RemoteContentConnection")
 
 
 @_attrs_define
-class RemoteContentHttpConnection:
+class RemoteContentConnection:
     """
     Attributes:
+        provider (str): Remote content provider or protocol. Currently "http"; future providers may add new values.
+            Example: http.
         hosts (list[str] | Unset): Hosts or base URLs this credential applies to.
     """
 
+    provider: str
     hosts: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider
+
         hosts: list[str] | Unset = UNSET
         if not isinstance(self.hosts, Unset):
             hosts = self.hosts
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
+        field_dict.update(
+            {
+                "provider": provider,
+            }
+        )
         if hosts is not UNSET:
             field_dict["hosts"] = hosts
 
@@ -37,14 +46,17 @@ class RemoteContentHttpConnection:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = d.pop("provider")
+
         hosts = cast(list[str], d.pop("hosts", UNSET))
 
-        remote_content_http_connection = cls(
+        remote_content_connection = cls(
+            provider=provider,
             hosts=hosts,
         )
 
-        remote_content_http_connection.additional_properties = d
-        return remote_content_http_connection
+        remote_content_connection.additional_properties = d
+        return remote_content_connection
 
     @property
     def additional_keys(self) -> list[str]:

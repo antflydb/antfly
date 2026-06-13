@@ -32,11 +32,11 @@ pub fn ApiResponse(comptime T: type) type {
 }
 
 pub const ListConnectionsParams = struct {
-    /// Comma-separated list of connection kinds to include (e.g. "inference_provider,object_store"). Defaults to all kinds.
+    /// Comma-separated list of connection kinds to include (e.g. "inference,object_store,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
     /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
     include: ?[]const u8 = null,
-    /// Set to "true" to bypass the server-side cache.
+    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
     refresh: ?[]const u8 = null,
 };
 

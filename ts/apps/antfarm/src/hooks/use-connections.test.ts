@@ -8,9 +8,9 @@ import { liveModelSuggestions } from "./use-connections";
 function providerConnection(overrides: Partial<Connection> = {}): Connection {
   return {
     name: "openai",
-    kind: "inference_provider",
+    kind: "inference",
     status: "connected",
-    inference_provider: {
+    inference: {
       provider: "openai",
       models: {
         embedders: [{ name: "text-embedding-3-small" }],
@@ -36,7 +36,7 @@ describe("liveModelSuggestions", () => {
     const suggestions = liveModelSuggestions(
       [
         providerConnection({
-          inference_provider: { provider: "openai" },
+          inference: { provider: "openai" },
         }),
       ],
       "embedder"
@@ -48,7 +48,7 @@ describe("liveModelSuggestions", () => {
     const first = providerConnection();
     const second = providerConnection({
       name: "openai-2",
-      inference_provider: {
+      inference: {
         provider: "openai",
         models: {
           embedders: [{ name: "text-embedding-3-small" }, { name: "text-embedding-3-large" }],
@@ -62,7 +62,7 @@ describe("liveModelSuggestions", () => {
   it("returns generator models for the generator kind", () => {
     const connection = providerConnection({
       name: "claude",
-      inference_provider: {
+      inference: {
         provider: "anthropic",
         models: {
           generators: [{ name: "claude-sonnet-4-5" }],
