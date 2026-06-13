@@ -2887,6 +2887,19 @@ pub const PostingStore = struct {
     pub fn materializeBaseDeltaMembers(index: anytype, txn: anytype, posting_id: PostingId, is_not_found: fn (anyerror) bool) ![]VectorId {
         if (useSegmentPostingBackend(index)) {
             const Index = IndexType(@TypeOf(index));
+            if (comptime @hasDecl(Index, "loadPostingBackendBaseData") and @hasDecl(Index, "applyPostingBackendDeltaTailIntoScratch")) {
+                const base_data = try index.loadPostingBackendBaseData(txn, posting_id, is_not_found);
+                defer index.alloc.free(base_data);
+                var scratch = FoldScratch{};
+                defer scratch.deinit(index.alloc);
+                const base_header = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
+                var materialized_len = base_header.member_count;
+                if (baseDeltaIsCanonical(index))
+                    _ = try applyDeltaTailIntoScratchAdaptiveSorted(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation)
+                else
+                    _ = try applyDeltaTailIntoScratchAdaptive(index, txn, posting_id, index.alloc, &scratch, &materialized_len, base_header.generation);
+                return try index.alloc.dupe(VectorId, scratch.member_ids[0..materialized_len]);
+            }
             if (comptime @hasDecl(Index, "materializePostingBackendMembers")) {
                 return index.materializePostingBackendMembers(txn, posting_id, is_not_found);
             }
@@ -5488,7 +5501,7 @@ test "posting store segment backend hooks route posting persistence" {
     );
     try std.testing.expectEqualSlices(VectorId, &.{ 20, 30 }, query_members);
     try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
-    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_member_materializations);
+    try std.testing.expectEqual(@as(u64, 0), index.posting_backend_member_materializations);
     try std.testing.expectEqual(@as(u64, 2), profile.posting_delta_replay_records);
 
     const folded = try PostingStore.foldDeltaTailIntoBaseWithOptions(&index, &txn, 9, isNotFoundForPostingPersistenceTest, .{
