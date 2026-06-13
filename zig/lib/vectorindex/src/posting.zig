@@ -631,6 +631,66 @@ pub const PostingFormat = struct {
         };
     }
 
+    pub fn materializeSortedBaseWithCompactDeltaRecordsIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_data: []const u8,
+    ) !usize {
+        var base_iter = try BaseMemberIterator.init(base_data);
+        stableSortCompactDeltaRecordsByVector(scratch);
+        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + scratch.compactDeltaRecordCount());
+        const out = scratch.member_ids;
+        var out_count: usize = 0;
+        var maybe_base = try base_iter.next();
+        var record_index: usize = 0;
+
+        while (maybe_base != null or record_index < scratch.compact_delta_count) {
+            if (record_index >= scratch.compact_delta_count) {
+                out[out_count] = maybe_base.?;
+                out_count += 1;
+                maybe_base = try base_iter.next();
+                continue;
+            }
+
+            const vector_id = scratch.compact_delta_ids[record_index];
+            var last_op = scratch.compact_delta_ops[record_index];
+            record_index += 1;
+            while (record_index < scratch.compact_delta_count and scratch.compact_delta_ids[record_index] == vector_id) : (record_index += 1) {
+                last_op = scratch.compact_delta_ops[record_index];
+            }
+
+            while (maybe_base) |base_member| {
+                if (base_member >= vector_id) break;
+                out[out_count] = base_member;
+                out_count += 1;
+                maybe_base = try base_iter.next();
+            }
+            const present_in_base = if (maybe_base) |base_member| base_member == vector_id else false;
+            if (last_op != .tombstone) {
+                out[out_count] = vector_id;
+                out_count += 1;
+            }
+            if (present_in_base) maybe_base = try base_iter.next();
+        }
+        try base_iter.finish();
+        return out_count;
+    }
+
+    pub fn stableSortCompactDeltaRecordsByVector(scratch: anytype) void {
+        var i: usize = 1;
+        while (i < scratch.compact_delta_count) : (i += 1) {
+            const id = scratch.compact_delta_ids[i];
+            const op = scratch.compact_delta_ops[i];
+            var j = i;
+            while (j > 0 and scratch.compact_delta_ids[j - 1] > id) : (j -= 1) {
+                scratch.compact_delta_ids[j] = scratch.compact_delta_ids[j - 1];
+                scratch.compact_delta_ops[j] = scratch.compact_delta_ops[j - 1];
+            }
+            scratch.compact_delta_ids[j] = id;
+            scratch.compact_delta_ops[j] = op;
+        }
+    }
+
     fn streamSortedBaseWithCompactDeltaRecords(sink: anytype, base_data: []const u8, scratch: anytype) !usize {
         var base_iter = try BaseMemberIterator.init(base_data);
         var member_count: usize = 0;

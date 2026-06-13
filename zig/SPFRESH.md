@@ -193,7 +193,9 @@ Current status:
   micro-batch append primitive. Segment folds can now materialize and re-encode
   directly through retained fold scratch, avoiding separate owned
   materialized-member and encoded-base allocations before publishing the folded
-  base. A runtime-facing directory store adapter now owns the lazy
+  base; when canonical base ordering is active, they use a sorted compact
+  delta merge instead of linear remove/apply replay. A runtime-facing directory
+  store adapter now owns the lazy
   manifest snapshot plus the bounded batch writer, making flushed
   base/delta/centroid appends visible through refreshed lazy snapshots and
   refreshing again after bounded directory maintenance. A

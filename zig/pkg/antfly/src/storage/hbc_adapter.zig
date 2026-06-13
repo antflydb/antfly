@@ -2823,8 +2823,9 @@ pub const HBCIndex = struct {
         posting_id: u64,
         generation: u64,
         members: []const vectorindex_posting.VectorId,
+        members_are_sorted: bool,
     ) !vectorindex_posting.PostingFormat.EncodedBaseResult {
-        const encoded_members = if (self.postingSegmentBaseMembersShouldSort()) blk: {
+        const encoded_members = if (self.postingSegmentBaseMembersShouldSort() and !members_are_sorted) blk: {
             try scratch.ensureCompactDeltaCapacity(self.alloc, members.len);
             @memcpy(scratch.compact_delta_ids[0..members.len], members);
             std.mem.sort(
@@ -3512,10 +3513,13 @@ pub const HBCIndex = struct {
             };
         }
 
-        const materialized_count = (try snapshot.materializeMembersIntoScratch(self.alloc, posting_id, &scratch)) orelse return error.NotFound;
+        const materialized_count = if (self.postingSegmentBaseMembersShouldSort())
+            (try snapshot.materializeSortedMembersIntoScratch(self.alloc, posting_id, &scratch)) orelse return error.NotFound
+        else
+            (try snapshot.materializeMembersIntoScratch(self.alloc, posting_id, &scratch)) orelse return error.NotFound;
         const materialized = scratch.member_ids[0..materialized_count];
         const next_generation = base_header.generation +| 1;
-        const encoded = try self.encodePostingSegmentBaseIntoScratch(&scratch, posting_id, next_generation, materialized);
+        const encoded = try self.encodePostingSegmentBaseIntoScratch(&scratch, posting_id, next_generation, materialized, self.postingSegmentBaseMembersShouldSort());
         try runtime.store.appendBase(posting_id, encoded.encoded);
         return .{
             .delta_records = tail_stats.records,
