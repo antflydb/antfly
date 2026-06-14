@@ -1619,14 +1619,26 @@ test "cluster backup manifest round trips extension metadata" {
         .granted_capabilities = &.{.{ .name = "read:table", .scope = "memories" }},
         .status = .ready,
     }};
-    const members = [_]metadata_mod.ExtensionMember{.{
-        .extension_name = "memoryaf",
-        .scope = .{ .kind = .table, .table_name = "memories" },
-        .object_kind = .data_shape,
-        .object_name = "memory_record",
-        .shape_version = "1",
-        .owner_metadata_json = "{\"type\":\"object\"}",
-    }};
+    const members = [_]metadata_mod.ExtensionMember{
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .data_shape,
+            .object_name = "memory_record",
+            .shape_kind = .document,
+            .shape_version = "1",
+            .owner_metadata_json = "{\"type\":\"object\"}",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .generated_artifact,
+            .object_name = "memory_embedding",
+            .shape_name = "memory_embedding_shape",
+            .shape_version = "2",
+            .owner_metadata_json = "{\"kind\":\"embedding\"}",
+        },
+    };
 
     var manifest = try createClusterManifestWithExtensions(
         std.testing.allocator,
@@ -1648,9 +1660,13 @@ test "cluster backup manifest round trips extension metadata" {
     try std.testing.expectEqualStrings("memories", loaded.installed_extensions[0].scope.table_name);
     try std.testing.expectEqual(@as(usize, 1), loaded.installed_extensions[0].granted_capabilities.len);
     try std.testing.expectEqualStrings("read:table", loaded.installed_extensions[0].granted_capabilities[0].name);
-    try std.testing.expectEqual(@as(usize, 1), loaded.extension_members.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.extension_members.len);
     try std.testing.expectEqual(.data_shape, loaded.extension_members[0].object_kind);
+    try std.testing.expectEqual(metadata_mod.DataShapeKind.document, loaded.extension_members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"type\":\"object\"}", loaded.extension_members[0].owner_metadata_json);
+    try std.testing.expectEqual(.generated_artifact, loaded.extension_members[1].object_kind);
+    try std.testing.expectEqualStrings("memory_embedding_shape", loaded.extension_members[1].shape_name);
+    try std.testing.expectEqualStrings("2", loaded.extension_members[1].shape_version);
 }
 
 test "backup location parsing requires absolute file uri" {

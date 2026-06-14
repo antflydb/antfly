@@ -18352,6 +18352,8 @@ components:
           type: string
         table_name:
           type: string
+        shape_name:
+          type: string
         shape_version:
           type: string
         owner_metadata_json:
