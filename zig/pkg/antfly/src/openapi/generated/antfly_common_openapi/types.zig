@@ -24,6 +24,145 @@ pub const NamedChainLink = struct {
     condition: ?antfly_generating_openapi.ChainCondition = null,
 };
 
+/// Broad physical category for a configured connection.
+pub const ConnectionKind = enum {
+    inference,
+    web_search,
+    external_io,
+    cdc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference => "inference",
+            .web_search => "web_search",
+            .external_io => "external_io",
+            .cdc => "cdc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference", .inference },
+            .{ "web_search", .web_search },
+            .{ "external_io", .external_io },
+            .{ "cdc", .cdc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// External IO transport protocol.
+pub const ExternalIoProtocol = enum {
+    s3,
+    gcs,
+    filesystem,
+    http,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .s3 => "s3",
+            .gcs => "gcs",
+            .filesystem => "filesystem",
+            .http => "http",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "s3", .s3 },
+            .{ "gcs", .gcs },
+            .{ "filesystem", .filesystem },
+            .{ "http", .http },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceConnectionConfig = struct {
+    /// Inference provider type, such as openai, anthropic, antfly, ollama, or mock.
+    provider: []const u8,
+    /// Provider endpoint URL when applicable.
+    url: ?[]const u8 = null,
+    /// Provider API key or secret reference. Never returned by inventory APIs.
+    api_key: ?[]const u8 = null,
+    /// Cloud region when applicable.
+    region: ?[]const u8 = null,
+    /// Google Cloud project when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    location: ?[]const u8 = null,
+    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    credentials_path: ?[]const u8 = null,
+    /// Optional aliases for this provider instance.
+    names: ?[]const []const u8 = null,
+    /// Model types this connection is configured to serve.
+    configured_model_types: ?[]const []const u8 = null,
+};
+
+pub const WebSearchConnectionConfig = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Request provider safe-search filtering.
+    safe_search: ?bool = null,
+    /// Preferred result language, such as en.
+    language: ?[]const u8 = null,
+    /// Preferred result region, such as us.
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported.
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported.
+    include_highlights: ?bool = null,
+    /// Provider API key or secret reference. Never returned by inventory APIs.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+    credentials_path: ?[]const u8 = null,
+    /// Only include results from these domains when provider supports it.
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains when provider supports it.
+    exclude_domains: ?[]const []const u8 = null,
+};
+
+pub const CdcConnectionConfig = struct {
+    /// CDC provider type. Initially postgres.
+    provider: []const u8,
+    /// Source DSN or secret reference. Never returned by inventory APIs.
+    dsn: ?[]const u8 = null,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: ?[]const u8 = null,
+    /// Zero-based ordinal of the source within the table's CDC runtime.
+    source_ordinal: ?i64 = null,
+    /// Source-side table or stream name.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+};
+
 pub const MetadataInfo = struct {
     /// Mapping from Metadata Node ID (hex string) to its URL used by store nodes for enrolling into the cluster
     orchestration_urls: ?std.json.ArrayHashMap([]const u8) = null,
@@ -74,11 +213,47 @@ pub const StorageBackend = enum {
     }
 };
 
+pub const ExternalIoConnectionConfig = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
+    /// HTTP headers or secret references. Never returned by inventory APIs.
+    headers: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Object-store access key or secret reference. Never returned by inventory APIs.
+    access_key_id: ?[]const u8 = null,
+    /// Object-store secret key or secret reference. Never returned by inventory APIs.
+    secret_access_key: ?[]const u8 = null,
+    /// Object-store session token or secret reference. Never returned by inventory APIs.
+    session_token: ?[]const u8 = null,
+    /// Whether S3-compatible endpoints should use TLS.
+    use_ssl: ?bool = null,
+};
+
 pub const StorageConfig = struct {
     local: ?LocalStorageConfig = null,
     data: ?StorageBackend = null,
     metadata: ?StorageBackend = null,
     s3: ?S3Info = null,
+};
+
+pub const ConnectionConfig = struct {
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
+    kind: ConnectionKind,
+    /// Namespaced actions and workflow uses this connection supports.
+    capabilities: []const []const u8,
+    inference: ?InferenceConnectionConfig = null,
+    web_search: ?WebSearchConnectionConfig = null,
+    external_io: ?ExternalIoConnectionConfig = null,
+    cdc: ?CdcConnectionConfig = null,
 };
 
 pub const Config = struct {
@@ -94,6 +269,8 @@ pub const Config = struct {
     inference: ?antfly_inference_config_openapi.Config = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
+    /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
+    connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
     /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```yaml speech_to_text: antfly-whisper: provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base openai-whisper: provider: openai model: whisper-1 ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
     speech_to_text: ?std.json.ArrayHashMap(antfly_audio_openapi.STTConfig) = null,
     cors: ?antfly_middleware_openapi.CORSConfig = null,

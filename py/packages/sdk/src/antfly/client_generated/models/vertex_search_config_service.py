@@ -1,9 +1,8 @@
 from enum import Enum
 
 
-class GoogleSearchConfigSearchType(str, Enum):
-    IMAGE = "image"
-    WEB = "web"
+class VertexSearchConfigService(str, Enum):
+    AGENT_SEARCH = "agent_search"
 
     def __str__(self) -> str:
         return str(self.value)

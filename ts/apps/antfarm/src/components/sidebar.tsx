@@ -35,6 +35,7 @@ import {
   Mic,
   Network,
   PanelLeft,
+  Plug,
   Plus,
   Repeat2,
   ScanLine,
@@ -258,6 +259,25 @@ export function AppSidebar({
                     >
                       <Network className="size-4" />
                       <span>Cluster</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={location.pathname === "/connections"}
+                    tooltip="Connected Providers & Stores"
+                  >
+                    <a
+                      href="/connections"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        navigate("/connections");
+                      }}
+                    >
+                      <Plug className="size-4" />
+                      <span>Connections</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

@@ -546,8 +546,9 @@ test "public bundled root still exposes foreign-owned shared contract types" {
     try std.testing.expect(@hasDecl(generated, "RerankerConfig"));
     try std.testing.expect(@hasDecl(generated, "ChatMessage"));
     try std.testing.expect(@hasDecl(generated, "EvalConfig"));
-    try std.testing.expect(@hasDecl(generated, "GoogleSearchConfig"));
-    try std.testing.expect(@hasDecl(generated, "DuckDuckGoSearchConfig"));
+    try std.testing.expect(@hasDecl(generated, "WebSearchConfig"));
+    try std.testing.expect(@hasDecl(generated, "ExaSearchConfig"));
+    try std.testing.expect(@hasDecl(generated, "VertexSearchConfig"));
     try std.testing.expect(@hasDecl(generated, "schemas_AntflyType"));
 }
 

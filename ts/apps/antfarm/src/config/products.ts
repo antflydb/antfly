@@ -31,6 +31,7 @@ export const PRODUCTS: Record<ProductId, Product> = {
       "/users",
       "/secrets",
       "/cluster",
+      "/connections",
       "/data/playground/evals",
       "/data/playground/rag",
       "/data/playground/chat",

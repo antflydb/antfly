@@ -71,6 +71,8 @@ const schema_openapi = @import("antfly_schema_openapi");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const connections_api = @import("connections.zig");
+const common_config = @import("../common/config.zig");
 const generating_runtime = @import("../generating/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -248,6 +250,9 @@ pub const ApiHttpServerConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+    /// Loaded node config, used by /connections to enumerate configured
+    /// providers and object stores. Must outlive the server.
+    node_config: ?*const common_config.Config = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
@@ -873,6 +878,7 @@ pub const ApiHttpServer = struct {
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    connections_cache: connections_api.Cache = .{ .alloc = undefined },
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
@@ -913,6 +919,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
         };
@@ -1013,7 +1020,41 @@ pub const ApiHttpServer = struct {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
         }
+        self.connections_cache.deinit();
         self.* = undefined;
+    }
+
+    /// Build the GET /connections response body. Shared by the legacy
+    /// dispatcher and the generated httpx handler so both paths use the same
+    /// per-connection result cache. The caller owns the returned JSON.
+    pub fn listConnectionsJsonAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        types_param: ?[]const u8,
+        include_param: ?[]const u8,
+        refresh_param: ?[]const u8,
+    ) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
+        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+
+        const node_config = self.cfg.node_config;
+        const response = try connections_api.buildConnectionsResponse(arena, .{
+            .node_config = node_config,
+            .snapshot = if (snapshot_opt) |*snapshot| snapshot else null,
+            .antfly_provider = self.antfly_provider,
+            .inference_api_url = if (node_config) |cfg| cfg.inference.api_url else null,
+            .inference_api_key = self.cfg.inference_api_key,
+        }, &self.connections_cache, .{
+            .include_models = connections_api.includeHasModels(include_param),
+            .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,
+            .types_filter = types_param,
+        });
+        return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(response, .{})});
     }
 
     pub fn joinContext(self: *ApiHttpServer) distributed_join.JoinContext {
@@ -1776,6 +1817,19 @@ pub const ApiHttpServer = struct {
             var topology_status = try cluster.topologyFromStatus(self.alloc, public_status);
             defer topology_status.deinit(self.alloc);
             return try jsonResponse(self.alloc, topology_status);
+        }
+        if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.connections)) {
+            const body = try self.listConnectionsJsonAlloc(
+                self.alloc,
+                parseSimpleQueryParam(uri_parts.query, "types"),
+                parseSimpleQueryParam(uri_parts.query, "include"),
+                parseSimpleQueryParam(uri_parts.query, "refresh"),
+            );
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = body,
+            };
         }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
@@ -8152,6 +8206,119 @@ test "api http server serves status" {
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
+}
+
+test "api http server serves connections with partial provider failures" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const config_json =
+        \\{
+        \\  "connections": {
+        \\    "mocked": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate"],
+        \\      "inference": {
+        \\        "provider": "mock",
+        \\        "configured_model_types": ["generator"]
+        \\      }
+        \\    },
+        \\    "broken-openai": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.embed"],
+        \\      "inference": {
+        \\        "provider": "openai",
+        \\        "url": "http://127.0.0.1:9",
+        \\        "api_key": "test-key",
+        \\        "configured_model_types": ["embedder"]
+        \\      }
+        \\    },
+        \\    "wiki": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["content.fetch", "indexing.use"],
+        \\      "external_io": {
+        \\        "protocol": "http",
+        \\        "hosts": ["https://en.wikipedia.org"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var node_config = try common_config.Config.parseFromSlice(std.testing.allocator, config_json);
+    defer node_config.deinit();
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{ .node_config = &node_config },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    var resp = try server.handle(.{ .method = .GET, .uri = "/connections?include=models" });
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const connection_list = parsed.value.object.get("connections").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), connection_list.len);
+
+    var saw_mock = false;
+    var saw_openai = false;
+    var saw_wiki = false;
+    for (connection_list) |connection| {
+        const name = connection.object.get("name").?.string;
+        const conn_status = connection.object.get("status").?.string;
+        if (std.mem.eql(u8, name, "mocked")) {
+            saw_mock = true;
+            try std.testing.expectEqualStrings("connected", conn_status);
+            const provider = connection.object.get("inference").?.object;
+            const models = provider.get("models").?.object;
+            try std.testing.expect(models.get("generators") != null);
+        } else if (std.mem.eql(u8, name, "broken-openai")) {
+            saw_openai = true;
+            // Partial failure: the unreachable provider reports an error
+            // without failing the whole response.
+            try std.testing.expectEqualStrings("error", conn_status);
+            try std.testing.expect(connection.object.get("error").? == .string);
+        } else if (std.mem.eql(u8, name, "wiki")) {
+            saw_wiki = true;
+            try std.testing.expectEqualStrings("external_io", connection.object.get("kind").?.string);
+            try std.testing.expectEqualStrings("configured", conn_status);
+        }
+    }
+    try std.testing.expect(saw_mock);
+    try std.testing.expect(saw_openai);
+    try std.testing.expect(saw_wiki);
+
+    // The kind filter trims the response to the requested connection types.
+    var filtered = try server.handle(.{ .method = .GET, .uri = "/connections?types=external_io" });
+    defer filtered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), filtered.status);
+    var parsed_filtered = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, filtered.body, .{});
+    defer parsed_filtered.deinit();
+    const filtered_list = parsed_filtered.value.object.get("connections").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), filtered_list.len);
+    try std.testing.expectEqualStrings("wiki", filtered_list[0].object.get("name").?.string);
+
+    // The /db/v1 prefix variant resolves to the same route.
+    var prefixed = try server.handle(.{ .method = .GET, .uri = "/db/v1/connections" });
+    defer prefixed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), prefixed.status);
 }
 
 test "api http server serves mcp and a2a protocol surfaces" {
