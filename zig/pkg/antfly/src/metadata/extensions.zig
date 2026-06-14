@@ -58,6 +58,11 @@ pub const Capability = struct {
     pub fn validate(self: Capability) !void {
         try requireName("capability.name", self.name);
     }
+
+    pub fn matches(self: Capability, grant: Capability) bool {
+        return std.mem.eql(u8, self.name, grant.name) and
+            (self.scope.len == 0 or std.mem.eql(u8, self.scope, grant.scope));
+    }
 };
 
 pub const PackageDependency = struct {
@@ -910,6 +915,7 @@ pub fn planManifestOnlyInstallAlloc(
     try request.validate();
     if (!package.install.supportsScope(request.scope.kind)) return error.UnsupportedExtensionScope;
     if (request.version.len > 0 and !std.mem.eql(u8, request.version, package.version)) return error.PackageVersionMismatch;
+    try validateGrantedCapabilities(package.capabilities_requested, request.grants);
 
     var members = std.ArrayListUnmanaged(ExtensionMember).empty;
     errdefer {
@@ -992,6 +998,19 @@ fn requireUpdatePath(from_version: []const u8, target: PackageManifest) !void {
         if (std.mem.eql(u8, update.from_version, from_version) and std.mem.eql(u8, update.to_version, target.version)) return;
     }
     return error.UpdatePathNotFound;
+}
+
+fn validateGrantedCapabilities(requested: []const Capability, grants: []const Capability) !void {
+    for (grants) |grant| {
+        var allowed = false;
+        for (requested) |candidate| {
+            if (candidate.matches(grant)) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) return error.UnrequestedCapabilityGrant;
+    }
 }
 
 fn memberFromShapeAlloc(
@@ -1480,8 +1499,8 @@ test "extension package manifest validates data shape and mcp objects" {
         \\  "digest": "sha256:abc",
         \\  "trusted": true,
         \\  "capabilities_requested": [
-        \\    {"name": "read:table", "scope": "memoryaf.memories"},
-        \\    {"name": "write:table", "scope": "memoryaf.memories"}
+        \\    {"name": "read:table", "scope": "memories"},
+        \\    {"name": "write:table", "scope": "memories"}
         \\  ],
         \\  "dependencies": [
         \\    {"name": "antfly_core", "version_requirement": ">=1.0.0"}
@@ -1697,6 +1716,7 @@ test "extension catalog registers package installs members and drops extension" 
         .name = "memoryaf",
         .version = "1.0.0",
         .digest = "sha256:abc",
+        .capabilities_requested = &.{.{ .name = "read:table", .scope = "memories" }},
         .install = .{
             .scopes_supported = &.{.table},
             .shapes = &.{.{
@@ -1803,6 +1823,58 @@ test "extension catalog enforces dependencies and drop modes" {
     try std.testing.expectEqual(@as(usize, 0), catalog.dependencies.items.len);
 }
 
+test "extension catalog rejects grants not requested by package" {
+    const package = PackageManifest{
+        .name = "memoryaf",
+        .version = "1.0.0",
+        .digest = "sha256:abc",
+        .capabilities_requested = &.{
+            .{ .name = "read:table", .scope = "memories" },
+            .{ .name = "network:allowlist", .scope = "https://api.example.com" },
+        },
+        .install = .{
+            .scopes_supported = &.{.table},
+            .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
+        },
+    };
+
+    var plan = try planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "memoryaf",
+        package,
+        .{
+            .version = "1.0.0",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .grants = &.{.{ .name = "read:table", .scope = "memories" }},
+        },
+        42,
+    );
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.UnrequestedCapabilityGrant, planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "memoryaf",
+        package,
+        .{
+            .version = "1.0.0",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .grants = &.{.{ .name = "write:table", .scope = "memories" }},
+        },
+        42,
+    ));
+    try std.testing.expectError(error.UnrequestedCapabilityGrant, planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "memoryaf",
+        package,
+        .{
+            .version = "1.0.0",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .grants = &.{.{ .name = "read:table", .scope = "other_table" }},
+        },
+        42,
+    ));
+}
+
 test "extension catalog updates configures disables and enables extension" {
     var catalog = ExtensionCatalog.init(std.testing.allocator);
     defer catalog.deinit();
@@ -1811,6 +1883,7 @@ test "extension catalog updates configures disables and enables extension" {
         .name = "memoryaf",
         .version = "1.0.0",
         .digest = "sha256:v1",
+        .capabilities_requested = &.{.{ .name = "read:table", .scope = "memories" }},
         .install = .{
             .scopes_supported = &.{.table},
             .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
@@ -1820,6 +1893,7 @@ test "extension catalog updates configures disables and enables extension" {
         .name = "memoryaf",
         .version = "1.1.0",
         .digest = "sha256:v11",
+        .capabilities_requested = &.{.{ .name = "read:table", .scope = "memories" }},
         .install = .{
             .scopes_supported = &.{.table},
             .objects = &.{

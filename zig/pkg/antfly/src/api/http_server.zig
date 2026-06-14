@@ -6768,6 +6768,7 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateTableRequest,
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
+        error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
         error.EmptyName,
         error.InvalidIdentifier,
@@ -8896,6 +8897,13 @@ test "api http server dispatches extension lifecycle mutations" {
     try std.testing.expectEqualStrings("memoryaf", installed.value.name);
     try std.testing.expectEqualStrings("1.2.3", installed.value.package_version);
     try std.testing.expectEqualStrings("memories", installed.value.scope.table_name);
+}
+
+test "extension lifecycle maps unrequested capability grants to client errors" {
+    var resp = try extensionLifecycleErrorResponse(std.testing.allocator, error.UnrequestedCapabilityGrant);
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid extension lifecycle request") != null);
 }
 
 test "extension lifecycle materializes table index members" {
