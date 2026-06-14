@@ -61,6 +61,9 @@ function validateDefinitions(definitions) {
     if (command.type === "navigation" && !command.product) {
       errors.push(`${command.id} is navigation but has no product`);
     }
+    if (command.adminOnly !== undefined && typeof command.adminOnly !== "boolean") {
+      errors.push(`${command.id} has invalid adminOnly`);
+    }
     if (typeof command.semantic !== "boolean") {
       errors.push(`${command.id} must set semantic to true or false`);
     }
