@@ -15,6 +15,7 @@ import {
   Bot,
   ClipboardCheck,
   FileInput,
+  FileStack,
   HelpCircle,
   KeyRound,
   Library,
@@ -25,6 +26,7 @@ import {
   Plug,
   Plus,
   Repeat2,
+  RotateCw,
   ScanLine,
   Scissors,
   Search,
@@ -42,6 +44,7 @@ import { isProductEnabled, type ProductId } from "@/config/products";
 import { type CommandAction, type CommandDefinition, commandDefinitions } from "@/data/commands";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useAuth } from "@/hooks/use-auth";
+import { useTable } from "@/hooks/use-table";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
 import { isExternalAuthMode } from "@/runtime-config";
@@ -53,6 +56,7 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   Library,
   Users,
   FileInput,
+  FileStack,
   Shield,
   KeyRound,
   Scissors,
@@ -67,6 +71,7 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   Waypoints,
   ArrowUpDown,
   Repeat2,
+  RotateCw,
   ScanLine,
   Mic,
   Moon,
@@ -116,6 +121,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const navigate = useNavigate();
 
   const { hasPermission } = useAuth();
+  const { selectedTable, graphIndexes, isLoadingIndexes } = useTable();
   const { theme, setTheme } = useTheme();
   const { inferenceApiUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
@@ -138,9 +144,12 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       if (item.adminOnly && !showAdmin) {
         return false;
       }
+      if (item.href === "/retrieval/graph" && !isLoadingIndexes && graphIndexes.length === 0) {
+        return false;
+      }
       return true;
     },
-    [showAdmin]
+    [graphIndexes.length, isLoadingIndexes, showAdmin]
   );
 
   React.useEffect(() => {
@@ -185,14 +194,50 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
     return commands.filter(isCommandAvailable);
   }, [isCommandAvailable]);
 
+  const contextualCommands = React.useMemo<PaletteCommand[]>(() => {
+    if (!selectedTable) return [];
+    const tablePath = `/tables/${encodeURIComponent(selectedTable)}`;
+    return [
+      {
+        id: "context-create-index",
+        icon: Plus,
+        label: `Create index for ${selectedTable}`,
+        href: `${tablePath}?section=indexes`,
+        product: "antfly",
+      },
+      {
+        id: "context-upload-data",
+        icon: Upload,
+        label: `Upload data to ${selectedTable}`,
+        href: `${tablePath}?section=bulk`,
+        product: "antfly",
+      },
+      {
+        id: "context-search-table",
+        icon: Search,
+        label: `Search ${selectedTable}`,
+        href: `${tablePath}?section=semantic`,
+        product: "antfly",
+      },
+      {
+        id: "context-view-retrieval-trace",
+        icon: ClipboardCheck,
+        label: `View retrieval trace for ${selectedTable}`,
+        href: `${tablePath}?section=semantic`,
+        product: "antfly",
+      },
+    ];
+  }, [selectedTable]);
+
   // All command items for string matching check
   const allItems = React.useMemo(
     () => [
       ...navigationCommands.map((c) => c.label),
       ...toolCommands.map((c) => c.label),
+      ...contextualCommands.map((c) => c.label),
       ...quickActionCommands.map((c) => c.label),
     ],
-    [navigationCommands, toolCommands, quickActionCommands]
+    [navigationCommands, toolCommands, contextualCommands, quickActionCommands]
   );
 
   // Check if cmdk's string filter would find any matches
@@ -339,6 +384,25 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
           </CommandGroup>
 
           <CommandSeparator />
+
+          {contextualCommands.length > 0 && (
+            <>
+              <CommandGroup heading="Current Table">
+                {contextualCommands.map((command) => (
+                  <CommandItem
+                    key={command.id}
+                    onSelect={() => handleSelect(command.href)}
+                    className="flex items-center gap-2 cursor-pointer"
+                  >
+                    <command.icon className="h-4 w-4" />
+                    <span>{command.label}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+
+              <CommandSeparator />
+            </>
+          )}
 
           {/* Tools */}
           <CommandGroup heading="Tools">
