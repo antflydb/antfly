@@ -1099,7 +1099,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
         {/* Upload Section */}
         {currentSection === "bulk" && <BulkInsert tableName={tableName || ""} />}
 
-        {/* Document Builder Section */}
+        {/* Manual Entry Section */}
         {currentSection === "document-builder" && (
           <DocumentBuilder tableName={tableName || ""} schema={tableSchema} />
         )}
