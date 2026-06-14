@@ -7045,6 +7045,8 @@ fn extensionEnrichmentMemberTableName(member: metadata_mod.ExtensionMember) ?[]c
 
 fn extensionDataShapeMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
     if (member.object_kind != .data_shape) return null;
+    const shape_kind = member.shape_kind orelse return null;
+    if (shape_kind != .document and shape_kind != .row) return null;
     return extensionMemberTableName(member);
 }
 
@@ -9007,6 +9009,7 @@ test "api http server validates writes against extension data shape members" {
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .object_kind = .data_shape,
                     .object_name = "memory_record",
+                    .shape_kind = .document,
                     .table_name = "memories",
                     .owner_metadata_json = shape_schema,
                 }})[0..]),

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const schema_mod = @import("../schema/mod.zig");
 
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";
@@ -399,6 +400,7 @@ pub const ExtensionMember = struct {
     object_kind: ExtensionObjectKind,
     object_name: []const u8,
     table_name: []const u8 = "",
+    shape_kind: ?DataShapeKind = null,
     shape_version: []const u8 = "",
     owner_metadata_json: []const u8 = "{}",
 
@@ -406,6 +408,7 @@ pub const ExtensionMember = struct {
         try requireObjectName(self.extension_name);
         try self.scope.validate();
         try requireObjectName(self.object_name);
+        if (self.shape_kind != null and self.object_kind != .data_shape) return error.MemberShapeKindWithoutDataShape;
         if (self.scope.kind == .table and self.table_name.len != 0 and !std.mem.eql(u8, self.scope.table_name, self.table_name)) {
             return error.MemberTableOutsideScope;
         }
@@ -939,6 +942,9 @@ pub fn planManifestOnlyInstallAlloc(
     }
 
     for (package.install.shapes) |shape| {
+        if (request.scope.kind == .table and dataShapeKindOwnsTableWrites(shape.kind)) {
+            try validateTableWriteDataShapeSchema(alloc, shape.schema_json);
+        }
         try members.append(alloc, try memberFromShapeAlloc(alloc, extension_name, request.scope, shape));
     }
     for (package.install.objects) |object| {
@@ -1039,9 +1045,23 @@ fn memberFromShapeAlloc(
         .scope = scope,
         .object_kind = .data_shape,
         .object_name = shape.name,
+        .shape_kind = shape.kind,
         .shape_version = shape.version,
         .owner_metadata_json = shape.schema_json,
     });
+}
+
+fn dataShapeKindOwnsTableWrites(kind: DataShapeKind) bool {
+    return kind == .document or kind == .row;
+}
+
+fn validateTableWriteDataShapeSchema(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed = schema_mod.parseValidatedTableSchema(alloc, schema_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExtensionShape,
+    };
+    defer parsed.deinit(alloc);
+    if (parsed.document_schemas.len == 0) return error.InvalidExtensionShape;
 }
 
 fn memberFromObjectAlloc(
@@ -1434,6 +1454,7 @@ fn cloneExtensionMember(alloc: std.mem.Allocator, member: ExtensionMember) !Exte
         .object_kind = member.object_kind,
         .object_name = object_name,
         .table_name = table_name,
+        .shape_kind = member.shape_kind,
         .shape_version = shape_version,
         .owner_metadata_json = owner_metadata_json,
     };
@@ -1531,7 +1552,7 @@ test "extension package manifest validates data shape and mcp objects" {
         \\        "name": "memory_record",
         \\        "kind": "document",
         \\        "version": "1",
-        \\        "schema_json": "{\"type\":\"object\"}"
+        \\        "schema_json": "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}"
         \\      },
         \\      {
         \\        "name": "recall_request",
@@ -1584,8 +1605,10 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
     try std.testing.expectEqual(@as(usize, 4), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
-    try std.testing.expectEqualStrings("{\"type\":\"object\"}", plan.members[0].owner_metadata_json);
+    try std.testing.expectEqual(DataShapeKind.document, plan.members[0].shape_kind.?);
+    try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", plan.members[0].owner_metadata_json);
     try std.testing.expectEqual(.data_shape, plan.members[1].object_kind);
+    try std.testing.expectEqual(DataShapeKind.tool_schema, plan.members[1].shape_kind.?);
     try std.testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}", plan.members[1].owner_metadata_json);
     try std.testing.expectEqual(.mcp_tool, plan.members[3].object_kind);
     try std.testing.expectEqualStrings("memories", plan.members[3].table_name);
@@ -1752,6 +1775,29 @@ test "manifest-only install rejects v2 object kinds in v1 plan" {
     ));
 }
 
+test "manifest-only table install rejects document shapes that are not table schemas" {
+    const package = PackageManifest{
+        .name = "memoryaf",
+        .version = "1.0.0",
+        .digest = "sha256:abc",
+        .install = .{
+            .scopes_supported = &.{.table},
+            .shapes = &.{.{
+                .name = "memory_record",
+                .kind = .document,
+                .schema_json = "{\"type\":\"object\"}",
+            }},
+        },
+    };
+    try std.testing.expectError(error.InvalidExtensionShape, planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "memoryaf",
+        package,
+        .{ .scope = .{ .kind = .table, .table_name = "memories" } },
+        1234,
+    ));
+}
+
 test "extension catalog registers package installs members and drops extension" {
     var catalog = ExtensionCatalog.init(std.testing.allocator);
     defer catalog.deinit();
@@ -1767,7 +1813,7 @@ test "extension catalog registers package installs members and drops extension" 
                 .name = "memory_record",
                 .kind = .document,
                 .version = "1",
-                .schema_json = "{\"type\":\"object\"}",
+                .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
             }},
             .objects = &.{
                 .{ .kind = .index, .name = "memory_full_text", .config_json = "{\"kind\":\"full_text\"}" },
@@ -1802,7 +1848,8 @@ test "extension catalog registers package installs members and drops extension" 
     defer catalog.freeMembers(std.testing.allocator, members);
     try std.testing.expectEqual(@as(usize, 3), members.len);
     try std.testing.expectEqual(.data_shape, members[0].object_kind);
-    try std.testing.expectEqualStrings("{\"type\":\"object\"}", members[0].owner_metadata_json);
+    try std.testing.expectEqual(DataShapeKind.document, members[0].shape_kind.?);
+    try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", members[0].owner_metadata_json);
 
     try catalog.dropInstalled("memoryaf");
     try std.testing.expectEqual(@as(usize, 0), catalog.installed.items.len);

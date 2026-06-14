@@ -1312,6 +1312,7 @@ fn cloneExtensionMembers(alloc: std.mem.Allocator, members: []const metadata_mod
             .object_kind = member.object_kind,
             .object_name = try alloc.dupe(u8, member.object_name),
             .table_name = if (member.table_name.len > 0) try alloc.dupe(u8, member.table_name) else "",
+            .shape_kind = member.shape_kind,
             .shape_version = if (member.shape_version.len > 0) try alloc.dupe(u8, member.shape_version) else "",
             .owner_metadata_json = try alloc.dupe(u8, member.owner_metadata_json),
         };
