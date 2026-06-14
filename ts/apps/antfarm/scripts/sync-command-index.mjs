@@ -9,6 +9,9 @@ const appRoot = path.resolve(dirname, "..");
 const definitionsPath = path.join(appRoot, "src/data/command-definitions.json");
 const indexPath = path.join(appRoot, "src/data/command-index.json");
 const checkOnly = process.argv.includes("--check");
+const commandTypes = new Set(["navigation", "action"]);
+const commandGroups = new Set(["navigation", "tools", "quickActions"]);
+const products = new Set(["antfly", "inference"]);
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -22,12 +25,41 @@ function validateDefinitions(definitions) {
   const seen = new Set();
   const errors = [];
 
+  if (!Array.isArray(definitions)) {
+    throw new Error("Invalid command definitions: expected a JSON array");
+  }
+
   for (const command of definitions) {
+    if (typeof command.id !== "string" || command.id.length === 0) {
+      errors.push("command is missing a non-empty id");
+      continue;
+    }
     if (seen.has(command.id)) {
       errors.push(`duplicate command id: ${command.id}`);
     }
     seen.add(command.id);
 
+    if (!commandTypes.has(command.type)) {
+      errors.push(`${command.id} has invalid type: ${command.type}`);
+    }
+    if (!commandGroups.has(command.group)) {
+      errors.push(`${command.id} has invalid group: ${command.group}`);
+    }
+    if (typeof command.label !== "string" || command.label.length === 0) {
+      errors.push(`${command.id} is missing a non-empty label`);
+    }
+    if (typeof command.description !== "string" || command.description.length === 0) {
+      errors.push(`${command.id} is missing a non-empty description`);
+    }
+    if (typeof command.icon !== "string" || command.icon.length === 0) {
+      errors.push(`${command.id} is missing a non-empty icon`);
+    }
+    if (command.product && !products.has(command.product)) {
+      errors.push(`${command.id} has invalid product: ${command.product}`);
+    }
+    if (typeof command.semantic !== "boolean") {
+      errors.push(`${command.id} must set semantic to true or false`);
+    }
     if (command.type === "navigation" && !command.href) {
       errors.push(`${command.id} is navigation but has no href`);
     }
@@ -145,7 +177,7 @@ function sameIndex(currentIndex, nextIndex) {
 }
 
 function formatWithBiome(filePath) {
-  const result = spawnSync("biome", ["format", "--write", filePath], {
+  const result = spawnSync("pnpm", ["exec", "biome", "format", "--write", filePath], {
     cwd: appRoot,
     encoding: "utf8",
     stdio: "pipe",
@@ -172,6 +204,9 @@ function main() {
   const nextIndex = buildIndex(definitions, existingIndex);
 
   if (sameIndex(existingIndex, nextIndex)) {
+    if (!checkOnly) {
+      formatWithBiome(indexPath);
+    }
     console.log("command-index.json is up to date");
     return;
   }
