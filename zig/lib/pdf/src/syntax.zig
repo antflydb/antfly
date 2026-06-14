@@ -284,6 +284,9 @@ pub const Scanner = struct {
     fn readArray(self: *Scanner) anyerror!Object {
         var items = std.ArrayList(Object).empty;
         defer items.deinit(self.alloc);
+        errdefer {
+            for (items.items) |*item| item.deinit(self.alloc);
+        }
 
         while (true) {
             var tok = try self.readToken();
@@ -291,10 +294,15 @@ pub const Scanner = struct {
             if (tok == .eof) return error.UnexpectedEof;
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, "]")) break;
             try self.unreadToken(try cloneToken(self.alloc, tok));
-            try items.append(self.alloc, try self.readObject());
+            var item = try self.readObject();
+            errdefer item.deinit(self.alloc);
+            try items.append(self.alloc, item);
+            item = .null;
         }
 
-        return .{ .array = try items.toOwnedSlice(self.alloc) };
+        const owned = try items.toOwnedSlice(self.alloc);
+        items = .empty;
+        return .{ .array = owned };
     }
 
     fn readDictOrStream(self: *Scanner) anyerror!Object {
@@ -788,7 +796,7 @@ test "scanner returns unterminated hex string prefix" {
     var tok = try scanner.readLexeme();
     defer tok.deinit(alloc);
     try std.testing.expect(tok == .string);
-    try std.testing.expectEqualSlices(u8, &.{ 0xAB }, tok.string);
+    try std.testing.expectEqualSlices(u8, &.{0xAB}, tok.string);
 }
 
 test "scanner terminates malformed hex strings with decoded prefix" {
@@ -799,7 +807,7 @@ test "scanner terminates malformed hex strings with decoded prefix" {
     var tok = try scanner.readLexeme();
     defer tok.deinit(alloc);
     try std.testing.expect(tok == .string);
-    try std.testing.expectEqualSlices(u8, &.{ 0xAB }, tok.string);
+    try std.testing.expectEqualSlices(u8, &.{0xAB}, tok.string);
 }
 
 test "scanner accepts odd-length hex strings" {
@@ -838,6 +846,14 @@ test "scanner tokenizes standalone closing delimiters" {
         try std.testing.expect(tok == .keyword);
         try std.testing.expectEqualStrings(">>", tok.keyword);
     }
+}
+
+test "scanner cleans partial array objects on parse error" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "[(abc");
+    defer scanner.deinit();
+
+    try std.testing.expectError(error.UnexpectedEof, scanner.readObject());
 }
 
 test "scanner tokenizes strings names and numbers" {
