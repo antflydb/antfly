@@ -155,10 +155,11 @@ export function GeneratorSelector({
       return;
     }
     const nextProvider = provider as GeneratorProvider;
+    const liveDefault = liveGenerators[nextProvider]?.[0];
     onChange({
       ...value,
       provider: nextProvider,
-      model: GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
+      model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
     });
   };
 

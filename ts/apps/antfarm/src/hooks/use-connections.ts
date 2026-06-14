@@ -91,6 +91,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       setConnections(fromCache.connections);
       setSupported(fromCache.supported);
       setLoading(false);
+      setError(null);
       return () => {
         isMountedRef.current = false;
       };

@@ -44,7 +44,7 @@ export function ConnectedProvidersSummary() {
         const count = modelCount(connection);
         return (
           <button
-            key={connection.name}
+            key={connection.id}
             type="button"
             onClick={() => navigate("/connections")}
             title={`${providerTypeLabel(connection.inference?.provider ?? "")}${
