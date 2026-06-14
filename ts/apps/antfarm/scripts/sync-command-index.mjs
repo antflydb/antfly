@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,7 +40,9 @@ function validateDefinitions(definitions) {
   }
 
   if (errors.length > 0) {
-    throw new Error(`Invalid command definitions:\n${errors.map((error) => `- ${error}`).join("\n")}`);
+    throw new Error(
+      `Invalid command definitions:\n${errors.map((error) => `- ${error}`).join("\n")}`
+    );
   }
 }
 
@@ -119,46 +122,46 @@ function buildIndex(definitions, existingIndex) {
   };
 }
 
-function formatArray(values, indent) {
-  const chunks = [];
-  for (let i = 0; i < values.length; i += 6) {
-    chunks.push(`${indent}${values.slice(i, i + 6).join(", ")}`);
-  }
-  return `[\n${chunks.join(",\n")}\n${indent.slice(0, -2)}]`;
-}
-
-function formatCommand(command) {
-  const lines = [
-    `    {`,
-    `      "id": ${JSON.stringify(command.id)},`,
-    `      "type": ${JSON.stringify(command.type)},`,
-    `      "group": ${JSON.stringify(command.group)},`,
-    `      "label": ${JSON.stringify(command.label)},`,
-    `      "description": ${JSON.stringify(command.description)},`,
-  ];
-
-  if (command.href) lines.push(`      "href": ${JSON.stringify(command.href)},`);
-  if (command.action) lines.push(`      "action": ${JSON.stringify(command.action)},`);
-  lines.push(`      "icon": ${JSON.stringify(command.icon)},`);
-  if (command.product) lines.push(`      "product": ${JSON.stringify(command.product)},`);
-  if (command.adminOnly) lines.push(`      "adminOnly": true,`);
-  lines.push(`      "embedding": ${formatArray(command.embedding, "        ")}`);
-  lines.push(`    }`);
-  return lines.join("\n");
-}
-
 function formatIndex(index) {
-  return [
-    `{`,
-    `  "model": ${JSON.stringify(index.model)},`,
-    `  "dimension": ${index.dimension},`,
-    `  "generatedFrom": ${JSON.stringify(index.generatedFrom)},`,
-    `  "commands": [`,
-    index.commands.map(formatCommand).join(",\n"),
-    `  ]`,
-    `}`,
-    ``,
-  ].join("\n");
+  return `${JSON.stringify(index, null, 2)}\n`;
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalize(value[key])])
+    );
+  }
+  return value;
+}
+
+function sameIndex(currentIndex, nextIndex) {
+  return JSON.stringify(canonicalize(currentIndex)) === JSON.stringify(canonicalize(nextIndex));
+}
+
+function formatWithBiome(filePath) {
+  const result = spawnSync("biome", ["format", "--write", filePath], {
+    cwd: appRoot,
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+
+  if (result.status !== 0) {
+    throw new Error(
+      [
+        "Generated command-index.json but failed to format it with Biome.",
+        result.stderr?.trim(),
+        result.stdout?.trim(),
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  }
 }
 
 function main() {
@@ -167,19 +170,20 @@ function main() {
   validateDefinitions(definitions);
 
   const nextIndex = buildIndex(definitions, existingIndex);
-  const nextText = formatIndex(nextIndex);
-  const currentText = fs.readFileSync(indexPath, "utf8");
 
-  if (currentText === nextText) {
+  if (sameIndex(existingIndex, nextIndex)) {
     console.log("command-index.json is up to date");
     return;
   }
 
   if (checkOnly) {
-    throw new Error("command-index.json is out of date; run pnpm --filter antfarm generate:commands");
+    throw new Error(
+      "command-index.json is out of date; run pnpm --filter antfarm generate:commands"
+    );
   }
 
-  fs.writeFileSync(indexPath, nextText);
+  fs.writeFileSync(indexPath, formatIndex(nextIndex));
+  formatWithBiome(indexPath);
   console.log(`Wrote ${path.relative(appRoot, indexPath)}`);
 }
 
