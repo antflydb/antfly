@@ -13,7 +13,8 @@ export function ConnectionStatusBanner() {
 
   const antflyTarget =
     apiUrl.startsWith("/") && devProxyTarget ? `${devProxyTarget}${apiUrl}` : apiUrl;
-  const inferenceTarget = inferenceApiUrl || (devProxyTarget ? `${devProxyTarget}/ai/v1` : "/ai/v1");
+  const inferenceTarget =
+    inferenceApiUrl || (devProxyTarget ? `${devProxyTarget}/ai/v1` : "/ai/v1");
 
   // Reset dismissed state when both servers reconnect
   useEffect(() => {

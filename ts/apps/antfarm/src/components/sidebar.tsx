@@ -63,11 +63,7 @@ function tableRoute(table: string, section: string) {
   return `/tables/${encodeURIComponent(table)}?section=${encodeURIComponent(section)}`;
 }
 
-export function AppSidebar({
-  currentSection,
-  onSectionChange,
-  ...props
-}: AppSidebarProps) {
+export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSidebarProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const { state: sidebarState, toggleSidebar, isMobile } = useSidebar();

@@ -2,6 +2,7 @@ import { SidebarInset, SidebarProvider } from "@antfly/design-system";
 import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiConfigProvider } from "@/components/api-config-provider";
+import { AppHeader } from "@/components/app-header";
 import { AuthProvider } from "@/components/auth-provider";
 import { CommandPaletteProvider } from "@/components/command-palette-provider";
 import { ConnectionStatusBanner } from "@/components/connection-status-banner";
@@ -10,10 +11,9 @@ import { GeneratorPreferenceProvider } from "@/components/generator-preference-p
 import { PrivateRoute } from "@/components/private-route";
 import { AppSidebar } from "@/components/sidebar";
 import { TableProvider } from "@/components/table-provider";
-import { AppHeader } from "@/components/app-header";
 import { getDefaultRoute, isProductEnabled } from "@/config/products";
-import { ThemeProvider } from "@/hooks/use-theme";
 import { useTable } from "@/hooks/use-table";
+import { ThemeProvider } from "@/hooks/use-theme";
 import { isExternalAuthMode } from "@/runtime-config";
 import AntflyChunkingPlaygroundPage from "./pages/AntflyChunkingPlaygroundPage";
 import AntflyEmbeddingPlaygroundPage from "./pages/AntflyEmbeddingPlaygroundPage";
@@ -50,13 +50,7 @@ const tableSections = new Set([
   "document-builder",
 ]);
 
-function TableSectionRedirect({
-  section,
-  fallback = "/",
-}: {
-  section: string;
-  fallback?: string;
-}) {
+function TableSectionRedirect({ section, fallback = "/" }: { section: string; fallback?: string }) {
   const { selectedTable, tables, isLoadingTables } = useTable();
   const tableName = selectedTable || tables[0]?.name;
 
@@ -117,10 +111,7 @@ function AppContent() {
         element={
           <PrivateRoute>
             <SidebarProvider className="af-dashboard">
-              <AppSidebar
-                currentSection={currentSection}
-                onSectionChange={setCurrentSection}
-              />
+              <AppSidebar currentSection={currentSection} onSectionChange={setCurrentSection} />
               <SidebarInset>
                 <AppHeader />
                 <ConnectionStatusBanner />
