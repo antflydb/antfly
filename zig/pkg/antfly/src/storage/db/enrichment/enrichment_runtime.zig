@@ -1785,16 +1785,33 @@ fn processDocumentExtractionAsset(
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(runtime.alloc);
 
-    var extraction = try document_extraction_mod.extractDownloadedAlloc(runtime.alloc, downloaded_mut, source_url, config);
-    defer extraction.deinit(runtime.alloc);
-    try completeRuntimeDocumentExtractionGeneratedText(runtime, config, source_url, extraction.content_type, &extraction);
-
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
     else
         null;
     defer if (byte_source_fingerprint) |fingerprint| runtime.alloc.free(fingerprint);
     const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
+
+    var extraction = document_extraction_mod.extractDownloadedAlloc(runtime.alloc, downloaded_mut, source_url, config) catch |err| {
+        try writeDocumentExtractionFailureManifest(
+            runtime,
+            request.doc_key,
+            artifact_name,
+            source_url,
+            source_fingerprint,
+            if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
+            @errorName(err),
+            manifest_key,
+            state_key,
+            previous_child_ranges,
+            existing_state,
+            from_generation,
+            window,
+        );
+        return;
+    };
+    defer extraction.deinit(runtime.alloc);
+    try completeRuntimeDocumentExtractionGeneratedText(runtime, config, source_url, extraction.content_type, &extraction);
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1888,6 +1905,7 @@ fn processDocumentExtractionAsset(
         from_generation,
         to_generation,
         "in_progress",
+        null,
     );
     defer runtime.alloc.free(in_progress_manifest);
     const in_progress_key = try runtime.alloc.dupe(u8, manifest_key);
@@ -1957,6 +1975,7 @@ fn processDocumentExtractionAsset(
         from_generation,
         to_generation,
         "converged",
+        null,
     );
     errdefer runtime.alloc.free(manifest);
     try writes.append(runtime.alloc, .{
@@ -1969,6 +1988,96 @@ fn processDocumentExtractionAsset(
         .key = try runtime.alloc.dupe(u8, state_key),
         .value = try runtime.alloc.dupe(u8, new_state),
     });
+
+    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    recordArtifactBytes(runtime, .asset, manifest.len);
+}
+
+fn writeDocumentExtractionFailureManifest(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    source_url: []const u8,
+    source_fingerprint: []const u8,
+    content_type: []const u8,
+    last_error: []const u8,
+    manifest_key: []const u8,
+    state_key: []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
+    existing_state: ?[]const u8,
+    from_generation: u64,
+    window: *GeneratedReplayWindow,
+) !void {
+    var previous_unit_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
+    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
+    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
+    var previous_chunk_keys: []const []const u8 = &.{};
+    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    if (existing_state) |state| {
+        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
+        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
+        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+    }
+
+    const empty_units: [0]document_extraction_mod.Unit = .{};
+    const failed_extraction = document_extraction_mod.Result{
+        .content_type = @constCast(content_type),
+        .route_type = @constCast("error"),
+        .units = @constCast(empty_units[0..]),
+    };
+    const to_generation = from_generation + 1;
+    const manifest = try documentExtractionManifestPayloadAlloc(
+        runtime.alloc,
+        doc_key,
+        artifact_name,
+        source_url,
+        source_fingerprint,
+        failed_extraction,
+        &.{},
+        &.{},
+        &.{},
+        previous_child_ranges,
+        previous_unit_keys,
+        previous_unit_descriptors,
+        previous_chunk_keys,
+        to_generation,
+        from_generation,
+        to_generation,
+        "failed",
+        last_error,
+    );
+    defer runtime.alloc.free(manifest);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            runtime.alloc.free(@constCast(write.key));
+            runtime.alloc.free(@constCast(write.value));
+        }
+        writes.deinit(runtime.alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
+        deletes.deinit(runtime.alloc);
+    }
+
+    try writes.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, manifest_key),
+        .value = try runtime.alloc.dupe(u8, manifest),
+    });
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+
+    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
+    for (previous_unit_keys) |previous_key| {
+        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+    }
+    for (previous_chunk_keys) |previous_key| {
+        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+    }
 
     try storePutBatchWithRetry(runtime, writes.items, deletes.items);
     recordArtifactBytes(runtime, .asset, manifest.len);
@@ -4897,6 +5006,7 @@ fn documentExtractionManifestPayloadAlloc(
     from_generation: u64,
     to_generation: u64,
     merge_status: []const u8,
+    last_error: ?[]const u8,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -4913,6 +5023,9 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
     if (extraction.unsupported_reason.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
+    }
+    if (last_error) |value| {
+        try appendJsonFieldString(alloc, &out, &first, "last_error", value);
     }
     try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
@@ -5738,6 +5851,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         4,
         5,
         "converged",
+        null,
     );
     defer alloc.free(manifest);
 
@@ -5788,12 +5902,45 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         4,
         5,
         "in_progress",
+        null,
     );
     defer alloc.free(in_progress);
     try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"generation\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"from_generation\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"to_generation\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, in_progress, "\"status\":\"in_progress\"") != null);
+
+    const failed_extraction = document_extraction_mod.Result{
+        .content_type = @constCast("application/pdf"),
+        .route_type = @constCast("error"),
+        .units = @constCast(&.{}),
+    };
+    const failed = try documentExtractionManifestPayloadAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "data:application/pdf;base64,bad",
+        "source-fingerprint",
+        failed_extraction,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
+        6,
+        5,
+        6,
+        "failed",
+        "InvalidPdf",
+    );
+    defer alloc.free(failed);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"generation\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"last_error\":\"InvalidPdf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"unit_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"chunk_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"status\":\"failed\"") != null);
 }
 
 test "extractSourceText with template renders all document fields" {

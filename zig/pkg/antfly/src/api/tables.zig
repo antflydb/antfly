@@ -1215,7 +1215,13 @@ fn appendCanonicalIndexConfig(
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        const encoded = try stringifyJsonValue(alloc, entry.value_ptr.*);
+        const value = if (std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            try canonicalIndexEnrichmentsValue(alloc, entry.value_ptr.*)
+        else
+            try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
+        var owned_value = value;
+        defer deinitJsonValue(alloc, &owned_value);
+        const encoded = try stringifyJsonValue(alloc, owned_value);
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
@@ -1249,9 +1255,34 @@ fn buildCanonicalIndexConfigValue(
     var it = config.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-        try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValueAlloc(alloc, entry.value_ptr.*));
+        const value = if (std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            try canonicalIndexEnrichmentsValue(alloc, entry.value_ptr.*)
+        else
+            try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
+        try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), value);
     }
     return .{ .object = object };
+}
+
+fn canonicalIndexEnrichmentsValue(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    if (value != .array) return try cloneJsonValueAlloc(alloc, value);
+    var array = std.json.Array.init(alloc);
+    errdefer {
+        var owned: std.json.Value = .{ .array = array };
+        deinitJsonValue(alloc, &owned);
+    }
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |name| try array.append(.{ .string = try alloc.dupe(u8, name) }),
+            .object => |object| {
+                const name = object.get("name") orelse return error.InvalidTableIndexMetadata;
+                if (name != .string) return error.InvalidTableIndexMetadata;
+                try array.append(.{ .string = try alloc.dupe(u8, name.string) });
+            },
+            else => return error.InvalidTableIndexMetadata,
+        }
+    }
+    return .{ .array = array };
 }
 
 fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType {
@@ -2302,6 +2333,44 @@ test "metadata.table status encoder canonicalizes embeddings indexes without inl
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_kg\":{\"name\":\"semantic_kg\",\"type\":\"embeddings\"") != null);
+}
+
+test "metadata.table status encoder projects inline enrichment configs as names" {
+    const indexes_json =
+        \\{
+        \\  "document_text":{
+        \\    "type":"full_text",
+        \\    "artifact_name":"document_chunks_v1",
+        \\    "enrichments":[
+        \\      {"name":"document_units_v1","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\"}"},
+        \\      {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text"}
+        \\    ]
+        \\  },
+        \\  "document_vectors":{
+        \\    "type":"embeddings",
+        \\    "field":"embedding",
+        \\    "dims":768,
+        \\    "metric":"cosine",
+        \\    "enrichments":[
+        \\      {"name":"document_chunk_dense_v1","kind":"embedding","source_artifact_name":"document_chunks_v1","field":"text"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = indexes_json, .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[\"document_units_v1\",\"document_chunks_v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichments\":[\"document_chunk_dense_v1\"]") != null);
 }
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
