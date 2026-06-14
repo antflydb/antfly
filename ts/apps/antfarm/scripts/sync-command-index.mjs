@@ -58,6 +58,9 @@ function validateDefinitions(definitions) {
     if (command.product && !products.has(command.product)) {
       errors.push(`${command.id} has invalid product: ${command.product}`);
     }
+    if (command.type === "navigation" && !command.product) {
+      errors.push(`${command.id} is navigation but has no product`);
+    }
     if (typeof command.semantic !== "boolean") {
       errors.push(`${command.id} must set semantic to true or false`);
     }

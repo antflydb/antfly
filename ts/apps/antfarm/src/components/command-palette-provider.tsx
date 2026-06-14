@@ -107,30 +107,6 @@ interface CommandDefinition {
 
 const commandDefinitions = rawCommandDefinitions as CommandDefinition[];
 
-function productForHref(href?: string): ProductId | undefined {
-  if (!href) return undefined;
-  if (href.startsWith("/inference")) return "inference";
-  if (
-    href === "/" ||
-    href.startsWith("/create") ||
-    href.startsWith("/tables") ||
-    href.startsWith("/retrieval") ||
-    href.startsWith("/ingest") ||
-    href.startsWith("/data/playground") ||
-    href === "/cluster" ||
-    href === "/connections" ||
-    href === "/users" ||
-    href === "/secrets"
-  ) {
-    return "antfly";
-  }
-  return undefined;
-}
-
-function isAdminHref(href?: string) {
-  return href === "/users" || href === "/secrets";
-}
-
 function isSupportedAction(action?: string) {
   return !action || action === "toggle-theme";
 }
@@ -172,11 +148,10 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       if (!isSupportedAction(item.action)) {
         return false;
       }
-      const product = item.product ?? productForHref(item.href);
-      if (product && !isProductEnabled(product)) {
+      if (item.product && !isProductEnabled(item.product)) {
         return false;
       }
-      if ((item.adminOnly || isAdminHref(item.href)) && !showAdmin) {
+      if (item.adminOnly && !showAdmin) {
         return false;
       }
       return true;
