@@ -6785,6 +6785,7 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateTableRequest,
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
+        error.InvalidExtensionEnrichment,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
         error.EmptyName,
@@ -6820,7 +6821,7 @@ fn installExtensionOnService(
         const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, dependencies);
 
-        try applyExtensionIndexMemberDelta(service, alloc, &snapshot, &.{}, members);
+        try applyExtensionStorageMemberDelta(service, alloc, &snapshot, &.{}, members);
         try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
         for (dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
         for (members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
@@ -6857,7 +6858,7 @@ fn updateExtensionOnService(
         const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, new_dependencies);
 
-        try applyExtensionIndexMemberDelta(service, alloc, &snapshot, old_members, new_members);
+        try applyExtensionStorageMemberDelta(service, alloc, &snapshot, old_members, new_members);
         for (old_dependencies) |dependency| {
             try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
                 .extension_name = dependency.extension_name,
@@ -6905,7 +6906,7 @@ fn dropExtensionOnService(
     const remaining_dependencies = try catalog.listDependencies(alloc);
     defer catalog.freeDependencies(alloc, remaining_dependencies);
 
-    try applyRemovedExtensionIndexMembers(service, alloc, &snapshot, remaining_members);
+    try applyRemovedExtensionStorageMembers(service, alloc, &snapshot, remaining_members);
     for (snapshot.extension_dependencies) |dependency| {
         if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
         try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
@@ -7027,6 +7028,11 @@ fn extensionIndexMemberTableName(member: metadata_mod.ExtensionMember) ?[]const 
     return extensionMemberTableName(member);
 }
 
+fn extensionEnrichmentMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .enrichment) return null;
+    return extensionMemberTableName(member);
+}
+
 fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         const member_table = extensionIndexMemberTableName(member) orelse continue;
@@ -7054,22 +7060,22 @@ fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, t
     return false;
 }
 
-fn validateNewExtensionIndexMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const metadata_mod.ExtensionMember) !void {
+fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const metadata_mod.ExtensionMember) !void {
     for (new_members) |member| {
-        if (member.object_kind != .index) continue;
-        const table_name = extensionIndexMemberTableName(member) orelse return error.UnsupportedExtensionScope;
+        if (member.object_kind != .index and member.object_kind != .enrichment) continue;
+        const table_name = extensionMemberTableName(member) orelse return error.UnsupportedExtensionScope;
         if (tables_api.findTableByName(snapshot, table_name) == null) return error.TableNotFound;
     }
 }
 
-fn applyExtensionIndexMemberDelta(
+fn applyExtensionStorageMemberDelta(
     service: anytype,
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     old_members: []const metadata_mod.ExtensionMember,
     new_members: []const metadata_mod.ExtensionMember,
 ) !void {
-    try validateNewExtensionIndexMembers(snapshot, new_members);
+    try validateNewExtensionStorageMembers(snapshot, new_members);
 
     for (snapshot.tables) |table| {
         var owned_indexes_json: ?[]u8 = null;
@@ -7081,6 +7087,15 @@ fn applyExtensionIndexMemberDelta(
             if (!std.mem.eql(u8, table_name, table.name)) continue;
             const current = owned_indexes_json orelse table.indexes_json;
             const next = (try indexes_api.removeIndexFromTableIndexesJson(alloc, current, member.object_name)) orelse continue;
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+        for (old_members) |member| {
+            const table_name = extensionEnrichmentMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, current, member.object_name)) orelse continue;
             if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
             owned_indexes_json = next;
             changed = true;
@@ -7097,6 +7112,15 @@ fn applyExtensionIndexMemberDelta(
             owned_indexes_json = next;
             changed = true;
         }
+        for (new_members) |member| {
+            const table_name = extensionEnrichmentMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = try indexes_api.addEnrichmentToTableIndexesJson(alloc, current, member.object_name, member.owner_metadata_json);
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
 
         if (!changed) continue;
         var updated_record = table;
@@ -7105,7 +7129,7 @@ fn applyExtensionIndexMemberDelta(
     }
 }
 
-fn applyRemovedExtensionIndexMembers(
+fn applyRemovedExtensionStorageMembers(
     service: anytype,
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -7117,7 +7141,7 @@ fn applyRemovedExtensionIndexMembers(
         if (extensionMemberExists(remaining_members, member)) continue;
         try removed.append(alloc, member);
     }
-    try applyExtensionIndexMemberDelta(service, alloc, snapshot, removed.items, &.{});
+    try applyExtensionStorageMemberDelta(service, alloc, snapshot, removed.items, &.{});
 }
 
 fn extensionMembersForName(
@@ -8959,7 +8983,7 @@ test "extension lifecycle maps unrequested capability grants to client errors" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid extension lifecycle request") != null);
 }
 
-test "extension lifecycle materializes table index members" {
+test "extension lifecycle materializes table index and enrichment members" {
     const FakeService = struct {
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 7,
@@ -8974,7 +8998,9 @@ test "extension lifecycle materializes table index members" {
             .install = .{
                 .scopes_supported = &.{.table},
                 .objects = &.{
+                    .{ .kind = .generated_artifact, .name = "memory_embedding", .config_json = "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\"}" },
                     .{ .kind = .index, .name = "memory_text", .config_json = "{\"type\":\"full_text\"}" },
+                    .{ .kind = .enrichment, .name = "memory_embed", .config_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}" },
                     .{ .kind = .mcp_tool, .name = "recall" },
                 },
             },
@@ -9023,11 +9049,9 @@ test "extension lifecycle materializes table index members" {
         }
 
         fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
-            switch (command) {
-                .upsert_installed_extension => self.installed_upserts += 1,
-                .upsert_extension_member => self.member_upserts += 1,
-                else => {},
-            }
+            const Command = @TypeOf(command);
+            if (@hasField(Command, "upsert_installed_extension")) self.installed_upserts += 1;
+            if (@hasField(Command, "upsert_extension_member")) self.member_upserts += 1;
         }
     };
 
@@ -9042,16 +9066,19 @@ test "extension lifecycle materializes table index members" {
     try std.testing.expect(service.upserted_indexes_json != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"expected_dims\":384") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
-    try std.testing.expectEqual(@as(usize, 2), service.member_upserts);
+    try std.testing.expectEqual(@as(usize, 4), service.member_upserts);
 }
 
-test "extension lifecycle drops extension-owned table indexes" {
+test "extension lifecycle drops extension-owned table index and enrichment members" {
     const FakeService = struct {
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 7,
             .name = "memories",
-            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"}}",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384},{\"name\":\"manual_embed\",\"kind\":\"embedding\",\"field\":\"summary\",\"expected_dims\":384}]}",
             .placement_role = "data",
         },
         installed_record: metadata_mod.InstalledExtension = .{
@@ -9062,13 +9089,23 @@ test "extension lifecycle drops extension-owned table indexes" {
             .scope = .{ .kind = .table, .table_name = "memories" },
             .status = .ready,
         },
-        member_record: metadata_mod.ExtensionMember = .{
-            .extension_name = "memoryaf",
-            .scope = .{ .kind = .table, .table_name = "memories" },
-            .object_kind = .index,
-            .object_name = "memory_text",
-            .table_name = "memories",
-            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        member_records: [2]metadata_mod.ExtensionMember = .{
+            .{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .index,
+                .object_name = "memory_text",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"type\":\"full_text\"}",
+            },
+            .{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .enrichment,
+                .object_name = "memory_embed",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}",
+            },
         },
         empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
         empty_stores: [0]metadata_table_manager.StoreRecord = .{},
@@ -9093,7 +9130,7 @@ test "extension lifecycle drops extension-owned table indexes" {
         }
 
         fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
-            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+            return self.member_records[0..];
         }
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -9119,11 +9156,9 @@ test "extension lifecycle drops extension-owned table indexes" {
         }
 
         fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
-            switch (command) {
-                .remove_installed_extension => self.installed_removes += 1,
-                .remove_extension_member => self.member_removes += 1,
-                else => {},
-            }
+            const Command = @TypeOf(command);
+            if (@hasField(Command, "remove_installed_extension")) self.installed_removes += 1;
+            if (@hasField(Command, "remove_extension_member")) self.member_removes += 1;
         }
     };
 
@@ -9134,9 +9169,11 @@ test "extension lifecycle drops extension-owned table indexes" {
     try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
     try std.testing.expect(service.upserted_indexes_json != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_embed\"") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
-    try std.testing.expectEqual(@as(usize, 1), service.member_removes);
+    try std.testing.expectEqual(@as(usize, 2), service.member_removes);
 }
 
 test "direct index deletion rejects extension-owned indexes" {
