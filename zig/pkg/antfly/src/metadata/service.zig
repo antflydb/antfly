@@ -1237,6 +1237,17 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
     }
 
+    pub fn upsertExtensionPackage(self: *MetadataService, record: metadata_mod.PackageManifest) !void {
+        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+    }
+
+    pub fn syncExtensionPackageStore(self: *MetadataService, io: std.Io, root_path: []const u8) !usize {
+        const entries = try metadata_mod.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer metadata_mod.freePackageStoreEntries(self.alloc, entries);
+        for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        return entries.len;
+    }
+
     pub fn runRound(self: *MetadataService) !void {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
@@ -2495,6 +2506,17 @@ pub const MetadataHttpService = struct {
 
     pub fn clearReallocationRequest(self: *MetadataHttpService) !void {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
+    }
+
+    pub fn upsertExtensionPackage(self: *MetadataHttpService, record: metadata_mod.PackageManifest) !void {
+        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+    }
+
+    pub fn syncExtensionPackageStore(self: *MetadataHttpService, io: std.Io, root_path: []const u8) !usize {
+        const entries = try metadata_mod.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer metadata_mod.freePackageStoreEntries(self.alloc, entries);
+        for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        return entries.len;
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {

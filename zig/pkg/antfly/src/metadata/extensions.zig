@@ -15,6 +15,8 @@
 const std = @import("std");
 
 pub const manifest_api_version_v1 = "extensions/v1";
+pub const package_manifest_filename = "extension.json";
+pub const max_package_manifest_bytes = 16 * 1024 * 1024;
 
 pub const PackageKind = enum {
     extension,
@@ -247,6 +249,50 @@ pub const PackageManifest = struct {
         self.* = undefined;
     }
 };
+
+pub const PackageStoreEntry = struct {
+    manifest: PackageManifest,
+    manifest_path: []u8,
+    package_root_path: []u8,
+    content_addressed: bool = false,
+
+    pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        self.manifest.deinitOwned(alloc);
+        alloc.free(self.manifest_path);
+        alloc.free(self.package_root_path);
+        self.* = undefined;
+    }
+};
+
+pub fn scanPackageStoreAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []const u8) ![]PackageStoreEntry {
+    var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    defer root_dir.close(io);
+
+    var walker = try root_dir.walk(alloc);
+    defer walker.deinit();
+
+    var out = std.ArrayListUnmanaged(PackageStoreEntry).empty;
+    errdefer {
+        for (out.items) |*entry| entry.deinitOwned(alloc);
+        out.deinit(alloc);
+    }
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.eql(u8, std.fs.path.basename(entry.path), package_manifest_filename)) continue;
+        try out.append(alloc, try loadPackageStoreEntryAlloc(alloc, io, root_path, entry.path));
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn freePackageStoreEntries(alloc: std.mem.Allocator, entries: []PackageStoreEntry) void {
+    for (entries) |*entry| entry.deinitOwned(alloc);
+    if (entries.len > 0) alloc.free(entries);
+}
 
 pub const InstallExtensionRequest = struct {
     version: []const u8 = "",
@@ -905,6 +951,42 @@ pub fn parsePackageManifestAlloc(alloc: std.mem.Allocator, json: []const u8) !st
     return parsed;
 }
 
+fn loadPackageStoreEntryAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    relative_manifest_path: []const u8,
+) !PackageStoreEntry {
+    const manifest_path = try joinStorePathAlloc(alloc, root_path, relative_manifest_path);
+    errdefer alloc.free(manifest_path);
+    const package_root_path = try packageRootPathAlloc(alloc, manifest_path);
+    errdefer alloc.free(package_root_path);
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, alloc, .limited(max_package_manifest_bytes));
+    defer alloc.free(raw);
+    var parsed = try parsePackageManifestAlloc(alloc, raw);
+    defer parsed.deinit();
+    const manifest = try clonePackageManifest(alloc, parsed.value);
+    errdefer freePackageManifest(alloc, manifest);
+
+    return .{
+        .manifest = manifest,
+        .manifest_path = manifest_path,
+        .package_root_path = package_root_path,
+        .content_addressed = std.mem.startsWith(u8, relative_manifest_path, "sha256/"),
+    };
+}
+
+fn joinStorePathAlloc(alloc: std.mem.Allocator, root_path: []const u8, relative_path: []const u8) ![]u8 {
+    if (root_path.len == 0 or std.mem.eql(u8, root_path, ".")) return try alloc.dupe(u8, relative_path);
+    return try std.fs.path.join(alloc, &.{ root_path, relative_path });
+}
+
+fn packageRootPathAlloc(alloc: std.mem.Allocator, manifest_path: []const u8) ![]u8 {
+    const root = std.fs.path.dirname(manifest_path) orelse ".";
+    return try alloc.dupe(u8, root);
+}
+
 fn requireUpdatePath(from_version: []const u8, target: PackageManifest) !void {
     for (target.updates) |update| {
         if (std.mem.eql(u8, update.from_version, from_version) and std.mem.eql(u8, update.to_version, target.version)) return;
@@ -1463,6 +1545,84 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqual(.mcp_tool, plan.members[2].object_kind);
     try std.testing.expectEqualStrings("memories", plan.members[2].table_name);
+}
+
+test "extension package store scans local and content-addressed manifests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/1.0.0");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/memoryaf/1.0.0/extension.json",
+        .data =
+        \\{
+        \\  "manifest_api_version": "extensions/v1",
+        \\  "name": "memoryaf",
+        \\  "version": "1.0.0",
+        \\  "kind": "extension",
+        \\  "digest": "sha256:memory",
+        \\  "install": {
+        \\    "scopes_supported": ["table"],
+        \\    "objects": [
+        \\      {"kind": "mcp_tool", "name": "recall"}
+        \\    ]
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.createDirPath(std.testing.io, "extensions/sha256/abc123");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/sha256/abc123/extension.json",
+        .data =
+        \\{
+        \\  "manifest_api_version": "extensions/v1",
+        \\  "name": "antfly_text_extras",
+        \\  "version": "2.0.0",
+        \\  "kind": "extension",
+        \\  "digest": "sha256:abc123",
+        \\  "install": {
+        \\    "scopes_supported": ["cluster"],
+        \\    "objects": [
+        \\      {"kind": "text_analyzer", "name": "porter"}
+        \\    ]
+        \\  }
+        \\}
+        ,
+    });
+
+    const entries = try scanPackageStoreAlloc(std.testing.allocator, std.testing.io, root_path);
+    defer freePackageStoreEntries(std.testing.allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var saw_memoryaf = false;
+    var saw_content_addressed = false;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.manifest.name, "memoryaf")) {
+            saw_memoryaf = true;
+            try std.testing.expect(!entry.content_addressed);
+            try std.testing.expect(std.mem.endsWith(u8, entry.package_root_path, "extensions/memoryaf/1.0.0"));
+        }
+        if (std.mem.eql(u8, entry.manifest.name, "antfly_text_extras")) {
+            saw_content_addressed = true;
+            try std.testing.expect(entry.content_addressed);
+            try std.testing.expectEqualStrings("sha256:abc123", entry.manifest.digest);
+        }
+    }
+    try std.testing.expect(saw_memoryaf);
+    try std.testing.expect(saw_content_addressed);
+}
+
+test "extension package store treats missing root as empty" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/missing-extensions", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_path);
+
+    const entries = try scanPackageStoreAlloc(std.testing.allocator, std.testing.io, root_path);
+    defer freePackageStoreEntries(std.testing.allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "installed extension and member validate scope and identity" {
