@@ -4373,7 +4373,7 @@ pub const Node = struct {
             .input = body.input,
         }) catch |err| switch (err) {
             error.ModelNotFound => return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "predictor not found" }),
-            error.BatchTooLarge => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "batch too large" }),
+            error.BatchTooLarge => return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "batch too large" }),
             error.FeatureMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature vector length mismatch" }),
             error.LoadFailed => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = "failed to load predictor" }),
             else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = @errorName(err) }),
