@@ -9690,6 +9690,33 @@ fn chunkColsForWorkers(
     return count;
 }
 
+fn chunkColsForWorkersAligned(
+    out_dim: usize,
+    plan: QuantLinearParallelPlan,
+    comptime align_cols: usize,
+    out: *[max_q4_k_parallel_workers]QuantColChunk,
+) usize {
+    if (align_cols <= 1 or plan.worker_count <= 1) return chunkColsForWorkers(out_dim, plan, out);
+    if (out_dim <= align_cols) return chunkColsForWorkers(out_dim, plan, out);
+
+    const cols_per_worker = std.math.divCeil(usize, out_dim, plan.worker_count) catch unreachable;
+    const aligned_cols_per_worker = std.mem.alignForward(usize, @max(cols_per_worker, align_cols), align_cols);
+
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < out_dim and count < plan.worker_count) {
+        const remaining = out_dim - start;
+        const end = if (count + 1 == plan.worker_count or remaining <= aligned_cols_per_worker + align_cols)
+            out_dim
+        else
+            start + aligned_cols_per_worker;
+        out[count] = .{ .start = start, .end = end };
+        count += 1;
+        start = end;
+    }
+    return count;
+}
+
 // Run the dispatched jobs and surface the first error any worker
 // recorded into its `err` slot.  Each worker context type carries an
 // `err: ?anyerror` field; this helper keeps the per-dispatcher tail
@@ -22814,7 +22841,10 @@ fn linearKPreparedQ8KActivationTripleParallel(
             std.debug.print("k_prepared_q8_k_activation_triple_parallel_cols q6={} workers={d} rows={d} out={d} row_blocks={d}\n", .{ q6, col_plan.worker_count, rows, out_dim, row_blocks });
         }
         var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
-        const num_chunks = chunkColsForWorkers(out_dim, col_plan, &chunks);
+        const num_chunks = if (use_panel16_direct)
+            chunkColsForWorkersAligned(out_dim, col_plan, prepared_k_panel16_nr, &chunks)
+        else
+            chunkColsForWorkers(out_dim, col_plan, &chunks);
         var contexts: [max_q4_k_parallel_workers]KPreparedQ8KActivationTripleWorkerCtx = undefined;
         var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
         for (chunks[0..num_chunks], 0..) |chunk, i| {
@@ -41027,6 +41057,22 @@ test "small-row quant column planner chunks output columns" {
         try std.testing.expect(chunk.start < chunk.end);
         try std.testing.expectEqual(chunk.end, chunks[idx + 1].start);
     }
+}
+
+test "aligned quant column chunks preserve panel16 groups" {
+    var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
+    const count = chunkColsForWorkersAligned(768, .{ .worker_count = 5 }, prepared_k_panel16_nr, &chunks);
+    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(QuantColChunk{ .start = 0, .end = 160 }, chunks[0]);
+    try std.testing.expectEqual(QuantColChunk{ .start = 160, .end = 320 }, chunks[1]);
+    try std.testing.expectEqual(QuantColChunk{ .start = 640, .end = 768 }, chunks[4]);
+    for (chunks[0 .. count - 1], 0..) |chunk, idx| {
+        try std.testing.expectEqual(@as(usize, 0), chunk.start % prepared_k_panel16_nr);
+        try std.testing.expectEqual(@as(usize, 0), chunk.end % prepared_k_panel16_nr);
+        try std.testing.expectEqual(chunk.end, chunks[idx + 1].start);
+    }
+    try std.testing.expectEqual(@as(usize, 0), chunks[count - 1].start % prepared_k_panel16_nr);
+    try std.testing.expectEqual(@as(usize, 0), chunks[count - 1].end % prepared_k_panel16_nr);
 }
 
 test "quantized storage budget bytes include prepared q4_k cache" {
