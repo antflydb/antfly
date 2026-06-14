@@ -20,6 +20,7 @@ import {
   HardDrive,
   RefreshCw,
 } from "lucide-react";
+import type { ComponentType } from "react";
 import { useState } from "react";
 import { AntyEmptyState, ErrorState } from "@/components/branded-empty-state";
 import {
@@ -68,7 +69,7 @@ function ModelGroup({
   models,
 }: {
   label: string;
-  icon: React.ComponentType<{ className?: string }>;
+  icon: ComponentType<{ className?: string }>;
   models: ConnectedModel[];
 }) {
   const [open, setOpen] = useState(false);
@@ -520,7 +521,7 @@ export default function ConnectionsPage() {
               <MonoLabel className="mb-3 block">Inference providers</MonoLabel>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {providers.map((connection) => (
-                  <ProviderCard key={connection.name} connection={connection} />
+                  <ProviderCard key={connection.id} connection={connection} />
                 ))}
               </div>
             </section>
@@ -531,7 +532,7 @@ export default function ConnectionsPage() {
               <MonoLabel className="mb-3 block">Web search</MonoLabel>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {webSearchConnections.map((connection) => (
-                  <WebSearchCard key={connection.name} connection={connection} />
+                  <WebSearchCard key={connection.id} connection={connection} />
                 ))}
               </div>
             </section>
@@ -542,7 +543,7 @@ export default function ConnectionsPage() {
               <MonoLabel className="mb-3 block">External IO</MonoLabel>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {infrastructure.map((connection) => (
-                  <InfrastructureCard key={connection.name} connection={connection} />
+                  <InfrastructureCard key={connection.id} connection={connection} />
                 ))}
               </div>
             </section>
@@ -553,7 +554,7 @@ export default function ConnectionsPage() {
               <MonoLabel className="mb-3 block">CDC sources</MonoLabel>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {cdcConnections.map((connection) => (
-                  <CdcCard key={connection.name} connection={connection} />
+                  <CdcCard key={connection.id} connection={connection} />
                 ))}
               </div>
             </section>
