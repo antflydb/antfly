@@ -6187,7 +6187,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       responses:
         '200':
           description: Package metadata.
@@ -6212,7 +6212,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
         - name: version
           in: path
           required: true
@@ -6251,7 +6251,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       requestBody:
         required: true
         content:
@@ -6275,7 +6275,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       responses:
         '200':
           description: Installed extension.
@@ -6294,7 +6294,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       requestBody:
         required: false
         content:
@@ -6319,7 +6319,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       requestBody:
         required: false
         content:
@@ -6344,7 +6344,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       responses:
         '200':
           description: Extension member objects.
@@ -6365,7 +6365,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       responses:
         '200':
           description: Enabled extension.
@@ -6384,7 +6384,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       responses:
         '200':
           description: Disabled extension.
@@ -6403,7 +6403,7 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: '#/components/schemas/ExtensionIdentifier'
       requestBody:
         required: true
         content:
@@ -18604,6 +18604,10 @@ components:
       type: string
       enum:
         - extension
+    ExtensionIdentifier:
+      type: string
+      pattern: ^[A-Za-z0-9_.-]+$
+      description: Path-safe extension or package identifier.
     ExtensionScopeKind:
       type: string
       enum:
@@ -18624,7 +18628,7 @@ components:
       type: object
       properties:
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
           example: read:table
         scope:
           type: string

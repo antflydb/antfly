@@ -1931,10 +1931,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
-        const is_extension_path = std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1) or
-            std.mem.startsWith(u8, uri_parts.path, routes.Routes.extensions_v1_packages) or
-            std.mem.startsWith(u8, uri_parts.path, routes.Routes.extensions_v1_installed);
-        if (!is_extension_path) return null;
+        if (!isExtensionPath(uri_parts.path)) return null;
 
         if (req.method != .GET) {
             if (req.method == .POST) {
@@ -6886,11 +6883,15 @@ fn installExtensionOnService(
         defer catalog.freeMembers(alloc, members);
         const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, dependencies);
+        const table_upserts = try planExtensionStorageMemberDeltaAlloc(alloc, &snapshot, &.{}, members);
+        defer freeExtensionLifecycleTables(alloc, table_upserts);
 
-        try applyExtensionStorageMemberDelta(service, alloc, &snapshot, &.{}, members);
-        try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
-        for (dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
-        for (members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
+        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+            .upsert_tables = table_upserts,
+            .upsert_installed_extensions = &.{installed},
+            .upsert_extension_dependencies = dependencies,
+            .upsert_extension_members = members,
+        } });
     }
 
     return installed;
@@ -6923,25 +6924,21 @@ fn updateExtensionOnService(
         defer catalog.freeMembers(alloc, new_members);
         const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, new_dependencies);
+        const table_upserts = try planExtensionStorageMemberDeltaAlloc(alloc, &snapshot, old_members, new_members);
+        defer freeExtensionLifecycleTables(alloc, table_upserts);
+        const remove_dependency_keys = try extensionDependencyRemoveKeysAlloc(alloc, old_dependencies);
+        defer freeExtensionDependencyRemoveKeys(alloc, remove_dependency_keys);
+        const remove_member_keys = try extensionMemberRemoveKeysAlloc(alloc, old_members);
+        defer freeExtensionMemberRemoveKeys(alloc, remove_member_keys);
 
-        try applyExtensionStorageMemberDelta(service, alloc, &snapshot, old_members, new_members);
-        for (old_dependencies) |dependency| {
-            try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
-                .extension_name = dependency.extension_name,
-                .required_extension_name = dependency.required_extension_name,
-                .package_name = dependency.package_name,
-            } });
-        }
-        for (old_members) |member| {
-            try service.proposeTransitionCommand(.{ .remove_extension_member = .{
-                .extension_name = member.extension_name,
-                .object_kind = member.object_kind,
-                .object_name = member.object_name,
-            } });
-        }
-        try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
-        for (new_dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
-        for (new_members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
+        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+            .upsert_tables = table_upserts,
+            .remove_extension_dependencies = remove_dependency_keys,
+            .remove_extension_members = remove_member_keys,
+            .upsert_installed_extensions = &.{installed},
+            .upsert_extension_dependencies = new_dependencies,
+            .upsert_extension_members = new_members,
+        } });
     }
 
     return installed;
@@ -6971,28 +6968,21 @@ fn dropExtensionOnService(
     defer catalog.freeMembers(alloc, remaining_members);
     const remaining_dependencies = try catalog.listDependencies(alloc);
     defer catalog.freeDependencies(alloc, remaining_dependencies);
+    const table_upserts = try planRemovedExtensionStorageMembersAlloc(alloc, &snapshot, remaining_members);
+    defer freeExtensionLifecycleTables(alloc, table_upserts);
+    const remove_dependency_keys = try missingExtensionDependencyKeysAlloc(alloc, snapshot.extension_dependencies, remaining_dependencies);
+    defer freeExtensionDependencyRemoveKeys(alloc, remove_dependency_keys);
+    const remove_member_keys = try missingExtensionMemberKeysAlloc(alloc, snapshot.extension_members, remaining_members);
+    defer freeExtensionMemberRemoveKeys(alloc, remove_member_keys);
+    const remove_installed_names = try missingInstalledExtensionNamesAlloc(alloc, snapshot.installed_extensions, remaining_installed);
+    defer freeExtensionInstalledRemoveNames(alloc, remove_installed_names);
 
-    try applyRemovedExtensionStorageMembers(service, alloc, &snapshot, remaining_members);
-    for (snapshot.extension_dependencies) |dependency| {
-        if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
-        try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
-            .extension_name = dependency.extension_name,
-            .required_extension_name = dependency.required_extension_name,
-            .package_name = dependency.package_name,
-        } });
-    }
-    for (snapshot.extension_members) |member| {
-        if (extensionMemberExists(remaining_members, member)) continue;
-        try service.proposeTransitionCommand(.{ .remove_extension_member = .{
-            .extension_name = member.extension_name,
-            .object_kind = member.object_kind,
-            .object_name = member.object_name,
-        } });
-    }
-    for (snapshot.installed_extensions) |installed| {
-        if (installedExtensionExists(remaining_installed, installed.name)) continue;
-        try service.proposeTransitionCommand(.{ .remove_installed_extension = .{ .name = installed.name } });
-    }
+    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        .upsert_tables = table_upserts,
+        .remove_extension_dependencies = remove_dependency_keys,
+        .remove_extension_members = remove_member_keys,
+        .remove_installed_extensions = remove_installed_names,
+    } });
 }
 
 fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !metadata_mod.InstalledExtension {
@@ -7004,7 +6994,9 @@ fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extensio
     try catalog.enableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        .upsert_installed_extensions = &.{installed},
+    } });
     return installed;
 }
 
@@ -7017,7 +7009,9 @@ fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extensi
     try catalog.disableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        .upsert_installed_extensions = &.{installed},
+    } });
     return installed;
 }
 
@@ -7035,7 +7029,9 @@ fn configureExtensionOnService(
     try catalog.configureInstalled(extension_name, request);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        .upsert_installed_extensions = &.{installed},
+    } });
     return installed;
 }
 
@@ -7064,7 +7060,8 @@ fn preflightClusterRestoreExtensions(self: *ApiHttpServer, manifest: *const back
 fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.PackageManifest {
     var found: ?*const metadata_mod.PackageManifest = null;
     for (snapshot.extension_packages) |*package| {
-        if (std.mem.eql(u8, package.name, name)) found = package;
+        if (!std.mem.eql(u8, package.name, name)) continue;
+        if (found == null or metadata_mod.extensions.packageVersionLess(found.?.version, package.version)) found = package;
     }
     return found;
 }
@@ -7185,14 +7182,19 @@ fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapsho
     }
 }
 
-fn applyExtensionStorageMemberDelta(
-    service: anytype,
+fn planExtensionStorageMemberDeltaAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     old_members: []const metadata_mod.ExtensionMember,
     new_members: []const metadata_mod.ExtensionMember,
-) !void {
+) ![]metadata_table_manager.TableRecord {
     try validateNewExtensionStorageMembers(snapshot, new_members);
+
+    var out = std.ArrayListUnmanaged(metadata_table_manager.TableRecord).empty;
+    errdefer {
+        for (out.items) |record| metadata_table_manager.freeTable(alloc, record);
+        out.deinit(alloc);
+    }
 
     for (snapshot.tables) |table| {
         var owned_indexes_json: ?[]u8 = null;
@@ -7240,25 +7242,127 @@ fn applyExtensionStorageMemberDelta(
         }
 
         if (!changed) continue;
-        var updated_record = table;
+        var updated_record = try metadata_table_manager.cloneTable(alloc, table);
+        errdefer metadata_table_manager.freeTable(alloc, updated_record);
+        alloc.free(@constCast(updated_record.indexes_json));
         updated_record.indexes_json = owned_indexes_json.?;
-        try service.upsertTable(updated_record);
+        owned_indexes_json = null;
+        try out.append(alloc, updated_record);
     }
+    return try out.toOwnedSlice(alloc);
 }
 
-fn applyRemovedExtensionStorageMembers(
-    service: anytype,
+fn planRemovedExtensionStorageMembersAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
     remaining_members: []const metadata_mod.ExtensionMember,
-) !void {
+) ![]metadata_table_manager.TableRecord {
     var removed = std.ArrayListUnmanaged(metadata_mod.ExtensionMember).empty;
     defer removed.deinit(alloc);
     for (snapshot.extension_members) |member| {
         if (extensionMemberExists(remaining_members, member)) continue;
         try removed.append(alloc, member);
     }
-    try applyExtensionStorageMemberDelta(service, alloc, snapshot, removed.items, &.{});
+    return try planExtensionStorageMemberDeltaAlloc(alloc, snapshot, removed.items, &.{});
+}
+
+fn freeExtensionLifecycleTables(alloc: std.mem.Allocator, tables: []metadata_table_manager.TableRecord) void {
+    for (tables) |record| metadata_table_manager.freeTable(alloc, record);
+    if (tables.len > 0) alloc.free(tables);
+}
+
+fn extensionMemberRemoveKeysAlloc(
+    alloc: std.mem.Allocator,
+    members: []const metadata_mod.ExtensionMember,
+) ![]metadata_mod.storage.ExtensionMemberKey {
+    const out = try alloc.alloc(metadata_mod.storage.ExtensionMemberKey, members.len);
+    errdefer alloc.free(out);
+    for (members, 0..) |member, i| {
+        out[i] = .{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        };
+    }
+    return out;
+}
+
+fn missingExtensionMemberKeysAlloc(
+    alloc: std.mem.Allocator,
+    members: []const metadata_mod.ExtensionMember,
+    remaining_members: []const metadata_mod.ExtensionMember,
+) ![]metadata_mod.storage.ExtensionMemberKey {
+    var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionMemberKey).empty;
+    errdefer out.deinit(alloc);
+    for (members) |member| {
+        if (extensionMemberExists(remaining_members, member)) continue;
+        try out.append(alloc, .{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionMemberRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_mod.storage.ExtensionMemberKey) void {
+    if (keys.len > 0) alloc.free(keys);
+}
+
+fn extensionDependencyRemoveKeysAlloc(
+    alloc: std.mem.Allocator,
+    dependencies: []const metadata_mod.ExtensionDependency,
+) ![]metadata_mod.storage.ExtensionDependencyKey {
+    const out = try alloc.alloc(metadata_mod.storage.ExtensionDependencyKey, dependencies.len);
+    errdefer alloc.free(out);
+    for (dependencies, 0..) |dependency, i| {
+        out[i] = .{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        };
+    }
+    return out;
+}
+
+fn missingExtensionDependencyKeysAlloc(
+    alloc: std.mem.Allocator,
+    dependencies: []const metadata_mod.ExtensionDependency,
+    remaining_dependencies: []const metadata_mod.ExtensionDependency,
+) ![]metadata_mod.storage.ExtensionDependencyKey {
+    var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionDependencyKey).empty;
+    errdefer out.deinit(alloc);
+    for (dependencies) |dependency| {
+        if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
+        try out.append(alloc, .{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionDependencyRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_mod.storage.ExtensionDependencyKey) void {
+    if (keys.len > 0) alloc.free(keys);
+}
+
+fn missingInstalledExtensionNamesAlloc(
+    alloc: std.mem.Allocator,
+    installed_extensions: []const metadata_mod.InstalledExtension,
+    remaining_installed: []const metadata_mod.InstalledExtension,
+) ![]const []const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer out.deinit(alloc);
+    for (installed_extensions) |installed| {
+        if (installedExtensionExists(remaining_installed, installed.name)) continue;
+        try out.append(alloc, installed.name);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionInstalledRemoveNames(alloc: std.mem.Allocator, names: []const []const u8) void {
+    if (names.len > 0) alloc.free(@constCast(names));
 }
 
 fn extensionMembersForName(
@@ -7324,18 +7428,21 @@ fn extensionDependencyExists(dependencies: []const metadata_mod.ExtensionDepende
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
-    if (std.mem.eql(u8, path, routes.Routes.extensions_v1) or
-        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_packages) or
-        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_installed))
-    {
-        return true;
-    }
+    if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
     if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
+}
+
+fn isExtensionPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, routes.Routes.extensions_v1) or
+        std.mem.eql(u8, path, routes.Routes.extensions_v1_packages) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_packages_prefix) or
+        std.mem.eql(u8, path, routes.Routes.extensions_v1_installed) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_installed_prefix);
 }
 
 pub const RequiredPermission = struct {
@@ -9279,8 +9386,16 @@ test "extension lifecycle materializes table index and enrichment members" {
 
         fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
             const Command = @TypeOf(command);
-            if (@hasField(Command, "upsert_installed_extension")) self.installed_upserts += 1;
-            if (@hasField(Command, "upsert_extension_member")) self.member_upserts += 1;
+            if (@hasField(Command, "apply_extension_lifecycle")) {
+                const delta = command.apply_extension_lifecycle;
+                self.upsert_table_count += delta.upsert_tables.len;
+                if (delta.upsert_tables.len > 0) {
+                    if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+                    self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                }
+                self.installed_upserts += delta.upsert_installed_extensions.len;
+                self.member_upserts += delta.upsert_extension_members.len;
+            }
         }
     };
 
@@ -9386,8 +9501,16 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
 
         fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
             const Command = @TypeOf(command);
-            if (@hasField(Command, "remove_installed_extension")) self.installed_removes += 1;
-            if (@hasField(Command, "remove_extension_member")) self.member_removes += 1;
+            if (@hasField(Command, "apply_extension_lifecycle")) {
+                const delta = command.apply_extension_lifecycle;
+                self.upsert_table_count += delta.upsert_tables.len;
+                if (delta.upsert_tables.len > 0) {
+                    if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+                    self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                }
+                self.installed_removes += delta.remove_installed_extensions.len;
+                self.member_removes += delta.remove_extension_members.len;
+            }
         }
     };
 
@@ -10078,6 +10201,16 @@ test "api http server authenticates trusted principal" {
     try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
     try std.testing.expectEqualStrings("docs", identity.row_filter[0].table);
     try std.testing.expect(std.mem.indexOf(u8, identity.row_filter[0].filter, "\"tenant_id\":\"t1\"") != null);
+}
+
+test "api http server treats only exact extension prefixes as admin routes" {
+    try std.testing.expect(requiresAdminPermission("/extensions/v1"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/packages"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/packages/memoryaf"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/installed"));
+    try std.testing.expect(requiresAdminPermission("/extensions/v1/installed/memoryaf"));
+    try std.testing.expect(!requiresAdminPermission("/extensions/v1/packagesXYZ"));
+    try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
 }
 
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {

@@ -276,6 +276,14 @@ The split is:
 /extensions/v1/installed = installed extension instances and lifecycle
 ```
 
+Package `{name}` values are path-safe package ids, not arbitrary registry paths.
+They should be single path segments such as `memoryaf` or `antfly.memoryaf`.
+Namespaced registry coordinates can be stored in package metadata later, but
+the public lifecycle API should keep a stable, unambiguous package id in the
+URL. When a client omits a package version, Antfly resolves the deterministic
+highest known package version according to its package version ordering; hosted
+profiles may additionally expose an explicit default/stable channel later.
+
 Alternative roots are weaker:
 
 - `/packages/v1` over-centers artifact distribution and separates package API
@@ -324,8 +332,8 @@ Install flow:
 1. Resolve package and dependency versions.
 2. Verify trust policy, digest/signature, target scope, and capability grants.
 3. Dry-run manifest against metadata validators.
-4. Write one metadata transaction containing the installed extension row,
-   member rows, and desired objects.
+4. Write one metadata lifecycle transition containing table metadata deltas,
+   installed extension rows, dependency rows, member rows, and desired objects.
 5. Let existing table/range provisioning and shard reconciliation apply changes
    to shard-local `IndexManager` catalogs.
 6. Mark runtime status per group as installed/ready/error.

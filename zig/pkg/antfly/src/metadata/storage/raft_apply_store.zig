@@ -31,6 +31,28 @@ pub const AppliedMetadataBatch = struct {
     entries_bytes: []const u8,
 };
 
+pub const ExtensionMemberKey = struct {
+    extension_name: []const u8,
+    object_kind: metadata.ExtensionObjectKind,
+    object_name: []const u8,
+};
+
+pub const ExtensionDependencyKey = struct {
+    extension_name: []const u8,
+    required_extension_name: []const u8,
+    package_name: []const u8,
+};
+
+pub const ExtensionLifecycleDelta = struct {
+    upsert_tables: []const metadata.TableRecord = &.{},
+    upsert_installed_extensions: []const metadata.InstalledExtension = &.{},
+    remove_installed_extensions: []const []const u8 = &.{},
+    upsert_extension_members: []const metadata.ExtensionMember = &.{},
+    remove_extension_members: []const ExtensionMemberKey = &.{},
+    upsert_extension_dependencies: []const metadata.ExtensionDependency = &.{},
+    remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
+};
+
 pub const TransitionCommand = union(enum) {
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
@@ -117,6 +139,7 @@ pub const TransitionCommand = union(enum) {
         required_extension_name: []const u8,
         package_name: []const u8,
     },
+    apply_extension_lifecycle: ExtensionLifecycleDelta,
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -171,6 +194,7 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
             },
+            .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
         self.* = undefined;
@@ -1494,6 +1518,71 @@ pub const RaftApplyStore = struct {
                 };
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
+            .apply_extension_lifecycle => |delta| {
+                try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
+            },
+        }
+    }
+
+    fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
+        for (delta.upsert_tables) |record| {
+            var key_buf: [160]u8 = undefined;
+            const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
+            const value = try encodeTableRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_extension_dependencies) |record| {
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_extension_members) |record| {
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_installed_extensions) |name| {
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_installed_extensions) |record| {
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, record.name);
+            const value = try encodeInstalledExtensionRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_extension_dependencies) |record| {
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+            const value = try encodeExtensionDependencyRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_extension_members) |record| {
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            const value = try encodeExtensionMemberRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         }
     }
 
@@ -1793,6 +1882,7 @@ const TransitionTag = enum(u8) {
     remove_extension_member = 37,
     upsert_extension_dependency = 38,
     remove_extension_dependency = 39,
+    apply_extension_lifecycle = 40,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -1965,6 +2055,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendRequiredString(alloc, &out, record.required_extension_name);
             try appendRequiredString(alloc, &out, record.package_name);
         },
+        .apply_extension_lifecycle => |delta| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
+            try appendJsonRecord(alloc, &out, delta);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -2130,6 +2224,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .required_extension_name = try readRequiredString(alloc, encoded, &pos),
                 .package_name = try readRequiredString(alloc, encoded, &pos),
             },
+        },
+        .apply_extension_lifecycle => .{
+            .apply_extension_lifecycle = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
         },
     };
 }
@@ -3322,6 +3419,39 @@ fn deinitExtensionJsonRecord(comptime T: type, alloc: std.mem.Allocator, value: 
     if (@hasDecl(T, "deinitOwned")) {
         value.deinitOwned(alloc);
     }
+}
+
+fn freeExtensionLifecycleDelta(alloc: std.mem.Allocator, delta: ExtensionLifecycleDelta) void {
+    for (delta.upsert_tables) |record| metadata_table_manager.freeTable(alloc, record);
+    if (delta.upsert_tables.len > 0) alloc.free(@constCast(delta.upsert_tables));
+    for (delta.upsert_installed_extensions) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_installed_extensions.len > 0) alloc.free(@constCast(delta.upsert_installed_extensions));
+    for (delta.remove_installed_extensions) |name| alloc.free(@constCast(name));
+    if (delta.remove_installed_extensions.len > 0) alloc.free(@constCast(delta.remove_installed_extensions));
+    for (delta.upsert_extension_members) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_extension_members.len > 0) alloc.free(@constCast(delta.upsert_extension_members));
+    for (delta.remove_extension_members) |record| {
+        alloc.free(@constCast(record.extension_name));
+        alloc.free(@constCast(record.object_name));
+    }
+    if (delta.remove_extension_members.len > 0) alloc.free(@constCast(delta.remove_extension_members));
+    for (delta.upsert_extension_dependencies) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_extension_dependencies.len > 0) alloc.free(@constCast(delta.upsert_extension_dependencies));
+    for (delta.remove_extension_dependencies) |record| {
+        alloc.free(@constCast(record.extension_name));
+        alloc.free(@constCast(record.required_extension_name));
+        alloc.free(@constCast(record.package_name));
+    }
+    if (delta.remove_extension_dependencies.len > 0) alloc.free(@constCast(delta.remove_extension_dependencies));
 }
 
 fn readRangeRecord(
@@ -4723,6 +4853,73 @@ test "metadata reallocation request transition command round-trips" {
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
+}
+
+test "metadata extension lifecycle transition command round-trips" {
+    const command: TransitionCommand = .{
+        .apply_extension_lifecycle = .{
+            .upsert_tables = &.{.{
+                .table_id = 7,
+                .name = "memories",
+                .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            }},
+            .upsert_installed_extensions = &.{.{
+                .name = "memoryaf",
+                .package_name = "memoryaf",
+                .package_version = "1.0.0",
+                .package_digest = "sha256:abc",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .status = .ready,
+            }},
+            .remove_installed_extensions = &.{"old_memoryaf"},
+            .upsert_extension_members = &.{.{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .index,
+                .object_name = "memory_text",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"type\":\"full_text\"}",
+            }},
+            .remove_extension_members = &.{.{
+                .extension_name = "memoryaf",
+                .object_kind = .mcp_tool,
+                .object_name = "old_recall",
+            }},
+            .upsert_extension_dependencies = &.{.{
+                .extension_name = "memoryaf",
+                .required_extension_name = "core",
+                .package_name = "antfly_core",
+            }},
+            .remove_extension_dependencies = &.{.{
+                .extension_name = "memoryaf",
+                .required_extension_name = "old_core",
+                .package_name = "old_core",
+            }},
+        },
+    };
+
+    const encoded = try encodeTransitionCommand(std.testing.allocator, command);
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decodeTransitionCommand(std.testing.allocator, encoded);
+    defer if (decoded) |*d| d.deinit(std.testing.allocator);
+
+    try std.testing.expect(decoded != null);
+    try std.testing.expect(decoded.? == .apply_extension_lifecycle);
+    const delta = decoded.?.apply_extension_lifecycle;
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_tables.len);
+    try std.testing.expectEqualStrings("memories", delta.upsert_tables[0].name);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_installed_extensions.len);
+    try std.testing.expectEqualStrings("memoryaf", delta.upsert_installed_extensions[0].name);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_installed_extensions.len);
+    try std.testing.expectEqualStrings("old_memoryaf", delta.remove_installed_extensions[0]);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_members.len);
+    try std.testing.expectEqual(.index, delta.upsert_extension_members[0].object_kind);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_members.len);
+    try std.testing.expectEqualStrings("old_recall", delta.remove_extension_members[0].object_name);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_dependencies.len);
+    try std.testing.expectEqualStrings("antfly_core", delta.upsert_extension_dependencies[0].package_name);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_dependencies.len);
 }
 
 test "metadata raft apply store projects schema progress records from committed entries" {

@@ -831,7 +831,8 @@ pub const ExtensionCatalog = struct {
         if (version.len == 0) {
             var found: ?*const PackageManifest = null;
             for (self.packages.items) |*package| {
-                if (std.mem.eql(u8, package.name, name)) found = package;
+                if (!std.mem.eql(u8, package.name, name)) continue;
+                if (found == null or packageVersionLess(found.?.version, package.version)) found = package;
             }
             return found;
         }
@@ -1521,7 +1522,7 @@ fn freeExtensionDependency(alloc: std.mem.Allocator, dependency: ExtensionDepend
 }
 
 pub fn requirePackageName(value: []const u8) !void {
-    try requireIdentifier("package.name", value, true);
+    try requireIdentifier("package.name", value, false);
 }
 
 pub fn requireObjectName(value: []const u8) !void {
@@ -1558,6 +1559,35 @@ fn validateJsonObject(_: []const u8, value: []const u8) !void {
         .object => {},
         else => return error.InvalidJsonObject,
     }
+}
+
+pub fn packageVersionLess(a: []const u8, b: []const u8) bool {
+    var a_it = std.mem.splitScalar(u8, a, '.');
+    var b_it = std.mem.splitScalar(u8, b, '.');
+    while (true) {
+        const a_part = a_it.next();
+        const b_part = b_it.next();
+        if (a_part == null and b_part == null) return false;
+        if (a_part == null) return true;
+        if (b_part == null) return false;
+        const a_num = std.fmt.parseUnsigned(u64, a_part.?, 10) catch null;
+        const b_num = std.fmt.parseUnsigned(u64, b_part.?, 10) catch null;
+        if (a_num != null and b_num != null) {
+            if (a_num.? != b_num.?) return a_num.? < b_num.?;
+            continue;
+        }
+        const order = std.mem.order(u8, a_part.?, b_part.?);
+        if (order != .eq) return order == .lt;
+    }
+}
+
+test "extension package names are path-safe and versions sort deterministically" {
+    try requirePackageName("memoryaf");
+    try requirePackageName("antfly.memoryaf");
+    try std.testing.expectError(error.InvalidIdentifier, requirePackageName("antfly/memoryaf"));
+    try std.testing.expect(packageVersionLess("1.0.9", "1.0.10"));
+    try std.testing.expect(packageVersionLess("1.0", "1.0.1"));
+    try std.testing.expect(!packageVersionLess("1.10.0", "1.2.0"));
 }
 
 test "extension package manifest validates data shape and mcp objects" {
@@ -1660,6 +1690,35 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqualStrings("recall_request", plan.members[4].shape_name);
     try std.testing.expectEqualStrings("1", plan.members[4].shape_version);
     try std.testing.expectEqualStrings("memories", plan.members[4].table_name);
+}
+
+test "extension catalog resolves unversioned installs to deterministic latest package" {
+    var catalog = ExtensionCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+
+    try catalog.registerPackage(.{
+        .name = "memoryaf",
+        .version = "1.10.0",
+        .digest = "sha256:v110",
+        .install = .{ .scopes_supported = &.{.cluster} },
+    });
+    try catalog.registerPackage(.{
+        .name = "memoryaf",
+        .version = "1.2.0",
+        .digest = "sha256:v12",
+        .install = .{ .scopes_supported = &.{.cluster} },
+    });
+
+    var installed = try catalog.installManifestOnly(
+        "memoryaf",
+        "memoryaf",
+        .{ .scope = .{ .kind = .cluster } },
+        42,
+    );
+    defer installed.deinitOwned(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("1.10.0", installed.package_version);
+    try std.testing.expectEqualStrings("sha256:v110", installed.package_digest);
 }
 
 test "extension package store scans local and content-addressed manifests" {
