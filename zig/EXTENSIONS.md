@@ -224,60 +224,86 @@ rather than `:action`.
 Suggested API surface:
 
 ```text
-GET    /db/v1/packages
-GET    /db/v1/packages/{name}
-GET    /db/v1/packages/{name}/versions/{version}
+GET    /extensions/v1/packages
+GET    /extensions/v1/packages/{name}
+GET    /extensions/v1/packages/{name}/versions/{version}
 
-GET    /db/v1/extensions
-POST   /db/v1/extensions/{name}
-GET    /db/v1/extensions/{name}
-POST   /db/v1/extensions/{name}/update
-POST   /db/v1/extensions/{name}/drop
-POST   /db/v1/extensions/{name}/enable
-POST   /db/v1/extensions/{name}/disable
-GET    /db/v1/extensions/{name}/objects
-PUT    /db/v1/extensions/{name}/config
+GET    /extensions/v1/installed
+POST   /extensions/v1/installed/{name}
+GET    /extensions/v1/installed/{name}
+POST   /extensions/v1/installed/{name}/update
+POST   /extensions/v1/installed/{name}/drop
+POST   /extensions/v1/installed/{name}/enable
+POST   /extensions/v1/installed/{name}/disable
+GET    /extensions/v1/installed/{name}/objects
+PUT    /extensions/v1/installed/{name}/config
 ```
 
-`/db/v1/packages` is intentionally generic. It is the catalog of signed,
-installable artifacts Antfly knows about. Extension packages are the first
-package kind. In v1, MCP tools, HTTP endpoints, workflows, model adapters,
-analyzers, connectors, and index backends should be installed as objects owned
-by extension packages when they need PostgreSQL-style lifecycle semantics. The
-same package catalog can later hold standalone MCP apps or other thin wrappers
-that do not own storage shape. `/db/v1/extensions` is narrower: it is the
-installed extension lifecycle, with PostgreSQL-style member tracking,
-dependencies, update/drop, backup/restore, and shape ownership.
+Use `/extensions/v1` as the top-level subsystem for both package catalog and
+installed extension lifecycle. Do not put these operations under `/db/v1`: an
+extension can install hooks into the database API, AI/model API, MCP surface,
+A2A surface, and auth policy surface. It is an Antfly platform capability, not a
+database subresource.
+
+`/extensions/v1/packages` is the catalog of signed, installable artifacts
+Antfly knows about. Extension packages are the first package kind. In v1, MCP
+tools, HTTP endpoints, workflows, model adapters, analyzers, connectors, and
+index backends should be installed as objects owned by extension packages when
+they need PostgreSQL-style lifecycle semantics. The same package catalog can
+later hold standalone MCP apps or other thin wrappers that do not own storage
+shape. `/extensions/v1/installed` is narrower: it is the installed extension
+lifecycle, with PostgreSQL-style member tracking, dependencies, update/drop,
+backup/restore, and shape ownership.
 
 The split is:
 
 ```text
-/db/v1/packages   = available installable artifacts
-/db/v1/extensions = installed extension instances and lifecycle
+/extensions/v1/packages  = available installable artifacts
+/extensions/v1/installed = installed extension instances and lifecycle
 ```
+
+Alternative roots are weaker:
+
+- `/packages/v1` over-centers artifact distribution and separates package API
+  versioning from install/update/drop semantics, even though they evolve
+  together.
+- `/pkg/v1` and `/pkgs/v1` are terse but less readable as a public API.
+- `/db/v1/extensions` is too narrow once extensions can affect `/ai/v1`,
+  `/mcp/v1`, A2A, and `/auth/v1`.
 
 The SQL-like DDL maps directly onto those API calls:
 
 ```text
 CREATE EXTENSION memoryaf
-=> POST /db/v1/extensions/memoryaf
+=> POST /extensions/v1/installed/memoryaf
 
 ALTER EXTENSION memoryaf UPDATE TO '1.2.0'
-=> POST /db/v1/extensions/memoryaf/update
+=> POST /extensions/v1/installed/memoryaf/update
 
 DROP EXTENSION memoryaf CASCADE
-=> POST /db/v1/extensions/memoryaf/drop
+=> POST /extensions/v1/installed/memoryaf/drop
    { "mode": "cascade" }
 ```
 
-`POST /db/v1/extensions/{name}` should behave like "install this named package
-into this scope", with body fields for version, target scope, config, grants,
-and dry-run. `POST /db/v1/extensions/{name}/update` should accept target
-version, update policy, and dry-run. `POST /db/v1/extensions/{name}/drop`
-should accept `restrict`/`cascade` mode and dry-run. A plain
-`DELETE /db/v1/extensions/{name}` can exist later as a shorthand for restricted
-drop, but the POST action is the better primary operation because extension drop
-has policy, dependency, and dry-run inputs.
+`POST /extensions/v1/installed/{name}` should behave like "install this named
+package into this scope", with body fields for version, target scope, config,
+grants, and dry-run. `POST /extensions/v1/installed/{name}/update` should
+accept target version, update policy, and dry-run.
+`POST /extensions/v1/installed/{name}/drop` should accept `restrict`/`cascade`
+mode and dry-run. A plain `DELETE /extensions/v1/installed/{name}` can exist
+later as a shorthand for restricted drop, but the POST action is the better
+primary operation because extension drop has policy, dependency, and dry-run
+inputs.
+
+Installed extension members can then augment existing Antfly surfaces:
+
+```text
+/db/v1        data shapes, indexes, enrichments, resolvers, query functions
+/ai/v1        model adapters, provider config, embedding/generation hooks
+/mcp/v1       extension-owned MCP tools
+/a2a/v1       agent cards, skills, task handlers, and delegation hooks
+/auth/v1      roles, permissions, capability policies, auth integration hooks
+```
 
 Install flow:
 
@@ -312,24 +338,73 @@ Every extension-created object needs a stable identity:
 scope/table_name/object_kind/object_name
 ```
 
-Candidate `object_kind` values:
+Treat `object_kind` as the kind of installed object Antfly must protect,
+update, drop, back up, and restore. It should not include every implementation
+subcomponent. Prefer kinds that line up with existing mutation surfaces and
+future runtime boundaries.
 
-- `data_shape`
-- `table_schema`
-- `extension_relation`
-- `generated_artifact`
-- `index`
-- `enrichment`
-- `resolver`
-- `provider`
-- `analyzer`
-- `tokenizer`
-- `query_function`
-- `mcp_tool`
-- `api_endpoint`
-- `graph_algorithm`
-- `index_backend`
-- `maintenance_task`
+V1 should support manifest-only or mostly declarative objects:
+
+- `data_shape`: a named data contract, such as a document shape, row shape,
+  generated artifact shape, MCP input/output schema, or HTTP request/response
+  schema. This is the reusable shape definition.
+- `table_schema`: a binding from extension-owned shape declarations into an
+  Antfly table schema. This lines up with today's table `schema_json` and schema
+  update flow.
+- `extension_relation`: extension-owned table/relation/state, including config
+  or state relations analogous to PostgreSQL extension-owned tables.
+- `generated_artifact`: the shape and lifecycle of derived data written by
+  enrichments or workflows, such as chunks, embeddings, summaries, extraction
+  records, resolver outputs, checkpoints, or graph edges.
+- `index`: an installed index instance over table data or generated artifacts.
+  This lines up with current `indexes_json` and index create/drop flows.
+- `enrichment`: a configured producer that creates generated artifacts. This
+  lines up with the existing durable enrichment catalog.
+- `resolver`: a configured resolver that consumes extraction artifacts and
+  writes resolution artifacts. This lines up with the existing resolver catalog.
+- `mcp_tool`: an MCP tool exposed from an installed extension, with schema,
+  handler mode, capabilities, and audit semantics.
+
+V2 should add safe runtime and integration objects:
+
+- `query_function`: a named callable used by query plans, API handlers, MCP
+  handlers, or workflows. It should declare determinism, cost, result shape, and
+  runtime mode.
+- `api_endpoint`: an extension-owned HTTP/OpenAPI endpoint. This is useful, but
+  should follow MCP tools because auth, routing, compatibility, and generated
+  clients make it a wider public surface.
+- `a2a_agent`: an A2A-facing agent card, skill, task handler, or delegation
+  hook exposed by an installed extension. This should be gated by the same
+  schema, auth, audit, and runtime capability model as MCP tools.
+- `auth_policy`: extension-owned roles, permission templates, capability
+  policies, or auth integration hooks. This should be declarative first and
+  tightly constrained, because auth objects affect every other extension
+  surface.
+- `workflow`: a durable workflow definition, such as `antfly_durable` jobs or
+  `memoryaf` summarization/compaction flows. Runtime state can live in
+  extension relations and generated artifacts.
+- `maintenance_task`: a scheduled or lease-owned background task, such as
+  compaction, reweighting, graph metric refresh, or repair.
+- `provider_config`: a model/provider/chunker/reranker/generator configuration
+  entry. This should be separate from provider implementation code.
+- `text_analyzer`: a configured text analyzer component or analyzer pipeline.
+- `text_tokenizer`: a configured tokenizer component referenced by analyzers.
+
+V3 and privileged objects should wait for stronger isolation and conformance
+tests:
+
+- `provider_adapter`: runtime code that implements a new provider backend.
+- `connector`: runtime code and configuration for external data sources or
+  sinks, including replication-like integrations.
+- `index_backend`: a PostgreSQL access-method-style backend that defines how an
+  index is built, updated, queried, snapshotted, and migrated. Individual index
+  instances should still be `index` members.
+
+Do not make `graph_algorithm` a core v1 object kind. A read-time graph algorithm
+is usually a `query_function`; a materialized graph metric is usually a
+`maintenance_task` plus `generated_artifact` or `extension_relation`; a graph
+index remains an `index`. Add a dedicated graph object kind only when the
+runtime contract is clearly distinct from those three cases.
 
 This is the Antfly equivalent of PostgreSQL tracking extension member objects.
 It prevents accidental deletion of individual extension-owned objects, makes
@@ -347,6 +422,14 @@ Expose narrow interfaces, not arbitrary internal structs:
   - handler mode: declarative Antfly API template, WASM, sidecar, or native
   - caller identity plus extension capability grants
   - audit record for every invocation
+- A2A agent hooks:
+  - agent card, skills, task input/output schemas, and handler mode
+  - caller identity plus extension capability grants
+  - audit record for every task invocation or delegation
+- Auth policy hooks:
+  - declarative roles, permission templates, and capability grants
+  - no arbitrary runtime code in v1
+  - explicit owner and scope so uninstall/update cannot orphan access
 - Analyzers/tokenizers:
   - text in, token stream out
   - language/config metadata
@@ -720,7 +803,7 @@ The important product behavior is:
 
 ```text
 CREATE EXTENSION memoryaf;
-GET /db/v1/extensions/memoryaf/objects
+GET /extensions/v1/installed/memoryaf/objects
 GET /mcp/extensions/memoryaf
 ```
 
@@ -1011,8 +1094,11 @@ plugins.
 - Extensions define data contracts, not only lifecycle metadata. Shape
   declarations are extension member objects and participate in install, update,
   backup, restore, and drop semantics.
-- Use `/db/v1/packages` for the generic catalog of available signed artifacts
-  and `/db/v1/extensions` for installed PostgreSQL-style extension lifecycle.
+- Use `/extensions/v1/packages` for the generic catalog of available signed
+  artifacts and `/extensions/v1/installed` for installed PostgreSQL-style
+  extension lifecycle. Version them together because package manifests,
+  dependency resolution, trust policy, capability grants, and install/update/drop
+  semantics evolve together.
 - In v1, MCP tools are extension-owned objects, not separate package installs.
   A package such as `memoryaf` should include its data shape, relations,
   artifacts, indexes, enrichments, query/API handlers, MCP tools, runtimes, and
@@ -1039,7 +1125,8 @@ plugins.
   are compatibility syntax over the same API, not the internal control plane.
 - Make existing APIs extension-aware in this order: table data shape, generated
   artifacts, index creation, enrichment/resolver creation, MCP/API endpoints,
-  provider/model adapters, then public index backends.
+  A2A hooks, auth policy hooks, provider/model adapters, then public index
+  backends.
 - WASM is the default code extension mechanism. Native loading is opt-in and
   restricted.
 - Existing object APIs should converge into extension member tracking rather
