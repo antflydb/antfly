@@ -285,7 +285,6 @@ pub const PackageStoreEntry = struct {
     manifest_path: []u8,
     package_root_path: []u8,
     layout: PackageStoreLayout = .loose,
-    content_addressed: bool = false,
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
         self.manifest.deinitOwned(alloc);
@@ -992,6 +991,22 @@ pub fn parsePackageManifestAlloc(alloc: std.mem.Allocator, json: []const u8) !st
     return parsed;
 }
 
+pub fn clonePackageManifestAlloc(alloc: std.mem.Allocator, package: PackageManifest) !PackageManifest {
+    return try clonePackageManifest(alloc, package);
+}
+
+pub fn cloneInstalledExtensionAlloc(alloc: std.mem.Allocator, installed: InstalledExtension) !InstalledExtension {
+    return try cloneInstalledExtension(alloc, installed);
+}
+
+pub fn cloneExtensionMemberAlloc(alloc: std.mem.Allocator, member: ExtensionMember) !ExtensionMember {
+    return try cloneExtensionMember(alloc, member);
+}
+
+pub fn cloneExtensionDependencyAlloc(alloc: std.mem.Allocator, dependency: ExtensionDependency) !ExtensionDependency {
+    return try cloneExtensionDependency(alloc, dependency);
+}
+
 fn loadPackageStoreEntryAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1016,7 +1031,6 @@ fn loadPackageStoreEntryAlloc(
         .manifest_path = manifest_path,
         .package_root_path = package_root_path,
         .layout = layout,
-        .content_addressed = layout == .content_addressed,
     };
 }
 
@@ -1826,19 +1840,16 @@ test "extension package store scans local and content-addressed manifests" {
         if (std.mem.eql(u8, entry.manifest.name, "memoryaf")) {
             saw_memoryaf = true;
             try std.testing.expectEqual(PackageStoreLayout.canonical, entry.layout);
-            try std.testing.expect(!entry.content_addressed);
             try std.testing.expect(std.mem.endsWith(u8, entry.package_root_path, "extensions/memoryaf/1.0.0"));
         }
         if (std.mem.eql(u8, entry.manifest.name, "antfly_text_extras")) {
             saw_content_addressed = true;
             try std.testing.expectEqual(PackageStoreLayout.content_addressed, entry.layout);
-            try std.testing.expect(entry.content_addressed);
             try std.testing.expectEqualStrings("sha256:abc123", entry.manifest.digest);
         }
         if (std.mem.eql(u8, entry.manifest.name, "looseaf")) {
             saw_loose = true;
             try std.testing.expectEqual(PackageStoreLayout.loose, entry.layout);
-            try std.testing.expect(!entry.content_addressed);
         }
     }
     try std.testing.expect(saw_memoryaf);

@@ -6365,6 +6365,10 @@ fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_a
         .restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses),
         .replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses),
         .replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints),
+        .extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages),
+        .installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions),
+        .extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members),
+        .extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies),
         .split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions),
         .merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions),
         .split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations),
@@ -7238,6 +7242,26 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
         alloc.free(record.reseed_exact_cutover_path);
     }
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
+    for (snapshot.extension_packages) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_packages.len > 0) alloc.free(snapshot.extension_packages);
+    for (snapshot.installed_extensions) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.installed_extensions.len > 0) alloc.free(snapshot.installed_extensions);
+    for (snapshot.extension_members) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_members.len > 0) alloc.free(snapshot.extension_members);
+    for (snapshot.extension_dependencies) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (snapshot.extension_dependencies.len > 0) alloc.free(snapshot.extension_dependencies);
     for (snapshot.split_transitions) |record| antfly.metadata.table_manager.freeSplitTransitionRecord(alloc, record);
     alloc.free(snapshot.split_transitions);
     for (snapshot.merge_transitions) |record| antfly.metadata.table_manager.freeMergeTransitionRecord(alloc, record);
@@ -7367,6 +7391,90 @@ fn cloneMergedGroupStatusesOwned(
     errdefer alloc.free(out);
     for (statuses, 0..) |status, i| {
         out[i] = status;
+    }
+    return out;
+}
+
+fn cloneExtensionPackagesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.PackageManifest,
+) ![]antfly.metadata.PackageManifest {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.PackageManifest, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.extensions.clonePackageManifestAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneInstalledExtensionsOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.InstalledExtension,
+) ![]antfly.metadata.InstalledExtension {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.InstalledExtension, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.extensions.cloneInstalledExtensionAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionMembersOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.ExtensionMember,
+) ![]antfly.metadata.ExtensionMember {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.ExtensionMember, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.extensions.cloneExtensionMemberAlloc(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneExtensionDependenciesOwned(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.ExtensionDependency,
+) ![]antfly.metadata.ExtensionDependency {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.ExtensionDependency, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| {
+            var owned = record;
+            owned.deinitOwned(alloc);
+        }
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.extensions.cloneExtensionDependencyAlloc(alloc, record);
+        initialized += 1;
     }
     return out;
 }
