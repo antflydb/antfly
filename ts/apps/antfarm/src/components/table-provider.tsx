@@ -5,19 +5,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { isProductEnabled } from "@/config/products";
 import { TableContext } from "@/contexts/table-context";
 import { useApi } from "@/hooks/use-api-config";
-
-const normalizeTablesResponse = (response: unknown): TableStatus[] => {
-  if (Array.isArray(response)) return response as TableStatus[];
-  if (
-    response &&
-    typeof response === "object" &&
-    "tables" in response &&
-    Array.isArray((response as { tables?: unknown }).tables)
-  ) {
-    return (response as { tables: TableStatus[] }).tables;
-  }
-  return [];
-};
+import { normalizeTablesResponse } from "@/lib/table-utils";
 
 export function TableProvider({ children }: { children: ReactNode }) {
   const apiClient = useApi();

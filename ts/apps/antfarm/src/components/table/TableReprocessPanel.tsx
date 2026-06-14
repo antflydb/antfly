@@ -16,7 +16,7 @@ import type {
   DocumentArtifactTableReprocessResponse,
 } from "@antfly/sdk";
 import { useState } from "react";
-import { api } from "../../api";
+import { useApi } from "@/hooks/use-api-config";
 import JsonViewer from "../JsonViewer";
 
 function formatCount(value: number | null | undefined) {
@@ -47,6 +47,7 @@ interface TableReprocessPanelProps {
 }
 
 export function TableReprocessPanel({ tableName }: TableReprocessPanelProps) {
+  const api = useApi();
   const [artifactName, setArtifactName] = useState("document_units_v1");
   const [fromKey, setFromKey] = useState("");
   const [toKey, setToKey] = useState("");

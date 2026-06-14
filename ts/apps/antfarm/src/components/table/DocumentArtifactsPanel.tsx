@@ -12,7 +12,7 @@ import {
 } from "@antfly/design-system";
 import type { DocumentArtifactManifest } from "@antfly/sdk";
 import { useCallback, useState } from "react";
-import { api } from "../../api";
+import { useApi } from "@/hooks/use-api-config";
 import JsonViewer from "../JsonViewer";
 
 function formatCount(value: number | null | undefined) {
@@ -38,6 +38,7 @@ interface DocumentArtifactsPanelProps {
 }
 
 export function DocumentArtifactsPanel({ tableName }: DocumentArtifactsPanelProps) {
+  const api = useApi();
   const [documentKey, setDocumentKey] = useState("");
   const [manifests, setManifests] = useState<DocumentArtifactManifest[]>([]);
   const [selectedArtifactName, setSelectedArtifactName] = useState("");
@@ -76,7 +77,7 @@ export function DocumentArtifactsPanel({ tableName }: DocumentArtifactsPanelProp
         setIsLoading(false);
       }
     },
-    [documentKey, tableName]
+    [api, documentKey, tableName]
   );
 
   const loadManifests = useCallback(async () => {
@@ -109,7 +110,7 @@ export function DocumentArtifactsPanel({ tableName }: DocumentArtifactsPanelProp
     } finally {
       setIsLoading(false);
     }
-  }, [documentKey, selectedArtifactName, tableName]);
+  }, [api, documentKey, selectedArtifactName, tableName]);
 
   const handleSelectArtifact = async (artifactName: string) => {
     setSelectedArtifactName(artifactName);

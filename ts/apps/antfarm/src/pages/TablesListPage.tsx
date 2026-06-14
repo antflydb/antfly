@@ -23,6 +23,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { NoTablesState } from "@/components/branded-empty-state";
+import { normalizeTablesResponse } from "@/lib/table-utils";
 import { useApi } from "../hooks/use-api-config";
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -32,19 +33,6 @@ const formatBytes = (bytes: number, decimals = 2) => {
   const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${parseFloat((bytes / k ** i).toFixed(dm))} ${sizes[i]}`;
-};
-
-const normalizeTablesResponse = (response: unknown): TableStatus[] => {
-  if (Array.isArray(response)) return response as TableStatus[];
-  if (
-    response &&
-    typeof response === "object" &&
-    "tables" in response &&
-    Array.isArray((response as { tables?: unknown }).tables)
-  ) {
-    return (response as { tables: TableStatus[] }).tables;
-  }
-  return [];
 };
 
 function indexesForTable(table: TableStatus) {
