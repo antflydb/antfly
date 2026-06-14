@@ -1778,6 +1778,7 @@ pub const ApiHttpServer = struct {
             return try jsonResponse(self.alloc, topology_status);
         }
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
+        if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         try self.runSessionMaintenanceOnce();
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
@@ -1796,6 +1797,70 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET and (std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card_legacy) or std.mem.eql(u8, uri_parts.path, routes.Routes.agent_card))) {
             return try protocol_adapters.handleA2aCard(self);
+        }
+        return null;
+    }
+
+    fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        const is_extension_path = std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1) or
+            std.mem.startsWith(u8, uri_parts.path, routes.Routes.extensions_v1_packages) or
+            std.mem.startsWith(u8, uri_parts.path, routes.Routes.extensions_v1_installed);
+        if (!is_extension_path) return null;
+
+        if (req.method != .GET) {
+            if (routes.Routes.matchInstalledExtension(uri_parts.path) != null or
+                routes.Routes.matchInstalledExtensionUpdate(uri_parts.path) != null or
+                routes.Routes.matchInstalledExtensionDrop(uri_parts.path) != null or
+                routes.Routes.matchInstalledExtensionEnable(uri_parts.path) != null or
+                routes.Routes.matchInstalledExtensionDisable(uri_parts.path) != null or
+                routes.Routes.matchInstalledExtensionConfig(uri_parts.path) != null)
+            {
+                return try jsonErrorResponse(self.alloc, 405, "extension lifecycle mutation is not wired to metadata storage yet");
+            }
+            return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+        }
+
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1)) {
+            return try jsonResponse(self.alloc, .{
+                .packages = routes.Routes.extensions_v1_packages,
+                .installed = routes.Routes.extensions_v1_installed,
+            });
+        }
+
+        var snapshot = (try self.source.adminSnapshot()) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_packages)) {
+            return try jsonResponse(self.alloc, snapshot.extension_packages);
+        }
+        if (routes.Routes.matchExtensionPackageVersion(uri_parts.path)) |package_version| {
+            const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, package.*);
+        }
+        if (routes.Routes.matchExtensionPackage(uri_parts.path)) |package_route| {
+            const package = findLatestExtensionPackage(&snapshot, package_route.name) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, package.*);
+        }
+        if (std.mem.eql(u8, uri_parts.path, routes.Routes.extensions_v1_installed)) {
+            return try jsonResponse(self.alloc, snapshot.installed_extensions);
+        }
+        if (routes.Routes.matchInstalledExtensionObjects(uri_parts.path)) |installed_route| {
+            const members = try extensionMembersForName(self.alloc, snapshot.extension_members, installed_route.name);
+            defer if (members.len > 0) self.alloc.free(members);
+            if (members.len == 0 and findInstalledExtension(&snapshot, installed_route.name) == null) {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            }
+            return try jsonResponse(self.alloc, members);
+        }
+        if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+            const installed = findInstalledExtension(&snapshot, installed_route.name) orelse {
+                return try jsonErrorResponse(self.alloc, 404, "not found");
+            };
+            return try jsonResponse(self.alloc, installed.*);
         }
         return null;
     }
@@ -6561,7 +6626,54 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     };
 }
 
+fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const metadata_mod.PackageManifest {
+    for (snapshot.extension_packages) |*package| {
+        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+    }
+    return null;
+}
+
+fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.PackageManifest {
+    var found: ?*const metadata_mod.PackageManifest = null;
+    for (snapshot.extension_packages) |*package| {
+        if (std.mem.eql(u8, package.name, name)) found = package;
+    }
+    return found;
+}
+
+fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.InstalledExtension {
+    for (snapshot.installed_extensions) |*extension| {
+        if (std.mem.eql(u8, extension.name, name)) return extension;
+    }
+    return null;
+}
+
+fn extensionMembersForName(
+    alloc: std.mem.Allocator,
+    members: []const metadata_mod.ExtensionMember,
+    extension_name: []const u8,
+) ![]metadata_mod.ExtensionMember {
+    var count: usize = 0;
+    for (members) |member| {
+        if (std.mem.eql(u8, member.extension_name, extension_name)) count += 1;
+    }
+    const out = try alloc.alloc(metadata_mod.ExtensionMember, count);
+    var i: usize = 0;
+    for (members) |member| {
+        if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+        out[i] = member;
+        i += 1;
+    }
+    return out;
+}
+
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (std.mem.eql(u8, path, routes.Routes.extensions_v1) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_packages) or
+        std.mem.startsWith(u8, path, routes.Routes.extensions_v1_installed))
+    {
+        return true;
+    }
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
     if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
@@ -8152,6 +8264,118 @@ test "api http server serves status" {
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 6), request_stats.request_count);
     try std.testing.expect(request_stats.first_request_started_at_ns >= server.created_at_ns);
+}
+
+test "api http server serves extension catalog reads" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_extension_packages = 1,
+                .projected_installed_extensions = 1,
+                .projected_extension_members = 2,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]metadata_mod.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:abc",
+                    .trusted = true,
+                    .install = .{
+                        .scopes_supported = &.{.table},
+                        .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
+                    },
+                }})[0..]),
+                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{.{
+                    .name = "memoryaf",
+                    .package_name = "memoryaf",
+                    .package_version = "1.0.0",
+                    .package_digest = "sha256:abc",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .status = .ready,
+                }})[0..]),
+                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .data_shape,
+                        .object_name = "memory_record",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "recall",
+                        .table_name = "memories",
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+
+    var packages_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
+    defer packages_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), packages_resp.status);
+    var packages = try std.json.parseFromSlice([]metadata_mod.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
+    defer packages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), packages.value.len);
+    try std.testing.expectEqualStrings("memoryaf", packages.value[0].name);
+
+    var package_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
+    defer package_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), package_resp.status);
+    var package = try std.json.parseFromSlice(metadata_mod.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
+    defer package.deinit();
+    try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
+
+    var installed_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
+    defer installed_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), installed_resp.status);
+    var installed = try std.json.parseFromSlice(metadata_mod.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
+    defer installed.deinit();
+    try std.testing.expectEqualStrings("1.0.0", installed.value.package_version);
+
+    var objects_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
+    defer objects_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), objects_resp.status);
+    var objects = try std.json.parseFromSlice([]metadata_mod.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
+    defer objects.deinit();
+    try std.testing.expectEqual(@as(usize, 2), objects.value.len);
+
+    var missing_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/missing" });
+    defer missing_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), missing_resp.status);
+
+    var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
+    defer write_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), write_resp.status);
 }
 
 test "api http server serves mcp and a2a protocol surfaces" {
