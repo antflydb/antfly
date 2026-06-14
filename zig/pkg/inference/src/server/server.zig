@@ -4209,7 +4209,17 @@ pub const Node = struct {
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const a = ctx.allocator;
+        const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
+        defer ctx.allocator.free(json_body);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json_body);
+        return ctx.response.build();
+    }
+
+    /// Build the /ai/v1/models response body. Exposed so an embedding host
+    /// (e.g. the antfly server's /connections endpoint) can list the embedded
+    /// node's models without going through HTTP. Caller owns the result.
+    pub fn listModelsJsonAlloc(self: *Node, a: std.mem.Allocator, io: std.Io) ![]u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(a);
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -4221,7 +4231,7 @@ pub const Node = struct {
 
         // Discover models from filesystem registry
         const ra = self.registry.allocator;
-        const discovered = self.registry.discover(ctx.io) catch &[_]registry_mod.ModelEntry{};
+        const discovered = self.registry.discoverShallow(io) catch &[_]registry_mod.ModelEntry{};
         defer {
             for (discovered) |entry| {
                 ra.free(entry.name);
@@ -4325,9 +4335,7 @@ pub const Node = struct {
         try buf.appendSlice(a, body.items);
         try buf.append(a, '}');
 
-        try ctx.setHeader("content-type", "application/json");
-        _ = ctx.response.body(buf.items);
-        return ctx.response.build();
+        return try buf.toOwnedSlice(a);
     }
 
     pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -5544,6 +5552,7 @@ test "download remote content accepts data uri" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
@@ -5562,6 +5571,7 @@ test "download remote content blocks private ip urls when configured" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,
@@ -5578,6 +5588,7 @@ test "download remote content blocks hosts outside allowlist" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
         .request_queue = undefined,

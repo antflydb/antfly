@@ -51,6 +51,278 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Kind of external connection configured on this node.
+pub const ConnectionKind = enum {
+    inference,
+    web_search,
+    external_io,
+    cdc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference => "inference",
+            .web_search => "web_search",
+            .external_io => "external_io",
+            .cdc => "cdc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference", .inference },
+            .{ "web_search", .web_search },
+            .{ "external_io", .external_io },
+            .{ "cdc", .cdc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+pub const ConnectionStatus = enum {
+    connected,
+    @"error",
+    configured,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .connected => "connected",
+            .@"error" => "error",
+            .configured => "configured",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "connected", .connected },
+            .{ "error", .@"error" },
+            .{ "configured", .configured },
+            .{ "unsupported", .unsupported },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Inference provider type for a connection.
+pub const InferenceProviderType = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    openrouter,
+    bedrock,
+    cohere,
+    anthropic,
+    antfly,
+    mock,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .openrouter => "openrouter",
+            .bedrock => "bedrock",
+            .cohere => "cohere",
+            .anthropic => "anthropic",
+            .antfly => "antfly",
+            .mock => "mock",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
+            .{ "bedrock", .bedrock },
+            .{ "cohere", .cohere },
+            .{ "anthropic", .anthropic },
+            .{ "antfly", .antfly },
+            .{ "mock", .mock },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model task type. Mirrors the inference registry taxonomy; "other" is used for models whose task type the provider's listing API does not classify.
+pub const ConnectedModelType = enum {
+    embedder,
+    generator,
+    reranker,
+    chunker,
+    recognizer,
+    classifier,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+    other,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedder => "embedder",
+            .generator => "generator",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .recognizer => "recognizer",
+            .classifier => "classifier",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+            .other => "other",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedder", .embedder },
+            .{ "generator", .generator },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "recognizer", .recognizer },
+            .{ "classifier", .classifier },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+            .{ "other", .other },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ConnectedModel = struct {
+    /// Model identifier as reported by the provider.
+    name: []const u8,
+    /// Human-readable model name when the provider reports one.
+    display_name: ?[]const u8 = null,
+    /// Embedding output dimension when known.
+    dimensions: ?i64 = null,
+    /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+    configured: ?bool = null,
+};
+
+/// External IO transport protocol.
+pub const ExternalIoProtocol = enum {
+    s3,
+    gcs,
+    filesystem,
+    http,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .s3 => "s3",
+            .gcs => "gcs",
+            .filesystem => "filesystem",
+            .http => "http",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "s3", .s3 },
+            .{ "gcs", .gcs },
+            .{ "filesystem", .filesystem },
+            .{ "http", .http },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const WebSearchConnection = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results this connection is configured to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Whether safe-search filtering is requested.
+    safe_search: ?bool = null,
+    /// Preferred result language.
+    language: ?[]const u8 = null,
+    /// Preferred result region.
+    region: ?[]const u8 = null,
+    /// Whether extracted content is requested when supported.
+    include_content: ?bool = null,
+    /// Whether highlighted passages are requested when supported.
+    include_highlights: ?bool = null,
+    /// Provider endpoint override when configured.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Domain allowlist when configured.
+    include_domains: ?[]const []const u8 = null,
+    /// Domain denylist when configured.
+    exclude_domains: ?[]const []const u8 = null,
+    /// True when required credentials/config are present. Secret values are never returned.
+    configured: ?bool = null,
+};
+
+pub const CdcConnection = struct {
+    /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
+    provider: []const u8,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: []const u8,
+    /// Zero-based ordinal of the replication source within the table config.
+    source_ordinal: i64,
+    /// Source-side table or stream name when reported by the provider.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+    /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
+    phase: ?[]const u8 = null,
+    /// Source records behind, when reported by the runtime.
+    lag_records: ?i64 = null,
+    /// Source commit lag in milliseconds, when reported by the runtime.
+    lag_millis: ?i64 = null,
+    /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+    last_success_at_ms: ?i64 = null,
+    /// Wall-clock timestamp of the last applied source change, in milliseconds.
+    last_change_applied_at_ms: ?i64 = null,
+    /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+    updated_at_ms: ?i64 = null,
+};
+
 /// Parsed child-range descriptor from a derived document artifact manifest.
 pub const DocumentArtifactChildRange = struct {
     /// Stable range identifier within the artifact manifest generation.
@@ -1432,6 +1704,36 @@ pub const ReplicationTransformOp = struct {
     value: ?std.json.Value = null,
 };
 
+pub const InferenceConnection = struct {
+    provider: InferenceProviderType,
+    /// Resolved endpoint URL when applicable.
+    url: ?[]const u8 = null,
+    /// Cloud region (Bedrock).
+    region: ?[]const u8 = null,
+    /// Google Cloud project (Vertex).
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location (Vertex).
+    location: ?[]const u8 = null,
+    /// Named registry entries from node config that resolve to this provider instance.
+    names: ?[]const []const u8 = null,
+    /// Model types this instance is configured for.
+    configured_model_types: ?[]const ConnectedModelType = null,
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
+};
+
+pub const ExternalIoConnection = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
+};
+
 /// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
 pub const DocumentArtifactManifest = struct {
     /// Stable identity of the source document.
@@ -1943,6 +2245,29 @@ pub const ReplicationRoute = struct {
     on_delete: ?[]const ReplicationTransformOp = null,
 };
 
+pub const Connection = struct {
+    /// Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path.
+    id: []const u8,
+    /// Human-readable short name for this connection instance.
+    name: []const u8,
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
+    kind: ConnectionKind,
+    status: ConnectionStatus,
+    /// Failure detail when status is "error".
+    @"error": ?[]const u8 = null,
+    /// Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream.
+    capabilities: []const []const u8,
+    /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
+    sources: ?[]const []const u8 = null,
+    inference: ?InferenceConnection = null,
+    web_search: ?WebSearchConnection = null,
+    external_io: ?ExternalIoConnection = null,
+    cdc: ?CdcConnection = null,
+};
+
 /// Available derived document artifact manifests for a source document.
 pub const DocumentArtifactManifestList = struct {
     /// Stable identity of the source document.
@@ -2095,6 +2420,10 @@ pub const ReplicationSource = struct {
     require_exact_cutover: ?bool = null,
     status: ?ReplicationSourceStatus = null,
     action_hint: ?ReplicationSourceActionHint = null,
+};
+
+pub const ConnectionsResponse = struct {
+    connections: []const Connection,
 };
 
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.

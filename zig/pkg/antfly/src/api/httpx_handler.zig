@@ -362,6 +362,17 @@ pub const AntflyApiHandler = struct {
         return ctx.json(topology);
     }
 
+    pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListConnectionsParams) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const body = try self.api_server.listConnectionsJsonAlloc(alloc, params.types, params.include, params.refresh);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(body);
+        return ctx.response.build();
+    }
+
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

@@ -355,6 +355,18 @@ fn parseDataUri(value: []const u8) ?DataUri {
     };
 }
 
+/// Mint a one-shot Authorization header value from ADC or a service-account
+/// credentials file. Used by control-plane calls (e.g. model listing) that do
+/// not hold a long-lived Provider.
+pub fn mintAuthorizationValueAlloc(alloc: Allocator, credentials_path: ?[]const u8) ![]u8 {
+    const source = try initVertexTokenSource(alloc, credentials_path);
+    defer {
+        source.deinit();
+        alloc.destroy(source);
+    }
+    return try source.authorizationValueAlloc(alloc);
+}
+
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
         var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
@@ -369,7 +381,7 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
     return source;
 }
 
-fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
+pub fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
         var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
         defer service_account.deinit(alloc);

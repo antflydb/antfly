@@ -2,12 +2,13 @@ from enum import Enum
 
 
 class WebSearchProvider(str, Enum):
-    BING = "bing"
     BRAVE = "brave"
-    DUCKDUCKGO = "duckduckgo"
-    GOOGLE = "google"
+    EXA = "exa"
+    LINKUP = "linkup"
     SERPER = "serper"
     TAVILY = "tavily"
+    VERTEX = "vertex"
+    YOU = "you"
 
     def __str__(self) -> str:
         return str(self.value)

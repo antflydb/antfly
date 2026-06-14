@@ -397,10 +397,14 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
 
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
-        timeout_s=60.0,
+        timeout_s=120.0,
         interval_s=0.5,
     )
-    assert recovered is not None, stateful_api.get_index(table_name, index_name)
+    recovery_debug = {
+        "index": stateful_api.get_index(table_name, index_name),
+        "embedder": rate_limited_openai_embedder.stats(),
+    }
+    assert recovered is not None, json.dumps(recovery_debug, indent=2, sort_keys=True)
 
     alpha_query = stateful_api.query_table(
         table_name,

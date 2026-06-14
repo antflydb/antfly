@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GO_VERSION: "1.26.4"
+
 jobs:
   trace-validate:
     # Temporarily disabled with the Go simulator CI jobs. Zig trace validation
@@ -29,7 +32,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version: ${{ env.GO_VERSION }}
           cache: false
 
       - name: Set Go experiment

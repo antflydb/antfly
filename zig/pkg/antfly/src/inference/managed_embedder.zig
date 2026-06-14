@@ -121,6 +121,11 @@ pub const AntflyProvider = struct {
         model: []const u8,
         request: extracting.Request,
     ) anyerror!extracting.Response = null,
+    /// Returns the task-keyed /ai/v1/models JSON body for the embedded node.
+    list_models_json: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) anyerror![]u8 = null,
 };
 
 pub const InitOptions = struct {

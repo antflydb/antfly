@@ -136,9 +136,18 @@ export type {
   ChatStreamCallbacks,
   ChatToolName,
   ChatToolsConfig,
+  CdcConnection,
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
   ClassificationTransformationResult,
+  // Connection types
+  ConnectedModel,
+  ConnectedModelType,
+  Connection,
+  ConnectionKind,
+  InferenceProviderType,
+  ConnectionStatus,
+  ConnectionsResponse,
   CreateTableRequest,
   CreateUserRequest,
   DenseEmbedding,
@@ -180,6 +189,9 @@ export type {
   IndexConfig,
   IndexStatus,
   IndexType,
+  InferenceConnection,
+  ExternalIoConnection,
+  ExternalIoProtocol,
   // Join types
   JoinClause,
   JoinCondition,

@@ -36,6 +36,7 @@ import (
 	_ "github.com/antflydb/antfly/go/pkg/antfly/lib/template" // Import for side effects: registers remoteMedia, remotePDF, remoteText helpers
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/types"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/metadata/foreign"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store"
 	client "github.com/antflydb/antfly/go/pkg/antfly/src/store/client"
@@ -75,6 +76,7 @@ var deletesPool = sync.Pool{
 type TableApi struct {
 	ln             *MetadataStore
 	tm             *tablemgr.TableManager
+	config         *common.Config
 	logger         *zap.Logger
 	pool           *workerpool.Pool
 	joinOnce       sync.Once
@@ -271,6 +273,15 @@ func (ca *ClusterApi) GetCluster(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ListConnections reports configured external connections. The Go server does
+// not enumerate connections; the Zig implementation provides the full view.
+func (ca *ClusterApi) ListConnections(w http.ResponseWriter, r *http.Request, params ListConnectionsParams) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(ConnectionsResponse{Connections: []Connection{}}); err != nil {
+		ca.ln.logger.Warn("Failed to marshal connections", zap.Error(err))
+	}
+}
+
 type wrapper struct {
 	*TableApi
 	*ClusterApi
@@ -284,6 +295,7 @@ func NewTableApi(logger *zap.Logger, ln *MetadataStore, tm *tablemgr.TableManage
 		logger:      logger,
 		tm:          tm,
 		ln:          ln,
+		config:      ln.config,
 		pool:        ln.pool,
 		foreignPool: foreign.NewPoolManager(),
 	}
