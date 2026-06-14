@@ -241,6 +241,11 @@ pub const PackageManifest = struct {
         try self.install.validate();
         for (self.updates) |update| try update.validate();
     }
+
+    pub fn deinitOwned(self: *PackageManifest, alloc: std.mem.Allocator) void {
+        freePackageManifest(alloc, self.*);
+        self.* = undefined;
+    }
 };
 
 pub const InstallExtensionRequest = struct {
@@ -315,6 +320,11 @@ pub const InstalledExtension = struct {
         try validateJsonObject("installed.config_json", self.config_json);
         for (self.granted_capabilities) |capability| try capability.validate();
     }
+
+    pub fn deinitOwned(self: *InstalledExtension, alloc: std.mem.Allocator) void {
+        freeInstalledExtension(alloc, self.*);
+        self.* = undefined;
+    }
 };
 
 pub const ExtensionMember = struct {
@@ -348,6 +358,11 @@ pub const ExtensionMember = struct {
             .{ @tagName(self.scope.kind), scope_name, @tagName(self.object_kind), self.object_name },
         );
     }
+
+    pub fn deinitOwned(self: *ExtensionMember, alloc: std.mem.Allocator) void {
+        freeExtensionMember(alloc, self.*);
+        self.* = undefined;
+    }
 };
 
 pub const ExtensionDependency = struct {
@@ -360,6 +375,11 @@ pub const ExtensionDependency = struct {
         try requireObjectName(self.extension_name);
         if (self.required_extension_name.len != 0) try requireObjectName(self.required_extension_name);
         try requirePackageName(self.package_name);
+    }
+
+    pub fn deinitOwned(self: *ExtensionDependency, alloc: std.mem.Allocator) void {
+        freeExtensionDependency(alloc, self.*);
+        self.* = undefined;
     }
 };
 

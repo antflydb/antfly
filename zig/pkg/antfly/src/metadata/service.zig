@@ -1463,6 +1463,36 @@ pub const MetadataService = struct {
         store.freeReplicationSourceStatuses(alloc, records);
     }
 
+    pub fn listProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.PackageManifest {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionPackages(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.PackageManifest) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionPackages(alloc, records);
+    }
+
+    pub fn listProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.InstalledExtension {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listInstalledExtensions(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.InstalledExtension) void {
+        const store = self.projectedStore() orelse return;
+        store.freeInstalledExtensions(alloc, records);
+    }
+
+    pub fn listProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionMember {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionMembers(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionMember) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionMembers(alloc, records);
+    }
+
     pub fn listProjectedShuffleJoinLeases(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.ShuffleJoinLeaseRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listShuffleJoinLeases(alloc, self.metadata_group_id);
@@ -2783,6 +2813,9 @@ pub const MetadataHttpService = struct {
             .split_observations = &.{},
             .merge_observations = &.{},
             .merged_group_statuses = &.{},
+            .extension_packages = &.{},
+            .installed_extensions = &.{},
+            .extension_members = &.{},
         };
         errdefer self.freeAdminSnapshot(&snapshot);
 
@@ -2800,6 +2833,9 @@ pub const MetadataHttpService = struct {
         snapshot.replication_source_statuses = try cloneProjectedReplicationSourceStatusesOwned(self.alloc, core.replication_source_statuses);
         snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);
         snapshot.merge_transitions = try cloneProjectedMergeTransitionsOwned(self.alloc, core.merge_transitions);
+        snapshot.extension_packages = try store.listExtensionPackages(self.alloc, self.metadata_group_id);
+        snapshot.installed_extensions = try store.listInstalledExtensions(self.alloc, self.metadata_group_id);
+        snapshot.extension_members = try store.listExtensionMembers(self.alloc, self.metadata_group_id);
         self.unlockRuntime();
 
         snapshot.local_bootstrap_statuses = try self.listLocalBootstrapStatuses(self.alloc);
@@ -2974,6 +3010,42 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedShuffleJoinLeases(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.ShuffleJoinLeaseRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeShuffleJoinLeases(alloc, records);
+    }
+
+    pub fn listProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.PackageManifest {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionPackages(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.PackageManifest) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionPackages(alloc, records);
+    }
+
+    pub fn listProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.InstalledExtension {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listInstalledExtensions(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.InstalledExtension) void {
+        const store = self.projectedStore() orelse return;
+        store.freeInstalledExtensions(alloc, records);
+    }
+
+    pub fn listProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionMember {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionMembers(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionMember) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionMembers(alloc, records);
     }
 
     pub fn listLocalBootstrapStatuses(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
@@ -5341,6 +5413,27 @@ pub fn snapshotStatusWithOptions(
     defer if (@hasDecl(SourceDeclType, "freeProjectedReplicationSourceStatuses") and projected_replication_source_statuses.len > 0) {
         service.freeProjectedReplicationSourceStatuses(alloc, projected_replication_source_statuses);
     };
+    const projected_extension_packages = if (@hasDecl(SourceDeclType, "listProjectedExtensionPackages"))
+        try service.listProjectedExtensionPackages(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedExtensionPackages") and projected_extension_packages.len > 0) {
+        service.freeProjectedExtensionPackages(alloc, projected_extension_packages);
+    };
+    const projected_installed_extensions = if (@hasDecl(SourceDeclType, "listProjectedInstalledExtensions"))
+        try service.listProjectedInstalledExtensions(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedInstalledExtensions") and projected_installed_extensions.len > 0) {
+        service.freeProjectedInstalledExtensions(alloc, projected_installed_extensions);
+    };
+    const projected_extension_members = if (@hasDecl(SourceDeclType, "listProjectedExtensionMembers"))
+        try service.listProjectedExtensionMembers(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedExtensionMembers") and projected_extension_members.len > 0) {
+        service.freeProjectedExtensionMembers(alloc, projected_extension_members);
+    };
     const projected_split_transitions = try service.listProjectedSplitTransitions(alloc);
     defer service.freeProjectedSplitTransitions(alloc, projected_split_transitions);
     const projected_merge_transitions = try service.listProjectedMergeTransitions(alloc);
@@ -5586,6 +5679,9 @@ pub fn snapshotStatusWithOptions(
         .projected_replication_source_last_success_at_ms_max = projected_replication_source_last_success_at_ms_max,
         .projected_replication_source_last_source_commit_at_ms_max = projected_replication_source_last_source_commit_at_ms_max,
         .projected_replication_source_last_change_applied_at_ms_max = projected_replication_source_last_change_applied_at_ms_max,
+        .projected_extension_packages = projected_extension_packages.len,
+        .projected_installed_extensions = projected_installed_extensions.len,
+        .projected_extension_members = projected_extension_members.len,
         .projected_ranges = projected_ranges.len,
         .projected_stores = projected_stores.len,
         .projected_placement_intents = projected_placement_intents.len,
