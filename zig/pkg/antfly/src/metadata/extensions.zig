@@ -193,14 +193,29 @@ pub const InstallManifest = struct {
     pub fn validate(self: InstallManifest) !void {
         if (self.scopes_supported.len == 0) return error.NoSupportedScopes;
         try validateJsonObject("install.config_schema_json", self.config_schema_json);
-        for (self.shapes) |shape| try shape.validate();
-        for (self.objects) |object| try object.validate();
+        for (self.shapes, 0..) |shape, i| {
+            try shape.validate();
+            for (self.shapes[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.name, shape.name)) return error.DuplicateShapeName;
+            }
+        }
+        for (self.objects) |object| {
+            try object.validate();
+            if (object.shape.len != 0 and !self.hasShape(object.shape)) return error.UnknownShapeReference;
+        }
         for (self.runtimes) |runtime| try runtime.validate();
     }
 
     pub fn supportsScope(self: InstallManifest, kind: ExtensionScopeKind) bool {
         for (self.scopes_supported) |candidate| {
             if (candidate == kind) return true;
+        }
+        return false;
+    }
+
+    fn hasShape(self: InstallManifest, name: []const u8) bool {
+        for (self.shapes) |shape| {
+            if (std.mem.eql(u8, shape.name, name)) return true;
         }
         return false;
     }
@@ -1517,6 +1532,12 @@ test "extension package manifest validates data shape and mcp objects" {
         \\        "kind": "document",
         \\        "version": "1",
         \\        "schema_json": "{\"type\":\"object\"}"
+        \\      },
+        \\      {
+        \\        "name": "recall_request",
+        \\        "kind": "tool_schema",
+        \\        "version": "1",
+        \\        "schema_json": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}"
         \\      }
         \\    ],
         \\    "objects": [
@@ -1561,11 +1582,13 @@ test "extension package manifest validates data shape and mcp objects" {
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("memoryaf", plan.installed.name);
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
-    try std.testing.expectEqual(@as(usize, 3), plan.members.len);
+    try std.testing.expectEqual(@as(usize, 4), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqualStrings("{\"type\":\"object\"}", plan.members[0].owner_metadata_json);
-    try std.testing.expectEqual(.mcp_tool, plan.members[2].object_kind);
-    try std.testing.expectEqualStrings("memories", plan.members[2].table_name);
+    try std.testing.expectEqual(.data_shape, plan.members[1].object_kind);
+    try std.testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}", plan.members[1].owner_metadata_json);
+    try std.testing.expectEqual(.mcp_tool, plan.members[3].object_kind);
+    try std.testing.expectEqualStrings("memories", plan.members[3].table_name);
 }
 
 test "extension package store scans local and content-addressed manifests" {
@@ -1685,6 +1708,25 @@ test "extension validation rejects unsupported scope and bad json shape" {
         .name = "memoryaf",
         .version = "1.0.0",
         .install = .{ .scopes_supported = &.{.cluster} },
+    }).validate());
+}
+
+test "extension validation rejects duplicate and unknown shape references" {
+    try std.testing.expectError(error.DuplicateShapeName, (InstallManifest{
+        .scopes_supported = &.{.table},
+        .shapes = &.{
+            .{ .name = "memory_record", .kind = .document },
+            .{ .name = "memory_record", .kind = .row },
+        },
+    }).validate());
+
+    try std.testing.expectError(error.UnknownShapeReference, (InstallManifest{
+        .scopes_supported = &.{.table},
+        .objects = &.{.{
+            .kind = .mcp_tool,
+            .name = "recall",
+            .shape = "recall_request",
+        }},
     }).validate());
 }
 
