@@ -33,6 +33,12 @@ type HuggingFaceClient struct {
 	progressHandler ProgressHandler
 }
 
+var huggingFaceTransientRetryDelays = []time.Duration{
+	2 * time.Second,
+	5 * time.Second,
+	15 * time.Second,
+}
+
 // HFClientOption configures the HuggingFace client
 type HFClientOption func(*HuggingFaceClient)
 
@@ -90,13 +96,18 @@ func (c *HuggingFaceClient) PullFromHuggingFace(
 		repo = repo.WithAuth(c.token)
 	}
 
-	// List all files in repo
 	var files []string
-	for fileName, err := range repo.IterFileNames() {
-		if err != nil {
-			return fmt.Errorf("listing files: %w", err)
+	if err := retryHuggingFaceTransient(ctx, func() error {
+		files = files[:0]
+		for fileName, err := range repo.IterFileNames() {
+			if err != nil {
+				return fmt.Errorf("listing files: %w", err)
+			}
+			files = append(files, fileName)
 		}
-		files = append(files, fileName)
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Filter and select files to download based on model type
@@ -127,8 +138,12 @@ func (c *HuggingFaceClient) PullFromHuggingFace(
 
 	// Download each file
 	for _, fileName := range toDownload {
-		localPath, err := repo.DownloadFileCtx(ctx, fileName)
-		if err != nil {
+		var localPath string
+		if err := retryHuggingFaceTransient(ctx, func() error {
+			var err error
+			localPath, err = repo.DownloadFileCtx(ctx, fileName)
+			return err
+		}); err != nil {
 			return fmt.Errorf("downloading %s: %w", fileName, err)
 		}
 
@@ -161,6 +176,62 @@ func (c *HuggingFaceClient) PullFromHuggingFace(
 	}
 
 	return nil
+}
+
+func retryHuggingFaceTransient(ctx context.Context, op func() error) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || attempt >= len(huggingFaceTransientRetryDelays) || !isTransientHuggingFaceError(err) {
+			return err
+		}
+
+		timer := time.NewTimer(huggingFaceTransientRetryDelays[attempt])
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return err
+		}
+	}
+}
+
+func isTransientHuggingFaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"timeout",
+		"temporary",
+		"connection reset",
+		"connection refused",
+		"connection timed out",
+		"i/o timeout",
+		"tls handshake timeout",
+		"unexpected eof",
+		"server misbehaving",
+		"too many requests",
+		"429",
+		"500",
+		"502",
+		"503",
+		"504",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // generateAndSaveManifest creates a manifest for downloaded model files

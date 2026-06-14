@@ -97,11 +97,11 @@ pub const InferenceConnectionConfig = struct {
     api_key: ?[]const u8 = null,
     /// Cloud region when applicable.
     region: ?[]const u8 = null,
-    /// Google Cloud project when applicable.
+    /// Google Cloud project when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     project_id: ?[]const u8 = null,
-    /// Google Cloud location when applicable.
+    /// Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     location: ?[]const u8 = null,
-    /// Filesystem path to provider credentials when applicable.
+    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
     /// Optional aliases for this provider instance.
     names: ?[]const []const u8 = null,
@@ -130,15 +130,15 @@ pub const WebSearchConnectionConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable.
     endpoint: ?[]const u8 = null,
-    /// Google Cloud project for provider vertex.
+    /// Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex.
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     location: ?[]const u8 = null,
     /// Agent Search data store ID for provider vertex.
     data_store: ?[]const u8 = null,
     /// Agent Search serving config ID for provider vertex.
     serving_config: ?[]const u8 = null,
-    /// Filesystem path to provider credentials when applicable.
+    /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
     /// Only include results from these domains when provider supports it.
     include_domains: ?[]const []const u8 = null,

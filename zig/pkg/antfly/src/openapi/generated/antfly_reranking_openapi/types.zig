@@ -67,9 +67,9 @@ pub const CohereRerankerConfig = struct {
 pub const VertexRerankerConfig = struct {
     /// The ranking model to use.
     model: []const u8,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
@@ -92,8 +92,8 @@ pub const RerankerConfig = struct {
     top_n: ?i64 = null,
     /// Maximum number of chunks per document for long document handling.
     max_chunks_per_doc: ?i64 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
 };

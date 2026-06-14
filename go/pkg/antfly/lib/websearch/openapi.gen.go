@@ -88,6 +88,12 @@ type BraveSearchConfig struct {
 	// ApiKey Brave Search API key (or set BRAVE_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
 	// Endpoint Provider endpoint override when applicable
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
@@ -103,8 +109,14 @@ type BraveSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -123,6 +135,9 @@ type BraveSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// Spellcheck Enable spellcheck suggestions
 	Spellcheck bool `json:"spellcheck,omitempty,omitzero"`
 
@@ -140,6 +155,12 @@ type BraveSearchConfigFreshness string
 type ExaSearchConfig struct {
 	// ApiKey Exa API key (or set EXA_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
 
 	// EndPublishedDate ISO date/time upper bound for published date filtering
 	EndPublishedDate string `json:"end_published_date,omitempty,omitzero"`
@@ -162,11 +183,17 @@ type ExaSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// NumResults Provider-specific result count override
 	NumResults int `json:"num_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -187,6 +214,9 @@ type ExaSearchConfig struct {
 
 	// SearchType Search mode to request from Exa
 	SearchType ExaSearchConfigSearchType `json:"search_type,omitempty,omitzero"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// StartPublishedDate ISO date/time lower bound for published date filtering
 	StartPublishedDate string `json:"start_published_date,omitempty,omitzero"`
@@ -266,6 +296,12 @@ type LinkupSearchConfig struct {
 	// ApiKey Linkup API key (or set LINKUP_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
 	// Depth Search depth to request from Linkup
 	Depth LinkupSearchConfigDepth `json:"depth,omitempty,omitzero"`
 
@@ -281,11 +317,17 @@ type LinkupSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// OutputType Linkup response shape to request
 	OutputType LinkupSearchConfigOutputType `json:"output_type,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -304,6 +346,9 @@ type LinkupSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
@@ -319,6 +364,12 @@ type SerperSearchConfig struct {
 	// ApiKey Serper API key (or set SERPER_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
 	// Endpoint Provider endpoint override when applicable
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
@@ -331,8 +382,14 @@ type SerperSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -354,6 +411,9 @@ type SerperSearchConfig struct {
 	// SearchType Type of search to perform
 	SearchType SerperSearchConfigSearchType `json:"search_type,omitempty,omitzero"`
 
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// TimePeriod Time period filter: d=day, w=week, m=month, y=year
 	TimePeriod SerperSearchConfigTimePeriod `json:"time_period,omitempty,omitzero"`
 
@@ -371,6 +431,12 @@ type SerperSearchConfigTimePeriod string
 type TavilySearchConfig struct {
 	// ApiKey Tavily API key (or set TAVILY_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
 
 	// Endpoint Provider endpoint override when applicable
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
@@ -396,8 +462,14 @@ type TavilySearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -420,6 +492,9 @@ type TavilySearchConfig struct {
 	// - basic: Fast search with standard results
 	// - advanced: Deeper search with more comprehensive results
 	SearchDepth TavilySearchConfigSearchDepth `json:"search_depth,omitempty,omitzero"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
@@ -509,6 +584,12 @@ type WebSearchConfig struct {
 	// ApiKey Provider API key or secret reference. Prefer named web_search connections for production use.
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
 	// Endpoint Provider endpoint override when applicable
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
@@ -521,8 +602,14 @@ type WebSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -540,6 +627,9 @@ type WebSearchConfig struct {
 
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
@@ -600,6 +690,12 @@ type YouSearchConfig struct {
 	// ApiKey You.com API key (or set YOU_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
 	// Endpoint You.com API endpoint URL
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
@@ -612,8 +708,14 @@ type YouSearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
@@ -632,6 +734,9 @@ type YouSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
@@ -639,73 +744,75 @@ type YouSearchConfig struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"H4sIAAAAAAAC/8xbe28bOZL/KoW+A+IYetjj3ZlZHeYPja3ktOvEhuVMLhgFWqq7JPHcTfaSbD0myHc/",
+	"FNlsdUuULXvmMgsDgtRNFotk1a+e/hLFMsulQGF01PsS6XiBGbNff1ZsiSNkKl5cSjHjc3rI0vRmFvV+",
+	"/RL9p8JZ1Iv+o7sl0C1ndz/itDHxa+tLlCuZozIcLXGW88kDbuhrgjpWPDdciqjnVgU3G/q3Q3jADZxI",
+	"BRoN/HzX/2Uw6d8OJ/8YfAIUS1gy9TpqRWaTY9SLtFFc0HLRTKFeCNR6f4U3/hXMeGpQ9SBPfkrYpgX5",
+	"6qcV4kML8uynTAqzaEG++WmDTEWtCEWRRb1fozyJWlG+oo+MPjbR58D6Osc0jRcYPzgGZqxITdQzqsDW",
+	"Dj8DwaYpwnYG6GI+R02v9XZvUylTZIKIG1ybSYKxVMwNqi8xY6neW2Mo4rRIEGgm1GbCyVSmSQu4YSmP",
+	"IWPqAZV+HVj1a/VITv8XYxN9/by7iLvswpGGmVSwe5mdsRiLxsNcySVPUEOu+JLFm/ZMxoXGBLR7v+Jm",
+	"AdxokCsBXCSYo0hQGPt9bemdno7QFHnv9HQszjsw4nMBRQ7MwMKYXPe63Smt2Ill1nVUuyzn3bH4rgNv",
+	"0VRCNlMyg4TpxVQylTjKVzLWvdPTihLLecfR6GyJsjzvJjIuMhTG7n0sor3TakWDNfvm2jRYsz0lGvxP",
+	"/ygVQpFM8mKacr3AZJIwg/v0h6MboDddwzOEIs9RwVQWIrHXX822Y0p1I+qh1dZWQieJzBgXOrQVJ8IK",
+	"dZEa7a7LLFAj+DmtiBvM7Nw9+uUDphTb0G8unljvRqQbKEf9UYuKIpuUpPYXvHWqoNo6x5jPeFyuCrEs",
+	"hAG5RKV4glErytiaZ4RG3521oowL9+O8Wo8Lg3NUFoes4EzcixpKRKwwMtrV4FIpM0lQIUHhvwrUxu16",
+	"sGY1FCynCywUS6NW9ICblVRJGAsNU+aZopTK1QtF6UVARXri9tLVmDFheAwrnJYoZGGGhnANMjc847+h",
+	"YyswuAULPl+kfL4wugVMJKDQKI5LTCBncxyLWApDCm4p3PXf2kFsTqi2kuphlsqVPhLZcM06jL8IyhIZ",
+	"646fH8KrN2jqWPXUEX64u4ZyZzCjqVzM7S4+aNQwl938Yd5lwszSTTfl066OFcu5mNvJiVyJVLKEftNp",
+	"5ErGqDWRgFGR51IZ3RuLNvz3/f1tlz5GtKB29kFjXChuNrBkKU9KCKax767tkWs4wbVRLDYaFLLE2ltr",
+	"CpecwVy23UOecrN5TTNvr96QiDUm0nj7cpg5kgpNoYQGpkkmGXy4G2o3O2VcOPqWCD0bXTh+T0inuEIN",
+	"+mISKyRbxllKE8di5PcxQ2YKGnRib/Lw4XUu3Yn7me5aXtuj6qekRAkspDawWnCDKdfGMki21iAMb2Ga",
+	"yviBTv1kNLp7A7nCJXEkhd3JVXktoPlvCCnPuLG7uecZysLY+1Yy1VaAdkySW31CqwfA7qPnB+QMWI1T",
+	"wTJ0mlETouEMMMvNpkVD7TANTGE18QTXMebGORF2Y/p1x6pslqfYg1/HkRd3ekBWexy1YEyGs/nws93K",
+	"8Yhuz29SrjvhuX7S3fuZZnho1QSzW65BMWFla/cyOmNh52HSg/Pvfuic0V/3xxacn9W+//Bd5/x7++v8",
+	"uxac/41+/uh+f1/Xce/UtaJ1ey7b9LStH3jelpZJlrZzSTZEld7kV2tyJqV2T1IUc7NobPSvZ2dnZ7s7",
+	"fefMVIUKbh5wAfGCkVKh0nBiVCFiZjABPgO6R0wwqTkkNWNGTHikmJBITqYbg80jPz/7y49//eH7w9wk",
+	"DZnmAiwNOCkp9OD87Ozdz2EGmjpL6z7mt5Ed1xOZoyD/TC+YwmSiLyaXNRIkUk6ZJhpjKZLmbi72tlGp",
+	"ZDmNduBn7rP89RCu31nXYl8v3XNnQLwCArPg7rDyIBIRgJVoRHaSHISMGR6zNN14PMcEpow+pYB3w3cD",
+	"IOZ6Hqt7cNcA5xJ6MQnAdInSPbhvjrSME0hY3N/CNdEmuMaE8JqY+P4vW9i2mIZr0xjV5iFcK4U55J+W",
+	"PHS3m/WDA06RV6atZ9YQVn84BI9mgSAVn3PB0sdI2vuakFxMsgDkEmiDYQ8oCHTs4LqtJUHKeJryw9JE",
+	"smrSALu3bI5g31UG098FXWwwvKj0PmQc0CxQVcCxYhq2MJEU1jkNIFIoVi5UGjiKBVqRNgvmqNvTQIrs",
+	"Z1JljBzkQvGgc1ka8IS8YCJeXWXN990q2zUXD0X+zeM+t+xe6Hc9fP+PD7dHRX8J5jsYT368SJhKDoUN",
+	"dspe3OBYqYUODTKYB0MGWZi8MIGwxfnYd2UM1QpvW6HOpdAIesHyeiRT52KHkJaFijHpC71CFeDpRWFF",
+	"yc9OAqR8yjUUGmdFaofWAwjHi48bWOrCCG1UEZNbmIyFQp8feWbAkNq1O1q+PGaokQiFDSNUOapvLvFu",
+	"2T2JHw3ubgd3R0n8wVDZvdgTtvsSnsubIEcOFcHHnpTZQHllUwXWGJFRSVlsv+iFzMl+BtXAYnmOisvk",
+	"AJ67l1Ums0xk+jxmlcbcy2KS9q2iVkTMbv4ocXd30ElwCW+lnKd7qb/ykqqkHwPNyfdWwIh/wQxfWn0t",
+	"p18W2sjMU6FYj6LnLEfD7chc8diHjMj0hq68yI9UBV1x+yJd2E63ahFWhnu25OnmmyuDW3ZPGe77vwyv",
+	"Px2X/PuT0nHM4e9TQZTPZ/eH7TkKVNYxcHNBF1nG1CboDfwpWT+/qGKrScN9PCZjr9jKJTK8MyRnzrcN",
+	"7q/EsIDxnjLN40ctt/XD7bAevGHaNFLw3mj7M6GxLFkyEVNIeoVIel2fkEmFQFKtcIFCk7ZWU2s45Nny",
+	"tP4oKPIaMNyFoPLFXibP5+H6Q2B5nvLYFUhaJVhxMR+LXGF769x76XDnY4WOE6bZjF+Kdj+gY6l8dPQ0",
+	"JBnLnM1EvNg812mEIOkXVAbX/1+QVAuPJznzQrhjqJc8RmCxy2v/fXTzHmhoB96wNKXgLH6wNuDm5u31",
+	"YNK/vb0eXvbvhzfvJ5d3g6vB+/th/3rUCTqtzLCJNlIFYpS+TbB6gafIzw6E4VWQVCqdBDS1aJ7Kqc13",
+	"N2l7c5XKIgE/88B+Lq9vPlxNrm/cloJr50rSbU14wOo3lioH0h4eW+z27ubvg8v7TtjrsdexUxygs5oc",
+	"8HsaHJQqX1KBWcqWsu5nNCh9PrS+mBMwVolmz0b5zb9rPXajJR1wY8O3+iIkaWy3sWQXnC5tUcbnu8Es",
+	"uEti2goGJhA6NLl0Ma5d0FU2SqHUINVYLFHxGceEYgPNDeoOUOBaek8KjKRYnmv459Ly8U8XFlNc37cJ",
+	"mld6LHDNtaGD2RUcRyOWoswxhiCqLE1fcR0TsxsYiDkXaEGJiwZJC1iXCplBYKJ5ULZAWm1uLC468FYx",
+	"YSqx8VjAYpuJMBL+VdByZoE7FxsGvpg46MwtO7YkWzoFfIltxtssz9vTgqcJqkd8tV1w20cQKIS7kHhP",
+	"SrbhW3W2LiQbsNojWDANVXmvSaXMK2QEuB1wQoR0dErmijODZH92K4SltJf+XSyzTApwWVxNhoVIGJlD",
+	"iktMyxseiCVXUtBC8AtTnK5Yw8mMpSmhh35tb79drxPbCkYjkrIZs4Y7SU8a/Rn04NPNh/rPZv6BnjwO",
+	"8q0gjrXCUGpvNeF0YxkXzEjrRmbMhVe9L5Gt2B8ybfvdLuQEs0PDd4v5rciFxYfGB/JAFvtycnbDUwKB",
+	"dCty1v3QlEC40YocOByaEnAHWtFGFofGf5LFjgvgPYDNe5bR8Xoprb16Kl7xpe/K27ECHSs0oHCGCkWM",
+	"Hbi130GwzGFiaVZICQTGTuZtrVjJpLC/odAYtHq/w03xSziG3eF2YGSz+94gbMnDjGOa/BdoRD92w7L0",
+	"kauoVQee5xHRofWvLv9Axyi41QOtIrZi9MjN+iFVHwOsFii8rz1NMUTXR05HR019/WAxr2YjwdVpazUC",
+	"Cp+2uWXiQrsSs00AHw4at3X938VIRcayorWtJh/BRsrEvGDzUPrdKgbJnx9jb84HKCfYmXda8ArFK/rU",
+	"9DlTr147hMvylBZC8bQX/KTL++frRtMktOgOBDivPSi5GVs3O3J8QfNQ+VAU2RRVLe/nT7m64Oc16LzA",
+	"1/93OeXHworKCPSOjChva1ZD4Twoc1s5dyOCUl5Y+S4e6DPBHSkvdDAGYjP0Mcqx3Zpshl4CAs1IL6iw",
+	"hwKh46OdsExcuZ1Y4WwGU8FL85XobLekHiju35U1nloZ+onq4U7trJKQz4/54rc1Odqv4QW8btoqWf2x",
+	"bQE6PcU1Oz3tPdHgRX6HG+5cMprxWDIbTnze2iacX7u5zjejuaHsE5zsJZzKedYvpWm77bLu9UYW9PKT",
+	"LCi0qVMkMq5vzCWddmtCbr5zTInEXjlqN3QhMt4wVtUnR8WJFFF5TkDcyPWh7SAsnd7KlW2VfrnzOis/",
+	"uvJbQ0mDSjzuykpfsJHB1QBdR0B9lza23G9YqmWeG3p3OMUMJ3y2Ndow3VRSGMypu3WDglznbFuVxjXG",
+	"RcMd2BI72EZ6XTZVNc1TPWF9FB6XDSKBdLavkx3XZ1DWxMpQ3rJ0VKOBNCw93Ct7T69rttgbAbZkPG16",
+	"k4fwx9N+FH4Otcn0QXNBWlATK0dwT66e6nu9pfel+2R7W/mssY2qIYFetunUgyYsDvr2d41ENMLJXgrh",
+	"dX2JWSpZrbXEna8lL3ieY+AgbPtN+bZbe1XVTLbHss+zLXPv07yyNRYb5/n2l3Jo0GYFO1LubTOKn71z",
+	"QXtEgk0iH+6uDxF4VpOI49AtEhK23Yj6WxQIvTHZrRDW8jVP/W/AgYCvTrmK+T7cXR9zas9Pzu4bRWv4",
+	"/eNmi4U1lTyuGztvM9tScRSmquqMRWX+Hivd1FmgDbv85Yv/s2TjSIXTk8d0E/b2BMAyRDIQDDD6H0c+",
+	"50p8Dq+23db0wOUB9EYYti7b3W1OJpXyoch3Y4P+x9Gkf3k5GI1IfCbDK5KgKtO4LDONBG9CGpK2TsM1",
+	"38hCtR0z7QfctHnyPMEbXbRJR5jhtEolej4s0BcdlrHfpGArTYf8CqSCVxS4pgupTe9vZ2dnr+wm33Ex",
+	"vGmGDbuTIxvVXZd9sOfBsgad1GR7/uHDLw90ewe/9wJGg8u7wX3tHl5wCW6R2l2E60ZacykmtggRqKOX",
+	"cQ64XdqxZcGC9mEwy6UiFyquB5vP2HuIbbtK23EUQnmNE63TY0O80ei6e389cp0tF40s47ZZmObbEf2P",
+	"oxbYWM7+tIK1FaWn/5vuq000zWToKFEQkniL/WjRoVlUsNj1MVCacJ3z1rbF5G26KMJIPxDXth0nLQ2v",
+	"HguboLIhKz32/+6mIZHilYEFBS62XmEd5I6DMGeayZvyAF2lAxtQ7px97bZ73jnrnNkeQAd1US+66Jx1",
+	"LsixYmaho54o0vTr/wUAAP//KVda07k6AAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

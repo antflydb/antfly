@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/secrets"
 )
 
 // SearchProvider is the interface that all web search providers must implement
@@ -54,6 +56,18 @@ func getConfigOrEnv(configVal *string, envVar string) string {
 		return *configVal
 	}
 	return os.Getenv(envVar)
+}
+
+func getResolvedConfigOrEnv(configVal *string, envVar string) (string, error) {
+	value := getConfigOrEnv(configVal, envVar)
+	if value == "" {
+		return "", nil
+	}
+	resolved, err := secrets.GetGlobalResolver().Resolve(value)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 // NewSearchProvider creates a search provider based on the config

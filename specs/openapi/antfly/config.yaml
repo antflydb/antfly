@@ -440,13 +440,13 @@ components:
           description: Cloud region when applicable.
         project_id:
           type: string
-          description: Google Cloud project when applicable.
+          description: Google Cloud project when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         location:
           type: string
-          description: Google Cloud location when applicable.
+          description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         credentials_path:
           type: string
-          description: Filesystem path to provider credentials when applicable.
+          description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         names:
           type: array
           items:
@@ -500,10 +500,10 @@ components:
           description: Provider endpoint override when applicable.
         project_id:
           type: string
-          description: Google Cloud project for provider vertex.
+          description: Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         location:
           type: string
-          description: Google Cloud location for provider vertex.
+          description: Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         data_store:
           type: string
           description: Agent Search data store ID for provider vertex.
@@ -512,7 +512,7 @@ components:
           description: Agent Search serving config ID for provider vertex.
         credentials_path:
           type: string
-          description: Filesystem path to provider credentials when applicable.
+          description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
         include_domains:
           type: array
           items:

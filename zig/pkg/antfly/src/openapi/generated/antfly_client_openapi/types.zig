@@ -3144,9 +3144,9 @@ pub const CohereRerankerConfig = struct {
 pub const VertexRerankerConfig = struct {
     /// The ranking model to use.
     model: []const u8,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
@@ -4532,6 +4532,16 @@ pub const WebSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -4655,9 +4665,9 @@ pub const RerankerConfig = struct {
     top_n: ?i64 = null,
     /// Maximum number of chunks per document for long document handling.
     max_chunks_per_doc: ?i64 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
 };
 
@@ -5155,6 +5165,16 @@ pub const ExaSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5190,6 +5210,16 @@ pub const SerperSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5217,6 +5247,16 @@ pub const TavilySearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5250,6 +5290,16 @@ pub const BraveSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5279,6 +5329,16 @@ pub const YouSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5302,6 +5362,16 @@ pub const LinkupSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5329,6 +5399,16 @@ pub const VertexSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -5345,16 +5425,6 @@ pub const VertexSearchConfig = struct {
     include_highlights: ?bool = null,
     /// Google Cloud search service flavor
     service: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
-    credentials_path: ?[]const u8 = null,
 };
 
 /// Configuration for chat agent tools. If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.

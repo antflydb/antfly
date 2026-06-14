@@ -1269,19 +1269,21 @@ func webSearchConfigFromConnection(name string, connection common.ConnectionConf
 	if provider == "" {
 		return websearch.WebSearchConfig{}, fmt.Errorf("web_search connection %q is missing provider", name)
 	}
-	if provider == string(websearch.WebSearchProviderVertex) {
-		return websearch.WebSearchConfig{}, fmt.Errorf("vertex web_search connection %q is configured but runtime search is not implemented yet", name)
-	}
 
 	webSearch := connection.WebSearch
 	config := websearch.WebSearchConfig{
 		Provider:          websearch.WebSearchProvider(provider),
 		ApiKey:            webSearch.ApiKey,
+		CredentialsPath:   webSearch.CredentialsPath,
+		DataStore:         webSearch.DataStore,
 		Endpoint:          webSearch.Endpoint,
 		MaxResults:        webSearch.MaxResults,
 		TimeoutMs:         webSearch.TimeoutMs,
 		Language:          webSearch.Language,
+		Location:          webSearch.Location,
+		ProjectId:         webSearch.ProjectId,
 		Region:            webSearch.Region,
+		ServingConfig:     webSearch.ServingConfig,
 		IncludeContent:    webSearch.IncludeContent,
 		IncludeHighlights: webSearch.IncludeHighlights,
 	}

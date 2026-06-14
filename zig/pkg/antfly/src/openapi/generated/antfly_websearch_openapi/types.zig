@@ -100,6 +100,16 @@ pub const WebSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -137,6 +147,16 @@ pub const ExaSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -172,6 +192,16 @@ pub const SerperSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -199,6 +229,16 @@ pub const TavilySearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -232,6 +272,16 @@ pub const BraveSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -261,6 +311,16 @@ pub const YouSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -284,6 +344,16 @@ pub const LinkupSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -311,6 +381,16 @@ pub const VertexSearchConfig = struct {
     api_key: ?[]const u8 = null,
     /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -327,14 +407,4 @@ pub const VertexSearchConfig = struct {
     include_highlights: ?bool = null,
     /// Google Cloud search service flavor
     service: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
-    credentials_path: ?[]const u8 = null,
 };

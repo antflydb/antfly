@@ -58,6 +58,11 @@ web_search:
   service: agent_search
 ```
 
+Vertex-backed providers should share the credential vocabulary from
+`specs/openapi/antfly/vertex.yaml`: `project_id`, `location`, and
+`credentials_path`. Keep those fields flat on provider configs unless a future
+provider has a strong reason to nest credentials.
+
 Do not use `google` for the new provider. In older web-search config, `google`
 meant Google Custom Search JSON API / CSE. That API is closed to new customers
 and should not remain the public production contract.
@@ -166,10 +171,10 @@ Common fields:
 - `include_highlights`: ask the provider to return highlighted passages when
   supported.
 - `api_key`: direct secret reference or resolved API key value.
-- `credentials_path`: service-account credential path for cloud providers that
-  use ADC-style authentication.
-- `project_id`: Google Cloud project for `provider: vertex`.
-- `location`: cloud region/location for `provider: vertex`.
+- `credentials_path`: shared Vertex service-account credential path for cloud
+  providers that use ADC-style authentication.
+- `project_id`: shared Vertex Google Cloud project for `provider: vertex`.
+- `location`: shared Vertex cloud region/location for `provider: vertex`.
 
 Provider implementations may accept additional fields, but unsupported fields
 must not silently change behavior.

@@ -19,9 +19,11 @@ import (
 	"testing"
 
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/ai"
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/websearch"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWebSearchConfigFromConnection(t *testing.T) {
@@ -35,11 +37,16 @@ func TestWebSearchConfigFromConnection(t *testing.T) {
 		},
 		WebSearch: common.WebSearchConnectionConfig{
 			ApiKey:            "${secret:exa.api_key}",
+			CredentialsPath:   "${secret:vertex.service_account_path}",
+			DataStore:         "docs-store",
 			Endpoint:          "https://search.example.test",
 			MaxResults:        7,
 			TimeoutMs:         2500,
 			Language:          "en",
+			Location:          "global",
+			ProjectId:         "test-project",
 			Region:            "us",
+			ServingConfig:     "default_config",
 			SafeSearch:        &safeSearch,
 			IncludeContent:    true,
 			IncludeHighlights: true,
@@ -49,11 +56,16 @@ func TestWebSearchConfigFromConnection(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "exa", string(config.Provider))
 	assert.Equal(t, "${secret:exa.api_key}", config.ApiKey)
+	assert.Equal(t, "${secret:vertex.service_account_path}", config.CredentialsPath)
+	assert.Equal(t, "docs-store", config.DataStore)
 	assert.Equal(t, "https://search.example.test", config.Endpoint)
 	assert.Equal(t, 7, config.MaxResults)
 	assert.Equal(t, 2500, config.TimeoutMs)
 	assert.Equal(t, "en", config.Language)
+	assert.Equal(t, "global", config.Location)
+	assert.Equal(t, "test-project", config.ProjectId)
 	assert.Equal(t, "us", config.Region)
+	assert.Equal(t, "default_config", config.ServingConfig)
 	if assert.NotNil(t, config.SafeSearch) {
 		assert.False(t, *config.SafeSearch)
 	}
@@ -67,6 +79,28 @@ func TestWebSearchConfigFromConnectionRejectsWrongKind(t *testing.T) {
 		Provider: "exa",
 	})
 	assert.ErrorContains(t, err, "expected web_search")
+}
+
+func TestWebSearchConfigFromConnectionAllowsVertex(t *testing.T) {
+	config, err := webSearchConfigFromConnection("agent-search", common.ConnectionConfig{
+		Kind:     common.ConnectionKindWebSearch,
+		Provider: "vertex",
+		WebSearch: common.WebSearchConnectionConfig{
+			CredentialsPath: "${secret:vertex.service_account_path}",
+			DataStore:       "docs-store",
+			Location:        "global",
+			ProjectId:       "test-project",
+			ServingConfig:   "default_config",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, websearch.WebSearchProviderVertex, config.Provider)
+	assert.Equal(t, "${secret:vertex.service_account_path}", config.CredentialsPath)
+	assert.Equal(t, "docs-store", config.DataStore)
+	assert.Equal(t, "global", config.Location)
+	assert.Equal(t, "test-project", config.ProjectId)
+	assert.Equal(t, "default_config", config.ServingConfig)
 }
 
 func TestResolveEffectiveGeneratorChain(t *testing.T) {
