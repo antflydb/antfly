@@ -91,6 +91,24 @@ export type TableSchema = components["schemas"]["TableSchema"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
+// Document artifact types
+export type DocumentArtifactChildRange = components["schemas"]["DocumentArtifactChildRange"];
+export type DocumentArtifactManifest = components["schemas"]["DocumentArtifactManifest"];
+export type DocumentArtifactManifestList = components["schemas"]["DocumentArtifactManifestList"];
+export type DocumentArtifactReprocessResponse =
+  components["schemas"]["DocumentArtifactReprocessResponse"];
+export type DocumentArtifactTableReprocessRequest =
+  components["schemas"]["DocumentArtifactTableReprocessRequest"];
+export type DocumentArtifactTableReprocessResponse =
+  components["schemas"]["DocumentArtifactTableReprocessResponse"];
+export type DocumentArtifactReprocessFailure =
+  components["schemas"]["DocumentArtifactReprocessFailure"];
+export type DocumentArtifactReprocessShardCursor =
+  components["schemas"]["DocumentArtifactReprocessShardCursor"];
+export type DocumentArtifactReprocessJobStartRequest =
+  components["schemas"]["DocumentArtifactReprocessJobStartRequest"];
+export type DocumentArtifactReprocessJob = components["schemas"]["DocumentArtifactReprocessJob"];
+
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
 export type IndexType = components["schemas"]["IndexType"];

@@ -18,6 +18,13 @@ import type {
   ConnectionsResponse,
   CreateTableRequest,
   CreateUserRequest,
+  DocumentArtifactManifest,
+  DocumentArtifactManifestList,
+  DocumentArtifactReprocessJob,
+  DocumentArtifactReprocessJobStartRequest,
+  DocumentArtifactReprocessResponse,
+  DocumentArtifactTableReprocessRequest,
+  DocumentArtifactTableReprocessResponse,
   IndexConfig,
   LinearMergeRequest,
   LinearMergeResult,
@@ -931,6 +938,180 @@ export class AntflyClient {
       });
       if (error) throw new Error(`Key lookup failed: ${error.error}`);
       return data;
+    },
+
+    artifacts: {
+      /**
+       * List derived artifact manifests attached to a document.
+       */
+      list: async (
+        tableName: string,
+        key: string,
+        detail: "summary" | "raw" = "summary"
+      ): Promise<DocumentArtifactManifestList | undefined> => {
+        const { data, error } = await this.client.GET(
+          "/db/v1/tables/{tableName}/documents/{key}/artifacts",
+          {
+            params: {
+              path: { tableName, key },
+              query: { detail },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to list document artifacts: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Get a single derived artifact manifest for a document.
+       */
+      get: async (
+        tableName: string,
+        key: string,
+        artifactName: string,
+        detail: "summary" | "raw" = "raw"
+      ): Promise<DocumentArtifactManifest | undefined> => {
+        const { data, error } = await this.client.GET(
+          "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}",
+          {
+            params: {
+              path: { tableName, key, artifactName },
+              query: { detail },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to get document artifact: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Reprocess one derived artifact for one document.
+       */
+      reprocessDocument: async (
+        tableName: string,
+        key: string,
+        artifactName: string
+      ): Promise<DocumentArtifactReprocessResponse | undefined> => {
+        const { data, error } = await this.client.POST(
+          "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess",
+          {
+            params: {
+              path: { tableName, key, artifactName },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to reprocess document artifact: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Run one bounded table-wide reprocess pass for an artifact.
+       */
+      reprocessRange: async (
+        tableName: string,
+        artifactName: string,
+        request: DocumentArtifactTableReprocessRequest = {}
+      ): Promise<DocumentArtifactTableReprocessResponse | undefined> => {
+        const { data, error } = await this.client.POST(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess",
+          {
+            params: {
+              path: { tableName, artifactName },
+            },
+            body: request,
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to reprocess table artifact range: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Start a durable table-wide artifact reprocess job.
+       */
+      startReprocessJob: async (
+        tableName: string,
+        artifactName: string,
+        request: DocumentArtifactReprocessJobStartRequest = {}
+      ): Promise<DocumentArtifactReprocessJob | undefined> => {
+        const { data, error } = await this.client.POST(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs",
+          {
+            params: {
+              path: { tableName, artifactName },
+            },
+            body: request,
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to start artifact reprocess job: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      getReprocessJob: async (
+        tableName: string,
+        artifactName: string,
+        jobId: string
+      ): Promise<DocumentArtifactReprocessJob | undefined> => {
+        const { data, error } = await this.client.GET(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}",
+          {
+            params: {
+              path: { tableName, artifactName, jobId },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to load artifact reprocess job: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      advanceReprocessJob: async (
+        tableName: string,
+        artifactName: string,
+        jobId: string
+      ): Promise<DocumentArtifactReprocessJob | undefined> => {
+        const { data, error } = await this.client.POST(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance",
+          {
+            params: {
+              path: { tableName, artifactName, jobId },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to advance artifact reprocess job: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      cancelReprocessJob: async (
+        tableName: string,
+        artifactName: string,
+        jobId: string
+      ): Promise<DocumentArtifactReprocessJob | undefined> => {
+        const { data, error } = await this.client.POST(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel",
+          {
+            params: {
+              path: { tableName, artifactName, jobId },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to cancel artifact reprocess job: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
     },
 
     /**
