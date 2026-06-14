@@ -683,6 +683,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
@@ -694,6 +695,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsTableSchema(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
@@ -3520,6 +3522,7 @@ pub const ApiHttpServer = struct {
                     self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
@@ -3540,6 +3543,7 @@ pub const ApiHttpServer = struct {
                 self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
@@ -3656,6 +3660,7 @@ pub const ApiHttpServer = struct {
                 }
                 self.source.dropTable(self.alloc, table_path.table_name) catch |err| switch (err) {
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     else => {
                         std.log.err("public drop table metadata remove failed table={s} err={s}", .{
@@ -5923,6 +5928,7 @@ pub const ApiHttpServer = struct {
                 self.source.dropTable(alloc, table_name) catch |err| {
                     statuses[i].@"error" = switch (err) {
                         error.TableNotFound => null,
+                        error.ExtensionOwnedObject => "method not allowed",
                         error.UnsupportedOperation => "method not allowed",
                         else => "failed to remove existing table",
                     };
@@ -6984,11 +6990,15 @@ fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []c
     return null;
 }
 
-fn extensionIndexMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
-    if (member.object_kind != .index) return null;
+fn extensionMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
     if (member.table_name.len != 0) return member.table_name;
     if (member.scope.kind == .table) return member.scope.table_name;
     return null;
+}
+
+fn extensionIndexMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .index) return null;
+    return extensionMemberTableName(member);
 }
 
 fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
@@ -6997,6 +7007,23 @@ fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: [
         if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) {
             return true;
         }
+    }
+    return false;
+}
+
+fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .table_schema) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
     }
     return false;
 }
@@ -9140,6 +9167,95 @@ test "direct index deletion rejects extension-owned indexes" {
 
     var service = FakeService{};
     try std.testing.expectError(error.ExtensionOwnedObject, dropIndexOnService(&service, std.testing.allocator, "memories", "memory_text"));
+}
+
+test "direct schema update rejects extension-owned table schema" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .schema_json = "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"}}}",
+            .placement_role = "data",
+        },
+        member_record: metadata_mod.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .table_schema,
+            .object_name = "memory_record",
+            .table_name = "memories",
+            .shape_version = "1",
+            .owner_metadata_json = "{\"shape\":\"memory_record\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
+            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(
+        error.ExtensionOwnedObject,
+        updateSchemaOnService(&service, std.testing.allocator, "memories", "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\"}}}"),
+    );
+}
+
+test "extension table ownership recognizes scoped objects for table drop guards" {
+    var member_record = metadata_mod.ExtensionMember{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "memories" },
+        .object_kind = .mcp_tool,
+        .object_name = "recall",
+        .owner_metadata_json = "{\"handler\":\"antfly_api_template\"}",
+    };
+    var empty_tables: [0]metadata_table_manager.TableRecord = .{};
+    var empty_ranges: [0]metadata_table_manager.RangeRecord = .{};
+    var empty_stores: [0]metadata_table_manager.StoreRecord = .{};
+    var empty_placements: [0]raft_reconciler.PlacementIntent = .{};
+    var empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{};
+    var empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = empty_tables[0..],
+        .ranges = empty_ranges[0..],
+        .stores = empty_stores[0..],
+        .placement_intents = empty_placements[0..],
+        .extension_members = @as([*]metadata_mod.ExtensionMember, @ptrCast(&member_record))[0..1],
+        .split_transitions = empty_splits[0..],
+        .merge_transitions = empty_merges[0..],
+    };
+
+    try std.testing.expect(extensionOwnsTableScopedObject(&snapshot, "memories"));
+    try std.testing.expect(!extensionOwnsTableScopedObject(&snapshot, "sessions"));
 }
 
 test "api http server serves mcp and a2a protocol surfaces" {
