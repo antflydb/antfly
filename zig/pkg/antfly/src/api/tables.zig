@@ -412,7 +412,9 @@ pub fn encodeTableListWithStorageStatuses(
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const listed = try buildTableListWithStorageStatuses(arena_impl.allocator(), snapshot, prefix, storage_statuses);
-    return try std.json.Stringify.valueAlloc(alloc, listed, .{ .emit_null_optional_fields = false });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, listed, .{ .emit_null_optional_fields = false });
+    defer alloc.free(encoded);
+    return try projectInlineEnrichmentConfigsInTableStatusJson(alloc, encoded);
 }
 
 pub fn encodeSingleTableStatus(
@@ -432,7 +434,9 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
-    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
+    defer alloc.free(encoded);
+    return try projectInlineEnrichmentConfigsInTableStatusJson(alloc, encoded);
 }
 
 pub fn buildTableListWithStorageStatuses(
@@ -1215,13 +1219,7 @@ fn appendCanonicalIndexConfig(
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        const value = if (std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
-            try canonicalIndexEnrichmentsValue(alloc, entry.value_ptr.*)
-        else
-            try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
-        var owned_value = value;
-        defer deinitJsonValue(alloc, &owned_value);
-        const encoded = try stringifyJsonValue(alloc, owned_value);
+        const encoded = try stringifyJsonValue(alloc, entry.value_ptr.*);
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
@@ -1255,11 +1253,7 @@ fn buildCanonicalIndexConfigValue(
     var it = config.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-        const value = if (std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
-            try canonicalIndexEnrichmentsValue(alloc, entry.value_ptr.*)
-        else
-            try cloneJsonValueAlloc(alloc, entry.value_ptr.*);
-        try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), value);
+        try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValueAlloc(alloc, entry.value_ptr.*));
     }
     return .{ .object = object };
 }
@@ -1283,6 +1277,34 @@ fn canonicalIndexEnrichmentsValue(alloc: std.mem.Allocator, value: std.json.Valu
         }
     }
     return .{ .array = array };
+}
+
+fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &parsed.value);
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+fn projectInlineEnrichmentConfigsInTableStatusValue(alloc: std.mem.Allocator, value: *std.json.Value) !void {
+    switch (value.*) {
+        .array => |*array| {
+            for (array.items) |*item| try projectInlineEnrichmentConfigsInTableStatusValue(alloc, item);
+        },
+        .object => |*object| {
+            const indexes_value = object.getPtr("indexes") orelse return;
+            if (indexes_value.* != .object) return;
+            var index_it = indexes_value.object.iterator();
+            while (index_it.next()) |index_entry| {
+                if (index_entry.value_ptr.* != .object) continue;
+                const enrichments_value = index_entry.value_ptr.object.getPtr("enrichments") orelse continue;
+                const projected = try canonicalIndexEnrichmentsValue(alloc, enrichments_value.*);
+                deinitJsonValue(alloc, enrichments_value);
+                enrichments_value.* = projected;
+            }
+        },
+        else => {},
+    }
 }
 
 fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType {

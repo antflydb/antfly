@@ -2265,6 +2265,10 @@ pub fn build(b: *std.Build) void {
             "artifact reprocess job store recovers durable jobs and reseeds ids",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
     const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
@@ -4036,6 +4040,10 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
@@ -6183,6 +6191,10 @@ pub fn build(b: *std.Build) void {
     });
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
