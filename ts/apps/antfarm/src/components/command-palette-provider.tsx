@@ -39,6 +39,7 @@ import {
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 import { isProductEnabled, type ProductId } from "@/config/products";
+import rawCommandDefinitions from "@/data/command-definitions.json";
 import { useAuth } from "@/hooks/use-auth";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useTheme } from "@/hooks/use-theme";
@@ -81,6 +82,7 @@ interface CommandPaletteContextType {
 const CommandPaletteContext = React.createContext<CommandPaletteContextType | undefined>(undefined);
 
 interface PaletteCommand {
+  id: string;
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   href?: string;
@@ -88,6 +90,22 @@ interface PaletteCommand {
   product?: ProductId;
   adminOnly?: boolean;
 }
+
+interface CommandDefinition {
+  id: string;
+  type: "navigation" | "action";
+  group: "navigation" | "tools" | "quickActions";
+  label: string;
+  description: string;
+  href?: string;
+  action?: string;
+  icon: string;
+  product?: ProductId;
+  adminOnly?: boolean;
+  semantic: boolean;
+}
+
+const commandDefinitions = rawCommandDefinitions as CommandDefinition[];
 
 function productForHref(href?: string): ProductId | undefined {
   if (!href) return undefined;
@@ -115,6 +133,18 @@ function isAdminHref(href?: string) {
 
 function isSupportedAction(action?: string) {
   return !action || action === "toggle-theme";
+}
+
+function toPaletteCommand(command: CommandDefinition): PaletteCommand {
+  return {
+    id: command.id,
+    icon: iconMap[command.icon] ?? HelpCircle,
+    label: command.label,
+    href: command.href,
+    action: command.action,
+    product: command.product,
+    adminOnly: command.adminOnly,
+  };
 }
 
 export function CommandPaletteProvider({ children }: { children: React.ReactNode }) {
@@ -176,81 +206,25 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   }, [toggle]);
 
   const navigationCommands = React.useMemo(() => {
-    const commands: PaletteCommand[] = [
-      { icon: Table, label: "Tables", href: "/", product: "antfly" },
-      { icon: Plus, label: "Create Table", href: "/create", product: "antfly" },
-      { icon: Search, label: "Search", href: "/retrieval/search", product: "antfly" },
-      { icon: Bot, label: "Ask Questions", href: "/retrieval/ask", product: "antfly" },
-      {
-        icon: ClipboardCheck,
-        label: "Evaluate Retrieval",
-        href: "/retrieval/evaluate",
-        product: "antfly",
-      },
-      { icon: Upload, label: "Upload Data", href: "/ingest/upload", product: "antfly" },
-      { icon: Library, label: "Models", href: "/inference/models", product: "inference" },
-      { icon: Network, label: "Cluster", href: "/cluster", product: "antfly" },
-      { icon: Plug, label: "Connections", href: "/connections", product: "antfly" },
-      { icon: Users, label: "Users", href: "/users", product: "antfly", adminOnly: true },
-      { icon: KeyRound, label: "Secrets", href: "/secrets", product: "antfly", adminOnly: true },
-    ];
+    const commands = commandDefinitions
+      .filter((command) => command.group === "navigation")
+      .map(toPaletteCommand);
     return commands.filter(isCommandAvailable);
   }, [isCommandAvailable]);
 
   const toolCommands = React.useMemo(() => {
-    const commands: PaletteCommand[] = [
-      { icon: Network, label: "Graph Retrieval", href: "/retrieval/graph", product: "antfly" },
-      {
-        icon: Scissors,
-        label: "Chunk Text",
-        href: "/inference/playground/chunk",
-        product: "inference",
-      },
-      {
-        icon: Tag,
-        label: "Extract Structured Data",
-        href: "/inference/playground/extract",
-        product: "inference",
-      },
-      {
-        icon: Repeat2,
-        label: "Rewrite Text",
-        href: "/inference/playground/rewrite",
-        product: "inference",
-      },
-      {
-        icon: ArrowUpDown,
-        label: "Rerank Text",
-        href: "/inference/playground/rerank",
-        product: "inference",
-      },
-      {
-        icon: Waypoints,
-        label: "Embed Text",
-        href: "/inference/playground/embed",
-        product: "inference",
-      },
-      {
-        icon: ScanLine,
-        label: "Read Image",
-        href: "/inference/playground/read",
-        product: "inference",
-      },
-      {
-        icon: Mic,
-        label: "Transcribe Audio",
-        href: "/inference/playground/transcribe",
-        product: "inference",
-      },
-      { icon: FileInput, label: "Manual Entry", href: "/ingest/manual", product: "antfly" },
-    ];
+    const commands = commandDefinitions
+      .filter((command) => command.group === "tools")
+      .map(toPaletteCommand);
     return commands.filter(isCommandAvailable);
   }, [isCommandAvailable]);
 
-  const quickActionCommands = React.useMemo(
-    () => [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }],
-    []
-  );
+  const quickActionCommands = React.useMemo(() => {
+    const commands = commandDefinitions
+      .filter((command) => command.group === "quickActions")
+      .map(toPaletteCommand);
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
   // All command items for string matching check
   const allItems = React.useMemo(
@@ -378,7 +352,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
               return (
                 <CommandItem
-                  key={command.action}
+                  key={command.id}
                   onSelect={() => handleSelect(undefined, command.action)}
                   className="flex items-center gap-2 cursor-pointer"
                 >
@@ -395,7 +369,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
           <CommandGroup heading="Navigation">
             {navigationCommands.map((command) => (
               <CommandItem
-                key={command.href}
+                key={command.id}
                 onSelect={() => handleSelect(command.href)}
                 className="flex items-center gap-2 cursor-pointer"
               >
@@ -411,7 +385,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
           <CommandGroup heading="Tools">
             {toolCommands.map((command) => (
               <CommandItem
-                key={command.href}
+                key={command.id}
                 onSelect={() => handleSelect(command.href)}
                 className="flex items-center gap-2 cursor-pointer"
               >

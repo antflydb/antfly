@@ -4,16 +4,20 @@
  */
 
 import type { InferenceClient } from "@antfly/sdk";
+import type { ProductId } from "@/config/products";
 import commandIndex from "@/data/command-index.json";
 
 export interface CommandItem {
   id: string;
   type: "navigation" | "action";
+  group?: "navigation" | "tools" | "quickActions";
   label: string;
   description: string;
   href?: string;
   action?: string;
   icon: string;
+  product?: ProductId;
+  adminOnly?: boolean;
 }
 
 export interface SemanticResult {
@@ -25,11 +29,14 @@ export interface SemanticResult {
 interface CommandIndexEntry {
   id: string;
   type: string;
+  group?: "navigation" | "tools" | "quickActions";
   label: string;
   description: string;
   href?: string;
   action?: string;
   icon: string;
+  product?: ProductId;
+  adminOnly?: boolean;
   embedding: number[];
 }
 
@@ -96,11 +103,14 @@ export async function semanticSearch(
       item: {
         id: cmd.id,
         type: cmd.type as "navigation" | "action",
+        group: cmd.group,
         label: cmd.label,
         description: cmd.description,
         href: cmd.href,
         action: cmd.action,
         icon: cmd.icon,
+        product: cmd.product,
+        adminOnly: cmd.adminOnly,
       },
       score: cosineSimilarity(queryVec, cmd.embedding),
     }));
@@ -121,10 +131,13 @@ export function getAllCommandItems(): CommandItem[] {
   return index.commands.map((cmd) => ({
     id: cmd.id,
     type: cmd.type as "navigation" | "action",
+    group: cmd.group,
     label: cmd.label,
     description: cmd.description,
     href: cmd.href,
     action: cmd.action,
     icon: cmd.icon,
+    product: cmd.product,
+    adminOnly: cmd.adminOnly,
   }));
 }
