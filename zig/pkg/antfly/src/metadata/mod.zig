@@ -48,6 +48,7 @@ pub const InstallManifest = extensions.InstallManifest;
 pub const InstalledExtension = extensions.InstalledExtension;
 pub const ExtensionMember = extensions.ExtensionMember;
 pub const ExtensionDependency = extensions.ExtensionDependency;
+pub const DataShapeKind = extensions.DataShapeKind;
 pub const InstallExtensionRequest = extensions.InstallExtensionRequest;
 pub const UpdateExtensionRequest = extensions.UpdateExtensionRequest;
 pub const DropMode = extensions.DropMode;

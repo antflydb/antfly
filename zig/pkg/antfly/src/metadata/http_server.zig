@@ -17,6 +17,7 @@ const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
+const metadata_extensions = @import("extensions.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -344,6 +345,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -356,6 +358,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
@@ -368,6 +371,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -381,6 +385,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
@@ -556,6 +561,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -568,6 +574,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
@@ -580,6 +587,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -593,6 +601,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
@@ -945,6 +954,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableSchema(req.uri)) |table| {
                     self.source.updateSchema(self.alloc, table.table_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                         else => return err,
@@ -954,6 +964,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.createIndex(self.alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
                         else => return err,
@@ -980,6 +991,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     self.source.dropTable(self.alloc, table.table_name) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -988,6 +1000,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.dropIndex(self.alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
                         error.TableNotFound, error.IndexNotFound => return try textResponse(self.alloc, 404, "index not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -2058,6 +2071,109 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
     return null;
 }
 
+fn extensionMemberTableName(member: metadata_extensions.ExtensionMember) ?[]const u8 {
+    if (member.table_name.len != 0) return member.table_name;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    return null;
+}
+
+fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .index) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .table_schema) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableDataShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .data_shape) continue;
+        const shape_kind = member.shape_kind orelse continue;
+        if (shape_kind != .document and shape_kind != .row) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    return extensionOwnsTableSchema(snapshot, table_name) or extensionOwnsTableDataShape(snapshot, table_name);
+}
+
+fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+test "metadata http extension ownership helpers protect internal table mutations" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "memories",
+        .placement_role = "data",
+    }};
+    var members = [_]metadata_extensions.ExtensionMember{
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .table_schema,
+            .object_name = "memory_record",
+            .table_name = "memories",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .enrichment,
+            .object_name = "memory_embed",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memory_events" },
+            .object_kind = .data_shape,
+            .object_name = "memory_event",
+            .shape_kind = .row,
+        },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .extension_members = members[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    try std.testing.expect(extensionOwnsTableScopedObject(&snapshot, "memories"));
+    try std.testing.expect(extensionOwnsTableSchema(&snapshot, "memories"));
+    try std.testing.expect(extensionOwnsIndex(&snapshot, "memories", "memory_text"));
+    try std.testing.expect(!extensionOwnsTableSchema(&snapshot, "memory_events"));
+    try std.testing.expect(extensionOwnsTableDataShape(&snapshot, "memory_events"));
+    try std.testing.expect(extensionOwnsTableShape(&snapshot, "memory_events"));
+    try std.testing.expect(!extensionOwnsIndex(&snapshot, "memories", "manual_text"));
+    try std.testing.expect(!extensionOwnsTableScopedObject(&snapshot, "sessions"));
+}
+
 fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, key: []const u8) ?u64 {
     for (ranges) |record| {
         if (record.table_id != table_id) continue;
@@ -2355,6 +2471,78 @@ test "metadata http server serves status and filtered admin routes" {
     defer active_resp.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9001") != null);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9010") != null);
+}
+
+test "metadata http server maps extension-owned object mutations to method not allowed" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) AdminSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .drop_table = dropTable,
+                    .update_schema = updateSchema,
+                    .create_index = createIndex,
+                    .drop_index = dropIndex,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn dropTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn updateSchema(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn dropIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    var schema_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/schema", .body = "{}" });
+    defer schema_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), schema_resp.status);
+
+    var create_index_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/indexes/memory_text", .body = "{\"type\":\"full_text\"}" });
+    defer create_index_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), create_index_resp.status);
+
+    var drop_index_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories/indexes/memory_text" });
+    defer drop_index_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), drop_index_resp.status);
+
+    var drop_table_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories" });
+    defer drop_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status);
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {

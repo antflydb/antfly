@@ -695,7 +695,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    if (extensionOwnsTableSchema(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
@@ -7106,6 +7106,15 @@ fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_n
     return false;
 }
 
+fn extensionOwnsTableShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    if (extensionOwnsTableSchema(snapshot, table_name)) return true;
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionDataShapeMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
 fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         const member_table = extensionMemberTableName(member) orelse continue;
@@ -9454,7 +9463,7 @@ test "direct index creation rejects extension-owned index names" {
     try std.testing.expectError(error.ExtensionOwnedObject, createIndexOnService(&service, std.testing.allocator, "memories", "memory_text", "{\"type\":\"full_text\"}"));
 }
 
-test "direct schema update rejects extension-owned table schema" {
+test "direct schema update rejects extension-owned data shapes" {
     const FakeService = struct {
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 7,
@@ -9465,11 +9474,12 @@ test "direct schema update rejects extension-owned table schema" {
         member_record: metadata_mod.ExtensionMember = .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
-            .object_kind = .table_schema,
+            .object_kind = .data_shape,
             .object_name = "memory_record",
+            .shape_kind = .document,
             .table_name = "memories",
             .shape_version = "1",
-            .owner_metadata_json = "{\"shape\":\"memory_record\"}",
+            .owner_metadata_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
         },
         empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
         empty_stores: [0]metadata_table_manager.StoreRecord = .{},
