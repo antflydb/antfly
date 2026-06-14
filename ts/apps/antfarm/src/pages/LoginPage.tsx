@@ -1,5 +1,6 @@
 import {
   Alert,
+  AlertDescription,
   Anty,
   AuthShell,
   Button,
@@ -15,6 +16,7 @@ import type { FormEvent } from "react";
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../hooks/use-auth";
+import { useApiConfig } from "../hooks/use-api-config";
 
 interface LocationState {
   from?: {
@@ -26,11 +28,17 @@ export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { login, isLoading } = useAuth();
+  const { apiUrl } = useApiConfig();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
   const from = (location.state as LocationState)?.from?.pathname || "/";
+  const devProxyTarget = import.meta.env.VITE_ANTFARM_API_PROXY_TARGET;
+  const apiTarget =
+    apiUrl.startsWith("/") && typeof devProxyTarget === "string"
+      ? `${devProxyTarget}${apiUrl}`
+      : apiUrl;
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -45,17 +53,18 @@ export function LoginPage() {
       await login(username, password);
       navigate(from, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      const message = err instanceof Error ? err.message : "Login failed";
+      setError(message);
     }
   };
 
   return (
     <AuthShell>
-      <div className="flex flex-col items-center gap-4">
-        <Anty size={64} expression="excited" float={false} showGlow />
-      </div>
-      <Card>
+      <Card className="w-full max-w-sm">
         <CardHeader className="space-y-1">
+          <div className="mb-3 flex justify-center">
+            <Anty size={56} expression="excited" float={false} showGlow />
+          </div>
           <CardTitle className="font-aeonik">Sign in to Antfly</CardTitle>
           <CardDescription>Enter your credentials to access the dashboard</CardDescription>
         </CardHeader>
@@ -63,7 +72,16 @@ export function LoginPage() {
           <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
               <Alert variant="destructive">
-                <p className="text-sm">{error}</p>
+                <AlertDescription className="text-sm leading-5">
+                  {error}
+                  {error.includes("Failed to fetch user info") && (
+                    <span className="mt-2 block text-xs">
+                      Antfarm could not reach the Antfly API at <code>{apiTarget}</code>. Run{" "}
+                      <code>./antfly swarm</code>, or restart Vite with{" "}
+                      <code>ANTFARM_API_PROXY_TARGET</code> set to a running backend.
+                    </span>
+                  )}
+                </AlertDescription>
               </Alert>
             )}
 
