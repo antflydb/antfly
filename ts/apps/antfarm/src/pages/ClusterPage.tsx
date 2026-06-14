@@ -474,7 +474,7 @@ const ClusterPage: React.FC = () => {
                       <div className="flex items-center gap-2">
                         <Database className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                         <Link
-                          to={`/tables/${table.name}`}
+                          to={`/tables/${encodeURIComponent(table.name)}?section=overview`}
                           className="font-medium hover:underline text-foreground"
                         >
                           {table.name}

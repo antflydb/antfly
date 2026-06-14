@@ -614,7 +614,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "i
           <BreadcrumbSeparator />
           <BreadcrumbItem>
             <BreadcrumbLink asChild>
-              <Link to={`/tables/${tableName}`}>{tableName}</Link>
+              <Link to={tableSectionPath("overview")}>{tableName}</Link>
             </BreadcrumbLink>
           </BreadcrumbItem>
           <BreadcrumbSeparator />

@@ -62,7 +62,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
       setSelectedTableState(name);
       const isOnTablePage = location.pathname.startsWith("/tables/");
       if (isOnTablePage) {
-        navigate(`/tables/${name}`);
+        navigate(`/tables/${encodeURIComponent(name)}?section=overview`);
       } else {
         setSearchParams(
           (prev) => {

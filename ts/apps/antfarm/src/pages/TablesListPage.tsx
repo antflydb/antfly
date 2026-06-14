@@ -108,7 +108,7 @@ const TablesListPage: React.FC = () => {
         header: "Name",
         cell: ({ row }) => (
           <Link
-            to={`/tables/${row.original.name}?section=overview`}
+            to={`/tables/${encodeURIComponent(row.original.name)}?section=overview`}
             className="font-medium hover:underline"
           >
             {row.original.name}
