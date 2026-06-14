@@ -203,6 +203,11 @@ pub const InstallManifest = struct {
         for (self.objects) |object| {
             try object.validate();
             if (object.shape.len != 0 and !self.hasShape(object.shape)) return error.UnknownShapeReference;
+            if (object.kind == .generated_artifact) {
+                if (object.shape.len == 0) return error.GeneratedArtifactShapeRequired;
+                const shape = self.findShape(object.shape) orelse return error.UnknownShapeReference;
+                if (shape.kind != .generated_artifact) return error.GeneratedArtifactShapeRequired;
+            }
         }
         for (self.runtimes) |runtime| try runtime.validate();
     }
@@ -215,10 +220,14 @@ pub const InstallManifest = struct {
     }
 
     fn hasShape(self: InstallManifest, name: []const u8) bool {
+        return self.findShape(name) != null;
+    }
+
+    fn findShape(self: InstallManifest, name: []const u8) ?DataShapeDecl {
         for (self.shapes) |shape| {
-            if (std.mem.eql(u8, shape.name, name)) return true;
+            if (std.mem.eql(u8, shape.name, name)) return shape;
         }
-        return false;
+        return null;
     }
 };
 
@@ -401,6 +410,7 @@ pub const ExtensionMember = struct {
     object_name: []const u8,
     table_name: []const u8 = "",
     shape_kind: ?DataShapeKind = null,
+    shape_name: []const u8 = "",
     shape_version: []const u8 = "",
     owner_metadata_json: []const u8 = "{}",
 
@@ -409,6 +419,7 @@ pub const ExtensionMember = struct {
         try self.scope.validate();
         try requireObjectName(self.object_name);
         if (self.shape_kind != null and self.object_kind != .data_shape) return error.MemberShapeKindWithoutDataShape;
+        if (self.shape_name.len > 0) try requireObjectName(self.shape_name);
         if (self.scope.kind == .table and self.table_name.len != 0 and !std.mem.eql(u8, self.scope.table_name, self.table_name)) {
             return error.MemberTableOutsideScope;
         }
@@ -949,8 +960,9 @@ pub fn planManifestOnlyInstallAlloc(
     }
     for (package.install.objects) |object| {
         if (!objectKindV1(object.kind)) return error.UnsupportedObjectKindForV1;
-        try members.append(alloc, try memberFromObjectAlloc(alloc, extension_name, request.scope, object));
+        try members.append(alloc, try memberFromObjectAlloc(alloc, extension_name, request.scope, package.install, object));
     }
+    try validateUniqueExtensionMemberIdentities(members.items);
 
     const installed = try cloneInstalledExtension(alloc, .{
         .name = extension_name,
@@ -1064,10 +1076,26 @@ fn validateTableWriteDataShapeSchema(alloc: std.mem.Allocator, schema_json: []co
     if (parsed.document_schemas.len == 0) return error.InvalidExtensionShape;
 }
 
+fn validateUniqueExtensionMemberIdentities(members: []const ExtensionMember) !void {
+    for (members, 0..) |member, i| {
+        for (members[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.extension_name, member.extension_name) and
+                prior.scope.kind == member.scope.kind and
+                std.mem.eql(u8, prior.scope.table_name, member.scope.table_name) and
+                prior.object_kind == member.object_kind and
+                std.mem.eql(u8, prior.object_name, member.object_name))
+            {
+                return error.DuplicateExtensionMember;
+            }
+        }
+    }
+}
+
 fn memberFromObjectAlloc(
     alloc: std.mem.Allocator,
     extension_name: []const u8,
     scope: ExtensionScope,
+    install: InstallManifest,
     object: ExtensionObjectDecl,
 ) !ExtensionMember {
     const table_name = if (object.table_name.len > 0)
@@ -1076,12 +1104,15 @@ fn memberFromObjectAlloc(
         scope.table_name
     else
         "";
+    const shape = if (object.shape.len > 0) install.findShape(object.shape) else null;
     return try cloneExtensionMember(alloc, .{
         .extension_name = extension_name,
         .scope = scope,
         .object_kind = object.kind,
         .object_name = object.name,
         .table_name = table_name,
+        .shape_name = object.shape,
+        .shape_version = if (shape) |value| value.version else "",
         .owner_metadata_json = object.config_json,
     });
 }
@@ -1444,6 +1475,8 @@ fn cloneExtensionMember(alloc: std.mem.Allocator, member: ExtensionMember) !Exte
     errdefer alloc.free(object_name);
     const table_name = if (member.table_name.len > 0) try alloc.dupe(u8, member.table_name) else "";
     errdefer if (table_name.len > 0) alloc.free(table_name);
+    const shape_name = if (member.shape_name.len > 0) try alloc.dupe(u8, member.shape_name) else "";
+    errdefer if (shape_name.len > 0) alloc.free(shape_name);
     const shape_version = if (member.shape_version.len > 0) try alloc.dupe(u8, member.shape_version) else "";
     errdefer if (shape_version.len > 0) alloc.free(shape_version);
     const owner_metadata_json = try alloc.dupe(u8, member.owner_metadata_json);
@@ -1455,6 +1488,7 @@ fn cloneExtensionMember(alloc: std.mem.Allocator, member: ExtensionMember) !Exte
         .object_name = object_name,
         .table_name = table_name,
         .shape_kind = member.shape_kind,
+        .shape_name = shape_name,
         .shape_version = shape_version,
         .owner_metadata_json = owner_metadata_json,
     };
@@ -1465,6 +1499,7 @@ fn freeExtensionMember(alloc: std.mem.Allocator, member: ExtensionMember) void {
     freeScope(alloc, member.scope);
     alloc.free(member.object_name);
     if (member.table_name.len > 0) alloc.free(member.table_name);
+    if (member.shape_name.len > 0) alloc.free(member.shape_name);
     if (member.shape_version.len > 0) alloc.free(member.shape_version);
     alloc.free(member.owner_metadata_json);
 }
@@ -1555,6 +1590,12 @@ test "extension package manifest validates data shape and mcp objects" {
         \\        "schema_json": "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}"
         \\      },
         \\      {
+        \\        "name": "memory_embedding",
+        \\        "kind": "generated_artifact",
+        \\        "version": "1",
+        \\        "schema_json": "{\"type\":\"object\",\"properties\":{\"vector\":{\"type\":\"array\"}}}"
+        \\      },
+        \\      {
         \\        "name": "recall_request",
         \\        "kind": "tool_schema",
         \\        "version": "1",
@@ -1562,7 +1603,7 @@ test "extension package manifest validates data shape and mcp objects" {
         \\      }
         \\    ],
         \\    "objects": [
-        \\      {"kind": "data_shape", "name": "memory_record", "shape": "memory_record"},
+        \\      {"kind": "generated_artifact", "name": "memory_embedding", "shape": "memory_embedding"},
         \\      {
         \\        "kind": "mcp_tool",
         \\        "name": "recall",
@@ -1603,15 +1644,22 @@ test "extension package manifest validates data shape and mcp objects" {
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("memoryaf", plan.installed.name);
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
-    try std.testing.expectEqual(@as(usize, 4), plan.members.len);
+    try std.testing.expectEqual(@as(usize, 5), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqual(DataShapeKind.document, plan.members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", plan.members[0].owner_metadata_json);
     try std.testing.expectEqual(.data_shape, plan.members[1].object_kind);
-    try std.testing.expectEqual(DataShapeKind.tool_schema, plan.members[1].shape_kind.?);
-    try std.testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}", plan.members[1].owner_metadata_json);
-    try std.testing.expectEqual(.mcp_tool, plan.members[3].object_kind);
-    try std.testing.expectEqualStrings("memories", plan.members[3].table_name);
+    try std.testing.expectEqual(DataShapeKind.generated_artifact, plan.members[1].shape_kind.?);
+    try std.testing.expectEqual(.data_shape, plan.members[2].object_kind);
+    try std.testing.expectEqual(DataShapeKind.tool_schema, plan.members[2].shape_kind.?);
+    try std.testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}", plan.members[2].owner_metadata_json);
+    try std.testing.expectEqual(.generated_artifact, plan.members[3].object_kind);
+    try std.testing.expectEqualStrings("memory_embedding", plan.members[3].shape_name);
+    try std.testing.expectEqualStrings("1", plan.members[3].shape_version);
+    try std.testing.expectEqual(.mcp_tool, plan.members[4].object_kind);
+    try std.testing.expectEqualStrings("recall_request", plan.members[4].shape_name);
+    try std.testing.expectEqualStrings("1", plan.members[4].shape_version);
+    try std.testing.expectEqualStrings("memories", plan.members[4].table_name);
 }
 
 test "extension package store scans local and content-addressed manifests" {
@@ -1790,6 +1838,57 @@ test "manifest-only table install rejects document shapes that are not table sch
         },
     };
     try std.testing.expectError(error.InvalidExtensionShape, planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "memoryaf",
+        package,
+        .{ .scope = .{ .kind = .table, .table_name = "memories" } },
+        1234,
+    ));
+}
+
+test "extension validation requires generated artifact objects to reference generated artifact shapes" {
+    try std.testing.expectError(error.GeneratedArtifactShapeRequired, (InstallManifest{
+        .scopes_supported = &.{.table},
+        .objects = &.{.{
+            .kind = .generated_artifact,
+            .name = "memory_embedding",
+        }},
+    }).validate());
+
+    try std.testing.expectError(error.GeneratedArtifactShapeRequired, (InstallManifest{
+        .scopes_supported = &.{.table},
+        .shapes = &.{.{
+            .name = "memory_record",
+            .kind = .document,
+        }},
+        .objects = &.{.{
+            .kind = .generated_artifact,
+            .name = "memory_embedding",
+            .shape = "memory_record",
+        }},
+    }).validate());
+}
+
+test "manifest-only install rejects duplicate member identities" {
+    const package = PackageManifest{
+        .name = "memoryaf",
+        .version = "1.0.0",
+        .digest = "sha256:abc",
+        .install = .{
+            .scopes_supported = &.{.table},
+            .shapes = &.{.{
+                .name = "memory_record",
+                .kind = .document,
+                .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+            }},
+            .objects = &.{.{
+                .kind = .data_shape,
+                .name = "memory_record",
+                .shape = "memory_record",
+            }},
+        },
+    };
+    try std.testing.expectError(error.DuplicateExtensionMember, planManifestOnlyInstallAlloc(
         std.testing.allocator,
         "memoryaf",
         package,

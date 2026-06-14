@@ -9147,8 +9147,22 @@ test "extension lifecycle materializes table index and enrichment members" {
             .digest = "sha256:memoryaf",
             .install = .{
                 .scopes_supported = &.{.table},
+                .shapes = &.{
+                    .{
+                        .name = "memory_record",
+                        .kind = .document,
+                        .version = "1",
+                        .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+                    },
+                    .{
+                        .name = "memory_embedding",
+                        .kind = .generated_artifact,
+                        .version = "1",
+                        .schema_json = "{\"type\":\"object\",\"properties\":{\"vector\":{\"type\":\"array\"}}}",
+                    },
+                },
                 .objects = &.{
-                    .{ .kind = .generated_artifact, .name = "memory_embedding", .config_json = "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\"}" },
+                    .{ .kind = .generated_artifact, .name = "memory_embedding", .shape = "memory_embedding", .config_json = "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\"}" },
                     .{ .kind = .index, .name = "memory_text", .config_json = "{\"type\":\"full_text\"}" },
                     .{ .kind = .enrichment, .name = "memory_embed", .config_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}" },
                     .{ .kind = .mcp_tool, .name = "recall" },
@@ -9220,7 +9234,7 @@ test "extension lifecycle materializes table index and enrichment members" {
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"expected_dims\":384") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
-    try std.testing.expectEqual(@as(usize, 4), service.member_upserts);
+    try std.testing.expectEqual(@as(usize, 6), service.member_upserts);
 }
 
 test "extension lifecycle drops extension-owned table index and enrichment members" {

@@ -188,6 +188,12 @@ installed; shards materialize the storage/index/runtime consequences. Direct
 data writes still go through normal Antfly validation, but validation can be
 derived from the installed extension shape.
 
+Extension-owned objects that consume or publish a shape should store the
+referenced `shape_name` and `shape_version` on their extension member record.
+That lets backup/export, update planning, and drop protection preserve the
+dependency between a generated artifact, MCP tool, index, or enrichment and the
+shape contract it was installed against.
+
 For implementation v1, a table-scoped `data_shape` member uses the existing
 Antfly table schema JSON as its `schema_json`/`owner_metadata_json`. That keeps
 extension write validation on the same parser and runtime checks as native table
