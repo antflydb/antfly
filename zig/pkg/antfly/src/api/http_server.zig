@@ -5833,6 +5833,8 @@ pub const ApiHttpServer = struct {
             for (cluster_tables.items) |*entry| entry.deinit(alloc);
             cluster_tables.deinit(alloc);
         }
+        var extension_snapshot_opt = self.source.adminSnapshot() catch null;
+        defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
 
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
@@ -5860,7 +5862,9 @@ pub const ApiHttpServer = struct {
             }) catch return error.InternalFailure;
         }
 
-        var manifest = backups_api.createClusterManifest(alloc, req.backup_id, req.location, cluster_tables.items) catch return error.InternalFailure;
+        const installed_extensions = if (extension_snapshot_opt) |*snapshot| snapshot.installed_extensions else &.{};
+        const extension_members = if (extension_snapshot_opt) |*snapshot| snapshot.extension_members else &.{};
+        var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members) catch return error.InternalFailure;
         defer manifest.deinit(alloc);
         backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
 
