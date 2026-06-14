@@ -707,6 +707,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
     const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table.schema_json);
     defer alloc.free(expanded_index_json);
 
@@ -5677,6 +5678,7 @@ pub const ApiHttpServer = struct {
 
         self.source.createIndex(alloc, table_name, index_name, normalized_index_json) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => {
@@ -9394,6 +9396,62 @@ test "direct index deletion rejects extension-owned indexes" {
 
     var service = FakeService{};
     try std.testing.expectError(error.ExtensionOwnedObject, dropIndexOnService(&service, std.testing.allocator, "memories", "memory_text"));
+}
+
+test "direct index creation rejects extension-owned index names" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+        member_record: metadata_mod.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
+            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(error.ExtensionOwnedObject, createIndexOnService(&service, std.testing.allocator, "memories", "memory_text", "{\"type\":\"full_text\"}"));
 }
 
 test "direct schema update rejects extension-owned table schema" {
