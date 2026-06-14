@@ -8019,6 +8019,16 @@ export interface components {
             api_key?: string;
             /** @description Provider endpoint override when applicable */
             endpoint?: string;
+            /** @description Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global. */
+            location?: string;
+            /** @description Agent Search data store ID for provider vertex. */
+            data_store?: string;
+            /** @description Agent Search serving config ID for provider vertex. Defaults to default_config. */
+            serving_config?: string;
+            /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
+            credentials_path?: string;
             /**
              * @description Maximum number of search results to return
              * @default 5
@@ -8683,9 +8693,9 @@ export interface components {
              * @example semantic-ranker-default@latest
              */
             model: string;
-            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
+            /** @description Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
-            /** @description Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
+            /** @description Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable. */
             credentials_path?: string;
             /** @description Maximum number of records to return. If not specified, returns all documents with scores. */
             top_n?: number;

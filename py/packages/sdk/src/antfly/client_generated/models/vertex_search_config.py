@@ -41,6 +41,11 @@ class VertexSearchConfig:
             api_key (str | Unset): Provider API key or secret reference. Prefer named web_search connections for production
                 use.
             endpoint (str | Unset): Provider endpoint override when applicable
+            project_id (str | Unset): Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
+            location (str | Unset): Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. Default: 'global'.
+            data_store (str | Unset): Agent Search data store ID.
+            serving_config (str | Unset): Agent Search serving config ID. Default: 'default_config'.
+            credentials_path (str | Unset): Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
             max_results (int | Unset): Maximum number of search results to return Default: 5.
             timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
             safe_search (bool | Unset): Enable safe search filtering Default: True.
@@ -51,16 +56,16 @@ class VertexSearchConfig:
                 False.
             service (VertexSearchConfigService | Unset): Google Cloud search service flavor Default:
                 VertexSearchConfigService.AGENT_SEARCH.
-            project_id (str | Unset): Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
-            location (str | Unset): Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. Default: 'global'.
-            data_store (str | Unset): Agent Search data store ID.
-            serving_config (str | Unset): Agent Search serving config ID. Default: 'default_config'.
-            credentials_path (str | Unset): Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
     """
 
     provider: WebSearchProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
+    project_id: str | Unset = UNSET
+    location: str | Unset = "global"
+    data_store: str | Unset = UNSET
+    serving_config: str | Unset = "default_config"
+    credentials_path: str | Unset = UNSET
     max_results: int | Unset = 5
     timeout_ms: int | Unset = 10000
     safe_search: bool | Unset = True
@@ -69,11 +74,6 @@ class VertexSearchConfig:
     include_content: bool | Unset = False
     include_highlights: bool | Unset = False
     service: VertexSearchConfigService | Unset = VertexSearchConfigService.AGENT_SEARCH
-    project_id: str | Unset = UNSET
-    location: str | Unset = "global"
-    data_store: str | Unset = UNSET
-    serving_config: str | Unset = "default_config"
-    credentials_path: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +82,16 @@ class VertexSearchConfig:
         api_key = self.api_key
 
         endpoint = self.endpoint
+
+        project_id = self.project_id
+
+        location = self.location
+
+        data_store = self.data_store
+
+        serving_config = self.serving_config
+
+        credentials_path = self.credentials_path
 
         max_results = self.max_results
 
@@ -101,16 +111,6 @@ class VertexSearchConfig:
         if not isinstance(self.service, Unset):
             service = self.service.value
 
-        project_id = self.project_id
-
-        location = self.location
-
-        data_store = self.data_store
-
-        serving_config = self.serving_config
-
-        credentials_path = self.credentials_path
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -122,6 +122,16 @@ class VertexSearchConfig:
             field_dict["api_key"] = api_key
         if endpoint is not UNSET:
             field_dict["endpoint"] = endpoint
+        if project_id is not UNSET:
+            field_dict["project_id"] = project_id
+        if location is not UNSET:
+            field_dict["location"] = location
+        if data_store is not UNSET:
+            field_dict["data_store"] = data_store
+        if serving_config is not UNSET:
+            field_dict["serving_config"] = serving_config
+        if credentials_path is not UNSET:
+            field_dict["credentials_path"] = credentials_path
         if max_results is not UNSET:
             field_dict["max_results"] = max_results
         if timeout_ms is not UNSET:
@@ -138,16 +148,6 @@ class VertexSearchConfig:
             field_dict["include_highlights"] = include_highlights
         if service is not UNSET:
             field_dict["service"] = service
-        if project_id is not UNSET:
-            field_dict["project_id"] = project_id
-        if location is not UNSET:
-            field_dict["location"] = location
-        if data_store is not UNSET:
-            field_dict["data_store"] = data_store
-        if serving_config is not UNSET:
-            field_dict["serving_config"] = serving_config
-        if credentials_path is not UNSET:
-            field_dict["credentials_path"] = credentials_path
 
         return field_dict
 
@@ -159,6 +159,16 @@ class VertexSearchConfig:
         api_key = d.pop("api_key", UNSET)
 
         endpoint = d.pop("endpoint", UNSET)
+
+        project_id = d.pop("project_id", UNSET)
+
+        location = d.pop("location", UNSET)
+
+        data_store = d.pop("data_store", UNSET)
+
+        serving_config = d.pop("serving_config", UNSET)
+
+        credentials_path = d.pop("credentials_path", UNSET)
 
         max_results = d.pop("max_results", UNSET)
 
@@ -181,20 +191,15 @@ class VertexSearchConfig:
         else:
             service = VertexSearchConfigService(_service)
 
-        project_id = d.pop("project_id", UNSET)
-
-        location = d.pop("location", UNSET)
-
-        data_store = d.pop("data_store", UNSET)
-
-        serving_config = d.pop("serving_config", UNSET)
-
-        credentials_path = d.pop("credentials_path", UNSET)
-
         vertex_search_config = cls(
             provider=provider,
             api_key=api_key,
             endpoint=endpoint,
+            project_id=project_id,
+            location=location,
+            data_store=data_store,
+            serving_config=serving_config,
+            credentials_path=credentials_path,
             max_results=max_results,
             timeout_ms=timeout_ms,
             safe_search=safe_search,
@@ -203,11 +208,6 @@ class VertexSearchConfig:
             include_content=include_content,
             include_highlights=include_highlights,
             service=service,
-            project_id=project_id,
-            location=location,
-            data_store=data_store,
-            serving_config=serving_config,
-            credentials_path=credentials_path,
         )
 
         vertex_search_config.additional_properties = d
