@@ -1025,6 +1025,7 @@ fn memberFromShapeAlloc(
         .object_kind = .data_shape,
         .object_name = shape.name,
         .shape_version = shape.version,
+        .owner_metadata_json = shape.schema_json,
     });
 }
 
@@ -1562,6 +1563,7 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
     try std.testing.expectEqual(@as(usize, 3), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", plan.members[0].owner_metadata_json);
     try std.testing.expectEqual(.mcp_tool, plan.members[2].object_kind);
     try std.testing.expectEqualStrings("memories", plan.members[2].table_name);
 }
@@ -1758,6 +1760,7 @@ test "extension catalog registers package installs members and drops extension" 
     defer catalog.freeMembers(std.testing.allocator, members);
     try std.testing.expectEqual(@as(usize, 3), members.len);
     try std.testing.expectEqual(.data_shape, members[0].object_kind);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", members[0].owner_metadata_json);
 
     try catalog.dropInstalled("memoryaf");
     try std.testing.expectEqual(@as(usize, 0), catalog.installed.items.len);
