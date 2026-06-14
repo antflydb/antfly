@@ -82,7 +82,7 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            r = requests.get(f"{url}/readyz", timeout=2)
+            r = requests.get(f"{url}/healthz", timeout=2)
             if r.ok:
                 return True
         except requests.RequestException:
