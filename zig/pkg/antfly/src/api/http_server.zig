@@ -719,6 +719,7 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
     const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(indexes_json);
@@ -5694,6 +5695,7 @@ pub const ApiHttpServer = struct {
         defer metadata_table_manager.freeTable(alloc, table_before);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
+            error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return error.InternalFailure,
         };
@@ -6763,6 +6765,9 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.UpdatePathNotFound,
         error.ExtensionDisabled,
         error.ExtensionLifecycleBusy,
+        error.InvalidCreateTableRequest,
+        error.InvalidCreateIndexRequest,
+        error.InvalidTableIndexMetadata,
         error.InvalidJsonObject,
         error.EmptyName,
         error.InvalidIdentifier,
@@ -6797,6 +6802,7 @@ fn installExtensionOnService(
         const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, dependencies);
 
+        try applyExtensionIndexMemberDelta(service, alloc, &snapshot, &.{}, members);
         try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
         for (dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
         for (members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
@@ -6833,6 +6839,7 @@ fn updateExtensionOnService(
         const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, new_dependencies);
 
+        try applyExtensionIndexMemberDelta(service, alloc, &snapshot, old_members, new_members);
         for (old_dependencies) |dependency| {
             try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
                 .extension_name = dependency.extension_name,
@@ -6880,6 +6887,7 @@ fn dropExtensionOnService(
     const remaining_dependencies = try catalog.listDependencies(alloc);
     defer catalog.freeDependencies(alloc, remaining_dependencies);
 
+    try applyRemovedExtensionIndexMembers(service, alloc, &snapshot, remaining_members);
     for (snapshot.extension_dependencies) |dependency| {
         if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
         try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
@@ -6973,6 +6981,89 @@ fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []c
         if (std.mem.eql(u8, extension.name, name)) return extension;
     }
     return null;
+}
+
+fn extensionIndexMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .index) return null;
+    if (member.table_name.len != 0) return member.table_name;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    return null;
+}
+
+fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionIndexMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn validateNewExtensionIndexMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const metadata_mod.ExtensionMember) !void {
+    for (new_members) |member| {
+        if (member.object_kind != .index) continue;
+        const table_name = extensionIndexMemberTableName(member) orelse return error.UnsupportedExtensionScope;
+        if (tables_api.findTableByName(snapshot, table_name) == null) return error.TableNotFound;
+    }
+}
+
+fn applyExtensionIndexMemberDelta(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    old_members: []const metadata_mod.ExtensionMember,
+    new_members: []const metadata_mod.ExtensionMember,
+) !void {
+    try validateNewExtensionIndexMembers(snapshot, new_members);
+
+    for (snapshot.tables) |table| {
+        var owned_indexes_json: ?[]u8 = null;
+        defer if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+        var changed = false;
+
+        for (old_members) |member| {
+            const table_name = extensionIndexMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = (try indexes_api.removeIndexFromTableIndexesJson(alloc, current, member.object_name)) orelse continue;
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+
+        for (new_members) |member| {
+            const table_name = extensionIndexMemberTableName(member) orelse continue;
+            if (!std.mem.eql(u8, table_name, table.name)) continue;
+            const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, member.owner_metadata_json, table.schema_json);
+            defer alloc.free(expanded_index_json);
+            const current = owned_indexes_json orelse table.indexes_json;
+            const next = try indexes_api.addIndexToTableIndexesJson(alloc, current, member.object_name, expanded_index_json);
+            if (owned_indexes_json) |indexes_json| alloc.free(indexes_json);
+            owned_indexes_json = next;
+            changed = true;
+        }
+
+        if (!changed) continue;
+        var updated_record = table;
+        updated_record.indexes_json = owned_indexes_json.?;
+        try service.upsertTable(updated_record);
+    }
+}
+
+fn applyRemovedExtensionIndexMembers(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    remaining_members: []const metadata_mod.ExtensionMember,
+) !void {
+    var removed = std.ArrayListUnmanaged(metadata_mod.ExtensionMember).empty;
+    defer removed.deinit(alloc);
+    for (snapshot.extension_members) |member| {
+        if (extensionMemberExists(remaining_members, member)) continue;
+        try removed.append(alloc, member);
+    }
+    try applyExtensionIndexMemberDelta(service, alloc, snapshot, removed.items, &.{});
 }
 
 fn extensionMembersForName(
@@ -8805,6 +8896,242 @@ test "api http server dispatches extension lifecycle mutations" {
     try std.testing.expectEqualStrings("memoryaf", installed.value.name);
     try std.testing.expectEqualStrings("1.2.3", installed.value.package_version);
     try std.testing.expectEqualStrings("memories", installed.value.scope.table_name);
+}
+
+test "extension lifecycle materializes table index members" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{}",
+            .placement_role = "data",
+        },
+        package_record: metadata_mod.PackageManifest = .{
+            .name = "memoryaf",
+            .version = "1.0.0",
+            .digest = "sha256:memoryaf",
+            .install = .{
+                .scopes_supported = &.{.table},
+                .objects = &.{
+                    .{ .kind = .index, .name = "memory_text", .config_json = "{\"type\":\"full_text\"}" },
+                    .{ .kind = .mcp_tool, .name = "recall" },
+                },
+            },
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+        upserted_indexes_json: ?[]u8 = null,
+        upsert_table_count: usize = 0,
+        installed_upserts: usize = 0,
+        member_upserts: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.upserted_indexes_json) |indexes_json| alloc.free(indexes_json);
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn packageSlice(self: *@This()) []metadata_mod.PackageManifest {
+            return @as([*]metadata_mod.PackageManifest, @ptrCast(&self.package_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_packages = @constCast(self.packageSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+            self.upserted_indexes_json = try std.testing.allocator.dupe(u8, record.indexes_json);
+            self.upsert_table_count += 1;
+        }
+
+        fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+            switch (command) {
+                .upsert_installed_extension => self.installed_upserts += 1,
+                .upsert_extension_member => self.member_upserts += 1,
+                else => {},
+            }
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(std.testing.allocator);
+    var installed = try installExtensionOnService(&service, std.testing.allocator, "memoryaf", .{
+        .scope = .{ .kind = .table, .table_name = "memories" },
+    });
+    defer installed.deinitOwned(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expect(service.upserted_indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"full_text\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
+    try std.testing.expectEqual(@as(usize, 2), service.member_upserts);
+}
+
+test "extension lifecycle drops extension-owned table indexes" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+        installed_record: metadata_mod.InstalledExtension = .{
+            .name = "memoryaf",
+            .package_name = "memoryaf",
+            .package_version = "1.0.0",
+            .package_digest = "sha256:memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .status = .ready,
+        },
+        member_record: metadata_mod.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+        upserted_indexes_json: ?[]u8 = null,
+        upsert_table_count: usize = 0,
+        installed_removes: usize = 0,
+        member_removes: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.upserted_indexes_json) |indexes_json| alloc.free(indexes_json);
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn installedSlice(self: *@This()) []metadata_mod.InstalledExtension {
+            return @as([*]metadata_mod.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
+            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .installed_extensions = @constCast(self.installedSlice()),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
+            self.upserted_indexes_json = try std.testing.allocator.dupe(u8, record.indexes_json);
+            self.upsert_table_count += 1;
+        }
+
+        fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+            switch (command) {
+                .remove_installed_extension => self.installed_removes += 1,
+                .remove_extension_member => self.member_removes += 1,
+                else => {},
+            }
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(std.testing.allocator);
+    try dropExtensionOnService(&service, std.testing.allocator, "memoryaf", .{});
+
+    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expect(service.upserted_indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
+    try std.testing.expectEqual(@as(usize, 1), service.member_removes);
+}
+
+test "direct index deletion rejects extension-owned indexes" {
+    const FakeService = struct {
+        table_record: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "memories",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+        member_record: metadata_mod.ExtensionMember = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+            .owner_metadata_json = "{\"type\":\"full_text\"}",
+        },
+        empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
+        empty_stores: [0]metadata_table_manager.StoreRecord = .{},
+        empty_placements: [0]raft_reconciler.PlacementIntent = .{},
+        empty_splits: [0]metadata_transition_state.SplitTransitionRecord = .{},
+        empty_merges: [0]metadata_transition_state.MergeTransitionRecord = .{},
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
+        }
+
+        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
+            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(self.tableSlice()),
+                .ranges = @constCast(self.empty_ranges[0..]),
+                .stores = @constCast(self.empty_stores[0..]),
+                .placement_intents = @constCast(self.empty_placements[0..]),
+                .extension_members = @constCast(self.memberSlice()),
+                .split_transitions = @constCast(self.empty_splits[0..]),
+                .merge_transitions = @constCast(self.empty_merges[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        fn upsertTable(_: *@This(), _: metadata_table_manager.TableRecord) !void {
+            return error.UnexpectedUpsert;
+        }
+        fn runRound(_: *@This()) !void {
+            return error.UnexpectedRunRound;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(error.ExtensionOwnedObject, dropIndexOnService(&service, std.testing.allocator, "memories", "memory_text"));
 }
 
 test "api http server serves mcp and a2a protocol surfaces" {
