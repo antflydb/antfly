@@ -39,7 +39,7 @@ import {
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 import { isProductEnabled, type ProductId } from "@/config/products";
-import rawCommandDefinitions from "@/data/command-definitions.json";
+import { type CommandAction, type CommandDefinition, commandDefinitions } from "@/data/commands";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useAuth } from "@/hooks/use-auth";
 import { useTheme } from "@/hooks/use-theme";
@@ -86,26 +86,10 @@ interface PaletteCommand {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   href?: string;
-  action?: string;
+  action?: CommandAction;
   product?: ProductId;
   adminOnly?: boolean;
 }
-
-interface CommandDefinition {
-  id: string;
-  type: "navigation" | "action";
-  group: "navigation" | "tools" | "quickActions";
-  label: string;
-  description: string;
-  href?: string;
-  action?: string;
-  icon: string;
-  product?: ProductId;
-  adminOnly?: boolean;
-  semantic: boolean;
-}
-
-const commandDefinitions = rawCommandDefinitions as CommandDefinition[];
 
 function isSupportedAction(action?: string) {
   return !action || action === "toggle-theme";

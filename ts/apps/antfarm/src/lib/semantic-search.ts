@@ -4,50 +4,12 @@
  */
 
 import type { InferenceClient } from "@antfly/sdk";
-import type { ProductId } from "@/config/products";
-import commandIndex from "@/data/command-index.json";
-
-export interface CommandItem {
-  id: string;
-  type: "navigation" | "action";
-  group?: "navigation" | "tools" | "quickActions";
-  label: string;
-  description: string;
-  href?: string;
-  action?: string;
-  icon: string;
-  product?: ProductId;
-  adminOnly?: boolean;
-}
+import { type CommandMetadata, commandIndex } from "@/data/commands";
 
 export interface SemanticResult {
-  item: CommandItem;
+  item: CommandMetadata;
   score: number;
 }
-
-// Type for the command index JSON structure
-interface CommandIndexEntry {
-  id: string;
-  type: string;
-  group?: "navigation" | "tools" | "quickActions";
-  label: string;
-  description: string;
-  href?: string;
-  action?: string;
-  icon: string;
-  product?: ProductId;
-  adminOnly?: boolean;
-  embedding: number[];
-}
-
-interface CommandIndexData {
-  model: string;
-  dimension: number;
-  commands: CommandIndexEntry[];
-}
-
-// Cast the imported JSON to our type
-const index = commandIndex as CommandIndexData;
 
 /**
  * Compute cosine similarity between two vectors.
@@ -92,17 +54,17 @@ export async function semanticSearch(
   try {
     // Get query embedding from Antfly inference.
     // Use the same model as the pre-computed embeddings
-    const response = await inferenceClient.embed(index.model, query);
+    const response = await inferenceClient.embed(commandIndex.model, query);
     const queryVec = response.data[0]?.embedding;
     if (!Array.isArray(queryVec)) {
       return [];
     }
 
     // Score all commands using cosine similarity
-    const scored = index.commands.map((cmd) => ({
+    const scored = commandIndex.commands.map((cmd) => ({
       item: {
         id: cmd.id,
-        type: cmd.type as "navigation" | "action",
+        type: cmd.type,
         group: cmd.group,
         label: cmd.label,
         description: cmd.description,
@@ -127,10 +89,10 @@ export async function semanticSearch(
 /**
  * Gets all command items (for reference/debugging).
  */
-export function getAllCommandItems(): CommandItem[] {
-  return index.commands.map((cmd) => ({
+export function getAllCommandItems(): CommandMetadata[] {
+  return commandIndex.commands.map((cmd) => ({
     id: cmd.id,
-    type: cmd.type as "navigation" | "action",
+    type: cmd.type,
     group: cmd.group,
     label: cmd.label,
     description: cmd.description,
