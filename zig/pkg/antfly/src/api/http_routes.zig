@@ -32,6 +32,8 @@ pub const Routes = struct {
     pub const agents_retrieval = "/agents/retrieval";
     pub const mcp_v1 = "/mcp/v1";
     pub const mcp_v1_prefix = "/mcp/v1/";
+    pub const mcp_extensions = "/mcp/extensions";
+    pub const mcp_extensions_prefix = "/mcp/extensions/";
     pub const a2a = "/a2a";
     pub const extensions_v1 = "/extensions/v1";
     pub const extensions_v1_packages = "/extensions/v1/packages";
@@ -227,6 +229,10 @@ pub const Routes = struct {
     };
 
     pub const InstalledExtension = struct {
+        name: []const u8,
+    };
+
+    pub const McpExtension = struct {
         name: []const u8,
     };
 
@@ -749,6 +755,13 @@ pub const Routes = struct {
 
     pub fn matchInstalledExtensionConfig(path: []const u8) ?InstalledExtension {
         return matchInstalledExtensionPath(path, extension_config_suffix);
+    }
+
+    pub fn matchMcpExtension(path: []const u8) ?McpExtension {
+        if (!std.mem.startsWith(u8, path, mcp_extensions_prefix)) return null;
+        const name = path[mcp_extensions_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
     }
 
     pub fn matchGroupLookup(path: []const u8) ?GroupLookup {
@@ -1286,6 +1299,9 @@ test "public api routes compile" {
     const installed_extension_config = Routes.matchInstalledExtensionConfig("/extensions/v1/installed/memoryaf/config").?;
     try std.testing.expectEqualStrings("memoryaf", installed_extension_config.name);
     try std.testing.expect(Routes.matchInstalledExtension("/extensions/v1/installed/memoryaf/update") == null);
+    const mcp_extension = Routes.matchMcpExtension("/mcp/extensions/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", mcp_extension.name);
+    try std.testing.expect(Routes.matchMcpExtension("/mcp/extensions/memoryaf/tools") == null);
     const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a").?;
     try std.testing.expectEqual(@as(u64, 7), group_lookup.group_id);
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);

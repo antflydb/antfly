@@ -1858,6 +1858,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
+            if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
+                return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
+            }
+        }
         if ((req.method == .GET or req.method == .POST or req.method == .DELETE) and (std.mem.eql(u8, uri_parts.path, routes.Routes.mcp_v1) or std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_prefix))) {
             return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
         }
@@ -9490,6 +9495,104 @@ test "api http server lists extension-owned mcp tools" {
     try std.testing.expectEqual(@as(u16, 200), call_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "no executable handler in v1") != null);
+}
+
+test "api http server scopes mcp endpoint to one extension" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 2 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{
+                    .{
+                        .name = "memoryaf",
+                        .package_name = "memoryaf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:abc",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .status = .ready,
+                    },
+                    .{
+                        .name = "otheraf",
+                        .package_name = "otheraf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:def",
+                        .scope = .{ .kind = .cluster },
+                        .status = .ready,
+                    },
+                })[0..]),
+                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "recall",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\"}}",
+                    },
+                    .{
+                        .extension_name = "otheraf",
+                        .scope = .{ .kind = .cluster },
+                        .object_kind = .mcp_tool,
+                        .object_name = "other_tool",
+                        .owner_metadata_json = "{\"description\":\"Other tool\",\"input_schema\":{\"type\":\"object\"}}",
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    const scoped_uri = "/mcp/extensions/memoryaf";
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = scoped_uri,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = scoped_uri,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"other_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
 }
 
 test "api http server authenticates trusted principal" {

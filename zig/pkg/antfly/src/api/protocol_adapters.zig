@@ -176,6 +176,14 @@ const ExtensionMcpTool = struct {
 };
 
 pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype) !http_common.HttpResponse {
+    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, routes.Routes.mcp_v1, null);
+}
+
+pub fn handleExtensionMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, extension_name: []const u8) !http_common.HttpResponse {
+    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, req.uri, extension_name);
+}
+
+fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, endpoint_path: []const u8, extension_name_filter: ?[]const u8) !http_common.HttpResponse {
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
@@ -381,11 +389,21 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
         extension_tools.deinit(server_ptr.alloc);
     }
     if (snapshot_opt) |*snapshot| {
+        if (extension_name_filter) |extension_name| {
+            if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, extension_name)) {
+                return try textResponse(server_ptr.alloc, 404, "extension not found");
+            }
+        }
         for (snapshot.extension_members) |*member| {
             if (member.object_kind != .mcp_tool) continue;
+            if (extension_name_filter) |extension_name| {
+                if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+            }
             if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, member.extension_name)) continue;
             try extension_tools.append(server_ptr.alloc, try extensionMcpToolFromMemberAlloc(server_ptr.alloc, member));
         }
+    } else if (extension_name_filter != null) {
+        return try textResponse(server_ptr.alloc, 404, "extension not found");
     }
     const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
     defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
@@ -408,14 +426,16 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
         .session_store = server_ptr.mcp_sessions.iface(),
     };
     defer protocol_server.deinit(server_ptr.alloc);
-    for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
-        if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
-        try protocol_server.addTool(server_ptr.alloc, .{
-            .name = spec.name,
-            .description = spec.description,
-            .input_schema_json = input_schemas[i],
-            .handler = ctx.handler(),
-        });
+    if (extension_name_filter == null) {
+        for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
+            if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
+            try protocol_server.addTool(server_ptr.alloc, .{
+                .name = spec.name,
+                .description = spec.description,
+                .input_schema_json = input_schemas[i],
+                .handler = ctx.handler(),
+            });
+        }
     }
     for (extension_tools.items, extension_contexts) |tool, *ctx| {
         try protocol_server.addTool(server_ptr.alloc, .{
@@ -434,7 +454,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
     var transport = switch (req.method) {
         .GET => try protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
-            routes.Routes.mcp_v1,
+            endpoint_path,
             req.header(mcp.session_id_header),
             req.header(mcp.last_event_id_header),
         ),
