@@ -5883,6 +5883,8 @@ pub const ApiHttpServer = struct {
         var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch return error.InvalidRequest;
         defer manifest.deinit(alloc);
 
+        preflightClusterRestoreExtensions(self, &manifest) catch return error.InvalidRequest;
+
         const owns_table_names = req.table_names == null;
         const table_names = if (req.table_names) |values|
             values
@@ -6970,6 +6972,21 @@ fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name
         if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
     }
     return null;
+}
+
+fn extensionPackageAvailableForRestore(snapshot: *const metadata_api.AdminSnapshot, installed: metadata_mod.InstalledExtension) bool {
+    const package = findExtensionPackageVersion(snapshot, installed.package_name, installed.package_version) orelse return false;
+    return std.mem.eql(u8, package.digest, installed.package_digest);
+}
+
+fn preflightClusterRestoreExtensions(self: *ApiHttpServer, manifest: *const backups_api.ClusterBackupManifest) !void {
+    if (manifest.installed_extensions.len == 0) return;
+    var snapshot = (try self.source.adminSnapshot()) orelse return error.MissingExtensionPackage;
+    defer self.source.freeAdminSnapshot(&snapshot);
+
+    for (manifest.installed_extensions) |installed| {
+        if (!extensionPackageAvailableForRestore(&snapshot, installed)) return error.MissingExtensionPackage;
+    }
 }
 
 fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.PackageManifest {
@@ -18136,6 +18153,135 @@ test "api http server cluster overwrite restore tolerates already absent metadat
     try std.testing.expect(state.local_drop_used_manifest_group);
     try std.testing.expect(state.restored);
     try std.testing.expect(std.mem.indexOf(u8, restore_resp.body, "\"status\":\"triggered\"") != null);
+}
+
+test "api http server cluster restore rejects missing extension package digest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-preflight", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
+    };
+    defer cluster_entry.deinit(alloc);
+    const installed = [_]metadata_mod.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:backup",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    }};
+    var cluster_manifest = try backups_api.createClusterManifestWithExtensions(
+        alloc,
+        "snap-cluster",
+        location_uri,
+        &.{cluster_entry},
+        &installed,
+        &.{},
+    );
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        restored: bool = false,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]metadata_mod.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:target",
+                    .install = .{ .scopes_supported = &.{.table} },
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeWrites = struct {
+        state: *State,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .restore_table = restoreTable,
+                },
+            };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: backups_api.TableRestorePlan) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.restored = true;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var write_source = FakeWrites{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, write_source.source());
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .content_type = "application/json",
+        .body = restore_body,
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), restore_resp.status);
+    try std.testing.expectEqualStrings("invalid restore request", restore_resp.body);
+    try std.testing.expect(!state.restored);
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {
