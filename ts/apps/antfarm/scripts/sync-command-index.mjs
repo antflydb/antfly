@@ -11,6 +11,7 @@ const indexPath = path.join(appRoot, "src/data/command-index.json");
 const checkOnly = process.argv.includes("--check");
 const commandTypes = new Set(["navigation", "action"]);
 const commandGroups = new Set(["navigation", "tools", "quickActions"]);
+const commandActions = new Set(["toggle-theme"]);
 const products = new Set(["antfly", "inference"]);
 
 function readJson(filePath) {
@@ -63,8 +64,17 @@ function validateDefinitions(definitions) {
     if (command.type === "navigation" && !command.href) {
       errors.push(`${command.id} is navigation but has no href`);
     }
+    if (command.href && typeof command.href !== "string") {
+      errors.push(`${command.id} has invalid href`);
+    }
     if (command.type === "action" && !command.action) {
       errors.push(`${command.id} is an action but has no action`);
+    }
+    if (command.action && typeof command.action !== "string") {
+      errors.push(`${command.id} has invalid action`);
+    }
+    if (command.action && !commandActions.has(command.action)) {
+      errors.push(`${command.id} has unsupported action: ${command.action}`);
     }
     if (command.href && command.action) {
       errors.push(`${command.id} must not define both href and action`);
