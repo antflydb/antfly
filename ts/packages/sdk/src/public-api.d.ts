@@ -2061,6 +2061,194 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/extensions/v1/packages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List available packages. */
+        get: operations["listExtensionPackages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/packages/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get available package metadata. */
+        get: operations["getExtensionPackage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/packages/{name}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a specific immutable package version. */
+        get: operations["getExtensionPackageVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List installed extensions. */
+        get: operations["listInstalledExtensions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an installed extension. */
+        get: operations["getInstalledExtension"];
+        put?: never;
+        /** Install a package as an extension. */
+        post: operations["installExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update an installed extension. */
+        post: operations["updateInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/drop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Drop an installed extension. */
+        post: operations["dropInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List objects owned by an installed extension. */
+        get: operations["listInstalledExtensionObjects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Enable a disabled installed extension. */
+        post: operations["enableInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Disable an installed extension without dropping owned state. */
+        post: operations["disableInstalledExtension"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extensions/v1/installed/{name}/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Replace installed extension configuration. */
+        put: operations["configureInstalledExtension"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -10141,6 +10329,154 @@ export interface components {
             /** @description Total tokens used */
             total_tokens: number;
         };
+        /** @enum {string} */
+        PackageKind: "extension";
+        /** @description Path-safe extension or package identifier. */
+        ExtensionIdentifier: string;
+        /** @enum {string} */
+        ExtensionScopeKind: "cluster" | "table" | "embedded_db";
+        ExtensionScope: {
+            kind: components["schemas"]["ExtensionScopeKind"];
+            /** @description Required when kind is table. */
+            table_name?: string;
+        };
+        Capability: {
+            /** @example read:table */
+            name: components["schemas"]["ExtensionIdentifier"];
+            /** @example memoryaf.memories */
+            scope?: string;
+        };
+        PackageDependency: {
+            /** @example antfly_core */
+            name: string;
+            /** @example >=1.0.0 */
+            version_requirement?: string;
+            /** @default false */
+            optional?: boolean;
+        };
+        PackageArtifact: {
+            /** @enum {string} */
+            kind: "manifest" | "wasm" | "native_library" | "asset";
+            /** @example extension.json */
+            path: string;
+            /** @example sha256:abc123 */
+            digest?: string;
+        };
+        /** @enum {string} */
+        DataShapeKind: "document" | "row" | "generated_artifact" | "extension_relation" | "endpoint_schema" | "tool_schema";
+        DataShapeDecl: {
+            /** @example memory_record */
+            name: string;
+            kind: components["schemas"]["DataShapeKind"];
+            /** @default 1 */
+            version?: string;
+            /**
+             * @description JSON object encoded as a string until the public shape language is finalized.
+             * @default {}
+             */
+            schema_json?: string;
+        };
+        /** @enum {string} */
+        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
+        ExtensionObjectDecl: {
+            kind: components["schemas"]["ExtensionObjectKind"];
+            name: string;
+            shape?: string;
+            table_name?: string;
+            /** @default {} */
+            config_json?: string;
+        };
+        RuntimeDecl: {
+            name: string;
+            /**
+             * @default manifest_only
+             * @enum {string}
+             */
+            mode?: "manifest_only" | "antfly_api_template" | "workflow" | "wasm" | "sidecar" | "native";
+            artifact?: string;
+            /** @default {} */
+            config_json?: string;
+        };
+        InstallManifest: {
+            scopes_supported: components["schemas"]["ExtensionScopeKind"][];
+            shapes?: components["schemas"]["DataShapeDecl"][];
+            objects?: components["schemas"]["ExtensionObjectDecl"][];
+            runtimes?: components["schemas"]["RuntimeDecl"][];
+            /** @default {} */
+            config_schema_json?: string;
+        };
+        PackageManifest: {
+            /** @enum {string} */
+            manifest_api_version: "extensions/v1";
+            name: string;
+            version: string;
+            kind: components["schemas"]["PackageKind"];
+            description?: string;
+            digest?: string;
+            /** @default false */
+            trusted?: boolean;
+            /** @default false */
+            relocatable?: boolean;
+            capabilities_requested?: components["schemas"]["Capability"][];
+            dependencies?: components["schemas"]["PackageDependency"][];
+            artifacts?: components["schemas"]["PackageArtifact"][];
+            install: components["schemas"]["InstallManifest"];
+        };
+        InstalledExtension: {
+            name: string;
+            package_name: string;
+            package_version: string;
+            package_digest: string;
+            scope: components["schemas"]["ExtensionScope"];
+            /** @default {} */
+            config_json?: string;
+            granted_capabilities?: components["schemas"]["Capability"][];
+            /** Format: int64 */
+            installed_at_epoch_ms?: number;
+            /** @enum {string} */
+            status: "installing" | "ready" | "disabled" | "updating" | "dropping" | "error_state";
+        };
+        ExtensionMember: {
+            extension_name: string;
+            scope: components["schemas"]["ExtensionScope"];
+            object_kind: components["schemas"]["ExtensionObjectKind"];
+            object_name: string;
+            table_name?: string;
+            shape_name?: string;
+            shape_version?: string;
+            /** @default {} */
+            owner_metadata_json?: string;
+        };
+        InstallExtensionRequest: {
+            version?: string;
+            scope: components["schemas"]["ExtensionScope"];
+            /** @default {} */
+            config_json?: string;
+            grants?: components["schemas"]["Capability"][];
+            /** @default false */
+            dry_run?: boolean;
+        };
+        UpdateExtensionRequest: {
+            target_version?: string;
+            /** @default false */
+            dry_run?: boolean;
+        };
+        DropExtensionRequest: {
+            /**
+             * @default restrict
+             * @enum {string}
+             */
+            mode?: "restrict" | "cascade";
+            /** @default false */
+            dry_run?: boolean;
+        };
+        ConfigureExtensionRequest: {
+            /** @default {} */
+            config_json: string;
+        };
+        ExtensionError: {
+            error: string;
+        };
         ExtractionToken: {
             text: string;
             box?: number[];
@@ -13872,6 +14208,292 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    listExtensionPackages: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Available package manifests. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"][];
+                };
+            };
+        };
+    };
+    getExtensionPackage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Package metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"];
+                };
+            };
+            /** @description Package not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionError"];
+                };
+            };
+        };
+    };
+    getExtensionPackageVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+                version: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Package version metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PackageManifest"];
+                };
+            };
+        };
+    };
+    listInstalledExtensions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed extensions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"][];
+                };
+            };
+        };
+    };
+    getInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    installExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Installed extension or dry-run result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    updateInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpdateExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated extension or dry-run result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    dropInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DropExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Drop result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    listInstalledExtensionObjects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension member objects. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtensionMember"][];
+                };
+            };
+        };
+    };
+    enableInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enabled extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    disableInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disabled extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
+                };
+            };
+        };
+    };
+    configureInstalledExtension: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: components["schemas"]["ExtensionIdentifier"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfigureExtensionRequest"];
+            };
+        };
+        responses: {
+            /** @description Reconfigured extension. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstalledExtension"];
                 };
             };
         };
