@@ -257,6 +257,35 @@ pub const InstallExtensionRequest = struct {
     }
 };
 
+pub const UpdateExtensionRequest = struct {
+    target_version: []const u8 = "",
+    dry_run: bool = false,
+
+    pub fn validate(self: UpdateExtensionRequest) !void {
+        if (self.target_version.len != 0) try requireName("update.target_version", self.target_version);
+    }
+};
+
+pub const DropMode = enum {
+    restrict,
+    cascade,
+};
+
+pub const DropExtensionRequest = struct {
+    mode: DropMode = .restrict,
+    dry_run: bool = false,
+
+    pub fn validate(_: DropExtensionRequest) !void {}
+};
+
+pub const ConfigureExtensionRequest = struct {
+    config_json: []const u8 = "{}",
+
+    pub fn validate(self: ConfigureExtensionRequest) !void {
+        try validateJsonObject("configure.config_json", self.config_json);
+    }
+};
+
 pub const ExtensionStatus = enum {
     installing,
     ready,
@@ -376,14 +405,38 @@ pub const ExtensionCatalog = struct {
         request: InstallExtensionRequest,
         installed_at_epoch_ms: i64,
     ) !InstalledExtension {
+        if (request.dry_run) return error.DryRunRequiresPlan;
         if (self.findInstalledIndex(extension_name) != null) return error.ExtensionAlreadyInstalled;
         const package = self.findPackage(package_name, request.version) orelse return error.PackageNotFound;
+        try self.requireInstalledDependencies(package.*);
         var plan = try planManifestOnlyInstallAlloc(self.alloc, extension_name, package.*, request, installed_at_epoch_ms);
         errdefer plan.deinit(self.alloc);
         try self.installed.ensureUnusedCapacity(self.alloc, 1);
         try self.members.ensureUnusedCapacity(self.alloc, plan.members.len);
+        try self.dependencies.ensureUnusedCapacity(self.alloc, package.dependencies.len);
         const installed_out = try cloneInstalledExtension(self.alloc, plan.installed);
         errdefer freeInstalledExtension(self.alloc, installed_out);
+        const dependency_start = self.dependencies.items.len;
+        errdefer {
+            while (self.dependencies.items.len > dependency_start) {
+                const last_idx = self.dependencies.items.len - 1;
+                const dependency = self.dependencies.items[last_idx];
+                self.dependencies.items.len = last_idx;
+                freeExtensionDependency(self.alloc, dependency);
+            }
+        }
+        for (package.dependencies) |dependency| {
+            const required_extension = self.findInstalledByPackage(dependency.name) orelse {
+                if (dependency.optional) continue;
+                return error.RequiredExtensionNotInstalled;
+            };
+            self.dependencies.appendAssumeCapacity(try cloneExtensionDependency(self.alloc, .{
+                .extension_name = extension_name,
+                .required_extension_name = required_extension.name,
+                .package_name = dependency.name,
+                .version_requirement = dependency.version_requirement,
+            }));
+        }
         self.installed.appendAssumeCapacity(plan.installed);
         plan.installed = undefined;
         for (plan.members) |member| {
@@ -395,6 +448,28 @@ pub const ExtensionCatalog = struct {
     }
 
     pub fn dropInstalled(self: *ExtensionCatalog, extension_name: []const u8) !void {
+        try self.dropInstalledWithMode(extension_name, .{});
+    }
+
+    pub fn dropInstalledWithMode(self: *ExtensionCatalog, extension_name: []const u8, request: DropExtensionRequest) !void {
+        try request.validate();
+        if (request.dry_run) return error.DryRunRequiresPlan;
+        _ = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        if (request.mode == .restrict and self.hasDependentExtension(extension_name)) return error.DependentExtensionExists;
+        if (request.mode == .cascade) {
+            var i: usize = 0;
+            while (i < self.dependencies.items.len) {
+                if (std.mem.eql(u8, self.dependencies.items[i].required_extension_name, extension_name)) {
+                    const dependent_name = try self.alloc.dupe(u8, self.dependencies.items[i].extension_name);
+                    defer self.alloc.free(dependent_name);
+                    try self.dropInstalledWithMode(dependent_name, .{ .mode = .cascade });
+                    i = 0;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
         const idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
         freeInstalledExtension(self.alloc, self.installed.items[idx]);
         _ = self.installed.swapRemove(idx);
@@ -407,6 +482,95 @@ pub const ExtensionCatalog = struct {
                 continue;
             }
             i += 1;
+        }
+
+        i = 0;
+        while (i < self.dependencies.items.len) {
+            if (std.mem.eql(u8, self.dependencies.items[i].extension_name, extension_name) or
+                std.mem.eql(u8, self.dependencies.items[i].required_extension_name, extension_name))
+            {
+                freeExtensionDependency(self.alloc, self.dependencies.items[i]);
+                _ = self.dependencies.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn updateManifestOnly(
+        self: *ExtensionCatalog,
+        extension_name: []const u8,
+        request: UpdateExtensionRequest,
+    ) !InstalledExtension {
+        try request.validate();
+        if (request.dry_run) return error.DryRunRequiresPlan;
+        const installed_idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        if (self.installed.items[installed_idx].status == .disabled) return error.ExtensionDisabled;
+        const current = self.installed.items[installed_idx];
+        const target = self.findPackage(current.package_name, request.target_version) orelse return error.PackageNotFound;
+        if (std.mem.eql(u8, current.package_version, target.version)) {
+            return try cloneInstalledExtension(self.alloc, current);
+        }
+        try requireUpdatePath(current.package_version, target.*);
+        try self.requireInstalledDependencies(target.*);
+
+        var plan = try planManifestOnlyInstallAlloc(self.alloc, current.name, target.*, .{
+            .version = target.version,
+            .scope = current.scope,
+            .config_json = current.config_json,
+            .grants = current.granted_capabilities,
+        }, current.installed_at_epoch_ms);
+        errdefer plan.deinit(self.alloc);
+        try self.members.ensureUnusedCapacity(self.alloc, plan.members.len);
+        var dependency_rows = try self.planDependencyRowsAlloc(extension_name, target.*);
+        defer {
+            for (dependency_rows) |dependency| freeExtensionDependency(self.alloc, dependency);
+            if (dependency_rows.len > 0) self.alloc.free(dependency_rows);
+        }
+        try self.dependencies.ensureUnusedCapacity(self.alloc, dependency_rows.len);
+
+        const installed_out = try cloneInstalledExtension(self.alloc, plan.installed);
+        errdefer freeInstalledExtension(self.alloc, installed_out);
+
+        self.removeMembersForExtension(extension_name);
+        self.removeDependenciesForExtension(extension_name);
+        freeInstalledExtension(self.alloc, self.installed.items[installed_idx]);
+        self.installed.items[installed_idx] = plan.installed;
+        plan.installed = undefined;
+        for (plan.members) |member| self.members.appendAssumeCapacity(member);
+        if (plan.members.len > 0) self.alloc.free(plan.members);
+        plan.members = &.{};
+        for (dependency_rows) |dependency| {
+            self.dependencies.appendAssumeCapacity(dependency);
+        }
+        dependency_rows = &.{};
+        return installed_out;
+    }
+
+    pub fn configureInstalled(self: *ExtensionCatalog, extension_name: []const u8, request: ConfigureExtensionRequest) !void {
+        try request.validate();
+        const idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        const config_json = try self.alloc.dupe(u8, request.config_json);
+        errdefer self.alloc.free(config_json);
+        self.alloc.free(self.installed.items[idx].config_json);
+        self.installed.items[idx].config_json = config_json;
+    }
+
+    pub fn disableInstalled(self: *ExtensionCatalog, extension_name: []const u8) !void {
+        const idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        switch (self.installed.items[idx].status) {
+            .installing, .updating, .dropping => return error.ExtensionLifecycleBusy,
+            .disabled => {},
+            else => self.installed.items[idx].status = .disabled,
+        }
+    }
+
+    pub fn enableInstalled(self: *ExtensionCatalog, extension_name: []const u8) !void {
+        const idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        switch (self.installed.items[idx].status) {
+            .disabled, .error_state => self.installed.items[idx].status = .ready,
+            .ready => {},
+            else => return error.ExtensionLifecycleBusy,
         }
     }
 
@@ -464,6 +628,33 @@ pub const ExtensionCatalog = struct {
         return self.listMembers(alloc);
     }
 
+    pub fn listMembersForExtension(self: *const ExtensionCatalog, alloc: std.mem.Allocator, extension_name: []const u8) ![]ExtensionMember {
+        var out = std.ArrayListUnmanaged(ExtensionMember).empty;
+        errdefer {
+            for (out.items) |member| freeExtensionMember(alloc, member);
+            out.deinit(alloc);
+        }
+        for (self.members.items) |member| {
+            if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+            try out.append(alloc, try cloneExtensionMember(alloc, member));
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn listDependencies(self: *const ExtensionCatalog, alloc: std.mem.Allocator) ![]ExtensionDependency {
+        const out = try alloc.alloc(ExtensionDependency, self.dependencies.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |dependency| freeExtensionDependency(alloc, dependency);
+            alloc.free(out);
+        }
+        for (self.dependencies.items, 0..) |dependency, i| {
+            out[i] = try cloneExtensionDependency(alloc, dependency);
+            initialized += 1;
+        }
+        return out;
+    }
+
     pub fn freePackages(_: *const ExtensionCatalog, alloc: std.mem.Allocator, records: []PackageManifest) void {
         for (records) |record| freePackageManifest(alloc, record);
         if (records.len > 0) alloc.free(records);
@@ -491,6 +682,11 @@ pub const ExtensionCatalog = struct {
         self.freeMembers(alloc, records);
     }
 
+    pub fn freeDependencies(_: *const ExtensionCatalog, alloc: std.mem.Allocator, records: []ExtensionDependency) void {
+        for (records) |record| freeExtensionDependency(alloc, record);
+        if (records.len > 0) alloc.free(records);
+    }
+
     fn findPackage(self: *const ExtensionCatalog, name: []const u8, version: []const u8) ?*const PackageManifest {
         if (version.len == 0) {
             var found: ?*const PackageManifest = null;
@@ -515,6 +711,72 @@ pub const ExtensionCatalog = struct {
             if (std.mem.eql(u8, extension.name, name)) return i;
         }
         return null;
+    }
+
+    fn findInstalledByPackage(self: *const ExtensionCatalog, package_name: []const u8) ?*const InstalledExtension {
+        for (self.installed.items) |*extension| {
+            if (std.mem.eql(u8, extension.package_name, package_name)) return extension;
+        }
+        return null;
+    }
+
+    fn requireInstalledDependencies(self: *const ExtensionCatalog, package: PackageManifest) !void {
+        for (package.dependencies) |dependency| {
+            if (dependency.optional) continue;
+            _ = self.findInstalledByPackage(dependency.name) orelse return error.RequiredExtensionNotInstalled;
+        }
+    }
+
+    fn planDependencyRowsAlloc(self: *const ExtensionCatalog, extension_name: []const u8, package: PackageManifest) ![]ExtensionDependency {
+        var out = std.ArrayListUnmanaged(ExtensionDependency).empty;
+        errdefer {
+            for (out.items) |dependency| freeExtensionDependency(self.alloc, dependency);
+            out.deinit(self.alloc);
+        }
+        for (package.dependencies) |dependency| {
+            const required_extension = self.findInstalledByPackage(dependency.name) orelse {
+                if (dependency.optional) continue;
+                return error.RequiredExtensionNotInstalled;
+            };
+            try out.append(self.alloc, try cloneExtensionDependency(self.alloc, .{
+                .extension_name = extension_name,
+                .required_extension_name = required_extension.name,
+                .package_name = dependency.name,
+                .version_requirement = dependency.version_requirement,
+            }));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn hasDependentExtension(self: *const ExtensionCatalog, extension_name: []const u8) bool {
+        for (self.dependencies.items) |dependency| {
+            if (std.mem.eql(u8, dependency.required_extension_name, extension_name)) return true;
+        }
+        return false;
+    }
+
+    fn removeMembersForExtension(self: *ExtensionCatalog, extension_name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.members.items.len) {
+            if (std.mem.eql(u8, self.members.items[i].extension_name, extension_name)) {
+                freeExtensionMember(self.alloc, self.members.items[i]);
+                _ = self.members.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn removeDependenciesForExtension(self: *ExtensionCatalog, extension_name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.dependencies.items.len) {
+            if (std.mem.eql(u8, self.dependencies.items[i].extension_name, extension_name)) {
+                freeExtensionDependency(self.alloc, self.dependencies.items[i]);
+                _ = self.dependencies.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 };
 
@@ -581,6 +843,13 @@ pub fn parsePackageManifestAlloc(alloc: std.mem.Allocator, json: []const u8) !st
     errdefer parsed.deinit();
     try parsed.value.validate();
     return parsed;
+}
+
+fn requireUpdatePath(from_version: []const u8, target: PackageManifest) !void {
+    for (target.updates) |update| {
+        if (std.mem.eql(u8, update.from_version, from_version) and std.mem.eql(u8, update.to_version, target.version)) return;
+    }
+    return error.UpdatePathNotFound;
 }
 
 fn memberFromShapeAlloc(
@@ -1253,4 +1522,126 @@ test "extension catalog registers package installs members and drops extension" 
     try catalog.dropInstalled("memoryaf");
     try std.testing.expectEqual(@as(usize, 0), catalog.installed.items.len);
     try std.testing.expectEqual(@as(usize, 0), catalog.members.items.len);
+}
+
+test "extension catalog enforces dependencies and drop modes" {
+    var catalog = ExtensionCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+
+    try catalog.registerPackage(.{
+        .name = "antfly_core",
+        .version = "1.0.0",
+        .digest = "sha256:core",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .objects = &.{.{ .kind = .data_shape, .name = "document" }},
+        },
+    });
+    try catalog.registerPackage(.{
+        .name = "memoryaf",
+        .version = "1.0.0",
+        .digest = "sha256:memory",
+        .dependencies = &.{.{ .name = "antfly_core", .version_requirement = ">=1.0.0" }},
+        .install = .{
+            .scopes_supported = &.{.table},
+            .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
+        },
+    });
+
+    try std.testing.expectError(error.RequiredExtensionNotInstalled, catalog.installManifestOnly(
+        "memoryaf",
+        "memoryaf",
+        .{ .version = "1.0.0", .scope = .{ .kind = .table, .table_name = "memories" } },
+        100,
+    ));
+
+    const core = try catalog.installManifestOnly(
+        "antfly_core",
+        "antfly_core",
+        .{ .version = "1.0.0", .scope = .{ .kind = .cluster } },
+        101,
+    );
+    defer freeInstalledExtension(std.testing.allocator, core);
+    const memory = try catalog.installManifestOnly(
+        "memoryaf",
+        "memoryaf",
+        .{ .version = "1.0.0", .scope = .{ .kind = .table, .table_name = "memories" } },
+        102,
+    );
+    defer freeInstalledExtension(std.testing.allocator, memory);
+
+    const dependencies = try catalog.listDependencies(std.testing.allocator);
+    defer catalog.freeDependencies(std.testing.allocator, dependencies);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.len);
+    try std.testing.expectEqualStrings("memoryaf", dependencies[0].extension_name);
+    try std.testing.expectEqualStrings("antfly_core", dependencies[0].required_extension_name);
+
+    try std.testing.expectError(error.DependentExtensionExists, catalog.dropInstalledWithMode("antfly_core", .{}));
+    try catalog.dropInstalledWithMode("antfly_core", .{ .mode = .cascade });
+    try std.testing.expectEqual(@as(usize, 0), catalog.installed.items.len);
+    try std.testing.expectEqual(@as(usize, 0), catalog.members.items.len);
+    try std.testing.expectEqual(@as(usize, 0), catalog.dependencies.items.len);
+}
+
+test "extension catalog updates configures disables and enables extension" {
+    var catalog = ExtensionCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+
+    try catalog.registerPackage(.{
+        .name = "memoryaf",
+        .version = "1.0.0",
+        .digest = "sha256:v1",
+        .install = .{
+            .scopes_supported = &.{.table},
+            .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
+        },
+    });
+    try catalog.registerPackage(.{
+        .name = "memoryaf",
+        .version = "1.1.0",
+        .digest = "sha256:v11",
+        .install = .{
+            .scopes_supported = &.{.table},
+            .objects = &.{
+                .{ .kind = .mcp_tool, .name = "recall" },
+                .{ .kind = .mcp_tool, .name = "remember" },
+            },
+        },
+        .updates = &.{.{ .from_version = "1.0.0", .to_version = "1.1.0", .path = "updates/1.0.0--1.1.0.json" }},
+    });
+
+    const installed = try catalog.installManifestOnly(
+        "memoryaf",
+        "memoryaf",
+        .{
+            .version = "1.0.0",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .config_json = "{\"ttl_days\":30}",
+            .grants = &.{.{ .name = "read:table", .scope = "memories" }},
+        },
+        42,
+    );
+    defer freeInstalledExtension(std.testing.allocator, installed);
+    try std.testing.expectEqualStrings("1.0.0", catalog.installed.items[0].package_version);
+    try std.testing.expectEqual(@as(usize, 1), catalog.members.items.len);
+
+    try catalog.disableInstalled("memoryaf");
+    try std.testing.expectEqual(.disabled, catalog.installed.items[0].status);
+    try std.testing.expectError(error.ExtensionDisabled, catalog.updateManifestOnly("memoryaf", .{ .target_version = "1.1.0" }));
+    try catalog.enableInstalled("memoryaf");
+    try std.testing.expectEqual(.ready, catalog.installed.items[0].status);
+
+    try catalog.configureInstalled("memoryaf", .{ .config_json = "{\"ttl_days\":60}" });
+    try std.testing.expectEqualStrings("{\"ttl_days\":60}", catalog.installed.items[0].config_json);
+
+    const updated = try catalog.updateManifestOnly("memoryaf", .{ .target_version = "1.1.0" });
+    defer freeInstalledExtension(std.testing.allocator, updated);
+    try std.testing.expectEqualStrings("1.1.0", updated.package_version);
+    try std.testing.expectEqualStrings("sha256:v11", catalog.installed.items[0].package_digest);
+    try std.testing.expectEqualStrings("{\"ttl_days\":60}", catalog.installed.items[0].config_json);
+    try std.testing.expectEqual(@as(usize, 2), catalog.members.items.len);
+
+    const members = try catalog.listMembersForExtension(std.testing.allocator, "memoryaf");
+    defer catalog.freeMembers(std.testing.allocator, members);
+    try std.testing.expectEqual(@as(usize, 2), members.len);
 }
