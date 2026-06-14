@@ -17,6 +17,7 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
+  Checkbox,
   type ColumnDef,
   DashboardPage,
   DashboardPageActions,
@@ -47,7 +48,13 @@ import {
   TabsTrigger,
   Textarea,
 } from "@antfly/design-system";
-import type { Table as AntflyTable, IndexStatus, QueryRequest, QueryResult } from "@antfly/sdk";
+import type {
+  Table as AntflyTable,
+  IndexStatus,
+  QueryRequest,
+  QueryResult,
+  TableStatus,
+} from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -66,6 +73,8 @@ import QueryBuilder from "../components/querybuilder/QueryBuilder";
 import { QueryResultsList } from "../components/results";
 import SearchBoxBuilder from "../components/SearchBoxBuilder";
 import DocumentSchemasForm from "../components/schema-builder/DocumentSchemasForm";
+import { DocumentArtifactsPanel } from "../components/table/DocumentArtifactsPanel";
+import { TableReprocessPanel } from "../components/table/TableReprocessPanel";
 import {
   type BasicField,
   generateBasicFields,
@@ -223,6 +232,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
   const [tableSchema, setTableSchema] = useState<TableSchema | null>(null);
+  const [storageStatus, setStorageStatus] = useState<TableStatus["storage_status"] | null>(null);
+  const [documentCount, setDocumentCount] = useState<number | null>(null);
   const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [openCreateDialog, setOpenCreateDialog] = useState(false);
@@ -234,6 +245,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [filterQuery, setFilterQuery] = useState(JSON.stringify({}, null, 2));
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
+  const [includeProfile, setIncludeProfile] = useState(true);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
@@ -291,6 +303,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         console.error("Invalid filter query JSON:", e);
       }
     }
+    queryRequest.profile = includeProfile;
     return JSON.stringify(queryRequest, null, 2);
   }, [
     query,
@@ -300,6 +313,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     hasSemanticQuery,
     hasFilterQuery,
     selectedFields,
+    includeProfile,
   ]);
 
   const [queryJsonString, setQueryJsonString] = useState(semanticQueryRequestString);
@@ -372,18 +386,42 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       } else {
         setTableSchema(null);
       }
+      setStorageStatus((response as TableStatus | undefined)?.storage_status ?? null);
       setMigration(response?.migration);
     } catch {
       // This is a 404, so we can ignore it.
       setTableSchema(null);
+      setStorageStatus(null);
       setMigration(undefined);
     }
   }, [tableName]);
+
+  const fetchDocumentCount = useCallback(async () => {
+    if (!tableName) return;
+    if (storageStatus?.empty) {
+      setDocumentCount(0);
+      return;
+    }
+    try {
+      const response = await api.tables.query(tableName, {
+        filter_query: { match_all: {} },
+        count: true,
+        limit: 0,
+      } as QueryRequest);
+      setDocumentCount(response?.responses?.[0]?.hits?.total ?? null);
+    } catch {
+      setDocumentCount(null);
+    }
+  }, [storageStatus?.empty, tableName]);
 
   useEffect(() => {
     fetchIndexes();
     fetchTableSchema();
   }, [fetchIndexes, fetchTableSchema]);
+
+  useEffect(() => {
+    fetchDocumentCount();
+  }, [fetchDocumentCount]);
 
   // Reset editing state when switching tables
   useEffect(() => {
@@ -476,9 +514,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   };
   const vectorIndexCount = indexes.filter((idx) => idx.config.type === "embeddings").length;
   const fullTextIndexCount = indexes.filter((idx) => idx.config.type === "full_text").length;
+  const graphIndexCount = indexes.filter((idx) => idx.config.type === "graph").length;
+  const hasGraphCapability = graphIndexCount > 0;
+  const hasData = documentCount !== 0 && storageStatus?.empty !== true;
+  const isRetrievalReady = hasData && indexes.length > 0;
+  const selectedVectorIndexes = indexes.filter((index) => queryIndexes.includes(index.config.name));
   const schemaCount = tableSchema?.document_schemas
     ? Object.keys(tableSchema.document_schemas).length
     : 0;
+  const documentCountLabel =
+    documentCount === null
+      ? storageStatus?.empty
+        ? "0"
+        : "Unknown"
+      : Intl.NumberFormat().format(documentCount);
   const tableSectionPath = (section: string) =>
     `/tables/${encodeURIComponent(tableName || "")}?section=${encodeURIComponent(section)}`;
 
@@ -600,6 +649,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     faceted: "Component Builder",
     bulk: "Upload",
     "document-builder": "Manual Entry",
+    artifacts: "Artifacts",
+    reprocess: "Reprocess",
   };
 
   return (
@@ -661,7 +712,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         {/* Overview Section */}
         {currentSection === "overview" && (
           <div className="space-y-6">
-            <div className="grid gap-3 md:grid-cols-4">
+            <div className="grid gap-3 md:grid-cols-5">
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-muted-foreground">Documents</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{documentCountLabel}</div>
+                  <p className="text-xs text-muted-foreground">
+                    {storageStatus?.disk_usage !== undefined
+                      ? `${formatBytes(storageStatus.disk_usage)} stored`
+                      : "data count from query API"}
+                  </p>
+                </CardContent>
+              </Card>
               <Card>
                 <CardHeader className="pb-2">
                   <CardTitle className="text-sm text-muted-foreground">Schema</CardTitle>
@@ -678,7 +742,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 <CardContent>
                   <div className="text-2xl font-semibold">{indexes.length}</div>
                   <p className="text-xs text-muted-foreground">
-                    {vectorIndexCount} vector, {fullTextIndexCount} full-text
+                    {vectorIndexCount} vector, {fullTextIndexCount} full-text, {graphIndexCount}{" "}
+                    graph
                   </p>
                 </CardContent>
               </Card>
@@ -699,10 +764,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 </CardHeader>
                 <CardContent>
                   <div className="text-2xl font-semibold">
-                    {indexes.length > 0 ? "Ready" : "Setup"}
+                    {isRetrievalReady ? "Ready" : "Setup"}
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {indexes.length > 0 ? "search surfaces available" : "create an index first"}
+                    {isRetrievalReady
+                      ? "search and ask are available"
+                      : !hasData
+                        ? "add data before retrieval"
+                        : "create an index first"}
                   </p>
                 </CardContent>
               </Card>
@@ -719,9 +788,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
               <Button
                 variant="outline"
                 onClick={() =>
-                  navigate(
-                    `/data/playground/chat?table=${encodeURIComponent(tableName || "")}`
-                  )
+                  navigate(`/data/playground/chat?table=${encodeURIComponent(tableName || "")}`)
                 }
               >
                 Ask
@@ -731,11 +798,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
             <div className="grid gap-4 lg:grid-cols-2">
               <Card>
                 <CardHeader>
-                  <CardTitle>Table Setup</CardTitle>
+                  <CardTitle>Setup Path</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3 text-sm">
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-muted-foreground">Schema</span>
+                    <span className="text-muted-foreground">1. Define the table shape</span>
                     <Button
                       variant="outline"
                       size="sm"
@@ -745,7 +812,17 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </Button>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-muted-foreground">Indexes</span>
+                    <span className="text-muted-foreground">2. Add documents</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("bulk"))}
+                    >
+                      {hasData ? "Upload more" : "Upload data"}
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">3. Build retrieval indexes</span>
                     <Button
                       variant="outline"
                       size="sm"
@@ -755,13 +832,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </Button>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <span className="text-muted-foreground">Data</span>
+                    <span className="text-muted-foreground">4. Search or ask</span>
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => navigate(tableSectionPath("bulk"))}
+                      onClick={() => navigate(tableSectionPath("semantic"))}
+                      disabled={!isRetrievalReady}
                     >
-                      Upload data
+                      Search
                     </Button>
                   </div>
                 </CardContent>
@@ -769,15 +847,32 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
               <Card>
                 <CardHeader>
-                  <CardTitle>Retrieval</CardTitle>
+                  <CardTitle>Retrieval Readiness</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3 text-sm">
+                  {!hasData && (
+                    <Alert>
+                      <AlertDescription>
+                        This table does not appear to have documents yet. Upload data or add a
+                        document manually before evaluating retrieval.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                  {hasData && indexes.length === 0 && (
+                    <Alert>
+                      <AlertDescription>
+                        This table has data but no indexes. Create a full-text or vector index to
+                        unlock Search and Ask.
+                      </AlertDescription>
+                    </Alert>
+                  )}
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-muted-foreground">Search ranked documents</span>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => navigate(tableSectionPath("semantic"))}
+                      disabled={!isRetrievalReady}
                     >
                       Search
                     </Button>
@@ -792,6 +887,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                           `/data/playground/chat?table=${encodeURIComponent(tableName || "")}`
                         )
                       }
+                      disabled={!isRetrievalReady}
                     >
                       Ask
                     </Button>
@@ -806,8 +902,20 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                           `/data/playground/evals?table=${encodeURIComponent(tableName || "")}`
                         )
                       }
+                      disabled={!isRetrievalReady}
                     >
                       Evaluate
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Explore graph relationships</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(tableSectionPath("graph"))}
+                      disabled={!hasGraphCapability}
+                    >
+                      {hasGraphCapability ? "Graph" : "Needs graph index"}
                     </Button>
                   </div>
                 </CardContent>
@@ -1005,6 +1113,43 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     availableFields={availableSearchableFields}
                     availableBasicFields={availableBasicFields}
                   />
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="text-base">Retrieval Settings & Trace</CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-3 text-sm">
+                      <div className="grid gap-3 md:grid-cols-3">
+                        <div>
+                          <p className="text-xs text-muted-foreground">Embedding</p>
+                          <p className="font-medium">
+                            {selectedVectorIndexes.length > 0
+                              ? selectedVectorIndexes
+                                  .map((index) => getModelInfo(index)?.model ?? index.config.name)
+                                  .join(", ")
+                              : "No vector index selected"}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">Chunking</p>
+                          <p className="font-medium">Configured by ingest/index pipeline</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">Reranking</p>
+                          <p className="font-medium">Not enabled for this query</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="include-retrieval-profile"
+                          checked={includeProfile}
+                          onCheckedChange={(checked) => setIncludeProfile(checked === true)}
+                        />
+                        <Label htmlFor="include-retrieval-profile" className="font-normal">
+                          Request execution profile and show it as the retrieval trace
+                        </Label>
+                      </div>
+                    </CardContent>
+                  </Card>
                 </TabsContent>
                 <TabsContent value="json">
                   {(() => {
@@ -1075,17 +1220,45 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                 </CardContent>
               </Card>
             )}
+
+            {queryResult?.profile && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Retrieval Trace</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <JsonViewer json={queryResult.profile} />
+                </CardContent>
+              </Card>
+            )}
           </div>
         )}
 
         {/* Graph Explorer Section */}
-        {currentSection === "graph" && tableName && (
-          <GraphIndexExplorer
-            tableName={tableName}
-            indexes={indexes}
-            onRefreshIndexes={fetchIndexes}
-          />
-        )}
+        {currentSection === "graph" &&
+          tableName &&
+          (hasGraphCapability ? (
+            <GraphIndexExplorer
+              tableName={tableName}
+              indexes={indexes}
+              onRefreshIndexes={fetchIndexes}
+            />
+          ) : (
+            <Card>
+              <CardHeader>
+                <CardTitle>Graph is not configured</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm text-muted-foreground">
+                <p>
+                  This table does not have a graph index yet. Add graph-capable schema or create a
+                  graph index before exploring relationships.
+                </p>
+                <Button variant="outline" onClick={() => navigate(tableSectionPath("indexes"))}>
+                  Create graph index
+                </Button>
+              </CardContent>
+            </Card>
+          ))}
 
         {/* SearchBox Builder Section */}
         {currentSection === "faceted" && (
@@ -1102,6 +1275,16 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         {/* Manual Entry Section */}
         {currentSection === "document-builder" && (
           <DocumentBuilder tableName={tableName || ""} schema={tableSchema} />
+        )}
+
+        {/* Artifacts Section */}
+        {currentSection === "artifacts" && (
+          <DocumentArtifactsPanel key={tableName} tableName={tableName || ""} />
+        )}
+
+        {/* Reprocess Section */}
+        {currentSection === "reprocess" && (
+          <TableReprocessPanel key={tableName} tableName={tableName || ""} />
         )}
 
         {/* Schema Section */}

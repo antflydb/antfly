@@ -222,6 +222,28 @@
     "semantic": false
   },
   {
+    "id": "tool-artifacts",
+    "type": "navigation",
+    "group": "tools",
+    "label": "Artifacts",
+    "description": "Inspect document artifacts for the selected table",
+    "href": "/ingest/artifacts",
+    "icon": "FileStack",
+    "product": "antfly",
+    "semantic": false
+  },
+  {
+    "id": "tool-reprocess",
+    "type": "navigation",
+    "group": "tools",
+    "label": "Reprocess",
+    "description": "Re-run document processing for the selected table",
+    "href": "/ingest/reprocess",
+    "icon": "RotateCw",
+    "product": "antfly",
+    "semantic": false
+  },
+  {
     "id": "action-toggle-theme",
     "type": "action",
     "group": "quickActions",
