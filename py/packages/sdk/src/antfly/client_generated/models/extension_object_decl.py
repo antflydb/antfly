@@ -17,7 +17,7 @@ class ExtensionObjectDecl:
     """
     Attributes:
         kind (ExtensionObjectKind):
-        name (str):
+        name (str): Path-safe extension or package identifier.
         shape (str | Unset):
         table_name (str | Unset):
         config_json (str | Unset):  Default: '{}'.

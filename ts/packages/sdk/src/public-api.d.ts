@@ -10333,6 +10333,8 @@ export interface components {
         PackageKind: "extension";
         /** @description Path-safe extension or package identifier. */
         ExtensionIdentifier: string;
+        /** @description Capability identifier. Capability names may use colon-delimited namespaces such as read:table. */
+        CapabilityName: string;
         /** @enum {string} */
         ExtensionScopeKind: "cluster" | "table" | "embedded_db";
         ExtensionScope: {
@@ -10342,13 +10344,13 @@ export interface components {
         };
         Capability: {
             /** @example read:table */
-            name: components["schemas"]["ExtensionIdentifier"];
+            name: components["schemas"]["CapabilityName"];
             /** @example memoryaf.memories */
             scope?: string;
         };
         PackageDependency: {
             /** @example antfly_core */
-            name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
             /** @example >=1.0.0 */
             version_requirement?: string;
             /** @default false */
@@ -10366,7 +10368,7 @@ export interface components {
         DataShapeKind: "document" | "row" | "generated_artifact" | "extension_relation" | "endpoint_schema" | "tool_schema";
         DataShapeDecl: {
             /** @example memory_record */
-            name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
             kind: components["schemas"]["DataShapeKind"];
             /** @default 1 */
             version?: string;
@@ -10380,14 +10382,14 @@ export interface components {
         ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
         ExtensionObjectDecl: {
             kind: components["schemas"]["ExtensionObjectKind"];
-            name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
             shape?: string;
             table_name?: string;
             /** @default {} */
             config_json?: string;
         };
         RuntimeDecl: {
-            name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
             /**
              * @default manifest_only
              * @enum {string}
@@ -10408,11 +10410,11 @@ export interface components {
         PackageManifest: {
             /** @enum {string} */
             manifest_api_version: "extensions/v1";
-            name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
             version: string;
             kind: components["schemas"]["PackageKind"];
             description?: string;
-            digest?: string;
+            digest: string;
             /** @default false */
             trusted?: boolean;
             /** @default false */
@@ -10423,8 +10425,8 @@ export interface components {
             install: components["schemas"]["InstallManifest"];
         };
         InstalledExtension: {
-            name: string;
-            package_name: string;
+            name: components["schemas"]["ExtensionIdentifier"];
+            package_name: components["schemas"]["ExtensionIdentifier"];
             package_version: string;
             package_digest: string;
             scope: components["schemas"]["ExtensionScope"];
@@ -10437,11 +10439,12 @@ export interface components {
             status: "installing" | "ready" | "disabled" | "updating" | "dropping" | "error_state";
         };
         ExtensionMember: {
-            extension_name: string;
+            extension_name: components["schemas"]["ExtensionIdentifier"];
             scope: components["schemas"]["ExtensionScope"];
             object_kind: components["schemas"]["ExtensionObjectKind"];
-            object_name: string;
+            object_name: components["schemas"]["ExtensionIdentifier"];
             table_name?: string;
+            shape_kind?: components["schemas"]["DataShapeKind"];
             shape_name?: string;
             shape_version?: string;
             /** @default {} */

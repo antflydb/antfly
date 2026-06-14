@@ -6874,7 +6874,7 @@ fn installExtensionOnService(
 
     var persisted_request = request;
     persisted_request.dry_run = false;
-    const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const installed_at_ms: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_ms));
     var installed = try catalog.installManifestOnly(extension_name, extension_name, persisted_request, installed_at_ms);
     errdefer installed.deinitOwned(alloc);
 
@@ -10127,7 +10127,7 @@ test "api http server scopes mcp endpoint to one extension" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
     defer server.deinit();
 
-    const scoped_uri = "/mcp/extensions/memoryaf";
+    const scoped_uri = "/mcp/v1/extensions/memoryaf";
     var init_resp = try server.handle(.{
         .method = .POST,
         .uri = scoped_uri,

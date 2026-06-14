@@ -15,7 +15,7 @@ T = TypeVar("T", bound="Capability")
 class Capability:
     """
     Attributes:
-        name (str): Path-safe extension or package identifier.
+        name (str): Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
         scope (str | Unset):  Example: memoryaf.memories.
     """
 

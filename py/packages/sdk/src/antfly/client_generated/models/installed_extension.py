@@ -21,8 +21,8 @@ T = TypeVar("T", bound="InstalledExtension")
 class InstalledExtension:
     """
     Attributes:
-        name (str):
-        package_name (str):
+        name (str): Path-safe extension or package identifier.
+        package_name (str): Path-safe extension or package identifier.
         package_version (str):
         package_digest (str):
         scope (ExtensionScope):

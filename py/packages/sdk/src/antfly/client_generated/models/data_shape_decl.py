@@ -16,7 +16,7 @@ T = TypeVar("T", bound="DataShapeDecl")
 class DataShapeDecl:
     """
     Attributes:
-        name (str):  Example: memory_record.
+        name (str): Path-safe extension or package identifier.
         kind (DataShapeKind):
         version (str | Unset):  Default: '1'.
         schema_json (str | Unset): JSON object encoded as a string until the public shape language is finalized.

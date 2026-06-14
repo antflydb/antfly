@@ -139,6 +139,12 @@ means resolve the package from configured trusted sources, verify its manifest,
 digest/signature, version, and capabilities, then write installed-extension
 metadata. Metadata remains the source of truth for installed extensions.
 
+The v1 scanner may still accept loose nested `extension.json` manifests for
+local development, but it should classify each discovered manifest as canonical
+`<name>/<version>`, content-addressed `sha256/<digest>`, or loose. Hosted and
+registry-backed profiles should require canonical or content-addressed layouts
+before exposing a package as trusted.
+
 ### 2. Extension Catalog
 
 Add a metadata-owned catalog, not shard-local ad hoc rows:
@@ -826,7 +832,7 @@ The important product behavior is:
 ```text
 CREATE EXTENSION memoryaf;
 GET /extensions/v1/installed/memoryaf/objects
-GET /mcp/extensions/memoryaf
+GET /mcp/v1/extensions/memoryaf
 ```
 
 or, for a merged tool list:
@@ -911,7 +917,7 @@ class.
 There are three deployment shapes:
 
 - Extension-scoped MCP endpoint:
-  - `/mcp/extensions/{extension_name}`
+  - `/mcp/v1/extensions/{extension_name}`
   - exposes only that extension's tools
   - best for clients that want one app-specific MCP server
 - Merged tenant MCP endpoint:

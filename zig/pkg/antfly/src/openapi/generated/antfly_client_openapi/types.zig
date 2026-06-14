@@ -3627,6 +3627,9 @@ pub const PackageKind = enum {
 /// Path-safe extension or package identifier.
 pub const ExtensionIdentifier = []const u8;
 
+/// Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
+pub const CapabilityName = []const u8;
+
 pub const ExtensionScopeKind = enum {
     cluster,
     table,
@@ -3653,12 +3656,6 @@ pub const ExtensionScopeKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-pub const PackageDependency = struct {
-    name: []const u8,
-    version_requirement: ?[]const u8 = null,
-    optional: ?bool = null,
 };
 
 pub const PackageArtifact = struct {
@@ -3781,13 +3778,6 @@ pub const ExtensionObjectKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-pub const RuntimeDecl = struct {
-    name: []const u8,
-    mode: ?[]const u8 = null,
-    artifact: ?[]const u8 = null,
-    config_json: ?[]const u8 = null,
 };
 
 pub const UpdateExtensionRequest = struct {
@@ -5080,8 +5070,21 @@ pub const InferenceschemasConfig = struct {
     style: ?InferenceStyle = null,
 };
 
-pub const Capability = struct {
+pub const PackageDependency = struct {
     name: ExtensionIdentifier,
+    version_requirement: ?[]const u8 = null,
+    optional: ?bool = null,
+};
+
+pub const RuntimeDecl = struct {
+    name: ExtensionIdentifier,
+    mode: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
+pub const Capability = struct {
+    name: CapabilityName,
     scope: ?[]const u8 = null,
 };
 
@@ -5092,7 +5095,7 @@ pub const ExtensionScope = struct {
 };
 
 pub const DataShapeDecl = struct {
-    name: []const u8,
+    name: ExtensionIdentifier,
     kind: DataShapeKind,
     version: ?[]const u8 = null,
     /// JSON object encoded as a string until the public shape language is finalized.
@@ -5101,7 +5104,7 @@ pub const DataShapeDecl = struct {
 
 pub const ExtensionObjectDecl = struct {
     kind: ExtensionObjectKind,
-    name: []const u8,
+    name: ExtensionIdentifier,
     shape: ?[]const u8 = null,
     table_name: ?[]const u8 = null,
     config_json: ?[]const u8 = null,
@@ -5888,8 +5891,8 @@ pub const InferenceConfig = struct {
 };
 
 pub const InstalledExtension = struct {
-    name: []const u8,
-    package_name: []const u8,
+    name: ExtensionIdentifier,
+    package_name: ExtensionIdentifier,
     package_version: []const u8,
     package_digest: []const u8,
     scope: ExtensionScope,
@@ -5900,11 +5903,12 @@ pub const InstalledExtension = struct {
 };
 
 pub const ExtensionMember = struct {
-    extension_name: []const u8,
+    extension_name: ExtensionIdentifier,
     scope: ExtensionScope,
     object_kind: ExtensionObjectKind,
-    object_name: []const u8,
+    object_name: ExtensionIdentifier,
     table_name: ?[]const u8 = null,
+    shape_kind: ?DataShapeKind = null,
     shape_name: ?[]const u8 = null,
     shape_version: ?[]const u8 = null,
     owner_metadata_json: ?[]const u8 = null,
@@ -6179,11 +6183,11 @@ pub const InferenceChunkResponse = struct {
 
 pub const PackageManifest = struct {
     manifest_api_version: []const u8,
-    name: []const u8,
+    name: ExtensionIdentifier,
     version: []const u8,
     kind: PackageKind,
     description: ?[]const u8 = null,
-    digest: ?[]const u8 = null,
+    digest: []const u8,
     trusted: ?bool = null,
     relocatable: ?bool = null,
     capabilities_requested: ?[]const Capability = null,

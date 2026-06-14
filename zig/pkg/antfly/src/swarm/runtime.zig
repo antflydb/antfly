@@ -1309,7 +1309,7 @@ fn registerMcpRoutes(server: anytype) !void {
     const mcp_paths = [_][]const u8{
         routes.mcp_v1,
         routes.mcp_v1_prefix ++ "*",
-        routes.mcp_extensions_prefix ++ "*",
+        routes.mcp_v1_extensions_prefix ++ "*",
     };
     inline for (mcp_paths) |path| {
         try server.get(path, mcpBridgeHandler);
@@ -2159,9 +2159,9 @@ test "swarm runtime registers mcp routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, routes.mcp_v1_prefix ++ "*"));
     try std.testing.expect(server.hasRoute(.post, routes.mcp_v1_prefix ++ "*"));
     try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.get, routes.mcp_extensions_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.post, routes.mcp_extensions_prefix ++ "*"));
-    try std.testing.expect(server.hasRoute(.delete, routes.mcp_extensions_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.get, routes.mcp_v1_extensions_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.post, routes.mcp_v1_extensions_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.delete, routes.mcp_v1_extensions_prefix ++ "*"));
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 

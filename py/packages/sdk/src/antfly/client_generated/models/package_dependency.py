@@ -15,7 +15,7 @@ T = TypeVar("T", bound="PackageDependency")
 class PackageDependency:
     """
     Attributes:
-        name (str):  Example: antfly_core.
+        name (str): Path-safe extension or package identifier.
         version_requirement (str | Unset):  Example: >=1.0.0.
         optional (bool | Unset):  Default: False.
     """

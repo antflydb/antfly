@@ -402,6 +402,7 @@ pub const InferenceEmbeddingObject = types.InferenceEmbeddingObject;
 pub const InferenceEmbeddingUsage = types.InferenceEmbeddingUsage;
 pub const PackageKind = types.PackageKind;
 pub const ExtensionIdentifier = types.ExtensionIdentifier;
+pub const CapabilityName = types.CapabilityName;
 pub const ExtensionScopeKind = types.ExtensionScopeKind;
 pub const ExtensionScope = types.ExtensionScope;
 pub const Capability = types.Capability;

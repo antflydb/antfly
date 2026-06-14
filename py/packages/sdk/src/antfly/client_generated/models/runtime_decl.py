@@ -16,7 +16,7 @@ T = TypeVar("T", bound="RuntimeDecl")
 class RuntimeDecl:
     """
     Attributes:
-        name (str):
+        name (str): Path-safe extension or package identifier.
         mode (RuntimeDeclMode | Unset):  Default: RuntimeDeclMode.MANIFEST_ONLY.
         artifact (str | Unset):
         config_json (str | Unset):  Default: '{}'.

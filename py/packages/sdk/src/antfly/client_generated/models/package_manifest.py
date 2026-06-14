@@ -25,12 +25,12 @@ class PackageManifest:
     """
     Attributes:
         manifest_api_version (PackageManifestManifestApiVersion):
-        name (str):
+        name (str): Path-safe extension or package identifier.
         version (str):
         kind (PackageKind):
+        digest (str):
         install (InstallManifest):
         description (str | Unset):
-        digest (str | Unset):
         trusted (bool | Unset):  Default: False.
         relocatable (bool | Unset):  Default: False.
         capabilities_requested (list[Capability] | Unset):
@@ -42,9 +42,9 @@ class PackageManifest:
     name: str
     version: str
     kind: PackageKind
+    digest: str
     install: InstallManifest
     description: str | Unset = UNSET
-    digest: str | Unset = UNSET
     trusted: bool | Unset = False
     relocatable: bool | Unset = False
     capabilities_requested: list[Capability] | Unset = UNSET
@@ -61,11 +61,11 @@ class PackageManifest:
 
         kind = self.kind.value
 
+        digest = self.digest
+
         install = self.install.to_dict()
 
         description = self.description
-
-        digest = self.digest
 
         trusted = self.trusted
 
@@ -100,13 +100,12 @@ class PackageManifest:
                 "name": name,
                 "version": version,
                 "kind": kind,
+                "digest": digest,
                 "install": install,
             }
         )
         if description is not UNSET:
             field_dict["description"] = description
-        if digest is not UNSET:
-            field_dict["digest"] = digest
         if trusted is not UNSET:
             field_dict["trusted"] = trusted
         if relocatable is not UNSET:
@@ -136,11 +135,11 @@ class PackageManifest:
 
         kind = PackageKind(d.pop("kind"))
 
+        digest = d.pop("digest")
+
         install = InstallManifest.from_dict(d.pop("install"))
 
         description = d.pop("description", UNSET)
-
-        digest = d.pop("digest", UNSET)
 
         trusted = d.pop("trusted", UNSET)
 
@@ -178,9 +177,9 @@ class PackageManifest:
             name=name,
             version=version,
             kind=kind,
+            digest=digest,
             install=install,
             description=description,
-            digest=digest,
             trusted=trusted,
             relocatable=relocatable,
             capabilities_requested=capabilities_requested,

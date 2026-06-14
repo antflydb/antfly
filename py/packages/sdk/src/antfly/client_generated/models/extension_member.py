@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.data_shape_kind import DataShapeKind
 from ..models.extension_object_kind import ExtensionObjectKind
 from ..types import UNSET, Unset
 
@@ -20,11 +21,12 @@ T = TypeVar("T", bound="ExtensionMember")
 class ExtensionMember:
     """
     Attributes:
-        extension_name (str):
+        extension_name (str): Path-safe extension or package identifier.
         scope (ExtensionScope):
         object_kind (ExtensionObjectKind):
-        object_name (str):
+        object_name (str): Path-safe extension or package identifier.
         table_name (str | Unset):
+        shape_kind (DataShapeKind | Unset):
         shape_name (str | Unset):
         shape_version (str | Unset):
         owner_metadata_json (str | Unset):  Default: '{}'.
@@ -35,6 +37,7 @@ class ExtensionMember:
     object_kind: ExtensionObjectKind
     object_name: str
     table_name: str | Unset = UNSET
+    shape_kind: DataShapeKind | Unset = UNSET
     shape_name: str | Unset = UNSET
     shape_version: str | Unset = UNSET
     owner_metadata_json: str | Unset = "{}"
@@ -50,6 +53,10 @@ class ExtensionMember:
         object_name = self.object_name
 
         table_name = self.table_name
+
+        shape_kind: str | Unset = UNSET
+        if not isinstance(self.shape_kind, Unset):
+            shape_kind = self.shape_kind.value
 
         shape_name = self.shape_name
 
@@ -69,6 +76,8 @@ class ExtensionMember:
         )
         if table_name is not UNSET:
             field_dict["table_name"] = table_name
+        if shape_kind is not UNSET:
+            field_dict["shape_kind"] = shape_kind
         if shape_name is not UNSET:
             field_dict["shape_name"] = shape_name
         if shape_version is not UNSET:
@@ -93,6 +102,13 @@ class ExtensionMember:
 
         table_name = d.pop("table_name", UNSET)
 
+        _shape_kind = d.pop("shape_kind", UNSET)
+        shape_kind: DataShapeKind | Unset
+        if isinstance(_shape_kind, Unset):
+            shape_kind = UNSET
+        else:
+            shape_kind = DataShapeKind(_shape_kind)
+
         shape_name = d.pop("shape_name", UNSET)
 
         shape_version = d.pop("shape_version", UNSET)
@@ -105,6 +121,7 @@ class ExtensionMember:
             object_kind=object_kind,
             object_name=object_name,
             table_name=table_name,
+            shape_kind=shape_kind,
             shape_name=shape_name,
             shape_version=shape_version,
             owner_metadata_json=owner_metadata_json,

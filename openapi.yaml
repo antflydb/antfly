@@ -18608,6 +18608,11 @@ components:
       type: string
       pattern: ^[A-Za-z0-9_.-]+$
       description: Path-safe extension or package identifier.
+    CapabilityName:
+      type: string
+      pattern: ^[A-Za-z0-9_.:-]+$
+      description: Capability identifier. Capability names may use colon-delimited namespaces such as
+        read:table.
     ExtensionScopeKind:
       type: string
       enum:
@@ -18628,7 +18633,7 @@ components:
       type: object
       properties:
         name:
-          $ref: '#/components/schemas/ExtensionIdentifier'
+          $ref: '#/components/schemas/CapabilityName'
           example: read:table
         scope:
           type: string
@@ -18639,7 +18644,7 @@ components:
       type: object
       properties:
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
           example: antfly_core
         version_requirement:
           type: string
@@ -18681,7 +18686,7 @@ components:
       type: object
       properties:
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
           example: memory_record
         kind:
           $ref: '#/components/schemas/DataShapeKind'
@@ -18724,7 +18729,7 @@ components:
         kind:
           $ref: '#/components/schemas/ExtensionObjectKind'
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         shape:
           type: string
         table_name:
@@ -18739,7 +18744,7 @@ components:
       type: object
       properties:
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         mode:
           type: string
           enum:
@@ -18789,7 +18794,7 @@ components:
           enum:
             - extensions/v1
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         version:
           type: string
         kind:
@@ -18823,14 +18828,15 @@ components:
         - name
         - version
         - kind
+        - digest
         - install
     InstalledExtension:
       type: object
       properties:
         name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         package_name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         package_version:
           type: string
         package_digest:
@@ -18867,15 +18873,17 @@ components:
       type: object
       properties:
         extension_name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         scope:
           $ref: '#/components/schemas/ExtensionScope'
         object_kind:
           $ref: '#/components/schemas/ExtensionObjectKind'
         object_name:
-          type: string
+          $ref: '#/components/schemas/ExtensionIdentifier'
         table_name:
           type: string
+        shape_kind:
+          $ref: '#/components/schemas/DataShapeKind'
         shape_name:
           type: string
         shape_version:

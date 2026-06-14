@@ -284,6 +284,7 @@ pub const PackageStoreEntry = struct {
     manifest: PackageManifest,
     manifest_path: []u8,
     package_root_path: []u8,
+    layout: PackageStoreLayout = .loose,
     content_addressed: bool = false,
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1008,13 +1009,42 @@ fn loadPackageStoreEntryAlloc(
     defer parsed.deinit();
     const manifest = try clonePackageManifest(alloc, parsed.value);
     errdefer freePackageManifest(alloc, manifest);
+    const layout = packageStoreLayout(relative_manifest_path, manifest);
 
     return .{
         .manifest = manifest,
         .manifest_path = manifest_path,
         .package_root_path = package_root_path,
-        .content_addressed = std.mem.startsWith(u8, relative_manifest_path, "sha256/"),
+        .layout = layout,
+        .content_addressed = layout == .content_addressed,
     };
+}
+
+pub const PackageStoreLayout = enum {
+    canonical,
+    content_addressed,
+    loose,
+};
+
+fn packageStoreLayout(relative_manifest_path: []const u8, manifest: PackageManifest) PackageStoreLayout {
+    var parts = std.mem.splitScalar(u8, relative_manifest_path, '/');
+    const first = parts.next() orelse return .loose;
+    const second = parts.next() orelse return .loose;
+    const third = parts.next() orelse return .loose;
+    if (parts.next() != null) return .loose;
+    if (!std.mem.eql(u8, third, package_manifest_filename)) return .loose;
+
+    if (std.mem.eql(u8, first, manifest.name) and std.mem.eql(u8, second, manifest.version)) {
+        return .canonical;
+    }
+    if (std.mem.eql(u8, first, "sha256")) {
+        if (std.mem.startsWith(u8, manifest.digest, "sha256:") and
+            std.mem.eql(u8, manifest.digest["sha256:".len..], second))
+        {
+            return .content_addressed;
+        }
+    }
+    return .loose;
 }
 
 fn joinStorePathAlloc(alloc: std.mem.Allocator, root_path: []const u8, relative_path: []const u8) ![]u8 {
@@ -1765,27 +1795,55 @@ test "extension package store scans local and content-addressed manifests" {
         \\}
         ,
     });
+    try tmp.dir.createDirPath(std.testing.io, "extensions/dev/loose");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extensions/dev/loose/extension.json",
+        .data =
+        \\{
+        \\  "manifest_api_version": "extensions/v1",
+        \\  "name": "looseaf",
+        \\  "version": "0.1.0",
+        \\  "kind": "extension",
+        \\  "digest": "sha256:loose",
+        \\  "install": {
+        \\    "scopes_supported": ["cluster"],
+        \\    "objects": [
+        \\      {"kind": "mcp_tool", "name": "loose_tool"}
+        \\    ]
+        \\  }
+        \\}
+        ,
+    });
 
     const entries = try scanPackageStoreAlloc(std.testing.allocator, std.testing.io, root_path);
     defer freePackageStoreEntries(std.testing.allocator, entries);
 
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
     var saw_memoryaf = false;
     var saw_content_addressed = false;
+    var saw_loose = false;
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.manifest.name, "memoryaf")) {
             saw_memoryaf = true;
+            try std.testing.expectEqual(PackageStoreLayout.canonical, entry.layout);
             try std.testing.expect(!entry.content_addressed);
             try std.testing.expect(std.mem.endsWith(u8, entry.package_root_path, "extensions/memoryaf/1.0.0"));
         }
         if (std.mem.eql(u8, entry.manifest.name, "antfly_text_extras")) {
             saw_content_addressed = true;
+            try std.testing.expectEqual(PackageStoreLayout.content_addressed, entry.layout);
             try std.testing.expect(entry.content_addressed);
             try std.testing.expectEqualStrings("sha256:abc123", entry.manifest.digest);
+        }
+        if (std.mem.eql(u8, entry.manifest.name, "looseaf")) {
+            saw_loose = true;
+            try std.testing.expectEqual(PackageStoreLayout.loose, entry.layout);
+            try std.testing.expect(!entry.content_addressed);
         }
     }
     try std.testing.expect(saw_memoryaf);
     try std.testing.expect(saw_content_addressed);
+    try std.testing.expect(saw_loose);
 }
 
 test "extension package store treats missing root as empty" {
