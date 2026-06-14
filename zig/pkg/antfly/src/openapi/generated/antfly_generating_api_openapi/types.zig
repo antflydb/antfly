@@ -135,7 +135,7 @@ pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
 
 pub const ChatMessage = antfly_generating_openapi.ChatMessage;
 
-/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
+/// Available tool names for the chat and retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - search: Execute semantic searches (legacy, use semantic_search for retrieval) - websearch: Search the web (requires websearch_connection or websearch_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search
 pub const ChatToolName = enum {
     add_filter,
     ask_clarification,
@@ -285,8 +285,10 @@ pub const ConfidenceStepConfig = struct {
 pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, defaults to filter, clarification, and search.
     enabled_tools: ?[]const ChatToolName = null,
-    /// Web search provider configuration. Required when websearch tool is enabled. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    /// Inline web search provider configuration. Prefer websearch_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
     websearch_config: ?antfly_websearch_openapi.WebSearchConfig = null,
+    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
+    websearch_connection: ?[]const u8 = null,
     /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
     fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
     /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.

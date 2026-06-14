@@ -15,6 +15,7 @@ import type {
   ChatAgentTurnResult,
   ChatMessage,
   ChatStreamCallbacks,
+  ConnectionsResponse,
   CreateTableRequest,
   CreateUserRequest,
   IndexConfig,
@@ -332,6 +333,33 @@ export class AntflyClient {
     if (error) throw new Error(`Failed to get cluster: ${errorMessage(error)}`);
     return data;
   }
+
+  connections = {
+    /**
+     * List configured external connections (inference providers, web search,
+     * external IO, CDC sources). Pass `include: ["models"]` to
+     * live-query each inference provider's model listing API.
+     * Returns undefined when the server predates the endpoint.
+     */
+    list: async (params?: {
+      types?: string[];
+      include?: "models"[];
+      refresh?: boolean;
+      signal?: AbortSignal;
+    }): Promise<ConnectionsResponse | undefined> => {
+      const query: { types?: string; include?: string; refresh?: string } = {};
+      if (params?.types?.length) query.types = params.types.join(",");
+      if (params?.include?.length) query.include = params.include.join(",");
+      if (params?.refresh) query.refresh = "true";
+      const { data, error, response } = await this.client.GET("/db/v1/connections", {
+        params: { query },
+        signal: params?.signal,
+      });
+      if (response?.status === 404) return undefined;
+      if (error) throw new Error(`Failed to list connections: ${errorMessage(error)}`);
+      return data;
+    },
+  };
 
   /**
    * Private helper for query requests to avoid code duplication

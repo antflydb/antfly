@@ -13,21 +13,23 @@ components:
     WebSearchProvider:
       type: string
       enum:
-        - google
-        - bing
+        - exa
         - serper
         - tavily
         - brave
-        - duckduckgo
+        - you
+        - linkup
+        - vertex
       description: |
         The web search provider to use.
 
-        - **google**: Google Custom Search API (requires CSE setup)
-        - **bing**: Microsoft Bing Web Search API
+        - **exa**: Exa neural/semantic web search API
         - **serper**: Serper.dev Google Search API (simpler setup)
         - **tavily**: Tavily AI Search API (optimized for RAG)
         - **brave**: Brave Search API
-        - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+        - **you**: You.com Search API for agent and research workflows
+        - **linkup**: Linkup Search API for web search and content retrieval
+        - **vertex**: Google Cloud Agent Search / Vertex AI Search
 
     WebSearchConfig:
       description: |
@@ -37,17 +39,40 @@ components:
         provider-specific config or set common options at the top level.
 
         **Environment Variables (fallbacks):**
-        - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
-        - BING_SEARCH_API_KEY
+        - EXA_API_KEY
         - SERPER_API_KEY
         - TAVILY_API_KEY
         - BRAVE_API_KEY
+        - YOU_API_KEY
+        - LINKUP_API_KEY
+        - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
       type: object
       required:
         - provider
       properties:
         provider:
           $ref: "#/components/schemas/WebSearchProvider"
+        api_key:
+          type: string
+          description: "Provider API key or secret reference. Prefer named web_search connections for production use."
+        endpoint:
+          type: string
+          description: "Provider endpoint override when applicable"
+        project_id:
+          type: string
+          description: "Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT."
+        location:
+          type: string
+          description: "Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global."
+        data_store:
+          type: string
+          description: "Agent Search data store ID for provider vertex."
+        serving_config:
+          type: string
+          description: "Agent Search serving config ID for provider vertex. Defaults to default_config."
+        credentials_path:
+          type: string
+          description: "Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC."
         max_results:
           type: integer
           default: 5
@@ -71,77 +96,71 @@ components:
           type: string
           description: "Preferred region for results (e.g., 'us', 'uk', 'de')"
           example: "us"
+        include_content:
+          type: boolean
+          default: false
+          description: "Ask the provider to return extracted page content when supported"
+        include_highlights:
+          type: boolean
+          default: false
+          description: "Ask the provider to return highlighted passages when supported"
       discriminator:
         propertyName: provider
         mapping:
-          google: "#/components/schemas/GoogleSearchConfig"
-          bing: "#/components/schemas/BingSearchConfig"
+          exa: "#/components/schemas/ExaSearchConfig"
           serper: "#/components/schemas/SerperSearchConfig"
           tavily: "#/components/schemas/TavilySearchConfig"
           brave: "#/components/schemas/BraveSearchConfig"
-          duckduckgo: "#/components/schemas/DuckDuckGoSearchConfig"
+          you: "#/components/schemas/YouSearchConfig"
+          linkup: "#/components/schemas/LinkupSearchConfig"
+          vertex: "#/components/schemas/VertexSearchConfig"
 
-    GoogleSearchConfig:
+    ExaSearchConfig:
       type: object
       description: |
-        Configuration for Google Custom Search API.
+        Configuration for Exa neural/semantic web search.
 
-        Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console.
+        Exa is optimized for semantic web search, highlights, and retrieved page
+        contents for RAG and agent workflows.
 
         **Setup:**
-        1. Create a project at https://console.cloud.google.com
-        2. Enable Custom Search API
-        3. Create a Custom Search Engine at https://cse.google.com
-        4. Get API key and CSE ID
+        1. Sign up at https://exa.ai
+        2. Get API key from dashboard
 
-        **Docs:** https://developers.google.com/custom-search/v1/overview
+        **Docs:** https://docs.exa.ai
       allOf:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
             api_key:
               type: string
-              description: "Google API key (or set GOOGLE_CSE_API_KEY env var)"
-            cse_id:
-              type: string
-              description: "Custom Search Engine ID (or set GOOGLE_CSE_ID env var)"
+              description: "Exa API key (or set EXA_API_KEY env var)"
             search_type:
               type: string
-              enum: ["web", "image"]
-              default: "web"
-              description: "Type of search to perform"
-            date_restrict:
+              enum: ["auto", "neural", "keyword"]
+              default: "auto"
+              description: "Search mode to request from Exa"
+            num_results:
+              type: integer
+              minimum: 1
+              maximum: 20
+              description: "Provider-specific result count override"
+            start_published_date:
               type: string
-              description: "Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)"
-              example: "m1"
-
-    BingSearchConfig:
-      type: object
-      description: |
-        Configuration for Microsoft Bing Web Search API.
-
-        **Setup:**
-        1. Create Azure account at https://portal.azure.com
-        2. Create a Bing Search resource
-        3. Get API key from resource keys
-
-        **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
-      allOf:
-        - $ref: "#/components/schemas/WebSearchConfig"
-        - type: object
-          properties:
-            api_key:
+              description: "ISO date/time lower bound for published date filtering"
+            end_published_date:
               type: string
-              description: "Bing Search API key (or set BING_SEARCH_API_KEY env var)"
-            endpoint:
-              type: string
-              format: uri
-              default: "https://api.bing.microsoft.com/v7.0/search"
-              description: "Bing API endpoint URL"
-            freshness:
-              type: string
-              enum: ["Day", "Week", "Month"]
-              description: "Filter results by freshness"
+              description: "ISO date/time upper bound for published date filtering"
+            include_domains:
+              type: array
+              items:
+                type: string
+              description: "Only include results from these domains"
+            exclude_domains:
+              type: array
+              items:
+                type: string
+              description: "Exclude results from these domains"
 
     SerperSearchConfig:
       type: object
@@ -252,30 +271,103 @@ components:
               default: true
               description: "Enable spellcheck suggestions"
 
-    DuckDuckGoSearchConfig:
+    YouSearchConfig:
       type: object
       description: |
-        Configuration for DuckDuckGo Instant Answer API.
+        Configuration for You.com Search API.
 
-        DuckDuckGo provides limited free search without requiring an API key.
-        Best for simple queries; may not return results for all searches.
+        You.com is useful for agentic search and research-oriented result
+        retrieval.
 
-        **Note:** This uses the Instant Answer API which has limitations.
-        For production use, consider other providers.
+        **Setup:**
+        1. Sign up for You.com API access
+        2. Get API key from dashboard
 
-        **Docs:** https://duckduckgo.com/api
+        **Docs:** https://api.you.com
       allOf:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
-            no_redirect:
-              type: boolean
-              default: true
-              description: "Skip HTTP redirect for bang queries"
-            no_html:
-              type: boolean
-              default: true
-              description: "Remove HTML from results"
+            api_key:
+              type: string
+              description: "You.com API key (or set YOU_API_KEY env var)"
+            endpoint:
+              type: string
+              format: uri
+              description: "You.com API endpoint URL"
+
+    LinkupSearchConfig:
+      type: object
+      description: |
+        Configuration for Linkup Search API.
+
+        Linkup is useful for web search, source retrieval, and structured
+        research workflows.
+
+        **Setup:**
+        1. Sign up at https://linkup.so
+        2. Get API key from dashboard
+
+        **Docs:** https://docs.linkup.so
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: "Linkup API key (or set LINKUP_API_KEY env var)"
+            depth:
+              type: string
+              enum: ["standard", "deep"]
+              default: "standard"
+              description: "Search depth to request from Linkup"
+            output_type:
+              type: string
+              enum: ["searchResults", "sourcedAnswer"]
+              default: "searchResults"
+              description: "Linkup response shape to request"
+
+    VertexSearchConfig:
+      type: object
+      description: |
+        Configuration for Google Cloud Agent Search / Vertex AI Search.
+
+        Use this for bounded Google Cloud search over configured data stores or
+        verified websites. The provider token is `vertex` to match Antfly's
+        existing Google Cloud provider convention.
+
+        **Setup:**
+        1. Enable Discovery Engine API in Google Cloud
+        2. Create an Agent Search app/data store
+        3. Grant service account access to query the serving config
+
+        **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+      allOf:
+        - $ref: "#/components/schemas/WebSearchConfig"
+        - type: object
+          properties:
+            service:
+              type: string
+              enum: ["agent_search"]
+              default: "agent_search"
+              description: "Google Cloud search service flavor"
+            project_id:
+              type: string
+              description: "Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT."
+            location:
+              type: string
+              default: "global"
+              description: "Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION."
+            data_store:
+              type: string
+              description: "Agent Search data store ID."
+            serving_config:
+              type: string
+              default: "default_config"
+              description: "Agent Search serving config ID."
+            credentials_path:
+              type: string
+              description: "Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS."
 
     WebSearchResult:
       type: object

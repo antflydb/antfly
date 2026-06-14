@@ -23,6 +23,7 @@ import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import { useFormContext } from "react-hook-form";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
 
@@ -84,13 +85,27 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
     fetchInferenceModels();
   }, [inferenceApiUrl]);
 
-  const modelSuggestions = useMemo(
-    () => ({
+  // Live model lists per configured provider from /db/v1/connections.
+  const { providers: connectedProviders } = useConnectedModels();
+  const liveEmbedders = useMemo(
+    () => liveModelSuggestions(connectedProviders, "embedder"),
+    [connectedProviders]
+  );
+
+  const modelSuggestions = useMemo(() => {
+    const merged: Record<EmbedderProvider, string[]> = {
       ...staticModelSuggestions,
       antfly: inferenceEmbedders.length > 0 ? inferenceEmbedders : staticModelSuggestions.antfly,
-    }),
-    [inferenceEmbedders]
-  );
+    };
+    // Live provider listings win over static suggestions; unconfigured or
+    // failing providers keep their static lists.
+    for (const [providerType, models] of Object.entries(liveEmbedders)) {
+      if (models.length > 0 && providerType in merged) {
+        merged[providerType as EmbedderProvider] = models;
+      }
+    }
+    return merged;
+  }, [inferenceEmbedders, liveEmbedders]);
 
   const sourceType = watch(`${prefix}sourceType`, "field");
   const provider = watch(`${prefix}embedder.provider`, "ollama");

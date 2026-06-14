@@ -33,9 +33,11 @@ class VertexRerankerConfig:
         Attributes:
             model (str): The ranking model to use. Default: 'semantic-ranker-default@latest'. Example: semantic-ranker-
                 default@latest.
-            project_id (str | Unset): Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-            credentials_path (str | Unset): Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS
-                environment variable.
+            project_id (str | Unset): Google Cloud project ID. Shared Vertex credential field; see
+                vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+            credentials_path (str | Unset): Path to service account JSON file. Shared Vertex credential field; see
+                vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment
+                variable.
             top_n (int | Unset): Maximum number of records to return. If not specified, returns all documents with scores.
     """
 

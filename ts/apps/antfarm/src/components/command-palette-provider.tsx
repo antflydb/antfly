@@ -22,6 +22,7 @@ import {
   Mic,
   Moon,
   Network,
+  Plug,
   Plus,
   Repeat2,
   ScanLine,
@@ -57,6 +58,7 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   Tag,
   HelpCircle,
   Network,
+  Plug,
   ClipboardCheck,
   Bot,
   Search,
@@ -98,6 +100,7 @@ function productForHref(href?: string): ProductId | undefined {
     href.startsWith("/ingest") ||
     href.startsWith("/data/playground") ||
     href === "/cluster" ||
+    href === "/connections" ||
     href === "/users" ||
     href === "/secrets"
   ) {
@@ -180,6 +183,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
       { icon: Upload, label: "Upload Data", href: "/ingest/upload", product: "antfly" },
       { icon: Library, label: "Models", href: "/inference/models", product: "inference" },
       { icon: Network, label: "Cluster", href: "/cluster", product: "antfly" },
+      { icon: Plug, label: "Connections", href: "/connections", product: "antfly" },
       { icon: Users, label: "Users", href: "/users", product: "antfly", adminOnly: true },
       { icon: KeyRound, label: "Secrets", href: "/secrets", product: "antfly", adminOnly: true },
     ];

@@ -1511,6 +1511,310 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ClusterDataGroupStatus"
+    ConnectionKind:
+      type: string
+      enum:
+        - inference
+        - web_search
+        - external_io
+        - cdc
+      description: Kind of external connection configured on this node.
+    ConnectionStatus:
+      type: string
+      enum:
+        - connected
+        - error
+        - configured
+        - unsupported
+      description: |
+        Connection status. "connected" means a live probe or listing succeeded,
+        "error" means the probe failed (see the error field), "configured" means
+        the connection is present but was not probed, and "unsupported" means
+        no probe is available for this connection kind or provider.
+    InferenceProviderType:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - cohere
+        - anthropic
+        - antfly
+        - mock
+      description: Inference provider type for a connection.
+    ConnectedModelType:
+      type: string
+      enum:
+        - embedder
+        - generator
+        - reranker
+        - chunker
+        - recognizer
+        - classifier
+        - rewriter
+        - reader
+        - transcriber
+        - extractor
+        - other
+      description: |
+        Model task type. Mirrors the inference registry taxonomy; "other" is
+        used for models whose task type the provider's listing API does not
+        classify.
+    ConnectedModel:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Model identifier as reported by the provider.
+        display_name:
+          type: string
+          description: Human-readable model name when the provider reports one.
+        dimensions:
+          type: integer
+          description: Embedding output dimension when known.
+        configured:
+          type: boolean
+          description: True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+    InferenceConnection:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: "#/components/schemas/InferenceProviderType"
+        url:
+          type: string
+          description: Resolved endpoint URL when applicable.
+        region:
+          type: string
+          description: Cloud region (Bedrock).
+        project_id:
+          type: string
+          description: Google Cloud project (Vertex).
+        location:
+          type: string
+          description: Google Cloud location (Vertex).
+        names:
+          type: array
+          items:
+            type: string
+          description: Named registry entries from node config that resolve to this provider instance.
+        configured_model_types:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectedModelType"
+          description: Model types this instance is configured for.
+        models:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/ConnectedModel"
+          description: |
+            Models reported by the provider, grouped by model type. Keys are
+            pluralized ConnectedModelType values ("embedders", "generators",
+            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "readers", "transcribers", "extractors") plus "other" for models
+            the provider's listing API does not classify by task. Populated
+            only when the request includes the "models" expansion.
+    ExternalIoProtocol:
+      type: string
+      enum:
+        - s3
+        - gcs
+        - filesystem
+        - http
+      description: External IO transport protocol.
+    WebSearchConnection:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Provider-specific service flavor, such as agent_search for provider vertex.
+        max_results:
+          type: integer
+          description: Maximum ranked results this connection is configured to return.
+        timeout_ms:
+          type: integer
+          description: Provider request timeout in milliseconds.
+        safe_search:
+          type: boolean
+          description: Whether safe-search filtering is requested.
+        language:
+          type: string
+          description: Preferred result language.
+        region:
+          type: string
+          description: Preferred result region.
+        include_content:
+          type: boolean
+          description: Whether extracted content is requested when supported.
+        include_highlights:
+          type: boolean
+          description: Whether highlighted passages are requested when supported.
+        endpoint:
+          type: string
+          description: Provider endpoint override when configured.
+        project_id:
+          type: string
+          description: Google Cloud project for provider vertex.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex.
+        include_domains:
+          type: array
+          items:
+            type: string
+          description: Domain allowlist when configured.
+        exclude_domains:
+          type: array
+          items:
+            type: string
+          description: Domain denylist when configured.
+        configured:
+          type: boolean
+          description: True when required credentials/config are present. Secret values are never returned.
+    ExternalIoConnection:
+      type: object
+      required:
+        - protocol
+      properties:
+        protocol:
+          $ref: "#/components/schemas/ExternalIoProtocol"
+        endpoint:
+          type: string
+          description: Custom endpoint URL when configured.
+        buckets:
+          type: array
+          items:
+            type: string
+          description: Buckets this connection is configured for.
+        prefix:
+          type: string
+          description: Key prefix when configured.
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Hosts or base URLs this connection applies to.
+    CdcConnection:
+      type: object
+      required:
+        - provider
+        - table_name
+        - source_ordinal
+      properties:
+        provider:
+          type: string
+          description: CDC provider type. Currently "postgres"; future CDC providers may add new values.
+          example: "postgres"
+        table_name:
+          type: string
+          description: Antfly table receiving changes from this CDC source.
+        source_ordinal:
+          type: integer
+          format: uint32
+          description: Zero-based ordinal of the replication source within the table config.
+        external_table:
+          type: string
+          description: Source-side table or stream name when reported by the provider.
+        slot_name:
+          type: string
+          description: Provider replication cursor or slot name when applicable.
+        publication_name:
+          type: string
+          description: Provider publication or stream grouping name when applicable.
+        phase:
+          type: string
+          description: Runtime CDC phase such as snapshot, streaming, configured, or failed.
+        lag_records:
+          type: integer
+          format: uint64
+          description: Source records behind, when reported by the runtime.
+        lag_millis:
+          type: integer
+          format: uint64
+          description: Source commit lag in milliseconds, when reported by the runtime.
+        last_success_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+        last_change_applied_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last applied source change, in milliseconds.
+        updated_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+    Connection:
+      type: object
+      required:
+        - id
+        - name
+        - kind
+        - status
+        - capabilities
+      properties:
+        id:
+          type: string
+          description: Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path.
+        name:
+          type: string
+          description: Human-readable short name for this connection instance.
+        display_name:
+          type: string
+          description: Optional display name for UIs.
+        provider:
+          type: string
+          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
+        kind:
+          $ref: "#/components/schemas/ConnectionKind"
+        status:
+          $ref: "#/components/schemas/ConnectionStatus"
+        error:
+          type: string
+          description: Failure detail when status is "error".
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream.
+        sources:
+          type: array
+          items:
+            type: string
+          description: |
+            Where this connection was configured, e.g.
+            "config:embedders/openai-small" or "table:docs/index:body_vec".
+        inference:
+          $ref: "#/components/schemas/InferenceConnection"
+        web_search:
+          $ref: "#/components/schemas/WebSearchConnection"
+        external_io:
+          $ref: "#/components/schemas/ExternalIoConnection"
+        cdc:
+          $ref: "#/components/schemas/CdcConnection"
+    ConnectionsResponse:
+      type: object
+      required:
+        - connections
+      properties:
+        connections:
+          type: array
+          items:
+            $ref: "#/components/schemas/Connection"
     DocumentArtifactChildRange:
       type: object
       description: Parsed child-range descriptor from a derived document artifact manifest.
@@ -6242,6 +6546,65 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ClusterTopology"
+        "401":
+          description: Unauthorized - authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /connections:
+    get:
+      summary: List configured external connections
+      tags:
+        - cluster_management
+      description: |
+        Enumerates public external connections configured on this node under
+        top-level `connections`: inference providers, web search providers,
+        external IO endpoints, and CDC replication sources.
+
+        The default response is config-derived and avoids slow provider calls.
+        With include=models, each inference provider is queried live for its
+        available models where the provider exposes a listing API. Connections
+        that fail to respond are reported with status "error" instead of
+        failing the whole response. A status of "configured" means the
+        connection exists but was not live-probed in this response.
+      operationId: listConnections
+      parameters:
+        - name: types
+          in: query
+          required: false
+          description: |
+            Comma-separated list of connection kinds to include
+            (e.g. "inference,external_io,cdc"). Defaults to all
+            kinds. This filters by the response "kind" field.
+          schema:
+            type: string
+        - name: include
+          in: query
+          required: false
+          description: |
+            Comma-separated list of expansions. Supported value: "models" —
+            live-query each inference provider's model listing API.
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          description: |
+            Set to "true" to bypass the short server-side cache for live
+            provider model listings and probes. This does not force a node
+            config or metadata reload.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Configured connections retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionsResponse"
         "401":
           description: Unauthorized - authentication required
           content:

@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/antflydb/antfly/go/pkg/antfly/lib/secrets"
 )
 
 // SearchProvider is the interface that all web search providers must implement
@@ -31,11 +33,13 @@ type SearchProvider interface {
 
 // SearchOptions contains options for search queries
 type SearchOptions struct {
-	MaxResults int
-	Language   string
-	Region     string
-	SafeSearch bool
-	TimeoutMS  int
+	MaxResults        int
+	Language          string
+	Region            string
+	SafeSearch        bool
+	TimeoutMS         int
+	IncludeContent    bool
+	IncludeHighlights bool
 }
 
 // FetchOptions contains options for URL fetching
@@ -54,21 +58,35 @@ func getConfigOrEnv(configVal *string, envVar string) string {
 	return os.Getenv(envVar)
 }
 
+func getResolvedConfigOrEnv(configVal *string, envVar string) (string, error) {
+	value := getConfigOrEnv(configVal, envVar)
+	if value == "" {
+		return "", nil
+	}
+	resolved, err := secrets.GetGlobalResolver().Resolve(value)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
 // NewSearchProvider creates a search provider based on the config
 func NewSearchProvider(config WebSearchConfig) (SearchProvider, error) {
 	switch config.Provider {
-	case WebSearchProviderGoogle:
-		return newGoogleProvider(config)
-	case WebSearchProviderBing:
-		return newBingProvider(config)
+	case WebSearchProviderExa:
+		return newExaProvider(config)
 	case WebSearchProviderSerper:
 		return newSerperProvider(config)
 	case WebSearchProviderTavily:
 		return newTavilyProvider(config)
 	case WebSearchProviderBrave:
 		return newBraveProvider(config)
-	case WebSearchProviderDuckduckgo:
-		return newDuckDuckGoProvider(config)
+	case WebSearchProviderYou:
+		return newYouProvider(config)
+	case WebSearchProviderLinkup:
+		return newLinkupProvider(config)
+	case WebSearchProviderVertex:
+		return newVertexProvider(config)
 	default:
 		return nil, fmt.Errorf("unsupported search provider: %s", config.Provider)
 	}
@@ -76,11 +94,13 @@ func NewSearchProvider(config WebSearchConfig) (SearchProvider, error) {
 
 // BaseProvider contains common functionality for all providers
 type BaseProvider struct {
-	client     *http.Client
-	maxResults int
-	language   string
-	region     string
-	safeSearch bool
+	client            *http.Client
+	maxResults        int
+	language          string
+	region            string
+	safeSearch        bool
+	includeContent    bool
+	includeHighlights bool
 }
 
 func newBaseProvider(config WebSearchConfig) BaseProvider {
@@ -103,9 +123,11 @@ func newBaseProvider(config WebSearchConfig) BaseProvider {
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		maxResults: maxResults,
-		language:   config.Language,
-		region:     config.Region,
-		safeSearch: safeSearch,
+		maxResults:        maxResults,
+		language:          config.Language,
+		region:            config.Region,
+		safeSearch:        safeSearch,
+		includeContent:    config.IncludeContent,
+		includeHighlights: config.IncludeHighlights,
 	}
 }
