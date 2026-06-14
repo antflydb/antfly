@@ -418,6 +418,28 @@ pub const ExtensionCatalog = struct {
         try self.packages.append(self.alloc, owned);
     }
 
+    pub fn loadProjectedRows(
+        self: *ExtensionCatalog,
+        packages: []const PackageManifest,
+        installed: []const InstalledExtension,
+        members: []const ExtensionMember,
+        dependencies: []const ExtensionDependency,
+    ) !void {
+        for (packages) |package| try self.registerPackage(package);
+        for (installed) |extension| {
+            try extension.validate();
+            try self.installed.append(self.alloc, try cloneInstalledExtension(self.alloc, extension));
+        }
+        for (members) |member| {
+            try member.validate();
+            try self.members.append(self.alloc, try cloneExtensionMember(self.alloc, member));
+        }
+        for (dependencies) |dependency| {
+            try dependency.validate();
+            try self.dependencies.append(self.alloc, try cloneExtensionDependency(self.alloc, dependency));
+        }
+    }
+
     pub fn installManifestOnly(
         self: *ExtensionCatalog,
         extension_name: []const u8,
@@ -661,6 +683,11 @@ pub const ExtensionCatalog = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    pub fn getInstalledAlloc(self: *const ExtensionCatalog, alloc: std.mem.Allocator, extension_name: []const u8) !InstalledExtension {
+        const idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
+        return try cloneInstalledExtension(alloc, self.installed.items[idx]);
+    }
+
     pub fn listDependencies(self: *const ExtensionCatalog, alloc: std.mem.Allocator) ![]ExtensionDependency {
         const out = try alloc.alloc(ExtensionDependency, self.dependencies.items.len);
         var initialized: usize = 0;
@@ -673,6 +700,19 @@ pub const ExtensionCatalog = struct {
             initialized += 1;
         }
         return out;
+    }
+
+    pub fn listDependenciesForExtension(self: *const ExtensionCatalog, alloc: std.mem.Allocator, extension_name: []const u8) ![]ExtensionDependency {
+        var out = std.ArrayListUnmanaged(ExtensionDependency).empty;
+        errdefer {
+            for (out.items) |dependency| freeExtensionDependency(alloc, dependency);
+            out.deinit(alloc);
+        }
+        for (self.dependencies.items) |dependency| {
+            if (!std.mem.eql(u8, dependency.extension_name, extension_name)) continue;
+            try out.append(alloc, try cloneExtensionDependency(alloc, dependency));
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     pub fn freePackages(_: *const ExtensionCatalog, alloc: std.mem.Allocator, records: []PackageManifest) void {

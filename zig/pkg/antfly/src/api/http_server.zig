@@ -354,6 +354,12 @@ pub const StatusSource = struct {
         get_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!void = null,
+        install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
+        update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
+        drop_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) anyerror!void = null,
+        enable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension = null,
+        disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension = null,
+        configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
     };
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
@@ -441,6 +447,36 @@ pub const StatusSource = struct {
         return true;
     }
 
+    pub fn installExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) !metadata_mod.InstalledExtension {
+        const fn_ptr = self.vtable.install_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn updateExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) !metadata_mod.InstalledExtension {
+        const fn_ptr = self.vtable.update_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn dropExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) !void {
+        const fn_ptr = self.vtable.drop_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn enableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !metadata_mod.InstalledExtension {
+        const fn_ptr = self.vtable.enable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn disableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !metadata_mod.InstalledExtension {
+        const fn_ptr = self.vtable.disable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn configureExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) !metadata_mod.InstalledExtension {
+        const fn_ptr = self.vtable.configure_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
     fn makeServiceVTable(comptime T: type) VTable {
         const Gen = struct {
             fn cast(ptr: *anyopaque) *T {
@@ -516,6 +552,30 @@ pub const StatusSource = struct {
             fn removeJoinShuffleLease(ptr: *anyopaque, job_id: u64) anyerror!void {
                 try cast(ptr).removeShuffleJoinLease(job_id);
             }
+
+            fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+                return try installExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+                return try updateExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn dropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) anyerror!void {
+                return try dropExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension {
+                return try enableExtensionOnService(cast(ptr), alloc, name);
+            }
+
+            fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension {
+                return try disableExtensionOnService(cast(ptr), alloc, name);
+            }
+
+            fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+                return try configureExtensionOnService(cast(ptr), alloc, name, req);
+            }
         };
 
         return .{
@@ -535,6 +595,12 @@ pub const StatusSource = struct {
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
             .upsert_join_shuffle_lease = Gen.upsertJoinShuffleLease,
             .remove_join_shuffle_lease = Gen.removeJoinShuffleLease,
+            .install_extension = Gen.installExtension,
+            .update_extension = Gen.updateExtension,
+            .drop_extension = Gen.dropExtension,
+            .enable_extension = Gen.enableExtension,
+            .disable_extension = Gen.disableExtension,
+            .configure_extension = Gen.configureExtension,
         };
     }
 
@@ -1808,14 +1874,66 @@ pub const ApiHttpServer = struct {
         if (!is_extension_path) return null;
 
         if (req.method != .GET) {
-            if (routes.Routes.matchInstalledExtension(uri_parts.path) != null or
-                routes.Routes.matchInstalledExtensionUpdate(uri_parts.path) != null or
-                routes.Routes.matchInstalledExtensionDrop(uri_parts.path) != null or
-                routes.Routes.matchInstalledExtensionEnable(uri_parts.path) != null or
-                routes.Routes.matchInstalledExtensionDisable(uri_parts.path) != null or
-                routes.Routes.matchInstalledExtensionConfig(uri_parts.path) != null)
-            {
-                return try jsonErrorResponse(self.alloc, 405, "extension lifecycle mutation is not wired to metadata storage yet");
+            if (req.method == .POST) {
+                if (routes.Routes.matchInstalledExtensionUpdate(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(metadata_mod.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension update request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.updateExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(metadata_mod.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension drop request");
+                    };
+                    defer parsed.deinit();
+                    self.source.dropExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    return try jsonResponse(self.alloc, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
+                }
+                if (routes.Routes.matchInstalledExtensionEnable(uri_parts.path)) |installed_route| {
+                    var installed = self.source.enableExtension(self.alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtensionDisable(uri_parts.path)) |installed_route| {
+                    var installed = self.source.disableExtension(self.alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, installed);
+                }
+                if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(metadata_mod.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension install request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.installExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, installed);
+                }
+            }
+            if (req.method == .PUT) {
+                if (routes.Routes.matchInstalledExtensionConfig(uri_parts.path)) |installed_route| {
+                    var parsed = std.json.parseFromSlice(metadata_mod.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try jsonErrorResponse(self.alloc, 400, "invalid extension config request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.configureExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, installed);
+                }
             }
             return try jsonErrorResponse(self.alloc, 405, "method not allowed");
         }
@@ -6626,6 +6744,208 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     };
 }
 
+fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
+    return if (body.len == 0) "{}" else body;
+}
+
+fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.UnsupportedOperation => try jsonErrorResponse(alloc, 405, "method not allowed"),
+        error.PackageNotFound, error.ExtensionNotInstalled => try jsonErrorResponse(alloc, 404, "not found"),
+        error.ExtensionAlreadyInstalled => try jsonErrorResponse(alloc, 409, "extension already installed"),
+        error.DependentExtensionExists => try jsonErrorResponse(alloc, 409, "dependent extension exists"),
+        error.RequiredExtensionNotInstalled => try jsonErrorResponse(alloc, 409, "required extension not installed"),
+        error.UnsupportedManifestApiVersion,
+        error.UnsupportedPackageKind,
+        error.UnsupportedExtensionScope,
+        error.UnsupportedObjectKindForV1,
+        error.PackageVersionMismatch,
+        error.UpdatePathNotFound,
+        error.ExtensionDisabled,
+        error.ExtensionLifecycleBusy,
+        error.InvalidJsonObject,
+        error.EmptyName,
+        error.InvalidIdentifier,
+        error.MemberTableOutsideScope,
+        => try jsonErrorResponse(alloc, 400, "invalid extension lifecycle request"),
+        else => err,
+    };
+}
+
+fn installExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: metadata_mod.InstallExtensionRequest,
+) !metadata_mod.InstalledExtension {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+
+    var persisted_request = request;
+    persisted_request.dry_run = false;
+    const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    var installed = try catalog.installManifestOnly(extension_name, extension_name, persisted_request, installed_at_ms);
+    errdefer installed.deinitOwned(alloc);
+
+    if (!request.dry_run) {
+        const members = try catalog.listMembersForExtension(alloc, extension_name);
+        defer catalog.freeMembers(alloc, members);
+        const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
+        defer catalog.freeDependencies(alloc, dependencies);
+
+        try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+        for (dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
+        for (members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
+    }
+
+    return installed;
+}
+
+fn updateExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: metadata_mod.UpdateExtensionRequest,
+) !metadata_mod.InstalledExtension {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+
+    var persisted_request = request;
+    persisted_request.dry_run = false;
+    var installed = try catalog.updateManifestOnly(extension_name, persisted_request);
+    errdefer installed.deinitOwned(alloc);
+
+    if (!request.dry_run) {
+        const old_members = try extensionMembersForName(alloc, snapshot.extension_members, extension_name);
+        defer if (old_members.len > 0) alloc.free(old_members);
+        const old_dependencies = try extensionDependenciesForName(alloc, snapshot.extension_dependencies, extension_name);
+        defer if (old_dependencies.len > 0) alloc.free(old_dependencies);
+        const new_members = try catalog.listMembersForExtension(alloc, extension_name);
+        defer catalog.freeMembers(alloc, new_members);
+        const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
+        defer catalog.freeDependencies(alloc, new_dependencies);
+
+        for (old_dependencies) |dependency| {
+            try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
+                .extension_name = dependency.extension_name,
+                .required_extension_name = dependency.required_extension_name,
+                .package_name = dependency.package_name,
+            } });
+        }
+        for (old_members) |member| {
+            try service.proposeTransitionCommand(.{ .remove_extension_member = .{
+                .extension_name = member.extension_name,
+                .object_kind = member.object_kind,
+                .object_name = member.object_name,
+            } });
+        }
+        try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+        for (new_dependencies) |dependency| try service.proposeTransitionCommand(.{ .upsert_extension_dependency = dependency });
+        for (new_members) |member| try service.proposeTransitionCommand(.{ .upsert_extension_member = member });
+    }
+
+    return installed;
+}
+
+fn dropExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: metadata_mod.DropExtensionRequest,
+) !void {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+
+    var persisted_request = request;
+    persisted_request.dry_run = false;
+    try catalog.dropInstalledWithMode(extension_name, persisted_request);
+    if (request.dry_run) return;
+
+    const remaining_installed = try catalog.listInstalled(alloc);
+    defer catalog.freeInstalled(alloc, remaining_installed);
+    const remaining_members = try catalog.listMembers(alloc);
+    defer catalog.freeMembers(alloc, remaining_members);
+    const remaining_dependencies = try catalog.listDependencies(alloc);
+    defer catalog.freeDependencies(alloc, remaining_dependencies);
+
+    for (snapshot.extension_dependencies) |dependency| {
+        if (extensionDependencyExists(remaining_dependencies, dependency)) continue;
+        try service.proposeTransitionCommand(.{ .remove_extension_dependency = .{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        } });
+    }
+    for (snapshot.extension_members) |member| {
+        if (extensionMemberExists(remaining_members, member)) continue;
+        try service.proposeTransitionCommand(.{ .remove_extension_member = .{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        } });
+    }
+    for (snapshot.installed_extensions) |installed| {
+        if (installedExtensionExists(remaining_installed, installed.name)) continue;
+        try service.proposeTransitionCommand(.{ .remove_installed_extension = .{ .name = installed.name } });
+    }
+}
+
+fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !metadata_mod.InstalledExtension {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+    try catalog.enableInstalled(extension_name);
+    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
+    errdefer installed.deinitOwned(alloc);
+    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    return installed;
+}
+
+fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !metadata_mod.InstalledExtension {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+    try catalog.disableInstalled(extension_name);
+    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
+    errdefer installed.deinitOwned(alloc);
+    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    return installed;
+}
+
+fn configureExtensionOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: metadata_mod.ConfigureExtensionRequest,
+) !metadata_mod.InstalledExtension {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
+    defer catalog.deinit();
+    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
+    try catalog.configureInstalled(extension_name, request);
+    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
+    errdefer installed.deinitOwned(alloc);
+    try service.proposeTransitionCommand(.{ .upsert_installed_extension = installed });
+    return installed;
+}
+
 fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const metadata_mod.PackageManifest {
     for (snapshot.extension_packages) |*package| {
         if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
@@ -6639,6 +6959,13 @@ fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name:
         if (std.mem.eql(u8, package.name, name)) found = package;
     }
     return found;
+}
+
+fn installedExtensionExists(installed_extensions: []const metadata_mod.InstalledExtension, name: []const u8) bool {
+    for (installed_extensions) |installed| {
+        if (std.mem.eql(u8, installed.name, name)) return true;
+    }
+    return false;
 }
 
 fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.InstalledExtension {
@@ -6665,6 +6992,49 @@ fn extensionMembersForName(
         i += 1;
     }
     return out;
+}
+
+fn extensionDependenciesForName(
+    alloc: std.mem.Allocator,
+    dependencies: []const metadata_mod.ExtensionDependency,
+    extension_name: []const u8,
+) ![]metadata_mod.ExtensionDependency {
+    var count: usize = 0;
+    for (dependencies) |dependency| {
+        if (std.mem.eql(u8, dependency.extension_name, extension_name)) count += 1;
+    }
+    const out = try alloc.alloc(metadata_mod.ExtensionDependency, count);
+    var i: usize = 0;
+    for (dependencies) |dependency| {
+        if (!std.mem.eql(u8, dependency.extension_name, extension_name)) continue;
+        out[i] = dependency;
+        i += 1;
+    }
+    return out;
+}
+
+fn extensionMemberExists(members: []const metadata_mod.ExtensionMember, needle: metadata_mod.ExtensionMember) bool {
+    for (members) |member| {
+        if (std.mem.eql(u8, member.extension_name, needle.extension_name) and
+            member.object_kind == needle.object_kind and
+            std.mem.eql(u8, member.object_name, needle.object_name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn extensionDependencyExists(dependencies: []const metadata_mod.ExtensionDependency, needle: metadata_mod.ExtensionDependency) bool {
+    for (dependencies) |dependency| {
+        if (std.mem.eql(u8, dependency.extension_name, needle.extension_name) and
+            std.mem.eql(u8, dependency.required_extension_name, needle.required_extension_name) and
+            std.mem.eql(u8, dependency.package_name, needle.package_name))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
@@ -8376,6 +8746,65 @@ test "api http server serves extension catalog reads" {
     var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
     defer write_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), write_resp.status);
+}
+
+test "api http server dispatches extension lifecycle mutations" {
+    const FakeSource = struct {
+        install_called: bool = false,
+        install_dry_run: bool = false,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .install_extension = installExtension,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) !metadata_mod.InstalledExtension {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.install_called = true;
+            self.install_dry_run = req.dry_run;
+            return .{
+                .name = try alloc.dupe(u8, name),
+                .package_name = try alloc.dupe(u8, name),
+                .package_version = try alloc.dupe(u8, if (req.version.len > 0) req.version else "1.0.0"),
+                .package_digest = try alloc.dupe(u8, "sha256:test"),
+                .scope = .{
+                    .kind = req.scope.kind,
+                    .table_name = if (req.scope.table_name.len > 0) try alloc.dupe(u8, req.scope.table_name) else "",
+                },
+                .config_json = try alloc.dupe(u8, req.config_json),
+                .granted_capabilities = &.{},
+                .installed_at_epoch_ms = 123,
+                .status = .ready,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var install_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/extensions/v1/installed/memoryaf",
+        .content_type = "application/json",
+        .body = "{\"version\":\"1.2.3\",\"scope\":{\"kind\":\"table\",\"table_name\":\"memories\"},\"config_json\":\"{\\\"tenant\\\":\\\"acme\\\"}\",\"dry_run\":true}",
+    });
+    defer install_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), install_resp.status);
+    try std.testing.expect(source.install_called);
+    try std.testing.expect(source.install_dry_run);
+    var installed = try std.json.parseFromSlice(metadata_mod.InstalledExtension, std.testing.allocator, install_resp.body, .{ .ignore_unknown_fields = true });
+    defer installed.deinit();
+    try std.testing.expectEqualStrings("memoryaf", installed.value.name);
+    try std.testing.expectEqualStrings("1.2.3", installed.value.package_version);
+    try std.testing.expectEqualStrings("memories", installed.value.scope.table_name);
 }
 
 test "api http server serves mcp and a2a protocol surfaces" {

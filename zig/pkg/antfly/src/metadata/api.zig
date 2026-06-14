@@ -94,6 +94,7 @@ pub const MetadataStatus = struct {
     projected_extension_packages: usize = 0,
     projected_installed_extensions: usize = 0,
     projected_extension_members: usize = 0,
+    projected_extension_dependencies: usize = 0,
     projected_ranges: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
@@ -149,6 +150,7 @@ pub const AdminSnapshot = struct {
     extension_packages: []metadata_extensions.PackageManifest = &.{},
     installed_extensions: []metadata_extensions.InstalledExtension = &.{},
     extension_members: []metadata_extensions.ExtensionMember = &.{},
+    extension_dependencies: []metadata_extensions.ExtensionDependency = &.{},
     split_transitions: []transition_state.SplitTransitionRecord,
     merge_transitions: []transition_state.MergeTransitionRecord,
     split_observations: []transition_state.SplitObservationRecord = &.{},
@@ -199,6 +201,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedExtensionMembers")) {
         snapshot.extension_members = try source.listProjectedExtensionMembers(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedExtensionDependencies")) {
+        snapshot.extension_dependencies = try source.listProjectedExtensionDependencies(alloc);
     }
     snapshot.replication_source_action_hints = try deriveReplicationSourceActionHints(alloc, snapshot.tables, snapshot.replication_source_statuses);
     snapshot.split_transitions = try source.listProjectedSplitTransitions(alloc);
@@ -261,6 +266,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedExtensionMembers") and snapshot.extension_members.len > 0) {
         source.freeProjectedExtensionMembers(alloc, snapshot.extension_members);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedExtensionDependencies") and snapshot.extension_dependencies.len > 0) {
+        source.freeProjectedExtensionDependencies(alloc, snapshot.extension_dependencies);
     }
     freeReplicationSourceActionHints(alloc, snapshot.replication_source_action_hints);
     source.freeProjectedSplitTransitions(alloc, snapshot.split_transitions);
