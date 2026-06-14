@@ -15,6 +15,7 @@
 const std = @import("std");
 const routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const metadata_mod = @import("../metadata/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
@@ -161,6 +162,17 @@ const mcp_tool_specs = [_]McpToolSpec{
             .{ .name = "deletes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
         },
     },
+};
+
+const ExtensionMcpTool = struct {
+    member: *const metadata_mod.ExtensionMember,
+    description: []u8,
+    input_schema_json: []u8,
+
+    fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
+        alloc.free(self.description);
+        alloc.free(self.input_schema_json);
+    }
 };
 
 pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype) !http_common.HttpResponse {
@@ -335,6 +347,20 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             return try mcpResultFromHttpResponse(alloc, resp);
         }
     };
+    const ExtensionToolContext = struct {
+        member: *const metadata_mod.ExtensionMember,
+
+        fn handler(ctx: *@This()) mcp.ToolHandler {
+            return .{ .ptr = ctx, .call_fn = call };
+        }
+
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.json.Value) !mcp.CallToolResult {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            const message = try std.fmt.allocPrint(alloc, "extension MCP tool '{s}' is registered but has no executable handler in v1", .{ctx.member.object_name});
+            defer alloc.free(message);
+            return mcpError(alloc, message);
+        }
+    };
 
     var contexts: [mcp_tool_specs.len]ToolContext = undefined;
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
@@ -344,6 +370,27 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             .trusted_principal = req.header(trusted_principal_header),
             .kind = spec.kind,
         };
+    }
+
+    var snapshot_opt = try server_ptr.source.adminSnapshot();
+    defer if (snapshot_opt) |*snapshot| server_ptr.source.freeAdminSnapshot(snapshot);
+
+    var extension_tools = std.ArrayListUnmanaged(ExtensionMcpTool).empty;
+    defer {
+        for (extension_tools.items) |tool| tool.deinit(server_ptr.alloc);
+        extension_tools.deinit(server_ptr.alloc);
+    }
+    if (snapshot_opt) |*snapshot| {
+        for (snapshot.extension_members) |*member| {
+            if (member.object_kind != .mcp_tool) continue;
+            if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, member.extension_name)) continue;
+            try extension_tools.append(server_ptr.alloc, try extensionMcpToolFromMemberAlloc(server_ptr.alloc, member));
+        }
+    }
+    const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
+    defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
+    for (extension_contexts, extension_tools.items) |*ctx, tool| {
+        ctx.* = .{ .member = tool.member };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -367,6 +414,14 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             .name = spec.name,
             .description = spec.description,
             .input_schema_json = input_schemas[i],
+            .handler = ctx.handler(),
+        });
+    }
+    for (extension_tools.items, extension_contexts) |tool, *ctx| {
+        try protocol_server.addTool(server_ptr.alloc, .{
+            .name = tool.member.object_name,
+            .description = tool.description,
+            .input_schema_json = tool.input_schema_json,
             .handler = ctx.handler(),
         });
     }
@@ -429,6 +484,60 @@ fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_
     const session_id = req.header(mcp.session_id_header) orelse return try textResponse(server_ptr.alloc, 400, "missing MCP session");
     if (!server_ptr.mcp_sessions.iface().exists(session_id)) return try textResponse(server_ptr.alloc, 404, "unknown MCP session");
     return null;
+}
+
+fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const metadata_mod.ExtensionMember) !ExtensionMcpTool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+
+    var description: ?[]u8 = null;
+    errdefer if (description) |value| alloc.free(value);
+    var input_schema_json: ?[]u8 = null;
+    errdefer if (input_schema_json) |value| alloc.free(value);
+
+    if (parsed) |config| {
+        if (config.value == .object) {
+            if (jsonStringObjectField(config.value.object, "description")) |value| {
+                description = try alloc.dupe(u8, value);
+            }
+            if (config.value.object.get("input_schema")) |schema| {
+                if (schema == .object) input_schema_json = try stringifyJsonValue(alloc, schema);
+            }
+            if (input_schema_json == null) {
+                if (jsonStringObjectField(config.value.object, "input_schema_json")) |schema_json| {
+                    if (schema_json.len != 0) input_schema_json = try cloneValidMcpInputSchemaJson(alloc, schema_json);
+                }
+            }
+        }
+    }
+
+    if (description == null) {
+        description = try std.fmt.allocPrint(alloc, "Extension MCP tool {s}.{s}", .{ member.extension_name, member.object_name });
+    }
+    if (input_schema_json == null) {
+        input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}");
+    }
+
+    return .{
+        .member = member,
+        .description = description.?,
+        .input_schema_json = input_schema_json.?,
+    };
+}
+
+fn extensionRuntimeMemberVisible(installed_extensions: []const metadata_mod.InstalledExtension, extension_name: []const u8) bool {
+    for (installed_extensions) |installed| {
+        if (!std.mem.eql(u8, installed.name, extension_name)) continue;
+        return installed.status == .ready;
+    }
+    return false;
+}
+
+fn cloneValidMcpInputSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return try alloc.dupe(u8, schema_json);
 }
 
 fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {

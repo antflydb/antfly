@@ -9381,6 +9381,96 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp.body, "\"state\":\"canceled\"") != null);
 }
 
+test "api http server lists extension-owned mcp tools" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 1, .projected_extension_members = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{.{
+                    .name = "memoryaf",
+                    .package_name = "memoryaf",
+                    .package_version = "1.0.0",
+                    .package_digest = "sha256:abc",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .status = .ready,
+                }})[0..]),
+                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{.{
+                    .extension_name = "memoryaf",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .object_kind = .mcp_tool,
+                    .object_name = "recall",
+                    .table_name = "memories",
+                    .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}}}",
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"description\":\"Search long-term memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"query\"]") != null);
+
+    var call_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"recall\",\"arguments\":{\"query\":\"alpha\"}}}",
+    });
+    defer call_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), call_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "no executable handler in v1") != null);
+}
+
 test "api http server authenticates trusted principal" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
