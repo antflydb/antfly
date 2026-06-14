@@ -97,13 +97,13 @@ type RerankerProvider string
 //
 // **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
 type VertexRerankerConfig struct {
-	// CredentialsPath Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+	// CredentialsPath Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
 	CredentialsPath *string `json:"credentials_path,omitempty"`
 
 	// Model The ranking model to use.
 	Model string `json:"model"`
 
-	// ProjectId Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+	// ProjectId Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
 	ProjectId *string `json:"project_id,omitempty"`
 
 	// TopN Maximum number of records to return. If not specified, returns all documents with scores.
@@ -417,30 +417,31 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"//8xL3vIYxEAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

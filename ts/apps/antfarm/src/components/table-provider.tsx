@@ -13,7 +13,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [tables, setTables] = useState<TableStatus[]>([]);
-  const [isLoadingTables, setIsLoadingTables] = useState(false);
+  const [isLoadingTables, setIsLoadingTables] = useState(() => isProductEnabled("antfly"));
   const [embeddingIndexes, setEmbeddingIndexes] = useState<string[]>([]);
   const [chatIndexes, setChatIndexes] = useState<string[]>([]);
   const [isLoadingIndexes, setIsLoadingIndexes] = useState(false);
@@ -62,7 +62,7 @@ export function TableProvider({ children }: { children: ReactNode }) {
       setSelectedTableState(name);
       const isOnTablePage = location.pathname.startsWith("/tables/");
       if (isOnTablePage) {
-        navigate(`/tables/${name}`);
+        navigate(`/tables/${encodeURIComponent(name)}?section=overview`);
       } else {
         setSearchParams(
           (prev) => {

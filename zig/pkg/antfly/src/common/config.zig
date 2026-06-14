@@ -49,6 +49,7 @@ pub const Config = struct {
     storage: StorageConfig = .{},
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
+    connections: ConnectionsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
 
     pub const MetadataConfig = struct {
@@ -138,6 +139,155 @@ pub const Config = struct {
     pub const S3CredentialConfig = scraping.S3CredentialConfig;
     pub const HTTPCredentialConfig = scraping.HTTPCredentialConfig;
     pub const RemoteContentConfig = scraping.RemoteContentConfig;
+
+    pub const ConnectionsConfig = std.StringArrayHashMapUnmanaged(ConnectionConfig);
+
+    pub const ConnectionKind = enum {
+        inference,
+        web_search,
+        external_io,
+        cdc,
+    };
+
+    pub const ExternalIoProtocol = enum {
+        s3,
+        gcs,
+        filesystem,
+        http,
+    };
+
+    pub const ConnectionConfig = struct {
+        display_name: ?[]u8 = null,
+        provider: ?[]u8 = null,
+        kind: ConnectionKind,
+        capabilities: []const []u8 = &.{},
+        inference: ?InferenceConnectionConfig = null,
+        web_search: ?WebSearchConnectionConfig = null,
+        external_io: ?ExternalIoConnectionConfig = null,
+        cdc: ?CdcConnectionConfig = null,
+
+        fn deinit(self: *ConnectionConfig, alloc: std.mem.Allocator) void {
+            if (self.display_name) |value| alloc.free(value);
+            if (self.provider) |value| alloc.free(value);
+            freeOwnedStringSlice(alloc, self.capabilities);
+            if (self.inference) |*inference| inference.deinit(alloc);
+            if (self.web_search) |*web_search| web_search.deinit(alloc);
+            if (self.external_io) |*external_io| external_io.deinit(alloc);
+            if (self.cdc) |*cdc| cdc.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    pub const InferenceConnectionConfig = struct {
+        provider: []u8,
+        url: ?[]u8 = null,
+        api_key: ?[]u8 = null,
+        region: ?[]u8 = null,
+        project_id: ?[]u8 = null,
+        location: ?[]u8 = null,
+        credentials_path: ?[]u8 = null,
+        names: []const []u8 = &.{},
+        configured_model_types: []const []u8 = &.{},
+
+        fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
+            alloc.free(self.provider);
+            if (self.url) |value| alloc.free(value);
+            if (self.api_key) |value| alloc.free(value);
+            if (self.region) |value| alloc.free(value);
+            if (self.project_id) |value| alloc.free(value);
+            if (self.location) |value| alloc.free(value);
+            if (self.credentials_path) |value| alloc.free(value);
+            freeOwnedStringSlice(alloc, self.names);
+            freeOwnedStringSlice(alloc, self.configured_model_types);
+            self.* = undefined;
+        }
+    };
+
+    pub const WebSearchConnectionConfig = struct {
+        service: ?[]u8 = null,
+        max_results: ?u32 = null,
+        timeout_ms: ?u32 = null,
+        safe_search: ?bool = null,
+        language: ?[]u8 = null,
+        region: ?[]u8 = null,
+        include_content: ?bool = null,
+        include_highlights: ?bool = null,
+        api_key: ?[]u8 = null,
+        endpoint: ?[]u8 = null,
+        project_id: ?[]u8 = null,
+        location: ?[]u8 = null,
+        data_store: ?[]u8 = null,
+        serving_config: ?[]u8 = null,
+        credentials_path: ?[]u8 = null,
+        include_domains: []const []u8 = &.{},
+        exclude_domains: []const []u8 = &.{},
+
+        fn deinit(self: *WebSearchConnectionConfig, alloc: std.mem.Allocator) void {
+            if (self.service) |value| alloc.free(value);
+            if (self.language) |value| alloc.free(value);
+            if (self.region) |value| alloc.free(value);
+            if (self.api_key) |value| alloc.free(value);
+            if (self.endpoint) |value| alloc.free(value);
+            if (self.project_id) |value| alloc.free(value);
+            if (self.location) |value| alloc.free(value);
+            if (self.data_store) |value| alloc.free(value);
+            if (self.serving_config) |value| alloc.free(value);
+            if (self.credentials_path) |value| alloc.free(value);
+            freeOwnedStringSlice(alloc, self.include_domains);
+            freeOwnedStringSlice(alloc, self.exclude_domains);
+            self.* = undefined;
+        }
+    };
+
+    pub const ExternalIoConnectionConfig = struct {
+        protocol: ExternalIoProtocol,
+        endpoint: ?[]u8 = null,
+        buckets: []const []u8 = &.{},
+        prefix: ?[]u8 = null,
+        hosts: []const []u8 = &.{},
+        headers: std.StringArrayHashMapUnmanaged([]u8) = .{},
+        access_key_id: ?[]u8 = null,
+        secret_access_key: ?[]u8 = null,
+        session_token: ?[]u8 = null,
+        use_ssl: ?bool = null,
+
+        fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
+            if (self.endpoint) |value| alloc.free(value);
+            freeOwnedStringSlice(alloc, self.buckets);
+            if (self.prefix) |value| alloc.free(value);
+            freeOwnedStringSlice(alloc, self.hosts);
+            var it = self.headers.iterator();
+            while (it.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
+            }
+            self.headers.deinit(alloc);
+            if (self.access_key_id) |value| alloc.free(value);
+            if (self.secret_access_key) |value| alloc.free(value);
+            if (self.session_token) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    pub const CdcConnectionConfig = struct {
+        provider: []u8,
+        dsn: ?[]u8 = null,
+        table_name: ?[]u8 = null,
+        source_ordinal: ?u32 = null,
+        external_table: ?[]u8 = null,
+        slot_name: ?[]u8 = null,
+        publication_name: ?[]u8 = null,
+
+        fn deinit(self: *CdcConnectionConfig, alloc: std.mem.Allocator) void {
+            alloc.free(self.provider);
+            if (self.dsn) |value| alloc.free(value);
+            if (self.table_name) |value| alloc.free(value);
+            if (self.external_table) |value| alloc.free(value);
+            if (self.slot_name) |value| alloc.free(value);
+            if (self.publication_name) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
 
     pub const ShardAllocationConfig = struct {
         default_shards_per_table: u32 = default_config_shards_per_table,
@@ -246,6 +396,7 @@ pub const Config = struct {
                 try parseRemoteContentConfig(alloc, remote_content)
             else
                 null,
+            .connections = try parseConnectionsConfig(alloc, root.get("connections")),
             .shard_allocation = .{
                 .default_shards_per_table = try optionalU32Field(root, "default_shards_per_table") orelse if (swarm_mode) default_swarm_shards_per_table else default_config_shards_per_table,
                 .max_shard_size_bytes = try optionalU64Field(root, "max_shard_size_bytes") orelse default_max_shard_size_bytes,
@@ -293,6 +444,7 @@ pub const Config = struct {
         self.readers.deinit();
         self.text_to_speech.deinit();
         if (self.remote_content) |*remote_content| remote_content.deinit(self.registry.allocator);
+        deinitConnectionsConfig(self.registry.allocator, &self.connections);
         self.registry.deinit();
         self.* = undefined;
     }
@@ -635,6 +787,197 @@ fn parseRemoteContentHttpCredential(alloc: std.mem.Allocator, value: std.json.Va
     return cfg;
 }
 
+fn parseConnectionsConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !Config.ConnectionsConfig {
+    var connections = Config.ConnectionsConfig{};
+    errdefer deinitConnectionsConfig(alloc, &connections);
+
+    const value = maybe_value orelse return connections;
+    if (value != .object) return error.InvalidConfig;
+
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const id = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(id);
+        var connection = try parseConnectionConfig(alloc, entry.value_ptr.*);
+        errdefer connection.deinit(alloc);
+
+        const gop = try connections.getOrPut(alloc, id);
+        if (gop.found_existing) {
+            alloc.free(id);
+            connection.deinit(alloc);
+            return error.InvalidConfig;
+        }
+        gop.key_ptr.* = id;
+        gop.value_ptr.* = connection;
+    }
+
+    return connections;
+}
+
+fn deinitConnectionsConfig(alloc: std.mem.Allocator, connections: *Config.ConnectionsConfig) void {
+    var it = connections.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(alloc);
+    }
+    connections.deinit(alloc);
+}
+
+fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ConnectionConfig {
+    if (value != .object) return error.InvalidConfig;
+    const kind = try requiredEnumField(Config.ConnectionKind, value.object, "kind");
+    var connection = Config.ConnectionConfig{
+        .display_name = try optionalStringFieldDup(alloc, value.object, "display_name"),
+        .provider = try optionalStringFieldDup(alloc, value.object, "provider"),
+        .kind = kind,
+        .capabilities = try requiredStringArrayField(alloc, value.object, "capabilities"),
+    };
+    errdefer connection.deinit(alloc);
+
+    switch (kind) {
+        .inference => connection.inference = try parseInferenceConnectionConfig(alloc, value.object.get("inference") orelse return error.InvalidConfig),
+        .web_search => {
+            if (connection.provider == null) return error.InvalidConfig;
+            connection.web_search = try parseWebSearchConnectionConfig(alloc, value.object.get("web_search") orelse return error.InvalidConfig);
+        },
+        .external_io => connection.external_io = try parseExternalIoConnectionConfig(alloc, value.object.get("external_io") orelse return error.InvalidConfig),
+        .cdc => connection.cdc = try parseCdcConnectionConfig(alloc, value.object.get("cdc") orelse return error.InvalidConfig),
+    }
+    return connection;
+}
+
+fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
+    if (value != .object) return error.InvalidConfig;
+    return .{
+        .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
+        .url = try optionalStringFieldDup(alloc, value.object, "url"),
+        .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
+        .region = try optionalStringFieldDup(alloc, value.object, "region"),
+        .project_id = try optionalStringFieldDup(alloc, value.object, "project_id"),
+        .location = try optionalStringFieldDup(alloc, value.object, "location"),
+        .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
+        .names = try optionalStringArrayField(alloc, value.object, "names") orelse &.{},
+        .configured_model_types = try optionalStringArrayField(alloc, value.object, "configured_model_types") orelse &.{},
+    };
+}
+
+fn parseWebSearchConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.WebSearchConnectionConfig {
+    if (value != .object) return error.InvalidConfig;
+    return .{
+        .service = try optionalStringFieldDup(alloc, value.object, "service"),
+        .max_results = try optionalU32Field(value.object, "max_results"),
+        .timeout_ms = try optionalU32Field(value.object, "timeout_ms"),
+        .safe_search = try optionalBoolField(value.object, "safe_search"),
+        .language = try optionalStringFieldDup(alloc, value.object, "language"),
+        .region = try optionalStringFieldDup(alloc, value.object, "region"),
+        .include_content = try optionalBoolField(value.object, "include_content"),
+        .include_highlights = try optionalBoolField(value.object, "include_highlights"),
+        .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
+        .endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint"),
+        .project_id = try optionalStringFieldDup(alloc, value.object, "project_id"),
+        .location = try optionalStringFieldDup(alloc, value.object, "location"),
+        .data_store = try optionalStringFieldDup(alloc, value.object, "data_store"),
+        .serving_config = try optionalStringFieldDup(alloc, value.object, "serving_config"),
+        .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
+        .include_domains = try optionalStringArrayField(alloc, value.object, "include_domains") orelse &.{},
+        .exclude_domains = try optionalStringArrayField(alloc, value.object, "exclude_domains") orelse &.{},
+    };
+}
+
+fn parseExternalIoConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.ExternalIoConnectionConfig {
+    if (value != .object) return error.InvalidConfig;
+    var cfg = Config.ExternalIoConnectionConfig{
+        .protocol = try requiredEnumField(Config.ExternalIoProtocol, value.object, "protocol"),
+        .endpoint = try optionalStringFieldDup(alloc, value.object, "endpoint"),
+        .buckets = try optionalStringArrayField(alloc, value.object, "buckets") orelse &.{},
+        .prefix = try optionalStringFieldDup(alloc, value.object, "prefix"),
+        .hosts = try optionalStringArrayField(alloc, value.object, "hosts") orelse &.{},
+        .access_key_id = try optionalStringFieldDup(alloc, value.object, "access_key_id"),
+        .secret_access_key = try optionalStringFieldDup(alloc, value.object, "secret_access_key"),
+        .session_token = try optionalStringFieldDup(alloc, value.object, "session_token"),
+        .use_ssl = try optionalBoolField(value.object, "use_ssl"),
+    };
+    errdefer cfg.deinit(alloc);
+
+    if (value.object.get("headers")) |headers| {
+        if (headers != .object) return error.InvalidConfig;
+        var it = headers.object.iterator();
+        while (it.next()) |entry| {
+            const key = try alloc.dupe(u8, entry.key_ptr.*);
+            errdefer alloc.free(key);
+            const header_value = switch (entry.value_ptr.*) {
+                .string => |string| try alloc.dupe(u8, string),
+                else => return error.InvalidConfig,
+            };
+            errdefer alloc.free(header_value);
+            const gop = try cfg.headers.getOrPut(alloc, key);
+            if (gop.found_existing) {
+                alloc.free(key);
+                alloc.free(header_value);
+                return error.InvalidConfig;
+            }
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = header_value;
+        }
+    }
+
+    return cfg;
+}
+
+fn parseCdcConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.CdcConnectionConfig {
+    if (value != .object) return error.InvalidConfig;
+    return .{
+        .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
+        .dsn = try optionalStringFieldDup(alloc, value.object, "dsn"),
+        .table_name = try optionalStringFieldDup(alloc, value.object, "table_name"),
+        .source_ordinal = try optionalU32Field(value.object, "source_ordinal"),
+        .external_table = try optionalStringFieldDup(alloc, value.object, "external_table"),
+        .slot_name = try optionalStringFieldDup(alloc, value.object, "slot_name"),
+        .publication_name = try optionalStringFieldDup(alloc, value.object, "publication_name"),
+    };
+}
+
+fn requiredEnumField(comptime T: type, object: std.json.ObjectMap, field_name: []const u8) !T {
+    const value = object.get(field_name) orelse return error.InvalidConfig;
+    if (value != .string) return error.InvalidConfig;
+    return std.meta.stringToEnum(T, value.string) orelse error.InvalidConfig;
+}
+
+fn requiredStringFieldDup(alloc: std.mem.Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    return try optionalStringFieldDup(alloc, object, field_name) orelse error.InvalidConfig;
+}
+
+fn optionalStringFieldDup(alloc: std.mem.Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
+    const value = object.get(field_name) orelse return null;
+    return switch (value) {
+        .string => try alloc.dupe(u8, value.string),
+        else => error.InvalidConfig,
+    };
+}
+
+fn requiredStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]const []u8 {
+    return try optionalStringArrayField(alloc, object, field_name) orelse error.InvalidConfig;
+}
+
+fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]const []u8 {
+    const value = object.get(field_name) orelse return null;
+    if (value != .array) return error.InvalidConfig;
+    const out = try alloc.alloc([]u8, value.array.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |entry| alloc.free(entry);
+        alloc.free(out);
+    }
+    for (value.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .string => |string| try alloc.dupe(u8, string),
+            else => return error.InvalidConfig,
+        };
+        filled = i + 1;
+    }
+    return out;
+}
+
 fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
@@ -692,6 +1035,7 @@ fn dupOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]
 }
 
 fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
+    if (values.len == 0) return;
     for (values) |value| alloc.free(value);
     alloc.free(values);
 }
@@ -970,6 +1314,106 @@ test "common config preserves remote content logging and storage fields" {
     const http_credential = remote_content.getHttp("internal-api").?;
     try std.testing.expectEqualStrings("https://docs.internal.com", http_credential.base_url.?);
     try std.testing.expectEqualStrings("Bearer abc", http_credential.headers.get("Authorization").?);
+}
+
+test "common config parses public connections map" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "metadata": {
+        \\    "orchestration_urls": {
+        \\      "1": "http://127.0.0.1:7001"
+        \\    }
+        \\  },
+        \\  "connections": {
+        \\    "openai-prod": {
+        \\      "display_name": "OpenAI prod",
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate", "models.embed", "agents.use"],
+        \\      "inference": {
+        \\        "provider": "openai",
+        \\        "url": "https://api.openai.com/v1",
+        \\        "api_key": "sk-test",
+        \\        "names": ["primary-generator", "primary-embedder"],
+        \\        "configured_model_types": ["generator", "embedder"]
+        \\      }
+        \\    },
+        \\    "docs-site": {
+        \\      "kind": "external_io",
+        \\      "capabilities": ["content.fetch", "indexing.use", "agents.use"],
+        \\      "external_io": {
+        \\        "protocol": "http",
+        \\        "hosts": ["https://docs.example.com"],
+        \\        "headers": {
+        \\          "Authorization": "Bearer abc"
+        \\        }
+        \\      }
+        \\    },
+        \\    "agent-web": {
+        \\      "kind": "web_search",
+        \\      "provider": "exa",
+        \\      "capabilities": ["web.search", "web.semantic_search", "web.fetch", "agents.use"],
+        \\      "web_search": {
+        \\        "max_results": 10,
+        \\        "safe_search": true,
+        \\        "include_content": true,
+        \\        "include_highlights": true,
+        \\        "api_key": "exa-test-key",
+        \\        "include_domains": ["docs.example.com"]
+        \\      }
+        \\    },
+        \\    "users-pg": {
+        \\      "kind": "cdc",
+        \\      "capabilities": ["cdc.read_stream"],
+        \\      "cdc": {
+        \\        "provider": "postgres",
+        \\        "dsn": "postgres://example",
+        \\        "table_name": "users",
+        \\        "source_ordinal": 0,
+        \\        "external_table": "public.users"
+        \\      }
+        \\    }
+        \\  },
+        \\  "replication_factor": 1,
+        \\  "default_shards_per_table": 1,
+        \\  "max_shard_size_bytes": 1024,
+        \\  "max_shards_per_table": 4
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), cfg.connections.count());
+
+    const inference = cfg.connections.get("openai-prod").?;
+    try std.testing.expectEqual(Config.ConnectionKind.inference, inference.kind);
+    try std.testing.expectEqualStrings("OpenAI prod", inference.display_name.?);
+    try std.testing.expectEqualStrings("models.generate", inference.capabilities[0]);
+    try std.testing.expectEqualStrings("openai", inference.inference.?.provider);
+    try std.testing.expectEqualStrings("primary-embedder", inference.inference.?.names[1]);
+    try std.testing.expectEqualStrings("embedder", inference.inference.?.configured_model_types[1]);
+
+    const external_io = cfg.connections.get("docs-site").?;
+    try std.testing.expectEqual(Config.ConnectionKind.external_io, external_io.kind);
+    try std.testing.expectEqual(Config.ExternalIoProtocol.http, external_io.external_io.?.protocol);
+    try std.testing.expectEqualStrings("https://docs.example.com", external_io.external_io.?.hosts[0]);
+    try std.testing.expectEqualStrings("Bearer abc", external_io.external_io.?.headers.get("Authorization").?);
+
+    const web_search = cfg.connections.get("agent-web").?;
+    try std.testing.expectEqual(Config.ConnectionKind.web_search, web_search.kind);
+    try std.testing.expectEqualStrings("exa", web_search.provider.?);
+    try std.testing.expectEqualStrings("web.semantic_search", web_search.capabilities[1]);
+    try std.testing.expectEqual(@as(?u32, 10), web_search.web_search.?.max_results);
+    try std.testing.expectEqual(true, web_search.web_search.?.safe_search.?);
+    try std.testing.expectEqual(true, web_search.web_search.?.include_content.?);
+    try std.testing.expectEqualStrings("exa-test-key", web_search.web_search.?.api_key.?);
+    try std.testing.expectEqualStrings("docs.example.com", web_search.web_search.?.include_domains[0]);
+
+    const cdc = cfg.connections.get("users-pg").?;
+    try std.testing.expectEqual(Config.ConnectionKind.cdc, cdc.kind);
+    try std.testing.expectEqualStrings("postgres", cdc.cdc.?.provider);
+    try std.testing.expectEqualStrings("users", cdc.cdc.?.table_name.?);
+    try std.testing.expectEqual(@as(?u32, 0), cdc.cdc.?.source_ordinal);
 }
 
 test "common config preserves tls and cors fields" {

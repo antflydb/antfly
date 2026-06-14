@@ -17,13 +17,6 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-// Defines values for BingSearchConfigFreshness.
-const (
-	BingSearchConfigFreshnessDay   BingSearchConfigFreshness = "Day"
-	BingSearchConfigFreshnessMonth BingSearchConfigFreshness = "Month"
-	BingSearchConfigFreshnessWeek  BingSearchConfigFreshness = "Week"
-)
-
 // Defines values for BraveSearchConfigFreshness.
 const (
 	BraveSearchConfigFreshnessPd BraveSearchConfigFreshness = "pd"
@@ -32,10 +25,23 @@ const (
 	BraveSearchConfigFreshnessPy BraveSearchConfigFreshness = "py"
 )
 
-// Defines values for GoogleSearchConfigSearchType.
+// Defines values for ExaSearchConfigSearchType.
 const (
-	GoogleSearchConfigSearchTypeImage GoogleSearchConfigSearchType = "image"
-	GoogleSearchConfigSearchTypeWeb   GoogleSearchConfigSearchType = "web"
+	ExaSearchConfigSearchTypeAuto    ExaSearchConfigSearchType = "auto"
+	ExaSearchConfigSearchTypeKeyword ExaSearchConfigSearchType = "keyword"
+	ExaSearchConfigSearchTypeNeural  ExaSearchConfigSearchType = "neural"
+)
+
+// Defines values for LinkupSearchConfigDepth.
+const (
+	LinkupSearchConfigDepthDeep     LinkupSearchConfigDepth = "deep"
+	LinkupSearchConfigDepthStandard LinkupSearchConfigDepth = "standard"
+)
+
+// Defines values for LinkupSearchConfigOutputType.
+const (
+	LinkupSearchConfigOutputTypeSearchResults LinkupSearchConfigOutputType = "searchResults"
+	LinkupSearchConfigOutputTypeSourcedAnswer LinkupSearchConfigOutputType = "sourcedAnswer"
 )
 
 // Defines values for SerperSearchConfigSearchType.
@@ -61,78 +67,66 @@ const (
 	TavilySearchConfigSearchDepthBasic    TavilySearchConfigSearchDepth = "basic"
 )
 
-// Defines values for WebSearchProvider.
+// Defines values for VertexSearchConfigService.
 const (
-	WebSearchProviderBing       WebSearchProvider = "bing"
-	WebSearchProviderBrave      WebSearchProvider = "brave"
-	WebSearchProviderDuckduckgo WebSearchProvider = "duckduckgo"
-	WebSearchProviderGoogle     WebSearchProvider = "google"
-	WebSearchProviderSerper     WebSearchProvider = "serper"
-	WebSearchProviderTavily     WebSearchProvider = "tavily"
+	VertexSearchConfigServiceAgentSearch VertexSearchConfigService = "agent_search"
 )
 
-// BingSearchConfig defines model for BingSearchConfig.
-type BingSearchConfig struct {
-	// ApiKey Bing Search API key (or set BING_SEARCH_API_KEY env var)
-	ApiKey string `json:"api_key,omitempty,omitzero"`
-
-	// Endpoint Bing API endpoint URL
-	Endpoint string `json:"endpoint,omitempty,omitzero"`
-
-	// Freshness Filter results by freshness
-	Freshness BingSearchConfigFreshness `json:"freshness,omitempty,omitzero"`
-
-	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
-	Language string `json:"language,omitempty,omitzero"`
-
-	// MaxResults Maximum number of search results to return
-	MaxResults int `json:"max_results,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
-	Provider WebSearchProvider `json:"provider"`
-
-	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
-	Region string `json:"region,omitempty,omitzero"`
-
-	// SafeSearch Enable safe search filtering
-	SafeSearch *bool `json:"safe_search,omitempty"`
-
-	// TimeoutMs Request timeout in milliseconds
-	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
-}
-
-// BingSearchConfigFreshness Filter results by freshness
-type BingSearchConfigFreshness string
+// Defines values for WebSearchProvider.
+const (
+	WebSearchProviderBrave  WebSearchProvider = "brave"
+	WebSearchProviderExa    WebSearchProvider = "exa"
+	WebSearchProviderLinkup WebSearchProvider = "linkup"
+	WebSearchProviderSerper WebSearchProvider = "serper"
+	WebSearchProviderTavily WebSearchProvider = "tavily"
+	WebSearchProviderVertex WebSearchProvider = "vertex"
+	WebSearchProviderYou    WebSearchProvider = "you"
+)
 
 // BraveSearchConfig defines model for BraveSearchConfig.
 type BraveSearchConfig struct {
 	// ApiKey Brave Search API key (or set BRAVE_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
 	// Freshness Freshness filter: pd=day, pw=week, pm=month, py=year
 	Freshness BraveSearchConfigFreshness `json:"freshness,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -140,6 +134,9 @@ type BraveSearchConfig struct {
 
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// Spellcheck Enable spellcheck suggestions
 	Spellcheck bool `json:"spellcheck,omitempty,omitzero"`
@@ -154,28 +151,59 @@ type BraveSearchConfig struct {
 // BraveSearchConfigFreshness Freshness filter: pd=day, pw=week, pm=month, py=year
 type BraveSearchConfigFreshness string
 
-// DuckDuckGoSearchConfig defines model for DuckDuckGoSearchConfig.
-type DuckDuckGoSearchConfig struct {
+// ExaSearchConfig defines model for ExaSearchConfig.
+type ExaSearchConfig struct {
+	// ApiKey Exa API key (or set EXA_API_KEY env var)
+	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// EndPublishedDate ISO date/time upper bound for published date filtering
+	EndPublishedDate string `json:"end_published_date,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// ExcludeDomains Exclude results from these domains
+	ExcludeDomains []string `json:"exclude_domains,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeDomains Only include results from these domains
+	IncludeDomains []string `json:"include_domains,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
+
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
 
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
-	// NoHtml Remove HTML from results
-	NoHtml bool `json:"no_html,omitempty,omitzero"`
+	// NumResults Provider-specific result count override
+	NumResults int `json:"num_results,omitempty,omitzero"`
 
-	// NoRedirect Skip HTTP redirect for bang queries
-	NoRedirect bool `json:"no_redirect,omitempty,omitzero"`
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
 
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -184,9 +212,21 @@ type DuckDuckGoSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
+	// SearchType Search mode to request from Exa
+	SearchType ExaSearchConfigSearchType `json:"search_type,omitempty,omitzero"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
+	// StartPublishedDate ISO date/time lower bound for published date filtering
+	StartPublishedDate string `json:"start_published_date,omitempty,omitzero"`
+
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
+
+// ExaSearchConfigSearchType Search mode to request from Exa
+type ExaSearchConfigSearchType string
 
 // FetchConfig Configuration for URL content fetching.
 //
@@ -251,31 +291,53 @@ type FetchResult struct {
 	Url string `json:"url"`
 }
 
-// GoogleSearchConfig defines model for GoogleSearchConfig.
-type GoogleSearchConfig struct {
-	// ApiKey Google API key (or set GOOGLE_CSE_API_KEY env var)
+// LinkupSearchConfig defines model for LinkupSearchConfig.
+type LinkupSearchConfig struct {
+	// ApiKey Linkup API key (or set LINKUP_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
-	// CseId Custom Search Engine ID (or set GOOGLE_CSE_ID env var)
-	CseId string `json:"cse_id,omitempty,omitzero"`
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
 
-	// DateRestrict Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
-	DateRestrict string `json:"date_restrict,omitempty,omitzero"`
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Depth Search depth to request from Linkup
+	Depth LinkupSearchConfigDepth `json:"depth,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
+	// OutputType Linkup response shape to request
+	OutputType LinkupSearchConfigOutputType `json:"output_type,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -284,35 +346,60 @@ type GoogleSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
-	// SearchType Type of search to perform
-	SearchType GoogleSearchConfigSearchType `json:"search_type,omitempty,omitzero"`
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
 
-// GoogleSearchConfigSearchType Type of search to perform
-type GoogleSearchConfigSearchType string
+// LinkupSearchConfigDepth Search depth to request from Linkup
+type LinkupSearchConfigDepth string
+
+// LinkupSearchConfigOutputType Linkup response shape to request
+type LinkupSearchConfigOutputType string
 
 // SerperSearchConfig defines model for SerperSearchConfig.
 type SerperSearchConfig struct {
 	// ApiKey Serper API key (or set SERPER_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
+
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
 
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -323,6 +410,9 @@ type SerperSearchConfig struct {
 
 	// SearchType Type of search to perform
 	SearchType SerperSearchConfigSearchType `json:"search_type,omitempty,omitzero"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
 
 	// TimePeriod Time period filter: d=day, w=week, m=month, y=year
 	TimePeriod SerperSearchConfigTimePeriod `json:"time_period,omitempty,omitzero"`
@@ -342,14 +432,29 @@ type TavilySearchConfig struct {
 	// ApiKey Tavily API key (or set TAVILY_API_KEY env var)
 	ApiKey string `json:"api_key,omitempty,omitzero"`
 
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
 	// ExcludeDomains Exclude results from these domains
 	ExcludeDomains []string `json:"exclude_domains,omitempty,omitzero"`
 
 	// IncludeAnswer Include AI-generated answer summary
 	IncludeAnswer bool `json:"include_answer,omitempty,omitzero"`
 
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
 	// IncludeDomains Only include results from these domains
 	IncludeDomains []string `json:"include_domains,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
 
 	// IncludeRawContent Include raw HTML content of pages
 	IncludeRawContent bool `json:"include_raw_content,omitempty,omitzero"`
@@ -357,17 +462,24 @@ type TavilySearchConfig struct {
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
 
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -381,6 +493,9 @@ type TavilySearchConfig struct {
 	// - advanced: Deeper search with more comprehensive results
 	SearchDepth TavilySearchConfigSearchDepth `json:"search_depth,omitempty,omitzero"`
 
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
@@ -390,32 +505,47 @@ type TavilySearchConfig struct {
 // - advanced: Deeper search with more comprehensive results
 type TavilySearchConfigSearchDepth string
 
-// WebSearchConfig A unified configuration for web search providers.
-//
-// Each provider has specific configuration requirements. Use the appropriate
-// provider-specific config or set common options at the top level.
-//
-// **Environment Variables (fallbacks):**
-// - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
-// - BING_SEARCH_API_KEY
-// - SERPER_API_KEY
-// - TAVILY_API_KEY
-// - BRAVE_API_KEY
-type WebSearchConfig struct {
+// VertexSearchConfig defines model for VertexSearchConfig.
+type VertexSearchConfig struct {
+	// ApiKey Provider API key or secret reference. Prefer named web_search connections for production use.
+	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	Language string `json:"language,omitempty,omitzero"`
+
+	// Location Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
+	Location string `json:"location,omitempty,omitzero"`
 
 	// MaxResults Maximum number of search results to return
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
+	// ProjectId Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
 	// Provider The web search provider to use.
 	//
-	// - **google**: Google Custom Search API (requires CSE setup)
-	// - **bing**: Microsoft Bing Web Search API
+	// - **exa**: Exa neural/semantic web search API
 	// - **serper**: Serper.dev Google Search API (simpler setup)
 	// - **tavily**: Tavily AI Search API (optimized for RAG)
 	// - **brave**: Brave Search API
-	// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 	Provider WebSearchProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
@@ -424,18 +554,96 @@ type WebSearchConfig struct {
 	// SafeSearch Enable safe search filtering
 	SafeSearch *bool `json:"safe_search,omitempty"`
 
+	// Service Google Cloud search service flavor
+	Service VertexSearchConfigService `json:"service,omitempty,omitzero"`
+
+	// ServingConfig Agent Search serving config ID.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
+	// TimeoutMs Request timeout in milliseconds
+	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
+}
+
+// VertexSearchConfigService Google Cloud search service flavor
+type VertexSearchConfigService string
+
+// WebSearchConfig A unified configuration for web search providers.
+//
+// Each provider has specific configuration requirements. Use the appropriate
+// provider-specific config or set common options at the top level.
+//
+// **Environment Variables (fallbacks):**
+// - EXA_API_KEY
+// - SERPER_API_KEY
+// - TAVILY_API_KEY
+// - BRAVE_API_KEY
+// - YOU_API_KEY
+// - LINKUP_API_KEY
+// - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
+type WebSearchConfig struct {
+	// ApiKey Provider API key or secret reference. Prefer named web_search connections for production use.
+	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint Provider endpoint override when applicable
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+
+	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
+	Language string `json:"language,omitempty,omitzero"`
+
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
+	// MaxResults Maximum number of search results to return
+	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
+	// Provider The web search provider to use.
+	//
+	// - **exa**: Exa neural/semantic web search API
+	// - **serper**: Serper.dev Google Search API (simpler setup)
+	// - **tavily**: Tavily AI Search API (optimized for RAG)
+	// - **brave**: Brave Search API
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
+	Provider WebSearchProvider `json:"provider"`
+
+	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
+	Region string `json:"region,omitempty,omitzero"`
+
+	// SafeSearch Enable safe search filtering
+	SafeSearch *bool `json:"safe_search,omitempty"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
 
 // WebSearchProvider The web search provider to use.
 //
-// - **google**: Google Custom Search API (requires CSE setup)
-// - **bing**: Microsoft Bing Web Search API
+// - **exa**: Exa neural/semantic web search API
 // - **serper**: Serper.dev Google Search API (simpler setup)
 // - **tavily**: Tavily AI Search API (optimized for RAG)
 // - **brave**: Brave Search API
-// - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+// - **you**: You.com Search API for agent and research workflows
+// - **linkup**: Linkup Search API for web search and content retrieval
+// - **vertex**: Google Cloud Agent Search / Vertex AI Search
 type WebSearchProvider string
 
 // WebSearchResponse Response from a web search query
@@ -477,70 +685,134 @@ type WebSearchResult struct {
 	Url string `json:"url"`
 }
 
+// YouSearchConfig defines model for YouSearchConfig.
+type YouSearchConfig struct {
+	// ApiKey You.com API key (or set YOU_API_KEY env var)
+	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// CredentialsPath Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// DataStore Agent Search data store ID for provider vertex.
+	DataStore string `json:"data_store,omitempty,omitzero"`
+
+	// Endpoint You.com API endpoint URL
+	Endpoint string `json:"endpoint,omitempty,omitzero"`
+
+	// IncludeContent Ask the provider to return extracted page content when supported
+	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+
+	// IncludeHighlights Ask the provider to return highlighted passages when supported
+	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+
+	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
+	Language string `json:"language,omitempty,omitzero"`
+
+	// Location Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+	Location string `json:"location,omitempty,omitzero"`
+
+	// MaxResults Maximum number of search results to return
+	MaxResults int `json:"max_results,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
+	// Provider The web search provider to use.
+	//
+	// - **exa**: Exa neural/semantic web search API
+	// - **serper**: Serper.dev Google Search API (simpler setup)
+	// - **tavily**: Tavily AI Search API (optimized for RAG)
+	// - **brave**: Brave Search API
+	// - **you**: You.com Search API for agent and research workflows
+	// - **linkup**: Linkup Search API for web search and content retrieval
+	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
+	Provider WebSearchProvider `json:"provider"`
+
+	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
+	Region string `json:"region,omitempty,omitzero"`
+
+	// SafeSearch Enable safe search filtering
+	SafeSearch *bool `json:"safe_search,omitempty"`
+
+	// ServingConfig Agent Search serving config ID for provider vertex. Defaults to default_config.
+	ServingConfig string `json:"serving_config,omitempty,omitzero"`
+
+	// TimeoutMs Request timeout in milliseconds
+	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/7xa/2/jtpL/Vwa6A+IE8pds+rp9PvQHb+LdGpftBna2i4emEGhpbPMskSpJ2XEX+d8P",
-	"Q0qyZNNJ2revKNaNJc5wOJz5cOZDfw1imeVSoDA6GH4NdLzCjNk/33GxnCFT8epaigVf0jOWpp8WwfDX",
-	"r8F/K1wEw+C/+nv5finc/4LzluBT+DXIlcxRGY5WN8t5tMYd/ZmgjhXPDZciGNpJwQnD6G4Ca9xBRyrQ",
-	"aODd5OcP0Ww8ml7/FI3uJtH/jv8FKDawYeo8CAOzyzEYBtooLmjOAEWSSy6Mm2XBitQEw2BlTK6H/T7L",
-	"eW/OxbKX8VhJLRemF8usv3nbG/S1NSAIfcaRVZVm+Dy9DcJgIVXGSHehuM+QhUK9Eqj18Xrf89SgAoW6",
-	"SI2G+Q72g2kFRRYMfw1u2C4Igy+I6yAMPkphVsFvR/M81U/k/P8wNsHTb4cLcPtRKEbfYSEVfKwWD3Zx",
-	"X3De8H7vQTyIi4sZmiIfXlw8iMseXCtkBmH0R6EQWBzLQhhgBiq35lIZlvYYvSeHPog3tRCD5vYq1LJQ",
-	"MT6Iqx58QFPv90LJrH5LT7Sz40bGenhxUU+VyFgf7B6KbqH7tK3lHnZZzt2D7hbnXfewLzeoNhy3DyI4",
-	"cloYvFNsg39/5NOsJ0N/Ovpl/Kqgfy7WqlewsFE3hDz5MWG7EPLtj1vEdQh59mNG4RVCvvtxh0w1gjBP",
-	"gjDIt/SR0cfOE4NhoHNM03iF8bqVdkYVeBiNY8HmKcJeAnSxXKKm13q/trmUKTJByg0+mijBWLoI1q0p",
-	"FizVR3NMRJwWCQJJQkMSOnOZJiFww1IeQ8bUGpU+98z6l9LqcDNtJrUe5kpueIIacsU3LN51FzIuNCbg",
-	"QhS23KyAGw1yK4CLBHMUCQpj/370ZeaMLwUUeTMZ5zSjTYwy8FnO+zYjj/ItYXo1l0wl/lwjtHQ6enul",
-	"LM8pCYsMhbFr9+fTTRGv6d8H+Z9KKiGjlcnSFyNuipncIPx0//G2RhnCXW+wCRkpTLiiVbykeLbmOfx0",
-	"f38HlYgNgzkTS/i9QEV2fqPQ2nsTJkIbJgyMhN6iquOsMaKOspRn3GBCpws2Q0wWBhT+XnDKX2CiCore",
-	"g3iH2q1C8yxPsVrH/0DGdiAkyZlCifrsoqEsTUvtqMsY/VkapEi6X3ENhUYNZoUe02G74vEKVqw01uVp",
-	"70G8l4rWkRSx9UGhMYRYCs0TVCDNClW1TFXNeXRSFPGa/i1lGbfcH6nv0TTD86Wt+Dy9JUsMpeWCRKmc",
-	"IAs+0zKXsp+vl30mzCLd9VM+7+tYsZz8TMKJ3IpUssT5PaE1xKg1qYBZkdM5qocPomvDqk8fM5pQO2TQ",
-	"GBeKmx1sWMqTMvm6LrJztkQNHXw0isVGg0KWWKS1ILjhDJay6x7ylJvdOUne3bynY6ElSOPty0nmVLod",
-	"18A0JMww+DydaCedMi6cfquEns2unL0dF1+oQV9FsUJCMc5SEnwQs2odC2SmoEEdm5innde7dh6vJN22",
-	"nFtXjdJUbjGBldSG4slgyrWxBhLKGoTJHcxTGa/J653ZbPoecoUbskgKu5KbcltA8z/QRaJdzT3PkJKF",
-	"9lvJVNsAOjja3ewRze45fr9U9oBcAGtYKliGLn0aQTRZAGa52YU2p6xKYFRylYIdfIwxN+74sAvT570H",
-	"MX5klKxD+PUhsPURuge2FAtCeKACpP3wN7sUbjCzRh+d6OUDphTb0Xfrv6icN+K5fhEd35GEhRmkZRjZ",
-	"sBoUEza2DjeDEIjkMBnC5Zu3vQH91/8hhMtB4++3b3qX39tvl29CuPwnff3Bff++meMV5obBY3cpu/S0",
-	"q9c870prJEu7tqBHVdYRT2GQsceozO4oRbE0q9ZC/zEYDAaHK/3IHnlWZDUqODngAuIVo6RCpaFjVCFi",
-	"RnDMF0D7iAkmjdqDDFmiCkojKqSIKCSj+c5g2+WXg+9++Mfb709bk7RimguwOqBTahjC5WDw8Z3fgHbO",
-	"0rzPHdU6x1hHMkdBda5eMYVJpK+i64YKCimXTJHGWIqkvZqro2XUKVmK0QoqyWOTn07h+tSeU8d56Z67",
-	"eqBKQGAW3B1WnkQiArASjYBrYIWRGTM8Zmm6q/AcE5gz+pQCPk4+joGMG1ZYPYRpC5xL6MXEA9MlSg/h",
-	"vj3SGk4gYXF/D9ekm+AaE8JrMuL77/awbTENH01rVJf7cK0M5mPPjSsb+vvFVoM9rUGVTO7FobLaOQSP",
-	"VCJIxZdcsPQ5lXa/IoqLKPNALoE2GLZGQaBjBzfPWgqkjKcpPx1NFKsm9Zh7x5YI9l19YFZ7QRvr7c3q",
-	"vPcdDmgrmQo4tkzDHiaSAmkBHkTyFa6FSj2uWKENabNiTrv1BiYv0hdPYVAe4Al1gaS83spGB7hPtg9S",
-	"LtO/v3920x51zh8+ffpwO46uZ69rn2ONEffsz3Whjcyq5m0sllwgTG5800xunp0hoVNTIT2I/Whk3zQp",
-	"IRKBDvaWvRDOkrdntlZImTbwFhK20yGcZZeNp7aFp8nLcz4YBtmlzxZXqjcSsiLJtjg/Yr/uy9wsuwc6",
-	"xVFR7DQ4AifHCX++FUNV7mt7A6pWZ1qVlgy8O9S5no3PydQ5UmpZ1XTsilptKosErqXQMsVn+C5GmEE2",
-	"N9vruBSLSUlvaTXWnFfJbhzZbemuWqvX6uYUGluKv2u37gRm17MxTG5OND64wZTSRze09GM7aUWGbS5f",
-	"4MNmqHJUf3tCu2mPEno2nt6Np69K5pPhfYLffU2E16ICt7qKdfojT1ls/9ArmVN54KXH7FGVo+IyOXFc",
-	"uZc1RVcydBVBV/NzR/QcIfk2CAMydvetks/tQS/BTZUwBwlYblLNM7CSLVDAyH7BDN/Ys8ubxtTKPggK",
-	"GzTcjswVj6uOGJne0ZYX+SvpLl1b+5c4rr24pZb9yXDPNjzd/e3J4KY9Sob70S+T23+97jbk0TKhUSIz",
-	"xoX2VXOOKq35HHKZWaFGqGT+TJvIHfMaMcvwvNgjVkTtaNJdokBl6x4nC7rIMqZ23mKnmubksj6JdAfl",
-	"qG+9NsW2Uas6fg0VrdjW8TRVrScXrnT3rq/EsATzg/4zmDPN4yMMKzPLjrdthh02hPdUGDS5ZW2YSJhK",
-	"Kp/QWJZsmIip475BpLxuCmRS0SGa5QpXKDRlay3awKHKrErXt4KiKgMmhxBUvuAaqJfP+B9Uh0sF09EH",
-	"CyOjCbA8T3nsGMWwBCsulg8iV9jd9y5VdDj/2KDjhGmCXqVo1wM6lqpq/l6GJGONq4uCPwtJlsJp6vBB",
-	"0iGsHKXACArBF9x1Zwdu3eK82uU2izpmjUeWlqXmni94fKCl7A4ygroefNZouzeWE7IpzgySm52a7oEK",
-	"KGEsllkmBTguRpP/SIWROaRUwJS+HosNV1LQRPALU5zqKw2dBUvTOYvX+tzuQ9dT8oft+pwGeS6TLWnZ",
-	"qi5sk9yCWCvavIyzW5JwcnfGBTPSQl3GXAkw/BrM7f/9B8LRFXsY2NuVk+OPbibDYM9tn5I6cf8SBq4k",
-	"PCXm6eMIjuiMPCXiqRTDwIXvKRHPefpUExC7n1lG9lXx03hVHpgpE8uCuo3jBl3hAhVV+9UYG+9Vjlft",
-	"FIoz+tT0uVBn7a4Jhe8kpTa8ujhqMYKn+DdRZHNUjcqyMsLI8hIlsFppcDB8MwiDjAv35dJHSdTuGL6y",
-	"3rhr+E/h0lp32l9uhNdbhfVTsabPBA+8VWhvEc4WGJVV82tvhNmivqRydTDp+ne43IpwzA6ZUw+HO3U8",
-	"dZNtfIEkOqBI6u357Tmwvmts4jFV44FlipZCuya1CxcXLnsvLoYnW+TG1Qs1ibaUPnfChEok+uzvP9xQ",
-	"l/I0+LluADpV4d+cxuU+yfqOb+gcndiVeQR0JHZ4ke5e7zGPxjx7Iwqd8uozBCGrs/e8VbGUMBg6qK4x",
-	"rkauCpRbWOtr7uq9naLOpdDopXfsm5K1be7z7wXaGvegI2iUz60z/XSdDB2+AO2uEDGB+a4OIW9j4Ob1",
-	"RmHTsj1ziI8YF8ZSh0fKWrjYVHdbXny1EbBZdb8KyUoS31OTV83+67jgsrG3dUZp0qvIYGlYGp1c5D29",
-	"bsB9BZ9sw3hK0PYyeFS6n8WOU1cZI9BcUF42wsopPIqrvJinXK8wiRJmfMcnvXcls+Mf+aK1jJo0ppdd",
-	"8roX/GOpvFnQrKYROkcF4nlzikUqWYP+d/616gXPc/Q4wl6RlG/7jVd147d3y7HN9ndnxzpvbKMIgmX1",
-	"FUU51MvzeG8N7u2FQSV9sEFHSrxE/ufp7SkFf4rIdxa6SXzB9pqrvOERfxFTKxWtcedl0UdfZuCG2A5o",
-	"crP/qYP9nZ+hYNA7Ydij++UJxgoNpFKui7wH71maaqBan1J49GUWja6vx7MZ1eEl7V43CJuyQaC4FZJa",
-	"X9NrVSs7WaiuM6a7xl2XJy//hrTVaF91CaiY4TRL/YvQqlLSVz2WsT+kYFtNrdsZ9TpnqYxZupLaDP85",
-	"GAzOyp9gismndiV1KBzYivC2vIS+9FKd5Klo73+/80uH7vfg392A2fh6Or5v7MNf2AQ3SWMv/Fyu1lyK",
-	"yMg1eqrXT2XpB26VdizYsXYdBrNcKjobG5fZf2rtPrPtLF1nkS99NUZap6+temez2/797czxrlfUIQuM",
-	"yx8r1jf1JG9HjL7MQrDlrbv3ocDah9LLvzR7sjTWQvpciYLqpAqKn+UK2lyArU2/eBgF97MVC1oxlRFs",
-	"SeFhZDUQHy1ZnJaIqh/EdoUCbBVPj6tfGWpIpDgzsKKq0NIMtvLpOWLEYW7QKGKrIhtafFIQBhtU2i33",
-	"sjfoDWi7SqgLhsFVb9C7ohOTmZUOhqJI06f/DwAA//9ZoM80KS8AAA==",
+	"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",
+	"LsixYmaho54o0vTr/wUAAP//KVda07k6AAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

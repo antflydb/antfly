@@ -2128,6 +2128,82 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/connections:
+    get:
+      summary: List configured external connections
+      tags:
+        - cluster_management
+      description: >
+        Enumerates public external connections configured on this node under
+
+        top-level `connections`: inference providers, web search providers,
+
+        external IO endpoints, and CDC replication sources.
+
+
+        The default response is config-derived and avoids slow provider calls.
+
+        With include=models, each inference provider is queried live for its
+
+        available models where the provider exposes a listing API. Connections
+
+        that fail to respond are reported with status "error" instead of
+
+        failing the whole response. A status of "configured" means the
+
+        connection exists but was not live-probed in this response.
+      operationId: listConnections
+      parameters:
+        - name: types
+          in: query
+          required: false
+          description: >
+            Comma-separated list of connection kinds to include
+
+            (e.g. "inference,external_io,cdc"). Defaults to all
+
+            kinds. This filters by the response "kind" field.
+          schema:
+            type: string
+        - name: include
+          in: query
+          required: false
+          description: >
+            Comma-separated list of expansions. Supported value: "models" —
+
+            live-query each inference provider's model listing API.
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          description: >
+            Set to "true" to bypass the short server-side cache for live
+
+            provider model listings and probes. This does not force a node
+
+            config or metadata reload.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Configured connections retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionsResponse'
+        '401':
+          description: Unauthorized - authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/secrets:
     get:
       summary: List secrets status
@@ -6483,6 +6559,325 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ClusterDataGroupStatus'
+    ConnectionKind:
+      type: string
+      enum:
+        - inference
+        - web_search
+        - external_io
+        - cdc
+      description: Kind of external connection configured on this node.
+    ConnectionStatus:
+      type: string
+      enum:
+        - connected
+        - error
+        - configured
+        - unsupported
+      description: >
+        Connection status. "connected" means a live probe or listing succeeded,
+
+        "error" means the probe failed (see the error field), "configured" means
+
+        the connection is present but was not probed, and "unsupported" means
+
+        no probe is available for this connection kind or provider.
+    InferenceProviderType:
+      type: string
+      enum:
+        - gemini
+        - vertex
+        - ollama
+        - openai
+        - openrouter
+        - bedrock
+        - cohere
+        - anthropic
+        - antfly
+        - mock
+      description: Inference provider type for a connection.
+    ConnectedModelType:
+      type: string
+      enum:
+        - embedder
+        - generator
+        - reranker
+        - chunker
+        - recognizer
+        - classifier
+        - rewriter
+        - reader
+        - transcriber
+        - extractor
+        - other
+      description: >
+        Model task type. Mirrors the inference registry taxonomy; "other" is
+
+        used for models whose task type the provider's listing API does not
+
+        classify.
+    ConnectedModel:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Model identifier as reported by the provider.
+        display_name:
+          type: string
+          description: Human-readable model name when the provider reports one.
+        dimensions:
+          type: integer
+          description: Embedding output dimension when known.
+        configured:
+          type: boolean
+          description: True when this model is referenced by a configured embedder, generator, reranker,
+            or chunker.
+    InferenceConnection:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: '#/components/schemas/InferenceProviderType'
+        url:
+          type: string
+          description: Resolved endpoint URL when applicable.
+        region:
+          type: string
+          description: Cloud region (Bedrock).
+        project_id:
+          type: string
+          description: Google Cloud project (Vertex).
+        location:
+          type: string
+          description: Google Cloud location (Vertex).
+        names:
+          type: array
+          items:
+            type: string
+          description: Named registry entries from node config that resolve to this provider instance.
+        configured_model_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectedModelType'
+          description: Model types this instance is configured for.
+        models:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ConnectedModel'
+          description: >
+            Models reported by the provider, grouped by model type. Keys are
+
+            pluralized ConnectedModelType values ("embedders", "generators",
+
+            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+
+            "readers", "transcribers", "extractors") plus "other" for models
+
+            the provider's listing API does not classify by task. Populated
+
+            only when the request includes the "models" expansion.
+    ExternalIoProtocol:
+      type: string
+      enum:
+        - s3
+        - gcs
+        - filesystem
+        - http
+      description: External IO transport protocol.
+    WebSearchConnection:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Provider-specific service flavor, such as agent_search for provider vertex.
+        max_results:
+          type: integer
+          description: Maximum ranked results this connection is configured to return.
+        timeout_ms:
+          type: integer
+          description: Provider request timeout in milliseconds.
+        safe_search:
+          type: boolean
+          description: Whether safe-search filtering is requested.
+        language:
+          type: string
+          description: Preferred result language.
+        region:
+          type: string
+          description: Preferred result region.
+        include_content:
+          type: boolean
+          description: Whether extracted content is requested when supported.
+        include_highlights:
+          type: boolean
+          description: Whether highlighted passages are requested when supported.
+        endpoint:
+          type: string
+          description: Provider endpoint override when configured.
+        project_id:
+          type: string
+          description: Google Cloud project for provider vertex.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex.
+        include_domains:
+          type: array
+          items:
+            type: string
+          description: Domain allowlist when configured.
+        exclude_domains:
+          type: array
+          items:
+            type: string
+          description: Domain denylist when configured.
+        configured:
+          type: boolean
+          description: True when required credentials/config are present. Secret values are never returned.
+    ExternalIoConnection:
+      type: object
+      required:
+        - protocol
+      properties:
+        protocol:
+          $ref: '#/components/schemas/ExternalIoProtocol'
+        endpoint:
+          type: string
+          description: Custom endpoint URL when configured.
+        buckets:
+          type: array
+          items:
+            type: string
+          description: Buckets this connection is configured for.
+        prefix:
+          type: string
+          description: Key prefix when configured.
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Hosts or base URLs this connection applies to.
+    CdcConnection:
+      type: object
+      required:
+        - provider
+        - table_name
+        - source_ordinal
+      properties:
+        provider:
+          type: string
+          description: CDC provider type. Currently "postgres"; future CDC providers may add new values.
+          example: postgres
+        table_name:
+          type: string
+          description: Antfly table receiving changes from this CDC source.
+        source_ordinal:
+          type: integer
+          format: uint32
+          description: Zero-based ordinal of the replication source within the table config.
+        external_table:
+          type: string
+          description: Source-side table or stream name when reported by the provider.
+        slot_name:
+          type: string
+          description: Provider replication cursor or slot name when applicable.
+        publication_name:
+          type: string
+          description: Provider publication or stream grouping name when applicable.
+        phase:
+          type: string
+          description: Runtime CDC phase such as snapshot, streaming, configured, or failed.
+        lag_records:
+          type: integer
+          format: uint64
+          description: Source records behind, when reported by the runtime.
+        lag_millis:
+          type: integer
+          format: uint64
+          description: Source commit lag in milliseconds, when reported by the runtime.
+        last_success_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+        last_change_applied_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp of the last applied source change, in milliseconds.
+        updated_at_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+    Connection:
+      type: object
+      required:
+        - id
+        - name
+        - kind
+        - status
+        - capabilities
+      properties:
+        id:
+          type: string
+          description: Stable resource identifier for this connection. Config-derived connections synthesize
+            this from the source config path.
+        name:
+          type: string
+          description: Human-readable short name for this connection instance.
+        display_name:
+          type: string
+          description: Optional display name for UIs.
+        provider:
+          type: string
+          description: Provider token for connection kinds that have a provider-level service identity,
+            such as web_search.
+        kind:
+          $ref: '#/components/schemas/ConnectionKind'
+        status:
+          $ref: '#/components/schemas/ConnectionStatus'
+        error:
+          type: string
+          description: Failure detail when status is "error".
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Namespaced actions and workflow uses this connection supports, such as models.embed,
+            content.fetch, objects.read, or cdc.read_stream.
+        sources:
+          type: array
+          items:
+            type: string
+          description: >
+            Where this connection was configured, e.g.
+
+            "config:embedders/openai-small" or "table:docs/index:body_vec".
+        inference:
+          $ref: '#/components/schemas/InferenceConnection'
+        web_search:
+          $ref: '#/components/schemas/WebSearchConnection'
+        external_io:
+          $ref: '#/components/schemas/ExternalIoConnection'
+        cdc:
+          $ref: '#/components/schemas/CdcConnection'
+    ConnectionsResponse:
+      type: object
+      required:
+        - connections
+      properties:
+        connections:
+          type: array
+          items:
+            $ref: '#/components/schemas/Connection'
     DocumentArtifactChildRange:
       type: object
       description: Parsed child-range descriptor from a derived document artifact manifest.
@@ -14571,7 +14966,7 @@ components:
 
         - search: Execute semantic searches (legacy, use semantic_search for retrieval)
 
-        - websearch: Search the web (requires websearch_config)
+        - websearch: Search the web (requires websearch_connection or websearch_config)
 
         - fetch: Fetch URL content (subject to security controls)
 
@@ -14595,19 +14990,18 @@ components:
     WebSearchProvider:
       type: string
       enum:
-        - google
-        - bing
+        - exa
         - serper
         - tavily
         - brave
-        - duckduckgo
+        - you
+        - linkup
+        - vertex
       description: >
         The web search provider to use.
 
 
-        - **google**: Google Custom Search API (requires CSE setup)
-
-        - **bing**: Microsoft Bing Web Search API
+        - **exa**: Exa neural/semantic web search API
 
         - **serper**: Serper.dev Google Search API (simpler setup)
 
@@ -14615,84 +15009,66 @@ components:
 
         - **brave**: Brave Search API
 
-        - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
-    GoogleSearchConfig:
+        - **you**: You.com Search API for agent and research workflows
+
+        - **linkup**: Linkup Search API for web search and content retrieval
+
+        - **vertex**: Google Cloud Agent Search / Vertex AI Search
+    ExaSearchConfig:
       type: object
       description: >
-        Configuration for Google Custom Search API.
+        Configuration for Exa neural/semantic web search.
 
 
-        Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console.
+        Exa is optimized for semantic web search, highlights, and retrieved page
+
+        contents for RAG and agent workflows.
 
 
         **Setup:**
 
-        1. Create a project at https://console.cloud.google.com
+        1. Sign up at https://exa.ai
 
-        2. Enable Custom Search API
-
-        3. Create a Custom Search Engine at https://cse.google.com
-
-        4. Get API key and CSE ID
+        2. Get API key from dashboard
 
 
-        **Docs:** https://developers.google.com/custom-search/v1/overview
+        **Docs:** https://docs.exa.ai
       allOf:
         - $ref: '#/components/schemas/WebSearchConfig'
         - type: object
           properties:
             api_key:
               type: string
-              description: Google API key (or set GOOGLE_CSE_API_KEY env var)
-            cse_id:
-              type: string
-              description: Custom Search Engine ID (or set GOOGLE_CSE_ID env var)
+              description: Exa API key (or set EXA_API_KEY env var)
             search_type:
               type: string
               enum:
-                - web
-                - image
-              default: web
-              description: Type of search to perform
-            date_restrict:
+                - auto
+                - neural
+                - keyword
+              default: auto
+              description: Search mode to request from Exa
+            num_results:
+              type: integer
+              minimum: 1
+              maximum: 20
+              description: Provider-specific result count override
+            start_published_date:
               type: string
-              description: Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
-              example: m1
-    BingSearchConfig:
-      type: object
-      description: >
-        Configuration for Microsoft Bing Web Search API.
-
-
-        **Setup:**
-
-        1. Create Azure account at https://portal.azure.com
-
-        2. Create a Bing Search resource
-
-        3. Get API key from resource keys
-
-
-        **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
-      allOf:
-        - $ref: '#/components/schemas/WebSearchConfig'
-        - type: object
-          properties:
-            api_key:
+              description: ISO date/time lower bound for published date filtering
+            end_published_date:
               type: string
-              description: Bing Search API key (or set BING_SEARCH_API_KEY env var)
-            endpoint:
-              type: string
-              format: uri
-              default: https://api.bing.microsoft.com/v7.0/search
-              description: Bing API endpoint URL
-            freshness:
-              type: string
-              enum:
-                - Day
-                - Week
-                - Month
-              description: Filter results by freshness
+              description: ISO date/time upper bound for published date filtering
+            include_domains:
+              type: array
+              items:
+                type: string
+              description: Only include results from these domains
+            exclude_domains:
+              type: array
+              items:
+                type: string
+              description: Exclude results from these domains
     SerperSearchConfig:
       type: object
       description: >
@@ -14833,35 +15209,126 @@ components:
               type: boolean
               default: true
               description: Enable spellcheck suggestions
-    DuckDuckGoSearchConfig:
+    YouSearchConfig:
       type: object
       description: >
-        Configuration for DuckDuckGo Instant Answer API.
+        Configuration for You.com Search API.
 
 
-        DuckDuckGo provides limited free search without requiring an API key.
+        You.com is useful for agentic search and research-oriented result
 
-        Best for simple queries; may not return results for all searches.
-
-
-        **Note:** This uses the Instant Answer API which has limitations.
-
-        For production use, consider other providers.
+        retrieval.
 
 
-        **Docs:** https://duckduckgo.com/api
+        **Setup:**
+
+        1. Sign up for You.com API access
+
+        2. Get API key from dashboard
+
+
+        **Docs:** https://api.you.com
       allOf:
         - $ref: '#/components/schemas/WebSearchConfig'
         - type: object
           properties:
-            no_redirect:
-              type: boolean
-              default: true
-              description: Skip HTTP redirect for bang queries
-            no_html:
-              type: boolean
-              default: true
-              description: Remove HTML from results
+            api_key:
+              type: string
+              description: You.com API key (or set YOU_API_KEY env var)
+            endpoint:
+              type: string
+              format: uri
+              description: You.com API endpoint URL
+    LinkupSearchConfig:
+      type: object
+      description: >
+        Configuration for Linkup Search API.
+
+
+        Linkup is useful for web search, source retrieval, and structured
+
+        research workflows.
+
+
+        **Setup:**
+
+        1. Sign up at https://linkup.so
+
+        2. Get API key from dashboard
+
+
+        **Docs:** https://docs.linkup.so
+      allOf:
+        - $ref: '#/components/schemas/WebSearchConfig'
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: Linkup API key (or set LINKUP_API_KEY env var)
+            depth:
+              type: string
+              enum:
+                - standard
+                - deep
+              default: standard
+              description: Search depth to request from Linkup
+            output_type:
+              type: string
+              enum:
+                - searchResults
+                - sourcedAnswer
+              default: searchResults
+              description: Linkup response shape to request
+    VertexSearchConfig:
+      type: object
+      description: >
+        Configuration for Google Cloud Agent Search / Vertex AI Search.
+
+
+        Use this for bounded Google Cloud search over configured data stores or
+
+        verified websites. The provider token is `vertex` to match Antfly's
+
+        existing Google Cloud provider convention.
+
+
+        **Setup:**
+
+        1. Enable Discovery Engine API in Google Cloud
+
+        2. Create an Agent Search app/data store
+
+        3. Grant service account access to query the serving config
+
+
+        **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+      allOf:
+        - $ref: '#/components/schemas/WebSearchConfig'
+        - type: object
+          properties:
+            service:
+              type: string
+              enum:
+                - agent_search
+              default: agent_search
+              description: Google Cloud search service flavor
+            project_id:
+              type: string
+              description: Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
+            location:
+              type: string
+              default: global
+              description: Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
+            data_store:
+              type: string
+              description: Agent Search data store ID.
+            serving_config:
+              type: string
+              default: default_config
+              description: Agent Search serving config ID.
+            credentials_path:
+              type: string
+              description: Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS.
     WebSearchConfig:
       description: >
         A unified configuration for web search providers.
@@ -14874,21 +15341,52 @@ components:
 
         **Environment Variables (fallbacks):**
 
-        - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID
-
-        - BING_SEARCH_API_KEY
+        - EXA_API_KEY
 
         - SERPER_API_KEY
 
         - TAVILY_API_KEY
 
         - BRAVE_API_KEY
+
+        - YOU_API_KEY
+
+        - LINKUP_API_KEY
+
+        - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
       type: object
       required:
         - provider
       properties:
         provider:
           $ref: '#/components/schemas/WebSearchProvider'
+        api_key:
+          type: string
+          description: Provider API key or secret reference. Prefer named web_search connections for production
+            use.
+        endpoint:
+          type: string
+          description: Provider endpoint override when applicable
+        project_id:
+          type: string
+          description: Google Cloud project ID for provider vertex. Shared Vertex credential field; see
+            vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex. Shared Vertex credential field; see
+            vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then
+            global.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex. Defaults to default_config.
+        credentials_path:
+          type: string
+          description: Service account JSON path for provider vertex. Shared Vertex credential field;
+            see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS
+            or ADC.
         max_results:
           type: integer
           default: 5
@@ -14912,15 +15410,24 @@ components:
           type: string
           description: Preferred region for results (e.g., 'us', 'uk', 'de')
           example: us
+        include_content:
+          type: boolean
+          default: false
+          description: Ask the provider to return extracted page content when supported
+        include_highlights:
+          type: boolean
+          default: false
+          description: Ask the provider to return highlighted passages when supported
       discriminator:
         propertyName: provider
         mapping:
-          google: '#/components/schemas/GoogleSearchConfig'
-          bing: '#/components/schemas/BingSearchConfig'
+          exa: '#/components/schemas/ExaSearchConfig'
           serper: '#/components/schemas/SerperSearchConfig'
           tavily: '#/components/schemas/TavilySearchConfig'
           brave: '#/components/schemas/BraveSearchConfig'
-          duckduckgo: '#/components/schemas/DuckDuckGoSearchConfig'
+          you: '#/components/schemas/YouSearchConfig'
+          linkup: '#/components/schemas/LinkupSearchConfig'
+          vertex: '#/components/schemas/VertexSearchConfig'
     Credentials:
       type: object
       properties:
@@ -15038,9 +15545,21 @@ components:
         websearch_config:
           $ref: '#/components/schemas/WebSearchConfig'
           description: >
-            Web search provider configuration. Required when websearch tool is enabled.
+            Inline web search provider configuration. Prefer websearch_connection for
 
-            See specs/openapi/antfly/websearch.yaml for provider-specific options.
+            configured production agents; inline config remains useful for CLI/dev
+
+            requests. See specs/openapi/antfly/websearch.yaml for provider-specific
+
+            options.
+        websearch_connection:
+          type: string
+          description: >
+            Name of a configured connections.<id> resource with kind web_search.
+
+            Request-level tool options may reduce scope, but cannot expand the
+
+            connection's configured capabilities or policy.
         fetch_config:
           $ref: '#/components/schemas/FetchConfig'
           description: >
@@ -15836,11 +16355,12 @@ components:
           example: semantic-ranker-default@latest
         project_id:
           type: string
-          description: Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+          description: Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+            Falls back to GOOGLE_CLOUD_PROJECT environment variable.
         credentials_path:
           type: string
-          description: Path to service account JSON file. Falls back to GOOGLE_APPLICATION_CREDENTIALS
-            environment variable.
+          description: Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+            Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
         top_n:
           type: integer
           description: Maximum number of records to return. If not specified, returns all documents with

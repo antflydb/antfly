@@ -9,6 +9,15 @@ const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 
 /// --- Extractors (framework-agnostic) ---
+pub const ListConnectionsParams = struct {
+    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
+    types: ?[]const u8 = null,
+    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    include: ?[]const u8 = null,
+    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    refresh: ?[]const u8 = null,
+};
+
 /// Store a secret
 pub const PutSecretPathParams = struct {
     /// Secret key name (e.g., openai.api_key)
@@ -410,6 +419,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
+    .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
@@ -473,6 +483,7 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "getStatus")) @compileError("ServerRouter: Impl missing required method 'getStatus'");
         if (!@hasDecl(Impl, "getCluster")) @compileError("ServerRouter: Impl missing required method 'getCluster'");
+        if (!@hasDecl(Impl, "listConnections")) @compileError("ServerRouter: Impl missing required method 'listConnections'");
         if (!@hasDecl(Impl, "listSecrets")) @compileError("ServerRouter: Impl missing required method 'listSecrets'");
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
@@ -537,6 +548,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             active_impl = self.impl;
             try server.get("/status", getStatus);
             try server.get("/cluster", getCluster);
+            try server.get("/connections", listConnections);
             try server.get("/secrets", listSecrets);
             try server.put("/secrets/:key", putSecret);
             try server.delete("/secrets/:key", deleteSecret);
@@ -599,6 +611,18 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getCluster(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.getCluster(ctx);
+        }
+
+        /// List configured external connections
+        /// GET /connections
+        fn listConnections(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const query_params = ListConnectionsParams{
+                .types = ctx.query("types"),
+                .include = ctx.query("include"),
+                .refresh = ctx.query("refresh"),
+            };
+            return impl.listConnections(ctx, query_params);
         }
 
         /// List secrets status
@@ -1014,6 +1038,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response

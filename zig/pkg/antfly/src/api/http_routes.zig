@@ -19,6 +19,7 @@ pub const Routes = struct {
     pub const readyz = "/readyz";
     pub const status = "/status";
     pub const cluster = "/cluster";
+    pub const connections = "/connections";
     pub const secrets = "/secrets";
     pub const secrets_prefix = "/secrets/";
     pub const auth_v1 = "/auth/v1";

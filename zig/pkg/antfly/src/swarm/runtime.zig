@@ -732,6 +732,7 @@ pub fn runFromIterator(
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
         .backend_runtime = node_backend_runtime.ptr(),
@@ -833,7 +834,15 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .read_images = localAntflyReadImages,
         .transcribe_audio = localAntflyTranscribeAudio,
         .extract = localAntflyExtract,
+        .list_models_json = localAntflyListModelsJson,
     };
+}
+
+fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try node.listModelsJsonAlloc(alloc, io_impl.io());
 }
 
 fn localAntflyEmbedDenseTexts(

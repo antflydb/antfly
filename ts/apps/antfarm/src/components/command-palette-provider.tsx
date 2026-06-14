@@ -12,24 +12,36 @@ import {
 import { InferenceClient } from "@antfly/sdk";
 import {
   ArrowUpDown,
+  Bot,
   ClipboardCheck,
+  FileInput,
   HelpCircle,
+  KeyRound,
   Library,
   Loader2,
-  MessageSquare,
+  Mic,
   Moon,
   Network,
+  Plug,
   Plus,
   Repeat2,
+  ScanLine,
   Scissors,
+  Search,
+  Shield,
   Sun,
   Table,
   Tag,
+  Upload,
   Users,
+  Waypoints,
 } from "lucide-react";
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
+import { isProductEnabled, type ProductId } from "@/config/products";
+import { type CommandAction, type CommandDefinition, commandDefinitions } from "@/data/commands";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { useAuth } from "@/hooks/use-auth";
 import { useTheme } from "@/hooks/use-theme";
 import { type SemanticResult, semanticSearch } from "@/lib/semantic-search";
 import { isExternalAuthMode } from "@/runtime-config";
@@ -40,12 +52,23 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   Plus,
   Library,
   Users,
+  FileInput,
+  Shield,
+  KeyRound,
   Scissors,
   Tag,
   HelpCircle,
   Network,
+  Plug,
   ClipboardCheck,
-  MessageSquare,
+  Bot,
+  Search,
+  Upload,
+  Waypoints,
+  ArrowUpDown,
+  Repeat2,
+  ScanLine,
+  Mic,
   Moon,
   Sun,
 };
@@ -58,6 +81,32 @@ interface CommandPaletteContextType {
 
 const CommandPaletteContext = React.createContext<CommandPaletteContextType | undefined>(undefined);
 
+interface PaletteCommand {
+  id: string;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  href?: string;
+  action?: CommandAction;
+  product?: ProductId;
+  adminOnly?: boolean;
+}
+
+function isSupportedAction(action?: string) {
+  return !action || action === "toggle-theme";
+}
+
+function toPaletteCommand(command: CommandDefinition): PaletteCommand {
+  return {
+    id: command.id,
+    icon: iconMap[command.icon] ?? HelpCircle,
+    label: command.label,
+    href: command.href,
+    action: command.action,
+    product: command.product,
+    adminOnly: command.adminOnly,
+  };
+}
+
 export function CommandPaletteProvider({ children }: { children: React.ReactNode }) {
   const [isOpen, setIsOpen] = React.useState(false);
   const [mounted, setMounted] = React.useState(false);
@@ -66,9 +115,11 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   const [isSearching, setIsSearching] = React.useState(false);
   const navigate = useNavigate();
 
+  const { hasPermission } = useAuth();
   const { theme, setTheme } = useTheme();
   const { inferenceApiUrl } = useApiConfig();
   const showLocalAdminRoutes = !isExternalAuthMode();
+  const showAdmin = showLocalAdminRoutes && hasPermission("*", "*", "admin");
 
   // Create InferenceClient for semantic search
   const inferenceClient = React.useMemo(
@@ -77,13 +128,19 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   );
 
   const isCommandAvailable = React.useCallback(
-    (item: { href?: string }) => {
-      if (showLocalAdminRoutes) {
-        return true;
+    (item: { href?: string; action?: string; product?: ProductId; adminOnly?: boolean }) => {
+      if (!isSupportedAction(item.action)) {
+        return false;
       }
-      return item.href !== "/users" && item.href !== "/secrets";
+      if (item.product && !isProductEnabled(item.product)) {
+        return false;
+      }
+      if (item.adminOnly && !showAdmin) {
+        return false;
+      }
+      return true;
     },
-    [showLocalAdminRoutes]
+    [showAdmin]
   );
 
   React.useEffect(() => {
@@ -108,47 +165,34 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   }, [toggle]);
 
   const navigationCommands = React.useMemo(() => {
-    const commands = [
-      { icon: Table, label: "Tables", href: "/" },
-      { icon: Plus, label: "Create Table", href: "/create" },
-      { icon: Library, label: "Models & Runtime", href: "/inference/models" },
-    ];
-    if (showLocalAdminRoutes) {
-      commands.push({ icon: Users, label: "Users", href: "/users" });
-    }
-    return commands;
-  }, [showLocalAdminRoutes]);
+    const commands = commandDefinitions
+      .filter((command) => command.group === "navigation")
+      .map(toPaletteCommand);
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
-  const playgroundCommands = React.useMemo(
-    () => [
-      { icon: Scissors, label: "Data Chunking Playground", href: "/data/playground/chunk" },
-      { icon: ClipboardCheck, label: "Data Evals", href: "/data/playground/evals" },
-      {
-        icon: Scissors,
-        label: "Antfly Inference Chunking Playground",
-        href: "/inference/playground/chunk",
-      },
-      { icon: Tag, label: "Extraction Playground", href: "/inference/playground/extract" },
-      { icon: Repeat2, label: "Rewriting Playground", href: "/inference/playground/rewrite" },
-      { icon: ArrowUpDown, label: "Reranking Playground", href: "/inference/playground/rerank" },
-      { icon: Network, label: "Knowledge Graph", href: "/inference/playground/kg" },
-    ],
-    []
-  );
+  const toolCommands = React.useMemo(() => {
+    const commands = commandDefinitions
+      .filter((command) => command.group === "tools")
+      .map(toPaletteCommand);
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
-  const quickActionCommands = React.useMemo(
-    () => [{ icon: Moon, label: "Toggle Theme", action: "toggle-theme" }],
-    []
-  );
+  const quickActionCommands = React.useMemo(() => {
+    const commands = commandDefinitions
+      .filter((command) => command.group === "quickActions")
+      .map(toPaletteCommand);
+    return commands.filter(isCommandAvailable);
+  }, [isCommandAvailable]);
 
   // All command items for string matching check
   const allItems = React.useMemo(
     () => [
       ...navigationCommands.map((c) => c.label),
-      ...playgroundCommands.map((c) => c.label),
+      ...toolCommands.map((c) => c.label),
       ...quickActionCommands.map((c) => c.label),
     ],
-    [navigationCommands, playgroundCommands, quickActionCommands]
+    [navigationCommands, toolCommands, quickActionCommands]
   );
 
   // Check if cmdk's string filter would find any matches
@@ -267,7 +311,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
               return (
                 <CommandItem
-                  key={command.action}
+                  key={command.id}
                   onSelect={() => handleSelect(undefined, command.action)}
                   className="flex items-center gap-2 cursor-pointer"
                 >
@@ -284,7 +328,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
           <CommandGroup heading="Navigation">
             {navigationCommands.map((command) => (
               <CommandItem
-                key={command.href}
+                key={command.id}
                 onSelect={() => handleSelect(command.href)}
                 className="flex items-center gap-2 cursor-pointer"
               >
@@ -296,11 +340,11 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
           <CommandSeparator />
 
-          {/* Playgrounds */}
-          <CommandGroup heading="Playgrounds">
-            {playgroundCommands.map((command) => (
+          {/* Tools */}
+          <CommandGroup heading="Tools">
+            {toolCommands.map((command) => (
               <CommandItem
-                key={command.href}
+                key={command.id}
                 onSelect={() => handleSelect(command.href)}
                 className="flex items-center gap-2 cursor-pointer"
               >
