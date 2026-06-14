@@ -188,6 +188,14 @@ installed; shards materialize the storage/index/runtime consequences. Direct
 data writes still go through normal Antfly validation, but validation can be
 derived from the installed extension shape.
 
+For implementation v1, a table-scoped `data_shape` member uses the existing
+Antfly table schema JSON as its `schema_json`/`owner_metadata_json`. That keeps
+extension write validation on the same parser and runtime checks as native table
+schemas, including `enforce_types`, document schemas, dynamic templates, and
+future compatible additions. A generic JSON Schema/OpenAPI-based shape language
+can be layered on later, but it should compile down to this table-validation
+contract before it can own table writes.
+
 Shape updates need the same discipline as code updates:
 
 1. Validate the new shape against existing stored data and dependent objects.

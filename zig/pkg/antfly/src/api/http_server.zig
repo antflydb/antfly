@@ -3816,11 +3816,13 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (table.schema_json.len == 0) return;
 
-        var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
-        defer parsed_schema.deinit(self.alloc);
-        try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
+        if (table.schema_json.len != 0) {
+            var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
+            defer parsed_schema.deinit(self.alloc);
+            try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
+        }
+        try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
     }
 
     pub fn validateCommitTablesAgainstSchema(self: *ApiHttpServer, tables: []const distributed_txn.TableCommitRequest) !void {
@@ -4928,6 +4930,14 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_writes orelse return error.NotFound;
+        self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.InvalidBatchRequest,
+            error.TableNotFound => return error.NotFound,
+            else => {
+                std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
         _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
@@ -7033,6 +7043,46 @@ fn extensionEnrichmentMemberTableName(member: metadata_mod.ExtensionMember) ?[]c
     return extensionMemberTableName(member);
 }
 
+fn extensionDataShapeMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+    if (member.object_kind != .data_shape) return null;
+    return extensionMemberTableName(member);
+}
+
+fn validateWritesAgainstExtensionDataShapes(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    writes: anytype,
+) !void {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionDataShapeMemberTableName(member) orelse continue;
+        if (!std.mem.eql(u8, member_table, table_name)) continue;
+
+        try validateExtensionDataShapeSchema(alloc, member.owner_metadata_json);
+        var parsed_shape = tables_api.parseValidatedTableSchema(alloc, member.owner_metadata_json) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidExtensionShape,
+        };
+        defer parsed_shape.deinit(alloc);
+        try tables_api.validateWritesAgainstTableSchema(alloc, parsed_shape, writes);
+    }
+}
+
+fn validateExtensionDataShapeSchema(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExtensionShape,
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidExtensionShape,
+    };
+    const document_schemas = root.get("document_schemas") orelse return error.InvalidExtensionShape;
+    if (document_schemas != .object or document_schemas.object.count() == 0) return error.InvalidExtensionShape;
+}
+
 fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         const member_table = extensionIndexMemberTableName(member) orelse continue;
@@ -8915,6 +8965,103 @@ test "api http server serves extension catalog reads" {
     var write_resp = try server.handle(.{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update", .body = "{}" });
     defer write_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 405), write_resp.status);
+}
+
+test "api http server validates writes against extension data shape members" {
+    const alloc = std.testing.allocator;
+    const shape_schema = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"},\"kind\":{\"type\":\"keyword\"}}}}}}";
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_tables = 1,
+                .projected_extension_members = 1,
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 10,
+                    .name = "memories",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{.{
+                    .extension_name = "memoryaf",
+                    .scope = .{ .kind = .table, .table_name = "memories" },
+                    .object_kind = .data_shape,
+                    .object_name = "memory_record",
+                    .table_name = "memories",
+                    .owner_metadata_json = shape_schema,
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+
+    try server.validateTableWritesAgainstSchema("memories", &[_]db_mod.types.BatchWrite{.{
+        .key = "doc:a",
+        .value = "{\"body\":\"remember this\",\"kind\":\"note\"}",
+    }});
+
+    try std.testing.expectError(error.InvalidBatchRequest, server.validateTableWritesAgainstSchema("memories", &[_]db_mod.types.BatchWrite{.{
+        .key = "doc:b",
+        .value = "{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}",
+    }}));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/extension-shape-batch", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var table_source = table_writes.BoundTableWriteSource.init("memories", &db);
+    var routed_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
+
+    const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
+    defer alloc.free(valid_body);
+    var valid_resp = try routed_server.handle(.{
+        .method = .POST,
+        .uri = "/tables/memories/batch",
+        .content_type = "application/json",
+        .body = valid_body,
+    });
+    defer valid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), valid_resp.status);
+
+    const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
+    defer alloc.free(invalid_body);
+    var invalid_resp = try routed_server.handle(.{
+        .method = .POST,
+        .uri = "/tables/memories/batch",
+        .content_type = "application/json",
+        .body = invalid_body,
+    });
+    defer invalid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
 }
 
 test "api http server dispatches extension lifecycle mutations" {
