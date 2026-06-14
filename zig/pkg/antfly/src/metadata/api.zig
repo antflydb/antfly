@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
+const metadata_extensions = @import("extensions.zig");
 const table_manager = @import("table_manager.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
@@ -90,6 +91,9 @@ pub const MetadataStatus = struct {
     projected_replication_source_last_success_at_ms_max: u64 = 0,
     projected_replication_source_last_source_commit_at_ms_max: u64 = 0,
     projected_replication_source_last_change_applied_at_ms_max: u64 = 0,
+    projected_extension_packages: usize = 0,
+    projected_installed_extensions: usize = 0,
+    projected_extension_members: usize = 0,
     projected_ranges: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
@@ -142,6 +146,9 @@ pub const AdminSnapshot = struct {
     restore_progresses: []table_manager.RestoreProgressRecord = &.{},
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
+    extension_packages: []metadata_extensions.PackageManifest = &.{},
+    installed_extensions: []metadata_extensions.InstalledExtension = &.{},
+    extension_members: []metadata_extensions.ExtensionMember = &.{},
     split_transitions: []transition_state.SplitTransitionRecord,
     merge_transitions: []transition_state.MergeTransitionRecord,
     split_observations: []transition_state.SplitObservationRecord = &.{},
@@ -183,6 +190,15 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     }
     if (@hasDecl(SourceDeclType, "listProjectedReplicationSourceStatuses")) {
         snapshot.replication_source_statuses = try source.listProjectedReplicationSourceStatuses(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedExtensionPackages")) {
+        snapshot.extension_packages = try source.listProjectedExtensionPackages(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedInstalledExtensions")) {
+        snapshot.installed_extensions = try source.listProjectedInstalledExtensions(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedExtensionMembers")) {
+        snapshot.extension_members = try source.listProjectedExtensionMembers(alloc);
     }
     snapshot.replication_source_action_hints = try deriveReplicationSourceActionHints(alloc, snapshot.tables, snapshot.replication_source_statuses);
     snapshot.split_transitions = try source.listProjectedSplitTransitions(alloc);
@@ -236,6 +252,15 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeProjectedReplicationSourceStatuses") and snapshot.replication_source_statuses.len > 0) {
         source.freeProjectedReplicationSourceStatuses(alloc, snapshot.replication_source_statuses);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedExtensionPackages") and snapshot.extension_packages.len > 0) {
+        source.freeProjectedExtensionPackages(alloc, snapshot.extension_packages);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedInstalledExtensions") and snapshot.installed_extensions.len > 0) {
+        source.freeProjectedInstalledExtensions(alloc, snapshot.installed_extensions);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedExtensionMembers") and snapshot.extension_members.len > 0) {
+        source.freeProjectedExtensionMembers(alloc, snapshot.extension_members);
     }
     freeReplicationSourceActionHints(alloc, snapshot.replication_source_action_hints);
     source.freeProjectedSplitTransitions(alloc, snapshot.split_transitions);

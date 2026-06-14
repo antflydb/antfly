@@ -33,6 +33,18 @@ pub const Routes = struct {
     pub const mcp_v1 = "/mcp/v1";
     pub const mcp_v1_prefix = "/mcp/v1/";
     pub const a2a = "/a2a";
+    pub const extensions_v1 = "/extensions/v1";
+    pub const extensions_v1_packages = "/extensions/v1/packages";
+    pub const extensions_v1_packages_prefix = "/extensions/v1/packages/";
+    pub const extensions_v1_installed = "/extensions/v1/installed";
+    pub const extensions_v1_installed_prefix = "/extensions/v1/installed/";
+    pub const extension_versions_marker = "/versions/";
+    pub const extension_update_suffix = "/update";
+    pub const extension_drop_suffix = "/drop";
+    pub const extension_enable_suffix = "/enable";
+    pub const extension_disable_suffix = "/disable";
+    pub const extension_objects_suffix = "/objects";
+    pub const extension_config_suffix = "/config";
     pub const agent_card_legacy = "/.well-known/agent.json";
     pub const agent_card = "/.well-known/agent-card.json";
     pub const backup = "/backup";
@@ -203,6 +215,19 @@ pub const Routes = struct {
     pub const SubjectRowFilter = struct {
         subject: []const u8,
         table: []const u8,
+    };
+
+    pub const ExtensionPackage = struct {
+        name: []const u8,
+    };
+
+    pub const ExtensionPackageVersion = struct {
+        name: []const u8,
+        version: []const u8,
+    };
+
+    pub const InstalledExtension = struct {
+        name: []const u8,
     };
 
     pub const GroupLookup = struct {
@@ -676,6 +701,56 @@ pub const Routes = struct {
         };
     }
 
+    pub fn matchExtensionPackage(path: []const u8) ?ExtensionPackage {
+        if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
+        const name = path[extensions_v1_packages_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
+    pub fn matchExtensionPackageVersion(path: []const u8) ?ExtensionPackageVersion {
+        if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
+        const rest = path[extensions_v1_packages_prefix.len..];
+        const marker_index = std.mem.indexOf(u8, rest, extension_versions_marker) orelse return null;
+        if (marker_index == 0) return null;
+        const name = rest[0..marker_index];
+        const version = rest[marker_index + extension_versions_marker.len ..];
+        if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        if (version.len == 0 or std.mem.indexOfScalar(u8, version, '/') != null) return null;
+        return .{ .name = name, .version = version };
+    }
+
+    pub fn matchInstalledExtension(path: []const u8) ?InstalledExtension {
+        if (!std.mem.startsWith(u8, path, extensions_v1_installed_prefix)) return null;
+        const name = path[extensions_v1_installed_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
+    pub fn matchInstalledExtensionUpdate(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_update_suffix);
+    }
+
+    pub fn matchInstalledExtensionDrop(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_drop_suffix);
+    }
+
+    pub fn matchInstalledExtensionEnable(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_enable_suffix);
+    }
+
+    pub fn matchInstalledExtensionDisable(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_disable_suffix);
+    }
+
+    pub fn matchInstalledExtensionObjects(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_objects_suffix);
+    }
+
+    pub fn matchInstalledExtensionConfig(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_config_suffix);
+    }
+
     pub fn matchGroupLookup(path: []const u8) ?GroupLookup {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1077,6 +1152,16 @@ pub const Routes = struct {
         return .{ .txn_id = txn_id };
     }
 
+    fn matchInstalledExtensionPath(path: []const u8, suffix: []const u8) ?InstalledExtension {
+        if (!std.mem.startsWith(u8, path, extensions_v1_installed_prefix)) return null;
+        const rest = path[extensions_v1_installed_prefix.len..];
+        if (rest.len <= suffix.len) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const name = rest[0 .. rest.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
     const GroupPrefix = struct {
         group_id: u64,
         rest: []const u8,
@@ -1179,6 +1264,28 @@ test "public api routes compile" {
     const subject_row_filter = Routes.matchSubjectRowFilter("/auth/v1/subjects/group:eng/row-filters/docs").?;
     try std.testing.expectEqualStrings("group:eng", subject_row_filter.subject);
     try std.testing.expectEqualStrings("docs", subject_row_filter.table);
+    try std.testing.expectEqualStrings("/extensions/v1/packages", Routes.extensions_v1_packages);
+    const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", extension_package.name);
+    try std.testing.expect(Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf/versions/1.0.0") == null);
+    const extension_package_version = Routes.matchExtensionPackageVersion("/extensions/v1/packages/memoryaf/versions/1.0.0").?;
+    try std.testing.expectEqualStrings("memoryaf", extension_package_version.name);
+    try std.testing.expectEqualStrings("1.0.0", extension_package_version.version);
+    const installed_extension = Routes.matchInstalledExtension("/extensions/v1/installed/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension.name);
+    const installed_extension_update = Routes.matchInstalledExtensionUpdate("/extensions/v1/installed/memoryaf/update").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_update.name);
+    const installed_extension_drop = Routes.matchInstalledExtensionDrop("/extensions/v1/installed/memoryaf/drop").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_drop.name);
+    const installed_extension_enable = Routes.matchInstalledExtensionEnable("/extensions/v1/installed/memoryaf/enable").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_enable.name);
+    const installed_extension_disable = Routes.matchInstalledExtensionDisable("/extensions/v1/installed/memoryaf/disable").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_disable.name);
+    const installed_extension_objects = Routes.matchInstalledExtensionObjects("/extensions/v1/installed/memoryaf/objects").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_objects.name);
+    const installed_extension_config = Routes.matchInstalledExtensionConfig("/extensions/v1/installed/memoryaf/config").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_config.name);
+    try std.testing.expect(Routes.matchInstalledExtension("/extensions/v1/installed/memoryaf/update") == null);
     const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a").?;
     try std.testing.expectEqual(@as(u64, 7), group_lookup.group_id);
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);

@@ -122,6 +122,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/antfly/reranking.yaml",
     "../specs/openapi/antfly/websearch.yaml",
     "../specs/openapi/auth/api.yaml",
+    "../specs/openapi/extensions/api.yaml",
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",

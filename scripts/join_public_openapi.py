@@ -27,6 +27,7 @@ from openapi_spec_validator import validate_spec
 ROOT = Path(__file__).resolve().parent.parent
 JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
 INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
+EXTENSIONS_SPEC = ROOT / "specs/openapi/extensions/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
@@ -89,10 +90,31 @@ def inference_public_path(path: str) -> str:
     return prefixed_path("/ai/v1", path)
 
 
+def extension_public_path(path: str) -> str:
+    return path
+
+
 def antfly_public_path(path: str) -> str:
     if path.startswith("/auth/v1/"):
         return path
     return prefixed_path("/db/v1", path)
+
+
+def merge_component_sections(base: dict, extra: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for section, section_map in extra.items():
+        if not isinstance(section_map, dict):
+            if section not in merged:
+                merged[section] = copy.deepcopy(section_map)
+            elif merged[section] != section_map:
+                raise RuntimeError(f"components/{section} conflict")
+            continue
+        target = merged.setdefault(section, {})
+        for name, value in section_map.items():
+            if name in target and target[name] != value:
+                raise RuntimeError(f"components/{section}/{name} conflict")
+            target[name] = copy.deepcopy(value)
+    return merged
 
 
 def walk_refs(value: object, rename_schema) -> object:
@@ -214,6 +236,7 @@ def merge_components(antfly: dict, inference: dict, inference_schema_names: set[
 def join_specs() -> dict:
     antfly = join_antfly_spec()
     inference = load_yaml(INFERENCE_SPEC)
+    extensions = load_yaml(EXTENSIONS_SPEC)
     inference_schema_names = referenced_inference_schema_names(inference)
 
     paths = {}
@@ -221,10 +244,12 @@ def join_specs() -> dict:
         paths[antfly_public_path(path)] = copy.deepcopy(item)
     for path, item in inference.get("paths", {}).items():
         paths[inference_public_path(path)] = walk_refs(item, inference_schema_name)
+    for path, item in extensions.get("paths", {}).items():
+        paths[extension_public_path(path)] = copy.deepcopy(item)
 
     tags = []
     seen_tags = set()
-    for item in antfly.get("tags", []) + inference.get("tags", []):
+    for item in antfly.get("tags", []) + inference.get("tags", []) + extensions.get("tags", []):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
             continue
@@ -239,14 +264,18 @@ def join_specs() -> dict:
             "description": (
                 "Joined public contract for the Antfly server. Antfly APIs are served under "
                 "`/db/v1`, auth APIs under `/auth/v1`, inference APIs under `/ai/v1`, "
-                "and ML prediction APIs under `/ml/v1`."
+                "ML prediction APIs under `/ml/v1`, and extension lifecycle APIs under "
+                "`/extensions/v1`."
             ),
         },
         "servers": [{"url": "/"}],
         "tags": tags,
         "security": copy.deepcopy(antfly.get("security", [])),
         "paths": paths,
-        "components": merge_components(antfly, inference, inference_schema_names),
+        "components": merge_component_sections(
+            merge_components(antfly, inference, inference_schema_names),
+            extensions.get("components", {}),
+        ),
         "x-tagGroups": [
             {
                 "name": "Antfly",
@@ -267,6 +296,14 @@ def join_specs() -> dict:
                 "tags": [
                     tag.get("name")
                     for tag in inference.get("tags", [])
+                    if isinstance(tag, dict) and tag.get("name")
+                ],
+            },
+            {
+                "name": "Extensions",
+                "tags": [
+                    tag.get("name")
+                    for tag in extensions.get("tags", [])
                     if isinstance(tag, dict) and tag.get("name")
                 ],
             },
