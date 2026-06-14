@@ -2809,6 +2809,10 @@ pub fn build(b: *std.Build) void {
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
@@ -3320,6 +3324,10 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
@@ -3356,6 +3364,10 @@ pub fn build(b: *std.Build) void {
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
             "artifact operations apply source document row filter visibility",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
