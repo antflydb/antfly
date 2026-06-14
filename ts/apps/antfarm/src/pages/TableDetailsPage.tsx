@@ -217,7 +217,7 @@ interface TableDetailsPageProps {
   currentSection?: string;
 }
 
-const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "indexes" }) => {
+const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
   const { tableName } = useParams<{ tableName: string }>();
   const navigate = useNavigate();
