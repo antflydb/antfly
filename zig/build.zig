@@ -4378,6 +4378,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_pdf", pdf_mod);
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
+    db_test_mod.addImport("structlog", structlog_mod);
 
     const db_split_sim_default_filters = [_][]const u8{
         "db split sim default workload stays green",
@@ -4471,6 +4472,10 @@ pub fn build(b: *std.Build) void {
             "dirty runtime status refresh finishes expired auto bulk before collecting leases",
             "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
             "provisioned table write source deinit drains restore repair jobs",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
