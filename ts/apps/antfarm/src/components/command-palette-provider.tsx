@@ -113,6 +113,10 @@ function isAdminHref(href?: string) {
   return href === "/users" || href === "/secrets";
 }
 
+function isSupportedAction(action?: string) {
+  return !action || action === "toggle-theme";
+}
+
 export function CommandPaletteProvider({ children }: { children: React.ReactNode }) {
   const [isOpen, setIsOpen] = React.useState(false);
   const [mounted, setMounted] = React.useState(false);
@@ -134,7 +138,10 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
   );
 
   const isCommandAvailable = React.useCallback(
-    (item: { href?: string; product?: ProductId; adminOnly?: boolean }) => {
+    (item: { href?: string; action?: string; product?: ProductId; adminOnly?: boolean }) => {
+      if (!isSupportedAction(item.action)) {
+        return false;
+      }
       const product = item.product ?? productForHref(item.href);
       if (product && !isProductEnabled(product)) {
         return false;
