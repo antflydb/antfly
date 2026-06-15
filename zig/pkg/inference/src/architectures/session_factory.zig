@@ -635,7 +635,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
 /// initialized via `Client.initFromEnv` which searches for the plugin in:
 ///   1. `PJRT_PLUGIN_PATH` env var
 ///   2. `~/Library/Application Support/go-xla/pjrt_c_api_cpu_plugin.dylib`
-///   3. `~/.termite/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
+///   3. `~/.antfly/inference/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
 ///
 /// If the plugin is not found, the session is created anyway but without a
 /// PJRT client (falls back to pure native CPU execution — no XLA-compiled
@@ -1277,7 +1277,7 @@ fn detectArchitecture(allocator: std.mem.Allocator, model_path: []const u8, mf: 
             defer allocator.free(model_type);
             if (mf.gliner_model_type.len > 0) {
                 // Split GLiNER bundles keep the DeBERTa encoder config in
-                // config.json and use termite_bundle/gliner_config sidecars
+                // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);

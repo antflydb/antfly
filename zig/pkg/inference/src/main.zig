@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const structlog = @import("structlog");
-const termite = @import("inference");
+const inference = @import("inference");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
@@ -24,18 +24,26 @@ pub const std_options: std.Options = .{
 
 const print = std.debug.print;
 
-/// Returns ~/.termite/models if $HOME is set, otherwise falls back to ./models.
+/// Returns ~/.antfly/inference/models if $HOME is set, otherwise falls back to ./models.
 fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
-    if (platform.env.getenv("ANTFLY_TERMITE_MODELS_DIR")) |value| return value;
-    if (platform.env.getenv("TERMITE_MODELS_DIR")) |value| return value;
+    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
     const home = platform.env.getenv("HOME") orelse return "./models";
-    return std.fs.path.join(allocator, &.{ home, ".termite", "models" }) catch "./models";
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
+}
+
+/// Returns ~/.antfly/inference/ml if $HOME is set, otherwise falls back to ./ml.
+fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
+    const home = platform.env.getenv("HOME") orelse return "./ml";
+    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
 }
 
 const RunConfig = struct {
     models_dir: ?[]const u8 = null,
-    content_security: ?termite.scraping.ContentSecurityConfig = null,
-    s3_credentials: ?termite.scraping.S3CredentialsConfig = null,
+    ml_dir: ?[]const u8 = null,
+    content_security: ?inference.scraping.ContentSecurityConfig = null,
+    s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
+    allow_downloads: ?bool = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -43,7 +51,7 @@ const RunConfig = struct {
 };
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
-    const raw = try termite.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
+    const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
     defer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(RunConfig, allocator, raw, .{
         .allocate = .alloc_always,
@@ -55,7 +63,6 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
 pub fn main(init: std.process.Init) !void {
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
-    // Collect args
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
     var args_buf: [64][]const u8 = undefined;
     var args_len: usize = 0;
@@ -68,58 +75,77 @@ pub fn main(init: std.process.Init) !void {
     const args = args_buf[0..args_len];
 
     if (args.len < 2) {
-        printUsage();
+        printUsage("inference");
         return;
     }
 
-    const command = args[1];
-    if (std.mem.eql(u8, command, "run")) {
+    return try runFromArgs(init, allocator, "antfly inference", args[1..]);
+}
+
+pub fn runFromArgs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    usage_name: []const u8,
+    args: []const []const u8,
+) !void {
+    if (args.len == 0) {
+        printUsage(usage_name);
+        return;
+    }
+
+    const command = args[0];
+    const command_args = args[1..];
+    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        printUsage(usage_name);
+    } else if (std.mem.eql(u8, command, "run")) {
         if (build_options.skip_openapi) {
-            print("termite run is unavailable when built with -Dskip-openapi=true\n", .{});
+            print("inference run is unavailable when built with -Dskip-openapi=true\n", .{});
             return;
         }
-        try runServer(allocator, init.io, args[2..]);
+        try runServer(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "embed")) {
-        try termite.native_embed.main(allocator, init.io, args[2..]);
+        try inference.native_embed.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "classify")) {
-        try termite.native_classify.main(allocator, init.io, args[2..]);
+        try inference.native_classify.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
-        try termite.native_generate.main(allocator, init.io, args[2..]);
+        try inference.native_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
-        try termite.native_compile.main(allocator, init.io, args[2..]);
+        try inference.native_compile.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "export")) {
-        try termite.native_export.main(allocator, init.io, args[2..]);
+        try inference.native_export.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "quantize")) {
-        try termite.native_quantize.main(allocator, init.io, args[2..]);
+        try inference.native_quantize.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "run-artifact")) {
-        try termite.native_run_artifact.main(allocator, init.io, args[2..]);
+        try inference.native_run_artifact.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "transcribe")) {
-        try termite.native_transcribe.main(allocator, init.io, args[2..]);
+        try inference.native_transcribe.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "read")) {
-        try termite.native_read.main(allocator, init.io, args[2..]);
+        try inference.native_read.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "recognize")) {
-        try termite.native_recognize.main(allocator, init.io, args[2..]);
+        try inference.native_recognize.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "extract")) {
-        try termite.native_extract.main(allocator, init.io, args[2..]);
+        try inference.native_extract.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compare")) {
-        try termite.compare_generate.main(allocator, init.io, args[2..]);
+        try inference.compare_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
-        try termite.finetune_cli.main(init, args[2..]);
+        try inference.finetune_cli.main(init, command_args);
     } else if (std.mem.eql(u8, command, "cuda-info")) {
-        try termite.cuda_info.main(allocator, init.io, args[2..]);
+        try inference.cuda_info.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "bench-cuda")) {
-        try termite.cuda_microbench.main(allocator, init.io, args[2..]);
+        try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
-        try termite.native_smoke.main(allocator, init.io, args[2..]);
+        try inference.native_smoke.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "list")) {
-        try listModels(allocator, init.io, args[2..]);
+        try listModels(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "pull")) {
-        try pullModel(allocator, init.io, args[2..]);
+        try pullModel(allocator, init.io, usage_name, command_args);
+    } else if (std.mem.eql(u8, command, "convert")) {
+        try inference.tabular.cli.convertMain(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "version")) {
         printVersion();
     } else {
         print("unknown command: {s}\n", .{command});
-        printUsage();
+        printUsage(usage_name);
     }
 }
 
@@ -129,8 +155,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(allocator);
+    var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
+    var ml_overridden = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -144,6 +172,10 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             models_dir = args[i + 1];
             models_overridden = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--ml-dir") and i + 1 < args.len) {
+            ml_dir = args[i + 1];
+            ml_overridden = true;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
@@ -155,36 +187,44 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (!models_overridden) {
             if (cfg.models_dir) |value| models_dir = value;
         }
+        if (!ml_overridden) {
+            if (cfg.ml_dir) |value| ml_dir = value;
+        }
     }
 
-    print("antfly-inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={}\n", .{
+    print("antfly inference v{s}\n", .{build_options.inference_version});
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
+        build_options.enable_cuda,
     });
-    print("models: {s}\n", .{models_dir});
+    print("ai models: {s}\n", .{models_dir});
+    print("ml models: {s}\n", .{ml_dir});
     print("listening on {s}:{d}\n", .{ host, port });
 
     // Leave SIGINT/SIGTERM on the default OS behavior for now. The previous
     // signal-context stop path could close the listener while accept() was in
     // flight, which panicked under Zig's threaded IO backend.
 
-    var node_cfg = termite.server.NodeConfig{
+    var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
+        .ml_dir = ml_dir,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
+        if (cfg.allow_downloads) |value| node_cfg.allow_downloads = value;
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
     }
 
-    var node = try termite.server.Node.init(allocator, node_cfg);
+    var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.seedAndDiscoverPredictors(io);
 
     try node.serve(allocator, io, host, port);
 
@@ -197,7 +237,7 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         models_dir = args[0];
     }
 
-    var reg = termite.registry.ModelRegistry.init(allocator, models_dir);
+    var reg = inference.registry.ModelRegistry.init(allocator, models_dir);
     defer reg.deinit();
 
     const models = try reg.discover(io);
@@ -208,18 +248,27 @@ fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     }
 }
 
-fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: termite pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>]\n", .{});
+        print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>]\n", .{usage_name});
+        print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
+        print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
+        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+        print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
     const ref = args[0];
+    if (inference.tabular.cli.isHttpUrl(ref) or isPredictorPull(args)) {
+        try inference.tabular.cli.pullMain(allocator, io, args, defaultMlDir(allocator));
+        return;
+    }
 
     // Parse optional --token flag
     var token: ?[]const u8 = null;
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
     var models_dir: []const u8 = defaultModelsDir(allocator);
+    var projector_selection: inference.registry.download.ProjectorSelection = .auto;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--token") and i + 1 < args.len) {
@@ -228,11 +277,16 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--models-dir") and i + 1 < args.len) {
             models_dir = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--ml-dir") and i + 1 < args.len) {
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--tasks") and i + 1 < args.len) {
             tasks_csv = args[i + 1];
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--capabilities") and i + 1 < args.len) {
             capabilities_csv = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--projector") and i + 1 < args.len) {
+            projector_selection = inference.registry.download.parseProjectorSelection(args[i + 1]) orelse return error.InvalidArguments;
             i += 1;
         }
     }
@@ -244,15 +298,26 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     print("pulling {s}...\n", .{ref});
 
-    var reg = termite.registry.ModelRegistry.init(allocator, models_dir);
+    var reg = inference.registry.ModelRegistry.init(allocator, models_dir);
     defer reg.deinit();
-    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, .auto);
+    try reg.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
 
     print("done.\n", .{});
 }
 
-fn printVersion() void {
-    print("antfly-inference v{s}\n", .{build_options.inference_version});
+fn isPredictorPull(args: []const []const u8) bool {
+    if (args.len == 0 or !inference.tabular.cli.isHuggingFaceRef(args[0])) return false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--type") and i + 1 < args.len) {
+            return std.mem.eql(u8, args[i + 1], "predictor") or std.mem.eql(u8, args[i + 1], "predictors");
+        }
+    }
+    return false;
+}
+
+pub fn printVersion() void {
+    print("antfly inference v{s}\n", .{build_options.inference_version});
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
@@ -262,9 +327,9 @@ fn printVersion() void {
     });
 }
 
-fn printUsage() void {
+fn printUsage(usage_name: []const u8) void {
     print(
-        \\Usage: termite <command> [options]
+        \\Usage: {s} <command> [options]
         \\
         \\Commands:
         \\  run       Start the inference server
@@ -285,23 +350,29 @@ fn printUsage() void {
         \\  cuda-info Inspect CUDA Driver API availability and optionally run a kernel smoke
         \\  bench-cuda Benchmark CUDA Q4_K CLIP/CLAP kernel shapes and optional ClipCLAP text embed
         \\  list      List available models
-        \\  pull      Download a model from HuggingFace Hub
+        \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
+        \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
         \\  version   Print version information
         \\
         \\Run options:
         \\  --host <addr>     Listen address (default: 127.0.0.1)
         \\  --port <port>     Listen port (default: 8090)
-        \\  --models-dir <dir>    Models directory (default: ~/.termite/models)
+        \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
+        \\  --name <name>     Local predictor name when pulling a tabular model URL
         \\  --tasks <list>    Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
-        \\  --models-dir <dir>    Models directory (default: ~/.termite/models)
-        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K_M, <model-ref>:mmproj
+        \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
+        \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
+        \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
+        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
+        \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\
-    , .{});
+    , .{ usage_name, usage_name });
 }
 
 test "run config parses shared scraping fields and ignores api_url" {
@@ -309,6 +380,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\{
         \\  "api_url": "http://127.0.0.1:8082",
         \\  "models_dir": "/tmp/models",
+        \\  "ml_dir": "/tmp/ml",
         \\  "content_security": {
         \\    "block_private_ips": true
         \\  },
@@ -326,6 +398,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
+    try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);

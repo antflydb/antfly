@@ -445,7 +445,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     )) return;
 
     if (!graph_mode) {
-        graph_mod.executor_stats.printBypass("termite.generate", "native_generation_direct_decoder_runtime");
+        graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
     const decoder_runtime_scheduler_override = false;
@@ -2061,10 +2061,10 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: termite generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
-        \\  Explicit compiled backends consult ~/.termite/artifacts/<owner>/<model>/<backend>/... by default.
+        \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
         \\  artifact-dir overrides that lookup root.
         \\  whole-model compiled generate prefers package manifests before raw sidecar scanning.
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.

@@ -40,18 +40,18 @@
 //   --seed <n>                   RNG seed (default: 42)
 
 const std = @import("std");
-const termite = @import("inference_internal");
+const inference = @import("inference_internal");
 const ml = @import("ml");
-const native_compute = termite.native_compute.native;
-const compat = termite.io.compat;
-const weight_source_mod = termite.models.weight_source;
+const native_compute = inference.native_compute.native;
+const compat = inference.io.compat;
+const weight_source_mod = inference.models.weight_source;
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
-const Tensor = termite.backends.Tensor;
+const Tensor = inference.backends.Tensor;
 
 // Finetune module imports — accessed via the termite internal module tree.
-const gliner2_data = termite.finetune.gliner2_data;
-const gliner2_autodiff = termite.finetune.gliner2_real_autodiff;
-const real_autodiff = termite.finetune.real_autodiff_trainer;
+const gliner2_data = inference.finetune.gliner2_data;
+const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
+const real_autodiff = inference.finetune.real_autodiff_trainer;
 const deberta_graph = @import("../../architectures/deberta_graph.zig");
 
 const print = std.debug.print;

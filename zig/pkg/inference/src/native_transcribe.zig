@@ -334,7 +334,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: termite transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--language <lang>]
+        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--language <lang>]
         \\  Runs local audio transcription and prints a JSON response to stdout.
         \\
     , .{});

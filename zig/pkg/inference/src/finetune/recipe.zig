@@ -203,7 +203,7 @@ const StepManifest = struct {
 };
 
 const RunManifest = struct {
-    schema_version: []const u8 = "termite_finetune_recipe_run/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_recipe_run/v1",
     status: RunStatus,
     recipe: Recipe,
     artifact_root: ?[]const u8,
@@ -211,14 +211,14 @@ const RunManifest = struct {
 };
 
 const TrainingConfigFile = struct {
-    schema_version: []const u8 = "termite_finetune_training_config/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_training_config/v1",
     recipe: Recipe,
     steps: []const StepManifest,
     metadata: StaticMetadata,
 };
 
 const TrainingReportFile = struct {
-    schema_version: []const u8 = "termite_finetune_training_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_training_report/v1",
     status: RunStatus,
     recipe: Recipe,
     artifact_root: ?[]const u8,
@@ -237,7 +237,7 @@ const PathFingerprint = struct {
 };
 
 const BackendBuildInfo = struct {
-    termite_version: []const u8,
+    inference_version: []const u8,
     enable_native: bool,
     enable_onnx: bool,
     enable_pjrt: bool,
@@ -290,7 +290,7 @@ const DirectoryDigest = struct {
 };
 
 const DpoReport = struct {
-    schema_version: []const u8 = "termite_finetune_dpo_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v1",
     examples: usize,
     loss: f32,
     mean_reward_margin: f32,
@@ -299,7 +299,7 @@ const DpoReport = struct {
 };
 
 const SftReport = struct {
-    schema_version: []const u8 = "termite_finetune_sft_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_sft_report/v1",
     examples: usize,
     supervised_tokens: usize,
     loss: f32,
@@ -308,7 +308,7 @@ const SftReport = struct {
 };
 
 const GrpoReport = struct {
-    schema_version: []const u8 = "termite_finetune_grpo_report/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v1",
     completions: usize,
     tokens: usize,
     groups: usize,
@@ -350,7 +350,7 @@ const FastSmokeCaseResult = struct {
 };
 
 const FastSmokeSummary = struct {
-    schema_version: []const u8 = "termite_finetune_fast_smoke/v1",
+    schema_version: []const u8 = "antfly_inference_finetune_fast_smoke/v1",
     status: RunStatus,
     output_root: []const u8,
     cases: []const FastSmokeCaseResult,
@@ -450,7 +450,7 @@ pub fn loadRecipe(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !s
 }
 
 fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    var out_root: []const u8 = "/tmp/termite-finetune-smoke-fast";
+    var out_root: []const u8 = "/tmp/antfly-inference-finetune-smoke-fast";
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out-root")) {
@@ -467,31 +467,31 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
     defer allocator.free(summary_path);
 
     const cases = [_]FastSmokeCase{
-        .{ .name = "gemma4_dry_run", .recipe_path = "pkg/termite/testdata/recipe_gemma4_lora.json", .mode = .dry_run },
-        .{ .name = "gliner2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_gliner2_lora.json", .mode = .dry_run },
-        .{ .name = "layoutlmv3_dry_run", .recipe_path = "pkg/termite/testdata/recipe_layoutlmv3_lora_token.json", .mode = .dry_run },
-        .{ .name = "reranker_head_dry_run", .recipe_path = "pkg/termite/testdata/recipe_reranker_head.json", .mode = .dry_run },
-        .{ .name = "reranker_lora_dry_run", .recipe_path = "pkg/termite/testdata/recipe_reranker_lora.json", .mode = .dry_run },
-        .{ .name = "colqwen2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_colqwen2_vlm_retrieval.json", .mode = .dry_run },
-        .{ .name = "dpo_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_native_fast.json", .mode = .dry_run },
-        .{ .name = "dpo_text_gemma_dry_run", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "dpo_rendered_text_gemma_dry_run", .recipe_path = "pkg/termite/testdata/recipe_dpo_rendered_text_preference_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "dpo_text_qwen2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_native_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_text_gemma_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_rendered_text_gemma_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_rendered_text_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_multimodal_gemma_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_multimodal_gemma_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_text_qwen2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_text_colqwen2_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_colqwen2_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_ci_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_ci_native_fast.json", .mode = .dry_run },
-        .{ .name = "grpo_prefix_text_dry_run", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_prefix_native_fast.json", .mode = .dry_run },
-        .{ .name = "gliner2_direct_execute", .recipe_path = "pkg/termite/testdata/recipe_gliner2_lora.json", .mode = .execute, .setup = .synthetic_gliner2_execute },
-        .{ .name = "qwen2_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .subprocess_execute, .setup = .synthetic_qwen2_dpo_execute },
-        .{ .name = "qwen2_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .execute, .setup = .synthetic_qwen2_grpo_execute },
-        .{ .name = "gemma4_dpo_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_dpo_execute },
-        .{ .name = "gemma4_grpo_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_text_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_grpo_execute },
-        .{ .name = "dpo_scalar_execute", .recipe_path = "pkg/termite/testdata/recipe_dpo_scalar.json", .mode = .execute },
-        .{ .name = "grpo_scalar_execute", .recipe_path = "pkg/termite/testdata/recipe_grpo_scalar.json", .mode = .execute },
+        .{ .name = "gemma4_dry_run", .recipe_path = "pkg/inference/testdata/recipe_gemma4_lora.json", .mode = .dry_run },
+        .{ .name = "gliner2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_gliner2_lora.json", .mode = .dry_run },
+        .{ .name = "layoutlmv3_dry_run", .recipe_path = "pkg/inference/testdata/recipe_layoutlmv3_lora_token.json", .mode = .dry_run },
+        .{ .name = "reranker_head_dry_run", .recipe_path = "pkg/inference/testdata/recipe_reranker_head.json", .mode = .dry_run },
+        .{ .name = "reranker_lora_dry_run", .recipe_path = "pkg/inference/testdata/recipe_reranker_lora.json", .mode = .dry_run },
+        .{ .name = "colqwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_colqwen2_vlm_retrieval.json", .mode = .dry_run },
+        .{ .name = "dpo_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_native_fast.json", .mode = .dry_run },
+        .{ .name = "dpo_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .dry_run },
+        .{ .name = "dpo_rendered_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_dpo_rendered_text_preference_gemma_fast.json", .mode = .dry_run },
+        .{ .name = "dpo_text_qwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_native_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_gemma_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_rendered_text_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_rendered_text_gemma_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_multimodal_gemma_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_multimodal_gemma_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_text_qwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_text_colqwen2_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_colqwen2_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_ci_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_ci_native_fast.json", .mode = .dry_run },
+        .{ .name = "grpo_prefix_text_dry_run", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_prefix_native_fast.json", .mode = .dry_run },
+        .{ .name = "gliner2_direct_execute", .recipe_path = "pkg/inference/testdata/recipe_gliner2_lora.json", .mode = .execute, .setup = .synthetic_gliner2_execute },
+        .{ .name = "qwen2_dpo_execute", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_qwen2_fast.json", .mode = .subprocess_execute, .setup = .synthetic_qwen2_dpo_execute },
+        .{ .name = "qwen2_grpo_execute", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_qwen2_fast.json", .mode = .execute, .setup = .synthetic_qwen2_grpo_execute },
+        .{ .name = "gemma4_dpo_execute", .recipe_path = "pkg/inference/testdata/recipe_dpo_text_preference_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_dpo_execute },
+        .{ .name = "gemma4_grpo_execute", .recipe_path = "pkg/inference/testdata/recipe_grpo_text_gemma_fast.json", .mode = .execute, .setup = .synthetic_gemma_grpo_execute },
+        .{ .name = "dpo_scalar_execute", .recipe_path = "pkg/inference/testdata/recipe_dpo_scalar.json", .mode = .execute },
+        .{ .name = "grpo_scalar_execute", .recipe_path = "pkg/inference/testdata/recipe_grpo_scalar.json", .mode = .execute },
     };
 
     var results = try allocator.alloc(FastSmokeCaseResult, cases.len);
@@ -572,10 +572,10 @@ fn runFastSmokeCase(
         const smoke_recipe_path = try std.fs.path.join(allocator, &.{ case_root, "smoke_recipe.json" });
         defer allocator.free(smoke_recipe_path);
         try writeJsonFile(allocator, io, smoke_recipe_path, recipe);
-        const termite_path = try std.fs.path.join(allocator, &.{ exe_dir, "termite" });
-        defer allocator.free(termite_path);
+        const antfly_path = try std.fs.path.join(allocator, &.{ exe_dir, "antfly" });
+        defer allocator.free(antfly_path);
         const result = try std.process.run(allocator, io, .{
-            .argv = &.{ termite_path, "finetune", "run", smoke_recipe_path },
+            .argv = &.{ antfly_path, "inference", "finetune", "run", smoke_recipe_path },
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(16 * 1024 * 1024),
         });
@@ -669,7 +669,7 @@ fn resolveCwdPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
     if (cwdPathExists(io, path)) return try allocator.dupe(u8, path);
 
-    const package_prefix = "pkg/termite/";
+    const package_prefix = "pkg/inference/";
     if (std.mem.startsWith(u8, path, package_prefix)) {
         const package_relative = path[package_prefix.len..];
         if (cwdPathExists(io, package_relative)) return try allocator.dupe(u8, package_relative);
@@ -937,7 +937,7 @@ fn copySmokeArtifactFromQwenTokenizerBundle(
     out_dir: []const u8,
     file_name: []const u8,
 ) !void {
-    const src_root = "/tmp/termite-models/Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+    const src_root = "/tmp/antfly-inference-models/Qwen/Qwen2.5-0.5B-Instruct-GGUF";
     const src_path = try std.fs.path.join(allocator, &.{ src_root, file_name });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
@@ -1220,7 +1220,7 @@ fn buildQwen35TextSftPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         .{
             .kind = .direct_sft,
             .name = "train-eval",
-            .argv = try argv(allocator, &.{"termite-internal-sft"}),
+            .argv = try argv(allocator, &.{"antfly-inference-internal-sft"}),
         },
     }) };
 }
@@ -1479,7 +1479,7 @@ fn buildDpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         .{
             .kind = .direct_dpo,
             .name = "train-eval",
-            .argv = try argv(allocator, &.{"termite-internal-dpo"}),
+            .argv = try argv(allocator, &.{"antfly-inference-internal-dpo"}),
         },
     }) };
 }
@@ -1490,7 +1490,7 @@ fn buildGrpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         .{
             .kind = .direct_grpo,
             .name = "train-eval",
-            .argv = try argv(allocator, &.{"termite-internal-grpo"}),
+            .argv = try argv(allocator, &.{"antfly-inference-internal-grpo"}),
         },
     }) };
 }
@@ -2133,7 +2133,7 @@ fn manifestPath(allocator: std.mem.Allocator, recipe: Recipe) ![]const u8 {
 }
 
 fn defaultArtifactPath(allocator: std.mem.Allocator, recipe: Recipe, leaf: []const u8) ![]const u8 {
-    const root = recipe.artifacts.root orelse "termite-finetune-out";
+    const root = recipe.artifacts.root orelse "antfly-inference-finetune-out";
     return std.fs.path.join(allocator, &.{ root, leaf });
 }
 
@@ -2167,7 +2167,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
         .backend = .{
             .requested = recipe.backend,
             .build = .{
-                .termite_version = build_options.inference_version,
+                .inference_version = build_options.inference_version,
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
                 .enable_pjrt = build_options.enable_pjrt,
@@ -5691,8 +5691,8 @@ fn readFileMax(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_b
 
 fn usage() void {
     print(
-        \\usage: termite finetune run <recipe.json> [--dry-run]
-        \\       termite finetune smoke-fast [--out-root <path>]
+        \\usage: antfly inference finetune run <recipe.json> [--dry-run]
+        \\       antfly inference finetune smoke-fast [--out-root <path>]
         \\
         \\recipe kinds: sft, lora-sft, qlora-sft, dpo, grpo, reranker, vlm-retrieval
         \\common fields: model, dataset, adapter, optimizer, eval, artifacts
@@ -6044,14 +6044,14 @@ test "run manifest captures recipe plan status" {
         .steps = steps,
     }, .{ .whitespace = .indent_2 });
     defer std.heap.page_allocator.free(rendered);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "termite_finetune_recipe_run/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_inference_finetune_recipe_run/v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "prepare-reranker-pooled-cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "running") != null);
 }
 
 test "fast smoke resolves checked-in testdata from current package cwd" {
     const allocator = std.testing.allocator;
-    const path = try resolveCwdPath(allocator, std.testing.io, "pkg/termite/testdata/recipe_gemma4_lora.json");
+    const path = try resolveCwdPath(allocator, std.testing.io, "pkg/inference/testdata/recipe_gemma4_lora.json");
     defer allocator.free(path);
     try std.testing.expect(cwdPathExists(std.testing.io, path));
 }
@@ -6091,7 +6091,7 @@ test "text reward modes score as expected" {
 
 test "synthetic gliner2 smoke assets tokenize within vocab bounds" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/termite_recipe_gliner2_smoke_assets_test";
+    const root = "/tmp/antfly_inference_recipe_gliner2_smoke_assets_test";
     compat.cwd().deleteTree(compat.io(), root) catch {};
 
     const assets = try writeSyntheticGliner2SmokeAssets(allocator, std.testing.io, root);
