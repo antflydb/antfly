@@ -30,11 +30,34 @@ pub const RuntimeBinding = struct {
 
 pub const InvokeError = anyerror;
 
+pub const HostImports = struct {
+    ptr: ?*anyopaque = null,
+    db_query: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]u8 = null,
+    db_write: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]u8 = null,
+    ai_embed: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror![]f32 = null,
+};
+
+pub const InvokeOptions = struct {
+    host_imports: HostImports = .{},
+    fuel: u64 = 50_000_000,
+    max_memory_bytes: i64 = 64 * 1024 * 1024,
+};
+
 pub fn invokeExtension(
     alloc: std.mem.Allocator,
     binding: RuntimeBinding,
     tool_name: []const u8,
     request_json: []const u8,
+) InvokeError![]u8 {
+    return try invokeExtensionWithOptions(alloc, binding, tool_name, request_json, .{});
+}
+
+pub fn invokeExtensionWithOptions(
+    alloc: std.mem.Allocator,
+    binding: RuntimeBinding,
+    tool_name: []const u8,
+    request_json: []const u8,
+    options: InvokeOptions,
 ) InvokeError![]u8 {
     const artifact_path = try resolveArtifactPathAlloc(alloc, binding);
     defer alloc.free(artifact_path);
@@ -48,7 +71,7 @@ pub fn invokeExtension(
     if (wasm.len >= component_magic.len and std.mem.eql(u8, wasm[0..component_magic.len], &component_magic)) {
         var lib = try WasmtimeLib.open();
         defer lib.close();
-        return try lib.invokeExtensionComponent(alloc, wasm, binding.entrypoint, tool_name, request_json);
+        return try lib.invokeExtensionComponent(alloc, wasm, binding.entrypoint, tool_name, request_json, options);
     }
     if (wasm.len < core_magic.len or !std.mem.eql(u8, wasm[0..core_magic.len], &core_magic)) {
         return error.WasmtimeUnsupportedArtifact;
@@ -163,6 +186,7 @@ const WasmName = extern struct {
 };
 
 const WasmtimeComponentValKind = u8;
+const WASMTIME_COMPONENT_F32: WasmtimeComponentValKind = 9;
 const WASMTIME_COMPONENT_STRING: WasmtimeComponentValKind = 12;
 const WASMTIME_COMPONENT_LIST: WasmtimeComponentValKind = 13;
 const WASMTIME_COMPONENT_RECORD: WasmtimeComponentValKind = 14;
@@ -252,6 +276,8 @@ const WasmtimeComponentFuncCallback = *const fn (
 
 const HostImportContext = struct {
     lib: *const WasmtimeLib,
+    alloc: std.mem.Allocator,
+    imports: HostImports,
 };
 
 const WasmtimeLib = struct {
@@ -262,12 +288,15 @@ const WasmtimeLib = struct {
     wasm_engine_new: *const fn () callconv(.c) ?*wasm_engine_t,
     wasm_engine_delete: *const fn (?*wasm_engine_t) callconv(.c) void,
     wasmtime_config_wasm_component_model_set: *const fn (?*wasm_config_t, bool) callconv(.c) void,
+    wasmtime_config_consume_fuel_set: *const fn (?*wasm_config_t, bool) callconv(.c) void,
     wasi_config_new: *const fn () callconv(.c) ?*wasi_config_t,
     wasi_config_delete: *const fn (?*wasi_config_t) callconv(.c) void,
     wasmtime_context_set_wasi: *const fn (?*wasmtime_context_t, ?*wasi_config_t) callconv(.c) ?*wasmtime_error_t,
     wasmtime_store_new: *const fn (?*wasm_engine_t, ?*anyopaque, ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) ?*wasmtime_store_t,
+    wasmtime_store_limiter: *const fn (?*wasmtime_store_t, i64, i64, i64, i64, i64) callconv(.c) void,
     wasmtime_store_delete: *const fn (?*wasmtime_store_t) callconv(.c) void,
     wasmtime_store_context: *const fn (?*wasmtime_store_t) callconv(.c) ?*wasmtime_context_t,
+    wasmtime_context_set_fuel: *const fn (?*wasmtime_context_t, u64) callconv(.c) ?*wasmtime_error_t,
     wasmtime_module_new: *const fn (?*wasm_engine_t, [*]const u8, usize, *?*wasmtime_module_t) callconv(.c) ?*wasmtime_error_t,
     wasmtime_module_delete: *const fn (?*wasmtime_module_t) callconv(.c) void,
     wasmtime_linker_new: *const fn (?*wasm_engine_t) callconv(.c) ?*wasmtime_linker_t,
@@ -324,12 +353,15 @@ const WasmtimeLib = struct {
             .wasm_engine_new = try lookup(&dynlib, "wasm_engine_new", *const fn () callconv(.c) ?*wasm_engine_t),
             .wasm_engine_delete = try lookup(&dynlib, "wasm_engine_delete", *const fn (?*wasm_engine_t) callconv(.c) void),
             .wasmtime_config_wasm_component_model_set = try lookup(&dynlib, "wasmtime_config_wasm_component_model_set", *const fn (?*wasm_config_t, bool) callconv(.c) void),
+            .wasmtime_config_consume_fuel_set = try lookup(&dynlib, "wasmtime_config_consume_fuel_set", *const fn (?*wasm_config_t, bool) callconv(.c) void),
             .wasi_config_new = try lookup(&dynlib, "wasi_config_new", *const fn () callconv(.c) ?*wasi_config_t),
             .wasi_config_delete = try lookup(&dynlib, "wasi_config_delete", *const fn (?*wasi_config_t) callconv(.c) void),
             .wasmtime_context_set_wasi = try lookup(&dynlib, "wasmtime_context_set_wasi", *const fn (?*wasmtime_context_t, ?*wasi_config_t) callconv(.c) ?*wasmtime_error_t),
             .wasmtime_store_new = try lookup(&dynlib, "wasmtime_store_new", *const fn (?*wasm_engine_t, ?*anyopaque, ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) ?*wasmtime_store_t),
+            .wasmtime_store_limiter = try lookup(&dynlib, "wasmtime_store_limiter", *const fn (?*wasmtime_store_t, i64, i64, i64, i64, i64) callconv(.c) void),
             .wasmtime_store_delete = try lookup(&dynlib, "wasmtime_store_delete", *const fn (?*wasmtime_store_t) callconv(.c) void),
             .wasmtime_store_context = try lookup(&dynlib, "wasmtime_store_context", *const fn (?*wasmtime_store_t) callconv(.c) ?*wasmtime_context_t),
+            .wasmtime_context_set_fuel = try lookup(&dynlib, "wasmtime_context_set_fuel", *const fn (?*wasmtime_context_t, u64) callconv(.c) ?*wasmtime_error_t),
             .wasmtime_module_new = try lookup(&dynlib, "wasmtime_module_new", *const fn (?*wasm_engine_t, [*]const u8, usize, *?*wasmtime_module_t) callconv(.c) ?*wasmtime_error_t),
             .wasmtime_module_delete = try lookup(&dynlib, "wasmtime_module_delete", *const fn (?*wasmtime_module_t) callconv(.c) void),
             .wasmtime_linker_new = try lookup(&dynlib, "wasmtime_linker_new", *const fn (?*wasm_engine_t) callconv(.c) ?*wasmtime_linker_t),
@@ -432,15 +464,21 @@ const WasmtimeLib = struct {
         return response;
     }
 
-    fn invokeExtensionComponent(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, entrypoint: []const u8, tool_name: []const u8, request_json: []const u8) InvokeError![]u8 {
+    fn invokeExtensionComponent(self: WasmtimeLib, alloc: std.mem.Allocator, wasm: []const u8, entrypoint: []const u8, tool_name: []const u8, request_json: []const u8, options: InvokeOptions) InvokeError![]u8 {
         const config = self.wasm_config_new() orelse return error.WasmtimeUnavailable;
         self.wasmtime_config_wasm_component_model_set(config, true);
+        self.wasmtime_config_consume_fuel_set(config, true);
         const engine = self.wasm_engine_new_with_config(config) orelse return error.WasmtimeUnavailable;
         defer self.wasm_engine_delete(engine);
 
         const store = self.wasmtime_store_new(engine, null, null) orelse return error.WasmtimeUnavailable;
         defer self.wasmtime_store_delete(store);
+        self.wasmtime_store_limiter(store, options.max_memory_bytes, -1, 64, 64, 16);
         const context = self.wasmtime_store_context(store) orelse return error.WasmtimeUnavailable;
+        if (self.wasmtime_context_set_fuel(context, options.fuel)) |err| {
+            self.wasmtime_error_delete(err);
+            return error.WasmtimeFuelUnavailable;
+        }
         try self.configureWasi(context);
 
         var component: ?*wasmtime_component_t = null;
@@ -452,7 +490,7 @@ const WasmtimeLib = struct {
 
         const linker = self.wasmtime_component_linker_new(engine) orelse return error.WasmtimeUnavailable;
         defer self.wasmtime_component_linker_delete(linker);
-        var host_imports = HostImportContext{ .lib = &self };
+        var host_imports = HostImportContext{ .lib = &self, .alloc = alloc, .imports = options.host_imports };
         try self.defineExtensionHostImports(linker, &host_imports);
 
         var instance: WasmtimeComponentInstance = .{};
@@ -633,12 +671,30 @@ fn componentDbQueryCallback(
     data: ?*anyopaque,
     _: ?*wasmtime_context_t,
     _: ?*const wasmtime_component_func_type_t,
-    _: [*]WasmtimeComponentVal,
-    _: usize,
+    args: [*]WasmtimeComponentVal,
+    args_len: usize,
     results: [*]WasmtimeComponentVal,
     results_len: usize,
 ) callconv(.c) ?*wasmtime_error_t {
-    setHostImportStringResult(data, results, results_len, "[]");
+    const host_imports = hostImportContext(data) orelse return null;
+    const callback = host_imports.imports.db_query orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.query host import is unavailable");
+        return null;
+    };
+    const table = componentStringArg(args, args_len, 0) orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.query table must be a string");
+        return null;
+    };
+    const query_json = componentStringArg(args, args_len, 1) orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.query request must be a string");
+        return null;
+    };
+    const response = callback(host_imports.imports.ptr, host_imports.alloc, table, query_json) catch |err| {
+        setHostImportError(data, results, results_len, err);
+        return null;
+    };
+    defer host_imports.alloc.free(response);
+    setHostImportStringResult(data, results, results_len, true, response);
     return null;
 }
 
@@ -646,12 +702,30 @@ fn componentDbWriteCallback(
     data: ?*anyopaque,
     _: ?*wasmtime_context_t,
     _: ?*const wasmtime_component_func_type_t,
-    _: [*]WasmtimeComponentVal,
-    _: usize,
+    args: [*]WasmtimeComponentVal,
+    args_len: usize,
     results: [*]WasmtimeComponentVal,
     results_len: usize,
 ) callconv(.c) ?*wasmtime_error_t {
-    setHostImportStringResult(data, results, results_len, "{\"ok\":true}");
+    const host_imports = hostImportContext(data) orelse return null;
+    const callback = host_imports.imports.db_write orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.write host import is unavailable");
+        return null;
+    };
+    const table = componentStringArg(args, args_len, 0) orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.write table must be a string");
+        return null;
+    };
+    const writes_json = componentStringArg(args, args_len, 1) orelse {
+        setHostImportStringResult(data, results, results_len, false, "db.write request must be a string");
+        return null;
+    };
+    const response = callback(host_imports.imports.ptr, host_imports.alloc, table, writes_json) catch |err| {
+        setHostImportError(data, results, results_len, err);
+        return null;
+    };
+    defer host_imports.alloc.free(response);
+    setHostImportStringResult(data, results, results_len, true, response);
     return null;
 }
 
@@ -659,14 +733,34 @@ fn componentAiEmbedCallback(
     data: ?*anyopaque,
     _: ?*wasmtime_context_t,
     _: ?*const wasmtime_component_func_type_t,
-    _: [*]WasmtimeComponentVal,
-    _: usize,
+    args: [*]WasmtimeComponentVal,
+    args_len: usize,
     results: [*]WasmtimeComponentVal,
     results_len: usize,
 ) callconv(.c) ?*wasmtime_error_t {
     const host_imports = hostImportContext(data) orelse return null;
     if (results_len == 0) return null;
-    var payload = componentEmptyList();
+    const callback = host_imports.imports.ai_embed orelse {
+        setHostImportStringResult(data, results, results_len, false, "ai.embed host import is unavailable");
+        return null;
+    };
+    const model = componentStringArg(args, args_len, 0) orelse {
+        setHostImportStringResult(data, results, results_len, false, "ai.embed model must be a string");
+        return null;
+    };
+    const text = componentStringArg(args, args_len, 1) orelse {
+        setHostImportStringResult(data, results, results_len, false, "ai.embed text must be a string");
+        return null;
+    };
+    const embedding = callback(host_imports.imports.ptr, host_imports.alloc, model, text) catch |err| {
+        setHostImportError(data, results, results_len, err);
+        return null;
+    };
+    defer host_imports.alloc.free(embedding);
+    var payload = componentF32List(host_imports.alloc, embedding) catch {
+        setHostImportStringResult(data, results, results_len, false, "ai.embed result allocation failed");
+        return null;
+    };
     const heap_payload = host_imports.lib.wasmtime_component_val_new(&payload) orelse return null;
     results[0] = .{
         .kind = WASMTIME_COMPONENT_RESULT,
@@ -675,14 +769,38 @@ fn componentAiEmbedCallback(
     return null;
 }
 
-fn setHostImportStringResult(data: ?*anyopaque, results: [*]WasmtimeComponentVal, results_len: usize, value: []const u8) void {
+fn componentStringArg(args: [*]WasmtimeComponentVal, args_len: usize, index: usize) ?[]const u8 {
+    if (index >= args_len) return null;
+    const value = args[index];
+    if (value.kind != WASMTIME_COMPONENT_STRING) return null;
+    return wasmNameSlice(value.of.string);
+}
+
+fn componentF32List(_: std.mem.Allocator, values: []const f32) !WasmtimeComponentVal {
+    if (values.len == 0) return componentEmptyList();
+    const data = try std.heap.c_allocator.alloc(WasmtimeComponentVal, values.len);
+    for (values, 0..) |value, i| {
+        data[i] = .{ .kind = WASMTIME_COMPONENT_F32, .of = .{ .f32 = value } };
+    }
+    return .{
+        .kind = WASMTIME_COMPONENT_LIST,
+        .of = .{ .list = .{ .size = values.len, .data = data.ptr } },
+    };
+}
+
+fn setHostImportError(data: ?*anyopaque, results: [*]WasmtimeComponentVal, results_len: usize, err: anyerror) void {
+    const message = @errorName(err);
+    setHostImportStringResult(data, results, results_len, false, message);
+}
+
+fn setHostImportStringResult(data: ?*anyopaque, results: [*]WasmtimeComponentVal, results_len: usize, is_ok: bool, value: []const u8) void {
     const host_imports = hostImportContext(data) orelse return;
     if (results_len == 0) return;
     var payload = ownedComponentString(host_imports.lib, value);
     const heap_payload = host_imports.lib.wasmtime_component_val_new(&payload) orelse return;
     results[0] = .{
         .kind = WASMTIME_COMPONENT_RESULT,
-        .of = .{ .result = .{ .is_ok = true, .val = heap_payload } },
+        .of = .{ .result = .{ .is_ok = is_ok, .val = heap_payload } },
     };
 }
 

@@ -387,6 +387,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
     };
     const ExtensionToolContext = struct {
+        server: Server,
+        installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
@@ -395,7 +397,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return try callExtensionMcpTool(alloc, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.installed, ctx.tool.*, args);
         }
     };
 
@@ -437,7 +439,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
     defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
     for (extension_contexts, 0..) |*ctx, i| {
-        ctx.* = .{ .tool = &extension_tools.items[i] };
+        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try textResponse(server_ptr.alloc, 404, "extension not found");
+        ctx.* = .{ .server = server_ptr, .installed = installed, .tool = &extension_tools.items[i] };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -657,7 +660,14 @@ fn findWasmRuntime(runtimes: []const extension_domain.RuntimeDecl, name: []const
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_domain.InstalledExtension, name: []const u8) ?*const extension_domain.InstalledExtension {
+    for (installed_extensions) |*installed| {
+        if (std.mem.eql(u8, installed.name, name) and installed.status == .ready) return installed;
+    }
+    return null;
+}
+
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -666,7 +676,18 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, tool: ExtensionMcpTool, args: 
         const binding = tool.runtime_binding orelse return try mcpError(alloc, "extension wasm runtime binding is unavailable");
         const request_json = try stringifyJsonValue(alloc, args);
         defer alloc.free(request_json);
-        if (wasmtime_runtime.invokeExtension(alloc, binding.runtime(), tool_name, request_json)) |body| {
+        var host_context = ExtensionHostContext(@TypeOf(server)){
+            .server = server,
+            .installed = installed,
+        };
+        if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
+            .host_imports = .{
+                .ptr = &host_context,
+                .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
+                .db_write = ExtensionHostContext(@TypeOf(server)).dbWrite,
+                .ai_embed = ExtensionHostContext(@TypeOf(server)).aiEmbed,
+            },
+        })) |body| {
             return try mcpResultFromExtensionJson(alloc, body);
         } else |err| switch (err) {
             error.WasmtimeUnavailable,
@@ -682,6 +703,127 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, tool: ExtensionMcpTool, args: 
     const message = try std.fmt.allocPrint(alloc, "extension MCP tool '{s}' is registered but has no executable handler", .{tool.member.object_name});
     defer alloc.free(message);
     return mcpError(alloc, message);
+}
+
+fn ExtensionHostContext(comptime Server: type) type {
+    return struct {
+        server: Server,
+        installed: *const extension_domain.InstalledExtension,
+
+        fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("db:read");
+            const table_name = try ctx.resolveTableName(table);
+            const body = try extensionQueryBodyAlloc(alloc, query_json);
+            defer alloc.free(body);
+            return try ctx.dispatchJson(alloc, .POST, table_name, "query", body);
+        }
+
+        fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("db:write");
+            const table_name = try ctx.resolveTableName(table);
+            const body = try extensionBatchBodyAlloc(alloc, writes_json);
+            defer alloc.free(body);
+            return try ctx.dispatchJson(alloc, .POST, table_name, "batch", body);
+        }
+
+        fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("ai:embed");
+            const out = try alloc.alloc(f32, 8);
+            var hash = std.hash.Wyhash.init(0);
+            hash.update(text);
+            var state = hash.final();
+            for (out, 0..) |*value, i| {
+                state = std.hash.Wyhash.hash(state +% @as(u64, @intCast(i)), text);
+                const raw: u16 = @truncate(state);
+                value.* = @as(f32, @floatFromInt(raw)) / 65535.0;
+            }
+            return out;
+        }
+
+        fn hostContext(ptr: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr.?));
+        }
+
+        fn requireCapability(ctx: *@This(), name: []const u8) !void {
+            for (ctx.installed.granted_capabilities) |capability| {
+                if (!std.mem.eql(u8, capability.name, name)) continue;
+                if (capability.scope.len == 0 or
+                    std.mem.eql(u8, capability.scope, ctx.installed.package_name) or
+                    (ctx.installed.scope.kind == .table and std.mem.eql(u8, capability.scope, ctx.installed.scope.table_name)))
+                {
+                    return;
+                }
+            }
+            return error.ExtensionCapabilityDenied;
+        }
+
+        fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
+            return switch (ctx.installed.scope.kind) {
+                .table => ctx.installed.scope.table_name,
+                .cluster => requested,
+                .embedded_db => error.UnsupportedExtensionScope,
+            };
+        }
+
+        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
+            const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
+            defer alloc.free(uri);
+            var resp = try ctx.server.handle(.{
+                .method = method,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(ctx.server.alloc);
+            if (resp.status < 200 or resp.status >= 300) return error.ExtensionHostApiFailed;
+            return try alloc.dupe(u8, resp.body);
+        }
+    };
+}
+
+fn extensionBatchBodyAlloc(alloc: std.mem.Allocator, writes_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, writes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtensionWrite;
+    const object = parsed.value.object;
+    if (object.get("inserts") != null or object.get("deletes") != null or object.get("transforms") != null) {
+        return try alloc.dupe(u8, writes_json);
+    }
+    const key = if (object.get("id")) |id_value| switch (id_value) {
+        .string => |value| try alloc.dupe(u8, value),
+        else => try extensionGeneratedKeyAlloc(alloc, writes_json),
+    } else try extensionGeneratedKeyAlloc(alloc, writes_json);
+    defer alloc.free(key);
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"inserts\":{");
+    try std.json.Stringify.value(key, .{}, &writer.writer);
+    try writer.writer.writeByte(':');
+    try std.json.Stringify.value(parsed.value, .{}, &writer.writer);
+    try writer.writer.writeAll("},\"sync_level\":\"full_index\"}");
+    return try writer.toOwnedSlice();
+}
+
+fn extensionGeneratedKeyAlloc(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "ext:{x}", .{std.hash.Wyhash.hash(0, bytes)});
+}
+
+fn extensionQueryBodyAlloc(alloc: std.mem.Allocator, query_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, query_json, .{});
+    defer parsed.deinit();
+    const object = if (parsed.value == .object) parsed.value.object else return error.InvalidExtensionQuery;
+    const limit = if (object.get("limit")) |value| switch (value) {
+        .integer => |raw| @max(1, @min(raw, 100)),
+        .float => |raw| @as(i64, @intFromFloat(@max(1, @min(raw, 100)))),
+        else => 10,
+    } else 10;
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.print("{{\"query\":{{\"match_all\":{{}}}},\"limit\":{d}}}", .{limit});
+    return try writer.toOwnedSlice();
 }
 
 fn mcpResultFromExtensionJson(alloc: std.mem.Allocator, body: []u8) !mcp.CallToolResult {

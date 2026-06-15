@@ -36,22 +36,23 @@ fn store_memory(request_json: &str) -> String {
     let write_result = host_db_write(
         "memory_record",
         &format!(
-            "{{\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{},\"embedding_dimensions\":{}}}",
+            "{{\"id\":{},\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{}}}",
+            json_quote(&memory_id(content)),
             json_quote(content),
             json_quote(memory_type),
             json_quote(json_string_field(request_json, "visibility").unwrap_or("team")),
-            json_quote(json_string_field(request_json, "project").unwrap_or("default")),
-            embedding.as_ref().map(|values| values.len()).unwrap_or(0)
+            json_quote(json_string_field(request_json, "project").unwrap_or("default"))
         ),
     );
     format!(
-        "{{\"ok\":true,\"tool\":\"store_memory\",\"status\":\"planned\",\"memory\":{{\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{}}},\"host_calls\":[\"db.write(memory_record)\",\"ai.embed(content)\"],\"host_results\":{{\"embedding_dimensions\":{},\"write\":{}}}}}",
+        "{{\"ok\":true,\"tool\":\"store_memory\",\"status\":\"stored\",\"memory\":{{\"id\":{},\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{}}},\"host_calls\":[\"db.write(memory_record)\",\"ai.embed(content)\"],\"host_results\":{{\"embedding_dimensions\":{},\"write\":{}}}}}",
+        json_quote(&memory_id(content)),
         json_quote(content),
         json_quote(memory_type),
         json_quote(json_string_field(request_json, "visibility").unwrap_or("team")),
         json_quote(json_string_field(request_json, "project").unwrap_or("default")),
         embedding.as_ref().map(|values| values.len()).unwrap_or(0),
-        json_quote(&write_result.unwrap_or_else(|err| format!("error:{err}")))
+        write_result.unwrap_or_else(|err| format!("{{\"ok\":false,\"error\":{}}}", json_quote(&err)))
     )
 }
 
@@ -193,6 +194,15 @@ fn json_quote(value: &str) -> String {
     out
 }
 
+fn memory_id(content: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in content.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("memory:{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +213,7 @@ mod tests {
         assert!(response.contains(r#""ok":true"#));
         assert!(response.contains(r#""db.write(memory_record)""#));
         assert!(response.contains(r#""Use wasm components""#));
+        assert!(response.contains("\"id\":\"memory:"));
     }
 
     #[test]

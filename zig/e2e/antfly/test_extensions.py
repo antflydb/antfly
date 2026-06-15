@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import json
 import signal
 import subprocess
 import tempfile
@@ -42,6 +43,12 @@ pytestmark = pytest.mark.slow
 
 MEMORYAF_VERSION = "0.0.1"
 MEMORYAF_PACKAGE_STORE = REPO_ROOT.parent / "extensions"
+MEMORYAF_GRANTS = [
+    {"name": "db:read", "scope": "memoryaf"},
+    {"name": "db:write", "scope": "memoryaf"},
+    {"name": "ai:embed", "scope": "memoryaf"},
+    {"name": "mcp:tool", "scope": "memoryaf"},
+]
 
 
 class _ExtensionProcess:
@@ -264,19 +271,26 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     installed_after_dry_run = _check_response(session.get(f"{base_url}/extensions/v1/installed", timeout=10))
     assert all(extension.get("name") != "memoryaf" for extension in installed_after_dry_run)
 
-    if extension_server.mode == "distributed":
-        return
+    table_name = f"memoryaf_memories_{extension_server.mode}"
+    created_table = _check_response(
+        session.post(f"{extension_server.api_url}/tables/{table_name}", json={"num_shards": 1}, timeout=30)
+    )
+    assert created_table["name"] == table_name
 
     installed = _check_response(
         session.post(
             f"{base_url}/extensions/v1/installed/memoryaf",
-            json={"version": MEMORYAF_VERSION, "scope": {"kind": "cluster"}},
+            json={
+                "version": MEMORYAF_VERSION,
+                "scope": {"kind": "table", "table_name": table_name},
+                "grants": MEMORYAF_GRANTS,
+            },
             timeout=10,
         )
     )
     assert installed["name"] == "memoryaf"
     assert installed["package_version"] == MEMORYAF_VERSION
-    assert installed["scope"]["kind"] == "cluster"
+    assert installed["scope"] == {"kind": "table", "table_name": table_name}
     assert isinstance(installed["installed_at_epoch_ms"], int)
     assert installed["installed_at_epoch_ms"] > 1_700_000_000_000
 
@@ -339,8 +353,11 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     assert store["result"]["isError"] is False
     assert store["result"]["structuredContent"]["ok"] is True
     assert store["result"]["structuredContent"]["tool"] == "store_memory"
+    assert store["result"]["structuredContent"]["status"] == "stored"
     assert "db.write(memory_record)" in store["result"]["structuredContent"]["host_calls"]
     assert "ai.embed(content)" in store["result"]["structuredContent"]["host_calls"]
+    assert store["result"]["structuredContent"]["host_results"]["embedding_dimensions"] == 8
+    assert store["result"]["structuredContent"]["host_results"]["write"]["inserted"] == 1
 
     search = _check_response(
         session.post(
@@ -359,6 +376,27 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     assert search["result"]["structuredContent"]["tool"] == "search_memories"
     assert search["result"]["structuredContent"]["query"] == "extension runtime"
     assert search["result"]["structuredContent"]["limit"] == 5
+    assert "Extension runtimes should be executable" in json.dumps(
+        search["result"]["structuredContent"]["host_results"]["rows"]
+    )
+
+    listed = _check_response(
+        session.post(
+            mcp_endpoint,
+            headers={"Mcp-Session-Id": mcp_session_id},
+            json={
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {"name": "list_memories", "arguments": {"limit": 5}},
+            },
+            timeout=10,
+        )
+    )
+    assert listed["result"]["isError"] is False
+    assert "Extension runtimes should be executable" in json.dumps(
+        listed["result"]["structuredContent"]["host_results"]["rows"]
+    )
 
     missing_query = _check_response(
         session.post(
@@ -366,7 +404,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
             headers={"Mcp-Session-Id": mcp_session_id},
             json={
                 "jsonrpc": "2.0",
-                "id": 5,
+                "id": 7,
                 "method": "tools/call",
                 "params": {"name": "search_memories", "arguments": {}},
             },

@@ -1968,6 +1968,10 @@ pub const ApiHttpServer = struct {
                         return try extensionLifecycleErrorResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
                     return try jsonResponse(self.alloc, installed);
                 }
                 if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
@@ -1985,6 +1989,10 @@ pub const ApiHttpServer = struct {
                         return try extensionLifecycleErrorResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
                     return try jsonResponse(self.alloc, installed);
                 }
                 if (routes.Routes.matchInstalledExtensionDisable(uri_parts.path)) |installed_route| {
@@ -1992,6 +2000,10 @@ pub const ApiHttpServer = struct {
                         return try extensionLifecycleErrorResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
                     return try jsonResponse(self.alloc, installed);
                 }
                 if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
@@ -2003,6 +2015,12 @@ pub const ApiHttpServer = struct {
                         return try extensionLifecycleErrorResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
+                    if (!parsed.value.dry_run) {
+                        self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                            error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                            else => return err,
+                        };
+                    }
                     return try jsonResponse(self.alloc, installed);
                 }
             }
@@ -2016,6 +2034,10 @@ pub const ApiHttpServer = struct {
                         return try extensionLifecycleErrorResponse(self.alloc, err);
                     };
                     defer installed.deinitOwned(self.alloc);
+                    self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
+                        error.ExtensionVisibilityTimeout => return try jsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        else => return err,
+                    };
                     return try jsonResponse(self.alloc, installed);
                 }
             }
@@ -4433,6 +4455,23 @@ pub const ApiHttpServer = struct {
                 return;
             }
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
+        }
+    }
+
+    pub fn waitForProjectedExtensionLifecycle(self: *ApiHttpServer, expected: extension_domain.InstalledExtension) !void {
+        const timeout_ns = 10 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            var maybe_snapshot = try self.source.adminSnapshot();
+            if (maybe_snapshot) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                if (projectedExtensionLifecycleReady(snapshot, expected)) return;
+            } else {
+                return;
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.ExtensionVisibilityTimeout;
             sleepNs(poll_interval_ns);
         }
     }
@@ -7005,6 +7044,30 @@ fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []c
         if (std.mem.eql(u8, extension.name, name)) return extension;
     }
     return null;
+}
+
+fn projectedExtensionLifecycleReady(snapshot: *const metadata_api.AdminSnapshot, expected: extension_domain.InstalledExtension) bool {
+    const installed = findInstalledExtension(snapshot, expected.name) orelse return false;
+    if (!installedExtensionMatchesProjected(expected, installed.*)) return false;
+    const package = findExtensionPackageVersion(snapshot, expected.package_name, expected.package_version) orelse return true;
+    const expected_members = package.install.shapes.len + package.install.objects.len;
+    if (expected_members == 0) return true;
+    var projected_members: usize = 0;
+    for (snapshot.extension_members) |member| {
+        if (std.mem.eql(u8, member.extension_name, expected.name)) projected_members += 1;
+    }
+    return projected_members >= expected_members;
+}
+
+fn installedExtensionMatchesProjected(expected: extension_domain.InstalledExtension, actual: extension_domain.InstalledExtension) bool {
+    return std.mem.eql(u8, actual.name, expected.name) and
+        std.mem.eql(u8, actual.package_name, expected.package_name) and
+        std.mem.eql(u8, actual.package_version, expected.package_version) and
+        std.mem.eql(u8, actual.package_digest, expected.package_digest) and
+        std.mem.eql(u8, actual.config_json, expected.config_json) and
+        actual.status == expected.status and
+        actual.scope.kind == expected.scope.kind and
+        std.mem.eql(u8, actual.scope.table_name, expected.scope.table_name);
 }
 
 fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
