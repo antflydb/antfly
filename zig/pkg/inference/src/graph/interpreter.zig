@@ -1397,9 +1397,55 @@ fn resolveRuntimeSplitLastDim(actual: []const i64, target: Shape, input_numel: u
     return null;
 }
 
+fn resolveFlattenedProjectionSuffixDims(src_actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
+    const rank = target.rank();
+    if (src_actual.len < 2 or rank <= src_actual.len - 1 or rank > out.len) return null;
+
+    const prefix_rank = src_actual.len - 1;
+    var prefix_numel: usize = 1;
+    for (0..prefix_rank) |i| {
+        const src_dim = src_actual[i];
+        if (src_dim <= 0) return null;
+        const target_dim = target.dim(@intCast(i));
+        if (target_dim > 0 and target_dim != src_dim) return null;
+        out[i] = src_dim;
+        prefix_numel = std.math.mul(usize, prefix_numel, @intCast(src_dim)) catch return null;
+    }
+    if (prefix_numel == 0 or input_numel % prefix_numel != 0) return null;
+    const projected_width = input_numel / prefix_numel;
+    if (projected_width == 0) return null;
+
+    var suffix_product: usize = 1;
+    var unknown_suffix: ?usize = null;
+    for (prefix_rank..rank) |i| {
+        const dim = target.dim(@intCast(i));
+        if (dim > 0) {
+            out[i] = dim;
+            suffix_product = std.math.mul(usize, suffix_product, @intCast(dim)) catch return null;
+        } else if (dim < 0) {
+            if (unknown_suffix != null) return null;
+            unknown_suffix = i;
+            out[i] = dim;
+        } else {
+            return null;
+        }
+    }
+
+    if (unknown_suffix) |idx| {
+        if (suffix_product == 0 or projected_width % suffix_product != 0) return null;
+        out[idx] = @intCast(projected_width / suffix_product);
+    } else if (suffix_product != projected_width) {
+        return null;
+    }
+
+    if (safeElementCountFromDims(out[0..rank]) == input_numel) return out[0..rank];
+    return null;
+}
+
 fn resolveProjectionRestoreFromSourceActual(src_actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
     if (resolveRuntimeAlignedDynamicDims(src_actual, target, input_numel, out)) |resolved| return resolved;
     if (resolveRuntimeSplitLastDim(src_actual, target, input_numel, out)) |resolved| return resolved;
+    if (resolveFlattenedProjectionSuffixDims(src_actual, target, input_numel, out)) |resolved| return resolved;
 
     const rank = target.rank();
     if (src_actual.len == rank + 1 and rank >= 2 and rank <= out.len) {
@@ -2480,7 +2526,7 @@ pub fn executeNode(
                 attrs.lhs_batch[0..attrs.num_batch],
                 attrs.rhs_batch[0..attrs.num_batch],
             ) catch |err| {
-                if (err == error.UnsupportedShape) {
+                if (err == error.UnsupportedShape or err == error.UnsupportedPrimitiveOp) {
                     const lhs_actual = cb.tensorShape(lhs.value, std.heap.page_allocator) catch null;
                     defer if (lhs_actual) |shape| std.heap.page_allocator.free(shape);
                     const rhs_actual = cb.tensorShape(rhs.value, std.heap.page_allocator) catch null;
@@ -3764,6 +3810,18 @@ test "resolveProjectionRestoreFromSourceActual restores packed attention output 
     ) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualSlices(i64, &.{ 3, 512, 128 }, resolved);
+}
+
+test "resolveProjectionRestoreFromSourceActual restores nomic qkv projection suffix" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveProjectionRestoreFromSourceActual(
+        &.{ 1, 512, 768 },
+        Shape.init(.f32, &.{ -1, -1, 3, 12, 64 }),
+        1 * 512 * 3 * 12 * 64,
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 512, 3, 12, 64 }, resolved);
 }
 
 test "isLeadingAxisFlatten validates only true leading-axis flatten" {
