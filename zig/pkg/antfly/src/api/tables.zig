@@ -1282,8 +1282,10 @@ fn canonicalIndexEnrichmentsValue(alloc: std.mem.Allocator, value: std.json.Valu
 fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
     defer parsed.deinit();
-    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &parsed.value);
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    var owned = try cloneJsonValueAlloc(alloc, parsed.value);
+    defer deinitJsonValue(alloc, &owned);
+    try projectInlineEnrichmentConfigsInTableStatusValue(alloc, &owned);
+    return try std.json.Stringify.valueAlloc(alloc, owned, .{ .emit_null_optional_fields = false });
 }
 
 fn projectInlineEnrichmentConfigsInTableStatusValue(alloc: std.mem.Allocator, value: *std.json.Value) !void {
