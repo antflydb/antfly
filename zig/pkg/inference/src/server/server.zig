@@ -105,6 +105,7 @@ pub const NodeConfig = struct {
     generation_budget_overrides: BudgetOverrides = .{},
 };
 
+pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 
 const GenerateBackendSelection = struct {
@@ -4422,6 +4423,13 @@ pub const Node = struct {
         active_models_dir = self.config.models_dir;
     }
 
+    /// Register AI routes without the Traditional ML predictor endpoints.
+    pub fn registerAiRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
+        const router = api.ServerRouter(Node).init(self);
+        var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
+        try router.register(&prefixed);
+    }
+
     fn registerRootOperationalRoutes(server: anytype) !void {
         try server.get("/healthz", healthzHandler);
         try server.get("/readyz", readyzHandler);
@@ -4439,6 +4447,7 @@ pub const Node = struct {
         defer server.deinit();
 
         try self.registerRoutesOn(public_api_prefix, &server);
+        try self.registerAiRoutesOn(ai_api_prefix, &server);
         try registerRootOperationalRoutes(&server);
         defer {
             active_node = null;
@@ -5345,6 +5354,36 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
     };
 }
 
+fn isMlOnlyRoute(comptime path: []const u8) bool {
+    return std.mem.eql(u8, path, "/predict") or std.mem.eql(u8, path, "/predictors");
+}
+
+fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
+    return struct {
+        inner: *Inner,
+
+        pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            if (comptime isMlOnlyRoute(path)) return;
+            try self.inner.post(prefix ++ path, handler);
+        }
+
+        pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            if (comptime isMlOnlyRoute(path)) return;
+            try self.inner.get(prefix ++ path, handler);
+        }
+
+        pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            if (comptime isMlOnlyRoute(path)) return;
+            try self.inner.put(prefix ++ path, handler);
+        }
+
+        pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            if (comptime isMlOnlyRoute(path)) return;
+            try self.inner.delete(prefix ++ path, handler);
+        }
+    };
+}
+
 const RecordingRouteMethod = enum {
     get,
     post,
@@ -5441,6 +5480,22 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "registerAiRoutesOn excludes Traditional ML predictor routes" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try node.registerAiRoutesOn(ai_api_prefix, &server);
+
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embed"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/predict"));
+    try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }
 
 test "root operational routes stay outside termite API prefix" {

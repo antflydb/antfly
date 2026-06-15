@@ -1228,9 +1228,10 @@ fn serveUnifiedInner(
     var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
 
-    // Register antfly routes under /ai/v1
+    // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (antfly_node) |node| {
         try node.registerRoutesOn(inference.server.public_api_prefix, &server);
+        try node.registerAiRoutesOn(inference.server.ai_api_prefix, &server);
     }
 
     // Register antfly public API routes under /db/v1
