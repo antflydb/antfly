@@ -61831,6 +61831,10 @@ const AppParityCorpusCoverage = struct {
     update_source_increment_expression: bool = false,
     update_source_modulo_expression: bool = false,
     update_source_regexp_replace_expression: bool = false,
+    update_source_regexp_match_expression: bool = false,
+    update_source_regexp_count_expression: bool = false,
+    update_source_regexp_instr_expression: bool = false,
+    update_source_regexp_substr_expression: bool = false,
     update_source_row_assignment: bool = false,
     schema_default_primary_named_conflict_target: bool = false,
     schema_custom_primary_named_conflict_target: bool = false,
@@ -62328,6 +62332,19 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_source_regexp_replace_expression = self.update_source_regexp_replace_expression or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "regexp_replace(status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
+        self.update_source_regexp_match_expression = self.update_source_regexp_match_expression or (entry.family == .update_source and
+            (std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null or
+                std.mem.indexOf(u8, entry.sql, "regexp_match(status") != null) and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
+        self.update_source_regexp_count_expression = self.update_source_regexp_count_expression or (entry.family == .update_source and
+            std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
+        self.update_source_regexp_instr_expression = self.update_source_regexp_instr_expression or (entry.family == .update_source and
+            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
+        self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
+            std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         if (entry.applied_plan.len > 0) {
@@ -63630,6 +63647,10 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.update_source_patch_expression);
         try std.testing.expect(self.update_source_increment_expression);
         try std.testing.expect(self.update_source_regexp_replace_expression);
+        try std.testing.expect(self.update_source_regexp_match_expression);
+        try std.testing.expect(self.update_source_regexp_count_expression);
+        try std.testing.expect(self.update_source_regexp_instr_expression);
+        try std.testing.expect(self.update_source_regexp_substr_expression);
         try std.testing.expect(self.schema_default_primary_named_conflict_target);
         try std.testing.expect(self.schema_custom_primary_named_conflict_target);
         try std.testing.expect(self.schema_unique_conflict_target);
@@ -68001,6 +68022,34 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .patch_expressions = 1, .returning = 2, .row_claim_skip_locked = false },
             .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
             .sql = "UPDATE usage_records SET status = regexp_replace(status, '[0-9]+', '#', 'g') WHERE status = 'queued' FOR UPDATE RETURNING id, status",
+        },
+        .{
+            .name = "claimed queue update regexp like patch expression",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .patch_expressions = 1, .returning = 2, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+            .sql = "UPDATE usage_records SET enabled = regexp_like(status, '^queue', true) WHERE status = 'queued' FOR UPDATE RETURNING id, enabled",
+        },
+        .{
+            .name = "claimed queue update regexp count patch expression",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .patch_expressions = 1, .returning = 2, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+            .sql = "UPDATE usage_records SET amount = regexp_count(status, '[0-9]+') WHERE status = 'queued' FOR UPDATE RETURNING id, amount",
+        },
+        .{
+            .name = "claimed queue update regexp instr patch expression",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .patch_expressions = 1, .returning = 2, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+            .sql = "UPDATE usage_records SET amount = regexp_instr(status, '[0-9]+') WHERE status = 'queued' FOR UPDATE RETURNING id, amount",
+        },
+        .{
+            .name = "claimed queue update regexp substr patch expression",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .patch_expressions = 1, .returning = 2, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+            .sql = "UPDATE usage_records SET status = regexp_substr(status, '[a-z]+') WHERE status = 'queued' FOR UPDATE RETURNING id, status",
         },
         .{
             .name = "claimed queue update returning all",

@@ -6145,6 +6145,58 @@
       "sql": "UPDATE usage_records SET status = regexp_replace(status, '[0-9]+', '#', 'g') WHERE status = 'queued' FOR UPDATE RETURNING id, status"
     },
     {
+      "name": "claimed queue update regexp like patch expression",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "patch_expressions": 1,
+        "returning": 2,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET enabled = regexp_like(status, '^queue', true) WHERE status = 'queued' FOR UPDATE RETURNING id, enabled"
+    },
+    {
+      "name": "claimed queue update regexp count patch expression",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "patch_expressions": 1,
+        "returning": 2,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET amount = regexp_count(status, '[0-9]+') WHERE status = 'queued' FOR UPDATE RETURNING id, amount"
+    },
+    {
+      "name": "claimed queue update regexp instr patch expression",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "patch_expressions": 1,
+        "returning": 2,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET amount = regexp_instr(status, '[0-9]+') WHERE status = 'queued' FOR UPDATE RETURNING id, amount"
+    },
+    {
+      "name": "claimed queue update regexp substr patch expression",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "patch_expressions": 1,
+        "returning": 2,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=2:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = regexp_substr(status, '[a-z]+') WHERE status = 'queued' FOR UPDATE RETURNING id, status"
+    },
+    {
       "name": "claimed queue update returning all",
       "family": "update_source",
       "summary": {
