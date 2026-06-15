@@ -2021,6 +2021,20 @@
       "sql": "SELECT id, regexp_like(status, $2, true) AS matches_status FROM usage_records WHERE regexp_like(status, $1) ORDER BY id ASC LIMIT 5"
     },
     {
+      "name": "single table regexp count predicate projection and order query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"string": "[0-9]+"}],
+      "sql": "SELECT id, regexp_count(status, '[0-9]+') AS status_digits FROM usage_records WHERE regexp_count(status, $1) > 0 ORDER BY regexp_count(status, '[A-Z]+') DESC LIMIT 5"
+    },
+    {
       "name": "single table computed prefix like query",
       "family": "query",
       "summary": {

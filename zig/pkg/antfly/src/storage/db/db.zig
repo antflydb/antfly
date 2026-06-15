@@ -24715,6 +24715,21 @@ pub const DB = struct {
                 const matched = try relationalRowsRegexpMatchTextAlloc(alloc, source.value.string, pattern.value.string, case_insensitive);
                 break :blk try alloc.dupe(u8, if (matched) "true" else "false");
             },
+            .regexp_count => blk: {
+                if (expression.operands.len != 2) return error.InvalidQueryRequest;
+                const source_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+                defer alloc.free(source_json);
+                const pattern_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
+                defer alloc.free(pattern_json);
+                var source = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidQueryRequest;
+                defer source.deinit();
+                var pattern = std.json.parseFromSlice(std.json.Value, alloc, pattern_json, .{}) catch return error.InvalidQueryRequest;
+                defer pattern.deinit();
+                if (source.value == .null or pattern.value == .null) break :blk try alloc.dupe(u8, "null");
+                if (source.value != .string or pattern.value != .string) return error.InvalidQueryRequest;
+                const count = try relationalRowsRegexpCountText(alloc, source.value.string, pattern.value.string);
+                break :blk try std.fmt.allocPrint(alloc, "{d}", .{count});
+            },
             .bool_and, .bool_or => blk: {
                 if (expression.operands.len < 2) return error.InvalidQueryRequest;
                 var saw_null = false;
@@ -26201,6 +26216,21 @@ pub const DB = struct {
         var compiled = regex_mod.compile(alloc, pattern_text) catch return error.InvalidQueryRequest;
         defer compiled.deinit();
         return relationalRowsRegexpFindLeftmostMatch(&compiled, source_text, 0) != null;
+    }
+
+    fn relationalRowsRegexpCountText(alloc: Allocator, source: []const u8, pattern: []const u8) !u64 {
+        var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidQueryRequest;
+        defer compiled.deinit();
+
+        var count: u64 = 0;
+        var cursor: usize = 0;
+        while (cursor <= source.len) {
+            const span = relationalRowsRegexpFindLeftmostMatch(&compiled, source, cursor) orelse break;
+            if (span.end <= span.start) return error.InvalidQueryRequest;
+            count += 1;
+            cursor = span.end;
+        }
+        return count;
     }
 
     fn relationalRowsAsciiLowerTextAlloc(alloc: Allocator, source: []const u8) ![]u8 {
