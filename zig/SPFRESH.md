@@ -1043,7 +1043,15 @@ tracking before making a segment-backend decision is:
 The write comparison summary now reports both the foreground delta density
 (`fg_delta_value_bytes_per_record`) and the total posting delta encoding density
 (`posting_delta_value_bytes_per_record`) so segment-vs-LSM rows can separate
-foreground grouping behavior from the full posting-format byte cost.
+foreground grouping behavior from the full posting-format byte cost. Write and
+read summaries also carry `posting_base_member_block_size`, so the opt-in
+16/32/64 block-size sweep can be interpreted directly beside base bytes/member
+and decode ns/member instead of relying on row labels alone. Probe summaries
+also derive skipped blocks, decoded blocks, and decoded members per call, which
+makes block-pruning efficiency comparable across different sample counts. Fold
+summaries likewise normalize retained peak scratch as bytes per folded record
+and as ratios to folded base bytes and deleted tail bytes, so fold-memory
+pressure can be compared across workloads.
 
 Benchmarks should report these by workload shape:
 

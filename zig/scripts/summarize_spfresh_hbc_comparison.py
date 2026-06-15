@@ -114,7 +114,10 @@ WRITE_COLUMNS = [
     "posting_base_member_probe_blocks_skipped_by_max",
     "posting_base_member_probe_skip_rate",
     "posting_base_member_probe_blocks_decoded",
+    "posting_base_member_probe_skipped_blocks_per_call",
+    "posting_base_member_probe_decoded_blocks_per_call",
     "posting_base_member_probe_members_decoded",
+    "posting_base_member_probe_decoded_members_per_call",
     "posting_base_decode_ns",
     "posting_base_decode_members",
     "posting_base_decode_ns_per_member",
@@ -198,6 +201,9 @@ WRITE_COLUMNS = [
     "repair_fold_tail_value_bytes",
     "repair_fold_written_base_value_bytes",
     "repair_fold_peak_scratch_bytes",
+    "repair_fold_peak_scratch_bytes_per_record",
+    "repair_fold_peak_scratch_to_base_ratio",
+    "repair_fold_peak_scratch_to_tail_ratio",
     "repair_fold_base_bytes_per_record",
     "repair_fold_base_tail_ratio",
     "backlog_dirty",
@@ -238,6 +244,7 @@ READ_COLUMNS = [
     "backend",
     "directory",
     "dataset_mode",
+    "posting_base_member_block_size",
     "skip_vector_store",
     "samples",
     "vectors",
@@ -1134,6 +1141,18 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("posting_base_member_probe_blocks_skipped_by_max"),
             summary.get("posting_base_member_probe_blocks_seen"),
         )
+        summary["posting_base_member_probe_skipped_blocks_per_call"] = safe_ratio(
+            summary.get("posting_base_member_probe_blocks_skipped_by_max"),
+            summary.get("posting_base_member_probe_calls"),
+        )
+        summary["posting_base_member_probe_decoded_blocks_per_call"] = safe_ratio(
+            summary.get("posting_base_member_probe_blocks_decoded"),
+            summary.get("posting_base_member_probe_calls"),
+        )
+        summary["posting_base_member_probe_decoded_members_per_call"] = safe_ratio(
+            summary.get("posting_base_member_probe_members_decoded"),
+            summary.get("posting_base_member_probe_calls"),
+        )
         summary["posting_base_decode_ns_per_member"] = safe_ratio(
             summary.get("posting_base_decode_ns"),
             summary.get("posting_base_decode_members"),
@@ -1162,6 +1181,18 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("repair_fold_written_base_value_bytes"),
             summary.get("repair_fold_tail_value_bytes"),
         )
+        summary["repair_fold_peak_scratch_bytes_per_record"] = safe_ratio(
+            summary.get("repair_fold_peak_scratch_bytes"),
+            summary.get("repair_fold_records"),
+        )
+        summary["repair_fold_peak_scratch_to_base_ratio"] = safe_ratio(
+            summary.get("repair_fold_peak_scratch_bytes"),
+            summary.get("repair_fold_written_base_value_bytes"),
+        )
+        summary["repair_fold_peak_scratch_to_tail_ratio"] = safe_ratio(
+            summary.get("repair_fold_peak_scratch_bytes"),
+            summary.get("repair_fold_tail_value_bytes"),
+        )
         summary["overlay_cache_hit_rate"] = cache_hit_rate(
             summary.get("overlay_cache_hits"),
             summary.get("overlay_cache_misses"),
@@ -1188,6 +1219,7 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "backend": first(group, "posting_backend"),
                 "directory": directory_name(group),
                 "dataset_mode": first(group, "dataset_mode"),
+                "posting_base_member_block_size": first(group, "posting_base_member_block_size"),
                 "skip_vector_store": first(group, "skip_vector_store"),
                 "samples": len(group),
                 "vectors": mean(group, "vectors"),
