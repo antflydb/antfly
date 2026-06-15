@@ -62,23 +62,10 @@ an external lake scan based on the table binding.
 
 ## Public Contract
 
-There are two reasonable catalog shapes. The second is preferable because it
-keeps relational table semantics intact.
-
-Option A: add a storage mode:
-
-```json
-{
-  "storage_mode": "external_parquet",
-  "external_source": {
-    "format": "parquet",
-    "uri": "s3://bucket/events/",
-    "snapshot": { "mode": "etag_manifest" }
-  }
-}
-```
-
-Option B: keep `storage_mode: "relational"` and add a base-source binding:
+Lake tables should remain logical relational tables. External Parquet, Iceberg,
+and Lance datasets are physical base-source adapters, not separate storage
+modes. The catalog should therefore keep `storage_mode: "relational"` and add a
+base-source binding:
 
 ```json
 {
@@ -121,6 +108,12 @@ Option B: keep `storage_mode: "relational"` and add a base-source binding:
 - JSON columns are allowed and use the same document-subtree indexing semantics
   as relational JSON columns.
 
+SQL remains syntax sugar over the same typed row-plan API. Long term, Antfly
+should accept broad SQL syntax only when it lowers to typed row plans plus known
+source capabilities. Queries that cannot lower into that contract should fail
+closed or route through an explicit experimental/batch path. The durable engine
+contract is the typed plan, not backend SQL text.
+
 ## External Row Identity
 
 Every external row needs a durable row reference, even when the user does not
@@ -135,17 +128,26 @@ sizes, ETags/version IDs, and selected schema metadata. For Iceberg, it should
 be the Iceberg snapshot id. For Lance, it should be the dataset version.
 
 Antfly should store sidecar index postings against this external row reference.
-When a query returns rows, the executor can either emit public primary-key
-identity or, for catalog/debug paths, expose the external row reference as
-`physical_key`.
+Public identity should be the declared primary key whenever one exists. External
+row references are physical identities for sidecar indexes, cache keys, repair,
+explain plans, cursors, and catalog/debug APIs. They may be exposed as
+`physical_key`, but they should not be promoted as stable application identity:
+compaction, rewrite, and table-format maintenance can move rows even when the
+logical primary key is unchanged.
 
 Deletes and updates from external table formats are snapshot concerns:
 
-- Raw Parquet prefix mode has append/replace semantics based on object changes.
+- Raw Parquet prefix mode is a convenience mode with append/replace semantics
+  based on object changes.
 - Iceberg mode honors position deletes and equality deletes before producing
   visible rows.
 - Antfly sidecar indexes are versioned by snapshot id and garbage-collected
   after snapshot retention allows it.
+
+Production users who need deletes, schema evolution, time travel, or strong
+snapshot correctness should use Iceberg. Raw Parquet prefixes are useful for
+tests, simple append-only datasets, and low-friction adoption, but Iceberg is
+the long-term durable table abstraction.
 
 ## Catalog And Metadata Stored In Antfly
 
@@ -169,9 +171,12 @@ Required catalog state:
 - Sidecar index lifecycle: built snapshot id, source file ids, generation,
   freshness, rebuild/reconcile status.
 
-This belongs in Antfly's metadata/catalog path, not in the user bucket. Optional
-sidecar files can be written to Antfly-owned object storage when metadata is too
-large for the main catalog.
+This belongs in Antfly's metadata/catalog path by default, not in the user
+bucket. Large sidecar files should be written to Antfly-owned object storage.
+An optional user-visible `_antfly/` sidecar prefix can be added later for
+portable rebuilds, offline inspection, cross-cluster sharing, and disaster
+recovery, but it should be an explicit table option because it mutates the
+user's dataset location and changes the security model.
 
 ## Planner
 
@@ -321,6 +326,14 @@ materialized table can accelerate hot operational queries, but it changes the
 cost model and freshness contract. The default lake path should query files in
 place.
 
+Cache eviction should be workload-aware rather than one shared object cache.
+Serving-critical document, text, and vector index pages must have a protected
+class. Lake metadata/footer cache should have a separate class. Decoded lake
+column pages and broad-scan scratch data should be admitted conservatively and
+evicted before serving-critical state. A cheap broad lake scan must not evict
+the hot retrieval indexes that make Antfly useful as a low-latency serving
+system.
+
 ## Consistency And Freshness
 
 Each query should bind to a snapshot before planning:
@@ -386,7 +399,8 @@ from efficient querying.
 The smallest useful path:
 
 1. Add an external base-source binding to relational table schema metadata.
-2. Implement raw Parquet prefix snapshots over `file://` and object storage.
+2. Implement raw Parquet prefix snapshots over `file://` and object storage as
+   a convenience source mode.
 3. Read Parquet footers and cache file/row-group/column statistics.
 4. Support `rows:query` with projection, scalar filters, limit, and simple
    ordering.
@@ -397,6 +411,8 @@ The smallest useful path:
 7. Add tests over filesystem-backed Parquet fixtures.
 
 That MVP proves the catalog, snapshot, pruning, and row-plan integration.
+Iceberg should follow soon after the MVP because it is the production-grade
+snapshot and table-evolution contract.
 
 ## Efficient Version
 
@@ -412,26 +428,25 @@ After the MVP:
 8. Add adaptive recommendations that decide between scanning lake files,
    using sidecar indexes, or materializing hot projections.
 
-## Open Questions
+## Long-Term Vision
 
-- Should the catalog model expose lake tables as `storage_mode: relational`
-  with `base_source`, or as separate storage modes such as `external_parquet`
-  and `external_iceberg`?
-- How much of the SQL surface should be accepted before the typed
-  column-vector executor exists?
-- Should raw Parquet prefix mode support object deletion as snapshot deletion,
-  or require append-only conventions for predictable freshness?
-- What is the first-class cache eviction policy when lake scans compete with
-  document/vector serving workloads?
-- How should external row refs be exposed in public APIs without making them a
-  durable application identity?
-- Should Antfly write sidecar metadata only into Antfly storage, or optionally
-  into a user-visible `_antfly/` prefix near the dataset?
+Antfly should become the serving index and query layer for operational and lake
+data, with one typed relational query contract across native Antfly rows,
+document-backed JSON, and external immutable files.
 
-## Direction
+The durable product direction is adaptive ownership:
+
+- Cold and broad analytical data stays in Parquet/Iceberg.
+- Hot metadata, footers, and row-group statistics stay in Antfly cache/catalog.
+- Hot filters and projections become cached column batches or optional
+  materialized relational projections.
+- Hot search, vector, sparse, graph, and algebraic access paths become
+  Antfly-native sidecar indexes over external row refs.
+- Hot aggregates become algebraic materializations.
+- Truly operational subsets can be promoted into native relational Antfly
+  tables when users need Antfly to own write serving and transaction semantics.
 
 Build lake query mode as an external relational row source first, not as an
 import pipeline. Importing Parquet into Antfly relational tables remains useful,
 but the differentiated path is querying object-store data in place while Antfly
-adds serving-grade indexing, caching, semantic search, graph traversal, and
-adaptive algebraic materialization.
+selectively owns the access paths that need serving-grade latency.
