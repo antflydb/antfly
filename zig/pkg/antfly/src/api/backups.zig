@@ -22,6 +22,7 @@ const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("../metadata/mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -1327,8 +1328,8 @@ fn freeExtensionMembers(alloc: std.mem.Allocator, members: []metadata_mod.Extens
     if (members.len > 0) alloc.free(members);
 }
 
-fn cloneExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const metadata_mod.extensions.Capability) ![]metadata_mod.extensions.Capability {
-    const out = try alloc.alloc(metadata_mod.extensions.Capability, capabilities.len);
+fn cloneExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) ![]extension_domain.Capability {
+    const out = try alloc.alloc(extension_domain.Capability, capabilities.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |capability| {

@@ -28,6 +28,7 @@ const table_contract = @import("table_contract.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -7061,7 +7062,7 @@ fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name:
     var found: ?*const metadata_mod.PackageManifest = null;
     for (snapshot.extension_packages) |*package| {
         if (!std.mem.eql(u8, package.name, name)) continue;
-        if (found == null or metadata_mod.extensions.packageVersionLess(found.?.version, package.version)) found = package;
+        if (found == null or extension_domain.packageVersionLess(found.?.version, package.version)) found = package;
     }
     return found;
 }

@@ -15,7 +15,7 @@
 const std = @import("std");
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
-const metadata_extensions = @import("extensions.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const table_manager = @import("table_manager.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
@@ -147,10 +147,10 @@ pub const AdminSnapshot = struct {
     restore_progresses: []table_manager.RestoreProgressRecord = &.{},
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
-    extension_packages: []metadata_extensions.PackageManifest = &.{},
-    installed_extensions: []metadata_extensions.InstalledExtension = &.{},
-    extension_members: []metadata_extensions.ExtensionMember = &.{},
-    extension_dependencies: []metadata_extensions.ExtensionDependency = &.{},
+    extension_packages: []extension_domain.PackageManifest = &.{},
+    installed_extensions: []extension_domain.InstalledExtension = &.{},
+    extension_members: []extension_domain.ExtensionMember = &.{},
+    extension_dependencies: []extension_domain.ExtensionDependency = &.{},
     split_transitions: []transition_state.SplitTransitionRecord,
     merge_transitions: []transition_state.MergeTransitionRecord,
     split_observations: []transition_state.SplitObservationRecord = &.{},

@@ -14,7 +14,7 @@
 
 pub const storage = @import("storage/mod.zig");
 pub const runtime = @import("runtime.zig");
-pub const extensions = @import("extensions.zig");
+pub const extensions = @import("../extensions/mod.zig");
 pub const api = @import("api.zig");
 pub const admin = @import("admin.zig");
 pub const http_routes = @import("http_routes.zig");

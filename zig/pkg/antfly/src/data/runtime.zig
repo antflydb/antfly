@@ -7410,7 +7410,7 @@ fn cloneExtensionPackagesOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = try antfly.metadata.extensions.clonePackageManifestAlloc(alloc, record);
+        out[i] = try antfly.extensions.clonePackageManifestAlloc(alloc, record);
         initialized += 1;
     }
     return out;
@@ -7431,7 +7431,7 @@ fn cloneInstalledExtensionsOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = try antfly.metadata.extensions.cloneInstalledExtensionAlloc(alloc, record);
+        out[i] = try antfly.extensions.cloneInstalledExtensionAlloc(alloc, record);
         initialized += 1;
     }
     return out;
@@ -7452,7 +7452,7 @@ fn cloneExtensionMembersOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = try antfly.metadata.extensions.cloneExtensionMemberAlloc(alloc, record);
+        out[i] = try antfly.extensions.cloneExtensionMemberAlloc(alloc, record);
         initialized += 1;
     }
     return out;
@@ -7473,7 +7473,7 @@ fn cloneExtensionDependenciesOwned(
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
-        out[i] = try antfly.metadata.extensions.cloneExtensionDependencyAlloc(alloc, record);
+        out[i] = try antfly.extensions.cloneExtensionDependencyAlloc(alloc, record);
         initialized += 1;
     }
     return out;

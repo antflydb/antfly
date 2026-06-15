@@ -17,7 +17,7 @@ const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
-const metadata_extensions = @import("extensions.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -2071,7 +2071,7 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
     return null;
 }
 
-fn extensionMemberTableName(member: metadata_extensions.ExtensionMember) ?[]const u8 {
+fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.table_name.len != 0) return member.table_name;
     if (member.scope.kind == .table) return member.scope.table_name;
     return null;
@@ -2124,7 +2124,7 @@ test "metadata http extension ownership helpers protect internal table mutations
         .name = "memories",
         .placement_role = "data",
     }};
-    var members = [_]metadata_extensions.ExtensionMember{
+    var members = [_]extension_domain.ExtensionMember{
         .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
