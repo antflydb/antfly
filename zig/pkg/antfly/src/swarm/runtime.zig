@@ -1794,6 +1794,19 @@ fn httpRequestHeadersFromContext(ctx: *httpx.Context) ![]const http_common.Reque
     return headers;
 }
 
+fn httpRequestBodyFromContext(ctx: *httpx.Context) ![]const u8 {
+    return (ctx.body() catch |err| switch (err) {
+        error.EndOfStream => {
+            if (ctx.header("content-length")) |content_length| {
+                const parsed = std.fmt.parseUnsigned(u64, content_length, 10) catch return err;
+                if (parsed != 0) return err;
+            }
+            return "";
+        },
+        else => return err,
+    }) orelse "";
+}
+
 fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const path = ctx.request.uri.path;
     const routes = antfly.public_api.http_routes.Routes;
@@ -1821,7 +1834,7 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         },
     };
 
-    const body_data = (try ctx.body()) orelse "";
+    const body_data = try httpRequestBodyFromContext(ctx);
 
     const legacy_req = http_common.HttpRequest{
         .method = method,
@@ -1855,7 +1868,7 @@ fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         },
     };
 
-    const body_data = (try ctx.body()) orelse "";
+    const body_data = try httpRequestBodyFromContext(ctx);
 
     const legacy_req = http_common.HttpRequest{
         .method = method,
@@ -1886,7 +1899,7 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         },
     };
 
-    const body_data = (try ctx.body()) orelse "";
+    const body_data = try httpRequestBodyFromContext(ctx);
 
     const legacy_req = http_common.HttpRequest{
         .method = method,
@@ -2357,6 +2370,19 @@ test "swarm bridge header conversion preserves protocol headers" {
 
     const req = http_common.HttpRequest{ .method = .POST, .uri = request.uri.raw, .headers = headers };
     try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
+}
+
+test "swarm bridge body conversion treats absent body as empty" {
+    const alloc = std.testing.allocator;
+
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/extensions/v1/packages");
+    defer request.deinit();
+
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    const body = try httpRequestBodyFromContext(&ctx);
+    try std.testing.expectEqualStrings("", body);
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
