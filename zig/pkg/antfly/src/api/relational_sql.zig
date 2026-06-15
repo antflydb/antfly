@@ -237,6 +237,11 @@ fn sqlKeywordIsUuidV4Function(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "uuid_generate_v4");
 }
 
+fn sqlKeywordIsRegexpMatchFunction(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "regexp_match") or
+        std.ascii.eqlIgnoreCase(text, "regexp_like");
+}
+
 fn rowExpressionBoundaryKeyword(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "as") or
         std.ascii.eqlIgnoreCase(text, "from") or
@@ -16605,7 +16610,7 @@ const Parser = struct {
             self.peekKeyword("concat_ws") or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -16680,7 +16685,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -17257,7 +17262,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
@@ -18514,7 +18519,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -21021,7 +21026,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -24673,6 +24678,8 @@ const Parser = struct {
                 } else {
                     try self.parseExpressionWhereConditions(expression_predicates, expression_or_predicates, expression_not_predicates);
                 }
+            } else if (try self.canParseBareBooleanWhereExpression()) {
+                try self.parseBareBooleanWhereExpression(expression_predicates);
             } else if (try self.canParseExpressionWhereCondition()) {
                 try self.parseExpressionWhereConditions(expression_predicates, expression_or_predicates, expression_not_predicates);
             } else {
@@ -24740,7 +24747,7 @@ const Parser = struct {
             std.ascii.eqlIgnoreCase(token.text, "cast") or
             std.ascii.eqlIgnoreCase(token.text, "coalesce") or
             std.ascii.eqlIgnoreCase(token.text, "nullif") or
-            std.ascii.eqlIgnoreCase(token.text, "regexp_match") or
+            sqlKeywordIsRegexpMatchFunction(token.text) or
             sqlKeywordIsStartsWithFunction(token.text) or
             relationalColumnForField(self.schema, token.text, null) != null;
     }
@@ -24831,7 +24838,7 @@ const Parser = struct {
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
             self.peekKeyword("coalesce") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekKeyword("nullif") or
             self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
@@ -24867,8 +24874,8 @@ const Parser = struct {
         if (self.peekTrimVariantFunctionCall()) return true;
         if (self.peekKeyword("replace")) return true;
         if (self.peekKeyword("regexp_replace")) return true;
-        if (self.peekKeyword("regexp_match")) return true;
-        if (self.peekKeyword("regexp_match")) return true;
+        if (self.peekRegexpMatchFunctionCall()) return true;
+        if (self.peekRegexpMatchFunctionCall()) return true;
         if (self.peekTranslateFunctionCall()) return true;
         if (self.peekKeyword("concat_ws")) return true;
         if (self.jsonExtractNullTestPredicateCanStartAt(self.pos)) return true;
@@ -29064,7 +29071,7 @@ const Parser = struct {
             self.peekJsonArrayLengthFunctionCall() or
             self.peekJsonBuildObjectFunctionCall() or
             self.peekKeyword("to_jsonb") or
-            self.peekArrayLengthFunctionCall() or self.peekArrayPositionFunctionCall() or self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace") or self.peekKeyword("array_to_string") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("coalesce") or self.peekTrimVariantFunctionCall() or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekKeyword("regexp_match") or
+            self.peekArrayLengthFunctionCall() or self.peekArrayPositionFunctionCall() or self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace") or self.peekKeyword("array_to_string") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("coalesce") or self.peekTrimVariantFunctionCall() or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or self.peekKeyword("nullif") or self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
             self.peekChrFunctionCall() or
@@ -29263,7 +29270,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -29886,7 +29893,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
-            self.peekKeyword("regexp_match") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
@@ -31027,7 +31034,7 @@ const Parser = struct {
 
     fn peekSimpleReturningField(self: *@This()) bool {
         if (!self.peekKind(.identifier)) return false;
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekInitcapFunctionCall() or self.peekKeyword("trim") or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekKeyword("regexp_match") or
+        if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekInitcapFunctionCall() or self.peekKeyword("trim") or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekRegexpMatchFunctionCall() or
             self.peekTranslateFunctionCall() or self.peekKeyword("concat") or self.peekKeyword("concat_ws") or self.peekKeyword("coalesce") or self.peekKeyword("nullif") or self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
             self.peekChrFunctionCall() or
@@ -31310,7 +31317,7 @@ const Parser = struct {
         if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekInitcapFunctionCall() or self.peekKeyword("trim") or self.peekTrimVariantFunctionCall()) return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() };
         if (self.peekKeyword("replace")) return .{ .expression = try self.parseReplaceExpressionProjectionAlloc() };
         if (self.peekKeyword("regexp_replace")) return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() };
-        if (self.peekKeyword("regexp_match")) return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() };
+        if (self.peekRegexpMatchFunctionCall()) return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() };
         if (self.peekTranslateFunctionCall()) return .{ .expression = try self.parseTranslateExpressionProjectionAlloc() };
         if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
         if (self.peekKeyword("nullif")) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
@@ -32599,13 +32606,14 @@ const Parser = struct {
     }
 
     fn parseRegexpMatchExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const default_output = if (self.peekKeyword("regexp_like")) "regexp_like" else "regexp_match";
         const expression = try self.parseRegexpMatchRowExpressionAlloc();
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
         const output = if (self.matchKeyword("as"))
             try self.parseIdentifierOwned()
         else
-            try self.alloc.dupe(u8, "regexp_match");
+            try self.alloc.dupe(u8, default_output);
         var output_transferred = false;
         errdefer if (!output_transferred) self.alloc.free(output);
 
@@ -32618,7 +32626,7 @@ const Parser = struct {
     }
 
     fn parseRegexpMatchRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("regexp_match");
+        if (!self.matchRegexpMatchFunctionKeyword()) return error.UnsupportedSqlShape;
         try self.expect(.lparen);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
@@ -33860,7 +33868,7 @@ const Parser = struct {
         if (self.peekKeyword("regexp_replace")) {
             return try self.parseRegexpReplaceRowExpressionAlloc();
         }
-        if (self.peekKeyword("regexp_match")) {
+        if (self.peekRegexpMatchFunctionCall()) {
             return try self.parseRegexpMatchRowExpressionAlloc();
         }
         if (self.peekTranslateFunctionCall()) {
@@ -36366,6 +36374,22 @@ const Parser = struct {
 
     fn peekFunctionCall(self: *@This(), keyword: []const u8) bool {
         return self.functionCallStartsAt(self.pos, keyword);
+    }
+
+    fn peekRegexpMatchFunctionCall(self: *@This()) bool {
+        if (self.pos + 1 >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        return token.kind == .identifier and
+            sqlKeywordIsRegexpMatchFunction(token.text) and
+            self.tokens[self.pos + 1].kind == .lparen;
+    }
+
+    fn matchRegexpMatchFunctionKeyword(self: *@This()) bool {
+        if (self.pos >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        if (token.kind != .identifier or !sqlKeywordIsRegexpMatchFunction(token.text)) return false;
+        self.pos += 1;
+        return true;
     }
 
     fn match(self: *@This(), kind: TokenKind) ?Token {
@@ -64833,6 +64857,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .params = &.{.{ .string = "^(open|ready)" }},
         },
         .{
+            .name = "single table regexp like predicate and projection query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id, regexp_like(status, $2, true) AS matches_status FROM usage_records WHERE regexp_like(status, $1) ORDER BY id ASC LIMIT 5",
+            .params = &.{ .{ .string = "^op" }, .{ .string = "_EN$" } },
+        },
+        .{
             .name = "single table computed prefix like query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1 },
@@ -75755,6 +75787,34 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             try std.testing.expectEqual(@as(usize, 2), result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"p1\",\"status\":\"op_en\"}", result.rows[0]);
             try std.testing.expectEqualStrings("{\"id\":\"p2\",\"status\":\"open\"}", result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var regexp_like_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, regexp_like(status, $2, true) AS matches_suffix FROM usage_records WHERE kind = 'pattern' AND regexp_like(status, $1) ORDER BY id",
+        schema,
+        &.{ .{ .string = "^op" }, .{ .string = "_EN$" } },
+    );
+    defer regexp_like_plan.deinit(alloc);
+
+    switch (regexp_like_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_match, lowered.plan.query.expression_predicates[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+            try std.testing.expectEqualStrings("matches_suffix", lowered.plan.query.expressions[0].output);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_match, lowered.plan.query.expressions[0].expression.kind);
+            try std.testing.expectEqual(@as(usize, 3), lowered.plan.query.expressions[0].expression.operands.len);
+            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 2), result.total);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"p1\",\"matches_suffix\":true}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"p2\",\"matches_suffix\":false}", result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }
