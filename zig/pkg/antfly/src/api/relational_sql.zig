@@ -61769,6 +61769,9 @@ const AppParityCorpusCoverage = struct {
     conflict_text_expression_update: bool = false,
     conflict_regexp_replace_expression_update: bool = false,
     conflict_regexp_match_expression_update: bool = false,
+    conflict_regexp_count_expression_update: bool = false,
+    conflict_regexp_instr_expression_update: bool = false,
+    conflict_regexp_substr_expression_update: bool = false,
     conflict_jsonb_update: bool = false,
     conflict_jsonb_concat_update: bool = false,
     conflict_guard_where: bool = false,
@@ -63173,6 +63176,15 @@ const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "regexp_like(excluded.status") != null or
                     std.mem.indexOf(u8, entry.sql, "regexp_match(excluded.status") != null) and
                     appParityPlanHasNonZeroToken(entry.plan, "transforms=");
+            self.conflict_regexp_count_expression_update = self.conflict_regexp_count_expression_update or
+                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
+            self.conflict_regexp_instr_expression_update = self.conflict_regexp_instr_expression_update or
+                std.mem.indexOf(u8, entry.sql, "regexp_instr(excluded.status") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
+            self.conflict_regexp_substr_expression_update = self.conflict_regexp_substr_expression_update or
+                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_nested_text_expression_update = self.conflict_nested_text_expression_update or
                 std.mem.indexOf(u8, entry.sql, "length(lower(excluded.next_status || '-' || status))") != null or
                 std.mem.indexOf(u8, entry.sql, "char_length(lower(excluded.next_status || '-' || status))") != null or
@@ -63563,6 +63575,9 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.conflict_text_expression_update);
         try std.testing.expect(self.conflict_regexp_replace_expression_update);
         try std.testing.expect(self.conflict_regexp_match_expression_update);
+        try std.testing.expect(self.conflict_regexp_count_expression_update);
+        try std.testing.expect(self.conflict_regexp_instr_expression_update);
+        try std.testing.expect(self.conflict_regexp_substr_expression_update);
         try std.testing.expect(self.conflict_nested_text_expression_update);
         try std.testing.expect(self.conflict_jsonb_update);
         try std.testing.expect(self.conflict_jsonb_concat_update);
@@ -67442,6 +67457,36 @@ test "postgres sql adapter classifies application parity corpus" {
             .resolver_version = 48,
             .returning_rows = &.{"{\"id\":\"u1\",\"enabled\":true}"},
             .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ACTIVE_USER_2026') ON CONFLICT (id) DO UPDATE SET enabled = regexp_like(excluded.status, '^active_', true) RETURNING id, enabled",
+        },
+        .{
+            .name = "conflict regexp count expression update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
+            .resolver_version = 49,
+            .returning_rows = &.{"{\"id\":\"u1\",\"amount\":2}"},
+            .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'A1B22') ON CONFLICT (id) DO UPDATE SET amount = regexp_count(excluded.status, '[0-9]+') RETURNING id, amount",
+        },
+        .{
+            .name = "conflict regexp instr expression update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
+            .resolver_version = 50,
+            .returning_rows = &.{"{\"id\":\"u1\",\"amount\":2}"},
+            .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'A1B22') ON CONFLICT (id) DO UPDATE SET amount = regexp_instr(excluded.status, '[0-9]+') RETURNING id, amount",
+        },
+        .{
+            .name = "conflict regexp substr expression update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+            .resolver_version = 51,
+            .returning_rows = &.{"{\"id\":\"u1\",\"status\":\"A\"}"},
+            .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'A1B22') ON CONFLICT (id) DO UPDATE SET status = regexp_substr(excluded.status, '[A-Z]+') RETURNING id, status",
         },
         .{
             .name = "conflict uuid generation update",
