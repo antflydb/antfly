@@ -200,7 +200,7 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    fn httpRequestFromContext(ctx: *httpx.Context, body_data: []const u8) !http_common.HttpRequest {
+    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !http_common.HttpRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -214,6 +214,7 @@ pub const AntflyApiHandler = struct {
         for (ctx.request.headers.entries.items, 0..) |entry, i| {
             headers[i] = .{ .name = entry.name, .value = entry.value };
         }
+        const body_data = body_data_opt orelse (try ctx.body()) orelse "";
         return .{
             .method = method,
             .uri = ctx.request.uri.raw,

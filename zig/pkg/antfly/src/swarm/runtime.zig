@@ -24,7 +24,6 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
-const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
@@ -1786,27 +1785,6 @@ fn registerInternalGroupRoutes(server: anytype) !void {
     }
 }
 
-fn httpRequestHeadersFromContext(ctx: *httpx.Context) ![]const http_common.RequestHeader {
-    const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
-    for (ctx.request.headers.entries.items, 0..) |entry, i| {
-        headers[i] = .{ .name = entry.name, .value = entry.value };
-    }
-    return headers;
-}
-
-fn httpRequestBodyFromContext(ctx: *httpx.Context) ![]const u8 {
-    return (ctx.body() catch |err| switch (err) {
-        error.EndOfStream => {
-            if (ctx.header("content-length")) |content_length| {
-                const parsed = std.fmt.parseUnsigned(u64, content_length, 10) catch return err;
-                if (parsed != 0) return err;
-            }
-            return "";
-        },
-        else => return err,
-    }) orelse "";
-}
-
 fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const path = ctx.request.uri.path;
     const routes = antfly.public_api.http_routes.Routes;
@@ -1822,27 +1800,12 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    // Reconstruct HttpRequest for legacy handler.
-    const method: http_common.Method = switch (ctx.request.method) {
-        .GET => .GET,
-        .POST => .POST,
-        .PUT => .PUT,
-        .DELETE => .DELETE,
-        else => {
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
-    };
-
-    const body_data = try httpRequestBodyFromContext(ctx);
-
-    const legacy_req = http_common.HttpRequest{
-        .method = method,
-        .uri = ctx.request.uri.raw,
-        .headers = try httpRequestHeadersFromContext(ctx),
-        .authorization = ctx.header("authorization"),
-        .content_type = ctx.header("content-type"),
-        .body = body_data,
+        else => return err,
     };
 
     var resp = (try server.handleInternalRoute(legacy_req)) orelse {
@@ -1858,25 +1821,12 @@ fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const method: http_common.Method = switch (ctx.request.method) {
-        .GET => .GET,
-        .POST => .POST,
-        .DELETE => .DELETE,
-        else => {
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
-    };
-
-    const body_data = try httpRequestBodyFromContext(ctx);
-
-    const legacy_req = http_common.HttpRequest{
-        .method = method,
-        .uri = ctx.request.uri.raw,
-        .headers = try httpRequestHeadersFromContext(ctx),
-        .authorization = ctx.header("authorization"),
-        .content_type = ctx.header("content-type"),
-        .body = body_data,
+        else => return err,
     };
 
     var resp = try server.handle(legacy_req);
@@ -1889,25 +1839,12 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const method: http_common.Method = switch (ctx.request.method) {
-        .GET => .GET,
-        .POST => .POST,
-        .PUT => .PUT,
-        else => {
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
-    };
-
-    const body_data = try httpRequestBodyFromContext(ctx);
-
-    const legacy_req = http_common.HttpRequest{
-        .method = method,
-        .uri = ctx.request.uri.raw,
-        .headers = try httpRequestHeadersFromContext(ctx),
-        .authorization = ctx.header("authorization"),
-        .content_type = ctx.header("content-type"),
-        .body = body_data,
+        else => return err,
     };
 
     var resp = try server.handle(legacy_req);
@@ -2355,7 +2292,7 @@ test "swarm runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
 }
 
-test "swarm bridge header conversion preserves protocol headers" {
+test "swarm bridge shared adapter preserves protocol headers and absent body" {
     const alloc = std.testing.allocator;
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
@@ -2365,24 +2302,11 @@ test "swarm bridge header conversion preserves protocol headers" {
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const headers = try httpRequestHeadersFromContext(&ctx);
-    defer alloc.free(headers);
+    const req = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
+    defer alloc.free(req.headers);
 
-    const req = http_common.HttpRequest{ .method = .POST, .uri = request.uri.raw, .headers = headers };
     try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
-}
-
-test "swarm bridge body conversion treats absent body as empty" {
-    const alloc = std.testing.allocator;
-
-    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/extensions/v1/packages");
-    defer request.deinit();
-
-    var ctx = httpx.Context.init(alloc, undefined, &request);
-    defer ctx.deinit();
-
-    const body = try httpRequestBodyFromContext(&ctx);
-    try std.testing.expectEqualStrings("", body);
+    try std.testing.expectEqualStrings("", req.body);
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
