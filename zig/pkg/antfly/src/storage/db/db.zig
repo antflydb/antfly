@@ -36405,13 +36405,16 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
     const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, @intCast(total_docs)), entry.index.stats().active_count);
 
-    const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", 1)) orelse return error.TestUnexpectedResult;
+    const first_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:00000000")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(denseTestVectorId("doc:00000000"), first_vector_id);
+    const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", first_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(first_doc);
     try std.testing.expectEqualStrings("doc:00000000", first_doc);
 
-    const last_vector_id: u64 = @intCast(total_docs);
     const expected_last_doc = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{total_docs - 1});
     defer alloc.free(expected_last_doc);
+    const last_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", expected_last_doc)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(denseTestVectorId(expected_last_doc), last_vector_id);
     const last_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", last_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(last_doc);
     try std.testing.expectEqualStrings(expected_last_doc, last_doc);
