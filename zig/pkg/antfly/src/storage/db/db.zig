@@ -30278,7 +30278,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
             .key = "doc:a",
             .value = "{\"body\":\"Ada mention\"}",
         }},
-        .sync_level = .write,
+        .sync_level = .enrichments,
     });
     try db.runUntilIdle();
     try db.runUntilIdle();

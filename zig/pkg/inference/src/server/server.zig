@@ -4413,6 +4413,9 @@ pub const Node = struct {
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
+        if (comptime std.mem.eql(u8, prefix, public_api_prefix)) {
+            try server.get(prefix ++ "/models", mlModelsHandler);
+        }
         try router.register(&prefixed);
         try server.get(prefix ++ "/metrics", metricsHandler);
         active_node = self;
@@ -4443,6 +4446,11 @@ pub const Node = struct {
         }
 
         try server.listen();
+    }
+
+    fn mlModelsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+        const node = active_node orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+        return node.listPredictors(ctx);
     }
 
     fn metricsHandler(ctx: *httpx.Context) anyerror!httpx.Response {
