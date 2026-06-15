@@ -3780,6 +3780,13 @@ pub const ExtensionObjectKind = enum {
     }
 };
 
+pub const UpdateManifestRef = struct {
+    from_version: []const u8,
+    to_version: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
 pub const UpdateExtensionRequest = struct {
     target_version: ?[]const u8 = null,
     dry_run: ?bool = null,
@@ -5083,6 +5090,11 @@ pub const RuntimeDecl = struct {
     config_json: ?[]const u8 = null,
 };
 
+pub const DropExtensionResponse = struct {
+    dropped: ExtensionIdentifier,
+    dry_run: bool,
+};
+
 pub const Capability = struct {
     name: CapabilityName,
     scope: ?[]const u8 = null,
@@ -6188,12 +6200,15 @@ pub const PackageManifest = struct {
     kind: PackageKind,
     description: ?[]const u8 = null,
     digest: []const u8,
+    antfly_min_version: ?[]const u8 = null,
+    antfly_max_version: ?[]const u8 = null,
     trusted: ?bool = null,
     relocatable: ?bool = null,
     capabilities_requested: ?[]const Capability = null,
     dependencies: ?[]const PackageDependency = null,
     artifacts: ?[]const PackageArtifact = null,
     install: InstallManifest,
+    updates: ?[]const UpdateManifestRef = null,
 };
 
 pub const ExtractionResponse = struct {

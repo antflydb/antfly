@@ -15,6 +15,8 @@
 const std = @import("std");
 const schema_mod = @import("../schema/mod.zig");
 
+pub const lifecycle = @import("lifecycle.zig");
+
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";
 pub const max_package_manifest_bytes = 16 * 1024 * 1024;
@@ -498,6 +500,42 @@ pub const ExtensionCatalog = struct {
         try self.packages.append(self.alloc, owned);
     }
 
+    pub fn upsertInstalled(self: *ExtensionCatalog, extension: InstalledExtension) !void {
+        try extension.validate();
+        const owned = try cloneInstalledExtension(self.alloc, extension);
+        errdefer freeInstalledExtension(self.alloc, owned);
+        if (self.findInstalledIndex(extension.name)) |idx| {
+            freeInstalledExtension(self.alloc, self.installed.items[idx]);
+            self.installed.items[idx] = owned;
+            return;
+        }
+        try self.installed.append(self.alloc, owned);
+    }
+
+    pub fn upsertMember(self: *ExtensionCatalog, member: ExtensionMember) !void {
+        try member.validate();
+        const owned = try cloneExtensionMember(self.alloc, member);
+        errdefer freeExtensionMember(self.alloc, owned);
+        if (self.findMemberIndex(member)) |idx| {
+            freeExtensionMember(self.alloc, self.members.items[idx]);
+            self.members.items[idx] = owned;
+            return;
+        }
+        try self.members.append(self.alloc, owned);
+    }
+
+    pub fn upsertDependency(self: *ExtensionCatalog, dependency: ExtensionDependency) !void {
+        try dependency.validate();
+        const owned = try cloneExtensionDependency(self.alloc, dependency);
+        errdefer freeExtensionDependency(self.alloc, owned);
+        if (self.findDependencyIndex(dependency)) |idx| {
+            freeExtensionDependency(self.alloc, self.dependencies.items[idx]);
+            self.dependencies.items[idx] = owned;
+            return;
+        }
+        try self.dependencies.append(self.alloc, owned);
+    }
+
     pub fn loadProjectedRows(
         self: *ExtensionCatalog,
         packages: []const PackageManifest,
@@ -850,6 +888,32 @@ pub const ExtensionCatalog = struct {
     fn findInstalledIndex(self: *const ExtensionCatalog, name: []const u8) ?usize {
         for (self.installed.items, 0..) |extension, i| {
             if (std.mem.eql(u8, extension.name, name)) return i;
+        }
+        return null;
+    }
+
+    fn findMemberIndex(self: *const ExtensionCatalog, needle: ExtensionMember) ?usize {
+        for (self.members.items, 0..) |member, i| {
+            if (std.mem.eql(u8, member.extension_name, needle.extension_name) and
+                member.scope.kind == needle.scope.kind and
+                std.mem.eql(u8, member.scope.table_name, needle.scope.table_name) and
+                member.object_kind == needle.object_kind and
+                std.mem.eql(u8, member.object_name, needle.object_name))
+            {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    fn findDependencyIndex(self: *const ExtensionCatalog, needle: ExtensionDependency) ?usize {
+        for (self.dependencies.items, 0..) |dependency, i| {
+            if (std.mem.eql(u8, dependency.extension_name, needle.extension_name) and
+                std.mem.eql(u8, dependency.required_extension_name, needle.required_extension_name) and
+                std.mem.eql(u8, dependency.package_name, needle.package_name))
+            {
+                return i;
+            }
         }
         return null;
     }

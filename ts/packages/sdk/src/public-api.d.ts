@@ -10399,6 +10399,16 @@ export interface components {
             /** @default {} */
             config_json?: string;
         };
+        UpdateManifestRef: {
+            /** @example 1.0.0 */
+            from_version: string;
+            /** @example 1.1.0 */
+            to_version: string;
+            /** @example updates/1.0.0-1.1.0.json */
+            path: string;
+            /** @example sha256:def456 */
+            digest?: string;
+        };
         InstallManifest: {
             scopes_supported: components["schemas"]["ExtensionScopeKind"][];
             shapes?: components["schemas"]["DataShapeDecl"][];
@@ -10415,6 +10425,8 @@ export interface components {
             kind: components["schemas"]["PackageKind"];
             description?: string;
             digest: string;
+            antfly_min_version?: string;
+            antfly_max_version?: string;
             /** @default false */
             trusted?: boolean;
             /** @default false */
@@ -10423,6 +10435,7 @@ export interface components {
             dependencies?: components["schemas"]["PackageDependency"][];
             artifacts?: components["schemas"]["PackageArtifact"][];
             install: components["schemas"]["InstallManifest"];
+            updates?: components["schemas"]["UpdateManifestRef"][];
         };
         InstalledExtension: {
             name: components["schemas"]["ExtensionIdentifier"];
@@ -10472,6 +10485,11 @@ export interface components {
             mode?: "restrict" | "cascade";
             /** @default false */
             dry_run?: boolean;
+        };
+        DropExtensionResponse: {
+            dropped: components["schemas"]["ExtensionIdentifier"];
+            /** @default false */
+            dry_run: boolean;
         };
         ConfigureExtensionRequest: {
             /** @default {} */
@@ -14404,7 +14422,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InstalledExtension"];
+                    "application/json": components["schemas"]["DropExtensionResponse"];
                 };
             };
         };

@@ -132,6 +132,7 @@ from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
 from .drop_extension_request import DropExtensionRequest
 from .drop_extension_request_mode import DropExtensionRequestMode
+from .drop_extension_response import DropExtensionResponse
 from .dynamic_template import DynamicTemplate
 from .dynamic_template_match_mapping_type import DynamicTemplateMatchMappingType
 from .edge import Edge
@@ -562,6 +563,7 @@ from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
 from .update_extension_request import UpdateExtensionRequest
+from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
@@ -707,6 +709,7 @@ __all__ = (
     "DocumentSchemaSchema",
     "DropExtensionRequest",
     "DropExtensionRequestMode",
+    "DropExtensionResponse",
     "DynamicTemplate",
     "DynamicTemplateMatchMappingType",
     "Edge",
@@ -1137,6 +1140,7 @@ __all__ = (
     "TraverseResponse",
     "TreeSearchConfig",
     "UpdateExtensionRequest",
+    "UpdateManifestRef",
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",

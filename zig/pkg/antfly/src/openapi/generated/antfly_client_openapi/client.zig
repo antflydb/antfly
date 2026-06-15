@@ -1216,13 +1216,13 @@ pub const Client = struct {
 
     /// Drop an installed extension.
     /// POST /extensions/v1/installed/{name}/drop
-    pub fn dropInstalledExtension(self: *@This(), name: []const u8, body: types.DropExtensionRequest) !ApiResponse(types.InstalledExtension) {
+    pub fn dropInstalledExtension(self: *@This(), name: []const u8, body: types.DropExtensionRequest) !ApiResponse(types.DropExtensionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/drop", .{ self.base_url, name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.DropExtensionResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List objects owned by an installed extension.

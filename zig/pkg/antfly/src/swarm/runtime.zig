@@ -124,7 +124,7 @@ const LocalSwarmMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     manager: antfly.metadata.TableManager,
-    extension_catalog: antfly.metadata.ExtensionCatalog,
+    extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
     store_id: u64,
     api_url: []const u8,
@@ -138,10 +138,10 @@ const LocalSwarmMetadata = struct {
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
-        extension_packages: []const antfly.metadata.PackageManifest = &.{},
-        installed_extensions: []const antfly.metadata.InstalledExtension = &.{},
-        extension_members: []const antfly.metadata.ExtensionMember = &.{},
-        extension_dependencies: []const antfly.metadata.ExtensionDependency = &.{},
+        extension_packages: []const antfly.extensions.PackageManifest = &.{},
+        installed_extensions: []const antfly.extensions.InstalledExtension = &.{},
+        extension_members: []const antfly.extensions.ExtensionMember = &.{},
+        extension_dependencies: []const antfly.extensions.ExtensionDependency = &.{},
     };
 
     fn init(
@@ -162,7 +162,7 @@ const LocalSwarmMetadata = struct {
         var self = LocalSwarmMetadata{
             .alloc = alloc,
             .manager = antfly.metadata.TableManager.init(alloc),
-            .extension_catalog = antfly.metadata.ExtensionCatalog.init(alloc),
+            .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
             .local_node_id = local_node_id,
             .store_id = store_id,
             .api_url = owned_api_url,
@@ -217,6 +217,7 @@ const LocalSwarmMetadata = struct {
                 .enable_extension = enableExtension,
                 .disable_extension = disableExtension,
                 .configure_extension = configureExtension,
+                .restore_extensions = restoreExtensions,
             },
         };
     }
@@ -449,39 +450,64 @@ const LocalSwarmMetadata = struct {
         };
     }
 
-    fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.metadata.InstallExtensionRequest) !antfly.metadata.InstalledExtension {
+    fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.InstallExtensionRequest) !antfly.extensions.InstalledExtension {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
-        var installed = try self.extension_catalog.installManifestOnly(extension_name, extension_name, req, installed_at_ms);
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            var planned = try catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
+            defer planned.deinitOwned(self.alloc);
+            return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
+        }
+        var installed = try self.extension_catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
         defer installed.deinitOwned(self.alloc);
         self.epoch +|= 1;
         try self.persistLocked();
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
-    fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.metadata.UpdateExtensionRequest) !antfly.metadata.InstalledExtension {
+    fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.UpdateExtensionRequest) !antfly.extensions.InstalledExtension {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        var installed = try self.extension_catalog.updateManifestOnly(extension_name, req);
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            var planned = try catalog.updateManifestOnly(extension_name, persisted_req);
+            defer planned.deinitOwned(self.alloc);
+            return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
+        }
+        var installed = try self.extension_catalog.updateManifestOnly(extension_name, persisted_req);
         defer installed.deinitOwned(self.alloc);
         self.epoch +|= 1;
         try self.persistLocked();
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
-    fn dropExtension(ptr: *anyopaque, _: std.mem.Allocator, extension_name: []const u8, req: antfly.metadata.DropExtensionRequest) !void {
+    fn dropExtension(ptr: *anyopaque, _: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.DropExtensionRequest) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        try self.extension_catalog.dropInstalledWithMode(extension_name, req);
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            return try catalog.dropInstalledWithMode(extension_name, persisted_req);
+        }
+        try self.extension_catalog.dropInstalledWithMode(extension_name, persisted_req);
         self.epoch +|= 1;
         try self.persistLocked();
     }
 
-    fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.metadata.InstalledExtension {
+    fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -491,7 +517,7 @@ const LocalSwarmMetadata = struct {
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
-    fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.metadata.InstalledExtension {
+    fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -501,7 +527,7 @@ const LocalSwarmMetadata = struct {
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
-    fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.metadata.ConfigureExtensionRequest) !antfly.metadata.InstalledExtension {
+    fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.ConfigureExtensionRequest) !antfly.extensions.InstalledExtension {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -511,9 +537,39 @@ const LocalSwarmMetadata = struct {
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
     }
 
+    fn restoreExtensions(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        installed: []const antfly.extensions.InstalledExtension,
+        members: []const antfly.extensions.ExtensionMember,
+        dependencies: []const antfly.extensions.ExtensionDependency,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        for (installed) |extension| try self.extension_catalog.upsertInstalled(extension);
+        for (members) |member| try self.extension_catalog.upsertMember(member);
+        for (dependencies) |dependency| try self.extension_catalog.upsertDependency(dependency);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn cloneExtensionCatalogLocked(self: *LocalSwarmMetadata) !antfly.extensions.ExtensionCatalog {
+        var catalog = antfly.extensions.ExtensionCatalog.init(self.alloc);
+        errdefer catalog.deinit();
+        try catalog.loadProjectedRows(
+            self.extension_catalog.packages.items,
+            self.extension_catalog.installed.items,
+            self.extension_catalog.members.items,
+            self.extension_catalog.dependencies.items,
+        );
+        return catalog;
+    }
+
     fn syncExtensionPackageStore(self: *LocalSwarmMetadata, io: std.Io, root_path: []const u8) !usize {
-        const entries = try antfly.metadata.scanPackageStoreAlloc(self.alloc, io, root_path);
-        defer antfly.metadata.freePackageStoreEntries(self.alloc, entries);
+        const entries = try antfly.extensions.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer antfly.extensions.freePackageStoreEntries(self.alloc, entries);
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();

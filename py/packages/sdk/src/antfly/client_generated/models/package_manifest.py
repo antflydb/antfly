@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.install_manifest import InstallManifest
     from ..models.package_artifact import PackageArtifact
     from ..models.package_dependency import PackageDependency
+    from ..models.update_manifest_ref import UpdateManifestRef
 
 
 T = TypeVar("T", bound="PackageManifest")
@@ -31,11 +32,14 @@ class PackageManifest:
         digest (str):
         install (InstallManifest):
         description (str | Unset):
+        antfly_min_version (str | Unset):
+        antfly_max_version (str | Unset):
         trusted (bool | Unset):  Default: False.
         relocatable (bool | Unset):  Default: False.
         capabilities_requested (list[Capability] | Unset):
         dependencies (list[PackageDependency] | Unset):
         artifacts (list[PackageArtifact] | Unset):
+        updates (list[UpdateManifestRef] | Unset):
     """
 
     manifest_api_version: PackageManifestManifestApiVersion
@@ -45,11 +49,14 @@ class PackageManifest:
     digest: str
     install: InstallManifest
     description: str | Unset = UNSET
+    antfly_min_version: str | Unset = UNSET
+    antfly_max_version: str | Unset = UNSET
     trusted: bool | Unset = False
     relocatable: bool | Unset = False
     capabilities_requested: list[Capability] | Unset = UNSET
     dependencies: list[PackageDependency] | Unset = UNSET
     artifacts: list[PackageArtifact] | Unset = UNSET
+    updates: list[UpdateManifestRef] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,6 +73,10 @@ class PackageManifest:
         install = self.install.to_dict()
 
         description = self.description
+
+        antfly_min_version = self.antfly_min_version
+
+        antfly_max_version = self.antfly_max_version
 
         trusted = self.trusted
 
@@ -92,6 +103,13 @@ class PackageManifest:
                 artifacts_item = artifacts_item_data.to_dict()
                 artifacts.append(artifacts_item)
 
+        updates: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.updates, Unset):
+            updates = []
+            for updates_item_data in self.updates:
+                updates_item = updates_item_data.to_dict()
+                updates.append(updates_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -106,6 +124,10 @@ class PackageManifest:
         )
         if description is not UNSET:
             field_dict["description"] = description
+        if antfly_min_version is not UNSET:
+            field_dict["antfly_min_version"] = antfly_min_version
+        if antfly_max_version is not UNSET:
+            field_dict["antfly_max_version"] = antfly_max_version
         if trusted is not UNSET:
             field_dict["trusted"] = trusted
         if relocatable is not UNSET:
@@ -116,6 +138,8 @@ class PackageManifest:
             field_dict["dependencies"] = dependencies
         if artifacts is not UNSET:
             field_dict["artifacts"] = artifacts
+        if updates is not UNSET:
+            field_dict["updates"] = updates
 
         return field_dict
 
@@ -125,6 +149,7 @@ class PackageManifest:
         from ..models.install_manifest import InstallManifest
         from ..models.package_artifact import PackageArtifact
         from ..models.package_dependency import PackageDependency
+        from ..models.update_manifest_ref import UpdateManifestRef
 
         d = dict(src_dict)
         manifest_api_version = PackageManifestManifestApiVersion(d.pop("manifest_api_version"))
@@ -140,6 +165,10 @@ class PackageManifest:
         install = InstallManifest.from_dict(d.pop("install"))
 
         description = d.pop("description", UNSET)
+
+        antfly_min_version = d.pop("antfly_min_version", UNSET)
+
+        antfly_max_version = d.pop("antfly_max_version", UNSET)
 
         trusted = d.pop("trusted", UNSET)
 
@@ -172,6 +201,15 @@ class PackageManifest:
 
                 artifacts.append(artifacts_item)
 
+        _updates = d.pop("updates", UNSET)
+        updates: list[UpdateManifestRef] | Unset = UNSET
+        if _updates is not UNSET:
+            updates = []
+            for updates_item_data in _updates:
+                updates_item = UpdateManifestRef.from_dict(updates_item_data)
+
+                updates.append(updates_item)
+
         package_manifest = cls(
             manifest_api_version=manifest_api_version,
             name=name,
@@ -180,11 +218,14 @@ class PackageManifest:
             digest=digest,
             install=install,
             description=description,
+            antfly_min_version=antfly_min_version,
+            antfly_max_version=antfly_max_version,
             trusted=trusted,
             relocatable=relocatable,
             capabilities_requested=capabilities_requested,
             dependencies=dependencies,
             artifacts=artifacts,
+            updates=updates,
         )
 
         package_manifest.additional_properties = d

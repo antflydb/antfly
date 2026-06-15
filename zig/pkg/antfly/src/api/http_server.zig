@@ -360,12 +360,13 @@ pub const StatusSource = struct {
         get_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (ptr: *anyopaque, record: metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (ptr: *anyopaque, job_id: u64) anyerror!void = null,
-        install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
-        update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
-        drop_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) anyerror!void = null,
-        enable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension = null,
-        disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension = null,
-        configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) anyerror!metadata_mod.InstalledExtension = null,
+        install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        drop_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) anyerror!void = null,
+        enable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
     };
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
@@ -453,34 +454,45 @@ pub const StatusSource = struct {
         return true;
     }
 
-    pub fn installExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) !metadata_mod.InstalledExtension {
+    pub fn installExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.install_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name, req);
     }
 
-    pub fn updateExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) !metadata_mod.InstalledExtension {
+    pub fn updateExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.update_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name, req);
     }
 
-    pub fn dropExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) !void {
+    pub fn dropExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
         const fn_ptr = self.vtable.drop_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name, req);
     }
 
-    pub fn enableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !metadata_mod.InstalledExtension {
+    pub fn enableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.enable_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name);
     }
 
-    pub fn disableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !metadata_mod.InstalledExtension {
+    pub fn disableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.disable_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name);
     }
 
-    pub fn configureExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) !metadata_mod.InstalledExtension {
+    pub fn configureExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.configure_extension orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn restoreExtensions(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        installed: []const extension_domain.InstalledExtension,
+        members: []const extension_domain.ExtensionMember,
+        dependencies: []const extension_domain.ExtensionDependency,
+    ) !void {
+        const fn_ptr = self.vtable.restore_extensions orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
     }
 
     fn makeServiceVTable(comptime T: type) VTable {
@@ -559,28 +571,38 @@ pub const StatusSource = struct {
                 try cast(ptr).removeShuffleJoinLease(job_id);
             }
 
-            fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+            fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension {
                 return try installExtensionOnService(cast(ptr), alloc, name, req);
             }
 
-            fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.UpdateExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+            fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension {
                 return try updateExtensionOnService(cast(ptr), alloc, name, req);
             }
 
-            fn dropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.DropExtensionRequest) anyerror!void {
+            fn dropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) anyerror!void {
                 return try dropExtensionOnService(cast(ptr), alloc, name, req);
             }
 
-            fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension {
+            fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension {
                 return try enableExtensionOnService(cast(ptr), alloc, name);
             }
 
-            fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!metadata_mod.InstalledExtension {
+            fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension {
                 return try disableExtensionOnService(cast(ptr), alloc, name);
             }
 
-            fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.ConfigureExtensionRequest) anyerror!metadata_mod.InstalledExtension {
+            fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension {
                 return try configureExtensionOnService(cast(ptr), alloc, name, req);
+            }
+
+            fn restoreExtensions(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                installed: []const extension_domain.InstalledExtension,
+                members: []const extension_domain.ExtensionMember,
+                dependencies: []const extension_domain.ExtensionDependency,
+            ) anyerror!void {
+                return try restoreExtensionsOnService(cast(ptr), alloc, installed, members, dependencies);
             }
         };
 
@@ -607,6 +629,7 @@ pub const StatusSource = struct {
             .enable_extension = Gen.enableExtension,
             .disable_extension = Gen.disableExtension,
             .configure_extension = Gen.configureExtension,
+            .restore_extensions = Gen.restoreExtensions,
         };
     }
 
@@ -1937,7 +1960,7 @@ pub const ApiHttpServer = struct {
         if (req.method != .GET) {
             if (req.method == .POST) {
                 if (routes.Routes.matchInstalledExtensionUpdate(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(metadata_mod.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
                         return try jsonErrorResponse(self.alloc, 400, "invalid extension update request");
                     };
                     defer parsed.deinit();
@@ -1948,7 +1971,7 @@ pub const ApiHttpServer = struct {
                     return try jsonResponse(self.alloc, installed);
                 }
                 if (routes.Routes.matchInstalledExtensionDrop(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(metadata_mod.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
                         return try jsonErrorResponse(self.alloc, 400, "invalid extension drop request");
                     };
                     defer parsed.deinit();
@@ -1972,7 +1995,7 @@ pub const ApiHttpServer = struct {
                     return try jsonResponse(self.alloc, installed);
                 }
                 if (routes.Routes.matchInstalledExtension(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(metadata_mod.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
                         return try jsonErrorResponse(self.alloc, 400, "invalid extension install request");
                     };
                     defer parsed.deinit();
@@ -1985,7 +2008,7 @@ pub const ApiHttpServer = struct {
             }
             if (req.method == .PUT) {
                 if (routes.Routes.matchInstalledExtensionConfig(uri_parts.path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(metadata_mod.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
                         return try jsonErrorResponse(self.alloc, 400, "invalid extension config request");
                     };
                     defer parsed.deinit();
@@ -5933,7 +5956,8 @@ pub const ApiHttpServer = struct {
 
         const installed_extensions = if (extension_snapshot_opt) |*snapshot| snapshot.installed_extensions else &.{};
         const extension_members = if (extension_snapshot_opt) |*snapshot| snapshot.extension_members else &.{};
-        var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members) catch return error.InternalFailure;
+        const extension_dependencies = if (extension_snapshot_opt) |*snapshot| snapshot.extension_dependencies else &.{};
+        var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
         defer manifest.deinit(alloc);
         backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
 
@@ -6097,6 +6121,21 @@ pub const ApiHttpServer = struct {
                 continue;
             };
             statuses[i].status = "triggered";
+        }
+
+        if (owns_table_names and clusterRestoreStatusesHaveNoErrors(statuses)) {
+            self.source.restoreExtensions(
+                alloc,
+                manifest.installed_extensions,
+                manifest.extension_members,
+                manifest.extension_dependencies,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation => {},
+                else => {
+                    std.log.err("cluster restore extension metadata restore failed err={}", .{err});
+                    return error.InternalFailure;
+                },
+            };
         }
 
         return backups_api.encodeClusterRestoreResponse(alloc, statuses) catch return error.InternalFailure;
@@ -6834,7 +6873,7 @@ fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
 fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
     return switch (err) {
         error.UnsupportedOperation => try jsonErrorResponse(alloc, 405, "method not allowed"),
-        error.PackageNotFound, error.ExtensionNotInstalled => try jsonErrorResponse(alloc, 404, "not found"),
+        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try jsonErrorResponse(alloc, 404, "not found"),
         error.ExtensionAlreadyInstalled => try jsonErrorResponse(alloc, 409, "extension already installed"),
         error.DependentExtensionExists => try jsonErrorResponse(alloc, 409, "dependent extension exists"),
         error.RequiredExtensionNotInstalled => try jsonErrorResponse(alloc, 409, "required extension not installed"),
@@ -6850,6 +6889,7 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidExtensionLifecycleRequest,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
         error.EmptyName,
@@ -6864,186 +6904,65 @@ fn installExtensionOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
-    request: metadata_mod.InstallExtensionRequest,
-) !metadata_mod.InstalledExtension {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-
-    var persisted_request = request;
-    persisted_request.dry_run = false;
-    const installed_at_ms: i64 = @intCast(@divTrunc(nowNs(), std.time.ns_per_ms));
-    var installed = try catalog.installManifestOnly(extension_name, extension_name, persisted_request, installed_at_ms);
-    errdefer installed.deinitOwned(alloc);
-
-    if (!request.dry_run) {
-        const members = try catalog.listMembersForExtension(alloc, extension_name);
-        defer catalog.freeMembers(alloc, members);
-        const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
-        defer catalog.freeDependencies(alloc, dependencies);
-        const table_upserts = try planExtensionStorageMemberDeltaAlloc(alloc, &snapshot, &.{}, members);
-        defer freeExtensionLifecycleTables(alloc, table_upserts);
-
-        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-            .upsert_tables = table_upserts,
-            .upsert_installed_extensions = &.{installed},
-            .upsert_extension_dependencies = dependencies,
-            .upsert_extension_members = members,
-        } });
-    }
-
-    return installed;
+    request: extension_domain.InstallExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.installOnService(service, alloc, extension_name, request);
 }
 
 fn updateExtensionOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
-    request: metadata_mod.UpdateExtensionRequest,
-) !metadata_mod.InstalledExtension {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-
-    var persisted_request = request;
-    persisted_request.dry_run = false;
-    var installed = try catalog.updateManifestOnly(extension_name, persisted_request);
-    errdefer installed.deinitOwned(alloc);
-
-    if (!request.dry_run) {
-        const old_members = try extensionMembersForName(alloc, snapshot.extension_members, extension_name);
-        defer if (old_members.len > 0) alloc.free(old_members);
-        const old_dependencies = try extensionDependenciesForName(alloc, snapshot.extension_dependencies, extension_name);
-        defer if (old_dependencies.len > 0) alloc.free(old_dependencies);
-        const new_members = try catalog.listMembersForExtension(alloc, extension_name);
-        defer catalog.freeMembers(alloc, new_members);
-        const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
-        defer catalog.freeDependencies(alloc, new_dependencies);
-        const table_upserts = try planExtensionStorageMemberDeltaAlloc(alloc, &snapshot, old_members, new_members);
-        defer freeExtensionLifecycleTables(alloc, table_upserts);
-        const remove_dependency_keys = try extensionDependencyRemoveKeysAlloc(alloc, old_dependencies);
-        defer freeExtensionDependencyRemoveKeys(alloc, remove_dependency_keys);
-        const remove_member_keys = try extensionMemberRemoveKeysAlloc(alloc, old_members);
-        defer freeExtensionMemberRemoveKeys(alloc, remove_member_keys);
-
-        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-            .upsert_tables = table_upserts,
-            .remove_extension_dependencies = remove_dependency_keys,
-            .remove_extension_members = remove_member_keys,
-            .upsert_installed_extensions = &.{installed},
-            .upsert_extension_dependencies = new_dependencies,
-            .upsert_extension_members = new_members,
-        } });
-    }
-
-    return installed;
+    request: extension_domain.UpdateExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.updateOnService(service, alloc, extension_name, request);
 }
 
 fn dropExtensionOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
-    request: metadata_mod.DropExtensionRequest,
+    request: extension_domain.DropExtensionRequest,
 ) !void {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-
-    var persisted_request = request;
-    persisted_request.dry_run = false;
-    try catalog.dropInstalledWithMode(extension_name, persisted_request);
-    if (request.dry_run) return;
-
-    const remaining_installed = try catalog.listInstalled(alloc);
-    defer catalog.freeInstalled(alloc, remaining_installed);
-    const remaining_members = try catalog.listMembers(alloc);
-    defer catalog.freeMembers(alloc, remaining_members);
-    const remaining_dependencies = try catalog.listDependencies(alloc);
-    defer catalog.freeDependencies(alloc, remaining_dependencies);
-    const table_upserts = try planRemovedExtensionStorageMembersAlloc(alloc, &snapshot, remaining_members);
-    defer freeExtensionLifecycleTables(alloc, table_upserts);
-    const remove_dependency_keys = try missingExtensionDependencyKeysAlloc(alloc, snapshot.extension_dependencies, remaining_dependencies);
-    defer freeExtensionDependencyRemoveKeys(alloc, remove_dependency_keys);
-    const remove_member_keys = try missingExtensionMemberKeysAlloc(alloc, snapshot.extension_members, remaining_members);
-    defer freeExtensionMemberRemoveKeys(alloc, remove_member_keys);
-    const remove_installed_names = try missingInstalledExtensionNamesAlloc(alloc, snapshot.installed_extensions, remaining_installed);
-    defer freeExtensionInstalledRemoveNames(alloc, remove_installed_names);
-
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-        .upsert_tables = table_upserts,
-        .remove_extension_dependencies = remove_dependency_keys,
-        .remove_extension_members = remove_member_keys,
-        .remove_installed_extensions = remove_installed_names,
-    } });
+    return try extension_domain.lifecycle.dropOnService(service, alloc, extension_name, request);
 }
 
-fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !metadata_mod.InstalledExtension {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-    try catalog.enableInstalled(extension_name);
-    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
-    errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-        .upsert_installed_extensions = &.{installed},
-    } });
-    return installed;
+fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.enableOnService(service, alloc, extension_name);
 }
 
-fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !metadata_mod.InstalledExtension {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-    try catalog.disableInstalled(extension_name);
-    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
-    errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-        .upsert_installed_extensions = &.{installed},
-    } });
-    return installed;
+fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.disableOnService(service, alloc, extension_name);
 }
 
 fn configureExtensionOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
-    request: metadata_mod.ConfigureExtensionRequest,
-) !metadata_mod.InstalledExtension {
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    var catalog = metadata_mod.ExtensionCatalog.init(alloc);
-    defer catalog.deinit();
-    try catalog.loadProjectedRows(snapshot.extension_packages, snapshot.installed_extensions, snapshot.extension_members, snapshot.extension_dependencies);
-    try catalog.configureInstalled(extension_name, request);
-    var installed = try catalog.getInstalledAlloc(alloc, extension_name);
-    errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
-        .upsert_installed_extensions = &.{installed},
-    } });
-    return installed;
+    request: extension_domain.ConfigureExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try extension_domain.lifecycle.configureOnService(service, alloc, extension_name, request);
 }
 
-fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const metadata_mod.PackageManifest {
+fn restoreExtensionsOnService(
+    service: anytype,
+    _: std.mem.Allocator,
+    installed: []const extension_domain.InstalledExtension,
+    members: []const extension_domain.ExtensionMember,
+    dependencies: []const extension_domain.ExtensionDependency,
+) !void {
+    if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
+    try extension_domain.lifecycle.restoreOnService(service, installed, members, dependencies);
+}
+
+fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const extension_domain.PackageManifest {
     for (snapshot.extension_packages) |*package| {
         if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
     }
     return null;
 }
 
-fn extensionPackageAvailableForRestore(snapshot: *const metadata_api.AdminSnapshot, installed: metadata_mod.InstalledExtension) bool {
+fn extensionPackageAvailableForRestore(snapshot: *const metadata_api.AdminSnapshot, installed: extension_domain.InstalledExtension) bool {
     const package = findExtensionPackageVersion(snapshot, installed.package_name, installed.package_version) orelse return false;
     return std.mem.eql(u8, package.digest, installed.package_digest);
 }
@@ -7058,8 +6977,15 @@ fn preflightClusterRestoreExtensions(self: *ApiHttpServer, manifest: *const back
     }
 }
 
-fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.PackageManifest {
-    var found: ?*const metadata_mod.PackageManifest = null;
+fn clusterRestoreStatusesHaveNoErrors(statuses: []const backups_api.ClusterTableRestoreStatus) bool {
+    for (statuses) |status| {
+        if (status.@"error" != null) return false;
+    }
+    return true;
+}
+
+fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.PackageManifest {
+    var found: ?*const extension_domain.PackageManifest = null;
     for (snapshot.extension_packages) |*package| {
         if (!std.mem.eql(u8, package.name, name)) continue;
         if (found == null or extension_domain.packageVersionLess(found.?.version, package.version)) found = package;
@@ -7067,37 +6993,37 @@ fn findLatestExtensionPackage(snapshot: *const metadata_api.AdminSnapshot, name:
     return found;
 }
 
-fn installedExtensionExists(installed_extensions: []const metadata_mod.InstalledExtension, name: []const u8) bool {
+fn installedExtensionExists(installed_extensions: []const extension_domain.InstalledExtension, name: []const u8) bool {
     for (installed_extensions) |installed| {
         if (std.mem.eql(u8, installed.name, name)) return true;
     }
     return false;
 }
 
-fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const metadata_mod.InstalledExtension {
+fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.InstalledExtension {
     for (snapshot.installed_extensions) |*extension| {
         if (std.mem.eql(u8, extension.name, name)) return extension;
     }
     return null;
 }
 
-fn extensionMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.table_name.len != 0) return member.table_name;
     if (member.scope.kind == .table) return member.scope.table_name;
     return null;
 }
 
-fn extensionIndexMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+fn extensionIndexMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.object_kind != .index) return null;
     return extensionMemberTableName(member);
 }
 
-fn extensionEnrichmentMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+fn extensionEnrichmentMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.object_kind != .enrichment) return null;
     return extensionMemberTableName(member);
 }
 
-fn extensionDataShapeMemberTableName(member: metadata_mod.ExtensionMember) ?[]const u8 {
+fn extensionDataShapeMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.object_kind != .data_shape) return null;
     const shape_kind = member.shape_kind orelse return null;
     if (shape_kind != .document and shape_kind != .row) return null;
@@ -7175,7 +7101,7 @@ fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, t
     return false;
 }
 
-fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const metadata_mod.ExtensionMember) !void {
+fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapshot, new_members: []const extension_domain.ExtensionMember) !void {
     for (new_members) |member| {
         if (member.object_kind != .index and member.object_kind != .enrichment) continue;
         const table_name = extensionMemberTableName(member) orelse return error.UnsupportedExtensionScope;
@@ -7186,8 +7112,8 @@ fn validateNewExtensionStorageMembers(snapshot: *const metadata_api.AdminSnapsho
 fn planExtensionStorageMemberDeltaAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
-    old_members: []const metadata_mod.ExtensionMember,
-    new_members: []const metadata_mod.ExtensionMember,
+    old_members: []const extension_domain.ExtensionMember,
+    new_members: []const extension_domain.ExtensionMember,
 ) ![]metadata_table_manager.TableRecord {
     try validateNewExtensionStorageMembers(snapshot, new_members);
 
@@ -7256,9 +7182,9 @@ fn planExtensionStorageMemberDeltaAlloc(
 fn planRemovedExtensionStorageMembersAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
-    remaining_members: []const metadata_mod.ExtensionMember,
+    remaining_members: []const extension_domain.ExtensionMember,
 ) ![]metadata_table_manager.TableRecord {
-    var removed = std.ArrayListUnmanaged(metadata_mod.ExtensionMember).empty;
+    var removed = std.ArrayListUnmanaged(extension_domain.ExtensionMember).empty;
     defer removed.deinit(alloc);
     for (snapshot.extension_members) |member| {
         if (extensionMemberExists(remaining_members, member)) continue;
@@ -7274,7 +7200,7 @@ fn freeExtensionLifecycleTables(alloc: std.mem.Allocator, tables: []metadata_tab
 
 fn extensionMemberRemoveKeysAlloc(
     alloc: std.mem.Allocator,
-    members: []const metadata_mod.ExtensionMember,
+    members: []const extension_domain.ExtensionMember,
 ) ![]metadata_mod.storage.ExtensionMemberKey {
     const out = try alloc.alloc(metadata_mod.storage.ExtensionMemberKey, members.len);
     errdefer alloc.free(out);
@@ -7290,8 +7216,8 @@ fn extensionMemberRemoveKeysAlloc(
 
 fn missingExtensionMemberKeysAlloc(
     alloc: std.mem.Allocator,
-    members: []const metadata_mod.ExtensionMember,
-    remaining_members: []const metadata_mod.ExtensionMember,
+    members: []const extension_domain.ExtensionMember,
+    remaining_members: []const extension_domain.ExtensionMember,
 ) ![]metadata_mod.storage.ExtensionMemberKey {
     var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionMemberKey).empty;
     errdefer out.deinit(alloc);
@@ -7312,7 +7238,7 @@ fn freeExtensionMemberRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_mod.
 
 fn extensionDependencyRemoveKeysAlloc(
     alloc: std.mem.Allocator,
-    dependencies: []const metadata_mod.ExtensionDependency,
+    dependencies: []const extension_domain.ExtensionDependency,
 ) ![]metadata_mod.storage.ExtensionDependencyKey {
     const out = try alloc.alloc(metadata_mod.storage.ExtensionDependencyKey, dependencies.len);
     errdefer alloc.free(out);
@@ -7328,8 +7254,8 @@ fn extensionDependencyRemoveKeysAlloc(
 
 fn missingExtensionDependencyKeysAlloc(
     alloc: std.mem.Allocator,
-    dependencies: []const metadata_mod.ExtensionDependency,
-    remaining_dependencies: []const metadata_mod.ExtensionDependency,
+    dependencies: []const extension_domain.ExtensionDependency,
+    remaining_dependencies: []const extension_domain.ExtensionDependency,
 ) ![]metadata_mod.storage.ExtensionDependencyKey {
     var out = std.ArrayListUnmanaged(metadata_mod.storage.ExtensionDependencyKey).empty;
     errdefer out.deinit(alloc);
@@ -7350,8 +7276,8 @@ fn freeExtensionDependencyRemoveKeys(alloc: std.mem.Allocator, keys: []metadata_
 
 fn missingInstalledExtensionNamesAlloc(
     alloc: std.mem.Allocator,
-    installed_extensions: []const metadata_mod.InstalledExtension,
-    remaining_installed: []const metadata_mod.InstalledExtension,
+    installed_extensions: []const extension_domain.InstalledExtension,
+    remaining_installed: []const extension_domain.InstalledExtension,
 ) ![]const []const u8 {
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer out.deinit(alloc);
@@ -7368,14 +7294,14 @@ fn freeExtensionInstalledRemoveNames(alloc: std.mem.Allocator, names: []const []
 
 fn extensionMembersForName(
     alloc: std.mem.Allocator,
-    members: []const metadata_mod.ExtensionMember,
+    members: []const extension_domain.ExtensionMember,
     extension_name: []const u8,
-) ![]metadata_mod.ExtensionMember {
+) ![]extension_domain.ExtensionMember {
     var count: usize = 0;
     for (members) |member| {
         if (std.mem.eql(u8, member.extension_name, extension_name)) count += 1;
     }
-    const out = try alloc.alloc(metadata_mod.ExtensionMember, count);
+    const out = try alloc.alloc(extension_domain.ExtensionMember, count);
     var i: usize = 0;
     for (members) |member| {
         if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
@@ -7387,14 +7313,14 @@ fn extensionMembersForName(
 
 fn extensionDependenciesForName(
     alloc: std.mem.Allocator,
-    dependencies: []const metadata_mod.ExtensionDependency,
+    dependencies: []const extension_domain.ExtensionDependency,
     extension_name: []const u8,
-) ![]metadata_mod.ExtensionDependency {
+) ![]extension_domain.ExtensionDependency {
     var count: usize = 0;
     for (dependencies) |dependency| {
         if (std.mem.eql(u8, dependency.extension_name, extension_name)) count += 1;
     }
-    const out = try alloc.alloc(metadata_mod.ExtensionDependency, count);
+    const out = try alloc.alloc(extension_domain.ExtensionDependency, count);
     var i: usize = 0;
     for (dependencies) |dependency| {
         if (!std.mem.eql(u8, dependency.extension_name, extension_name)) continue;
@@ -7404,7 +7330,7 @@ fn extensionDependenciesForName(
     return out;
 }
 
-fn extensionMemberExists(members: []const metadata_mod.ExtensionMember, needle: metadata_mod.ExtensionMember) bool {
+fn extensionMemberExists(members: []const extension_domain.ExtensionMember, needle: extension_domain.ExtensionMember) bool {
     for (members) |member| {
         if (std.mem.eql(u8, member.extension_name, needle.extension_name) and
             member.object_kind == needle.object_kind and
@@ -7416,7 +7342,7 @@ fn extensionMemberExists(members: []const metadata_mod.ExtensionMember, needle: 
     return false;
 }
 
-fn extensionDependencyExists(dependencies: []const metadata_mod.ExtensionDependency, needle: metadata_mod.ExtensionDependency) bool {
+fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDependency, needle: extension_domain.ExtensionDependency) bool {
     for (dependencies) |dependency| {
         if (std.mem.eql(u8, dependency.extension_name, needle.extension_name) and
             std.mem.eql(u8, dependency.required_extension_name, needle.required_extension_name) and
@@ -9060,7 +8986,7 @@ test "api http server serves extension catalog reads" {
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .extension_packages = @constCast((&[_]metadata_mod.PackageManifest{.{
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
                     .name = "memoryaf",
                     .version = "1.0.0",
                     .digest = "sha256:abc",
@@ -9070,7 +8996,7 @@ test "api http server serves extension catalog reads" {
                         .objects = &.{.{ .kind = .mcp_tool, .name = "recall" }},
                     },
                 }})[0..]),
-                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{.{
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{.{
                     .name = "memoryaf",
                     .package_name = "memoryaf",
                     .package_version = "1.0.0",
@@ -9078,7 +9004,7 @@ test "api http server serves extension catalog reads" {
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .status = .ready,
                 }})[0..]),
-                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{
                     .{
                         .extension_name = "memoryaf",
                         .scope = .{ .kind = .table, .table_name = "memories" },
@@ -9107,7 +9033,7 @@ test "api http server serves extension catalog reads" {
     var packages_resp = try server.handle(.{ .method = .GET, .uri = routes.Routes.extensions_v1_packages });
     defer packages_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), packages_resp.status);
-    var packages = try std.json.parseFromSlice([]metadata_mod.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
+    var packages = try std.json.parseFromSlice([]extension_domain.PackageManifest, std.testing.allocator, packages_resp.body, .{ .ignore_unknown_fields = true });
     defer packages.deinit();
     try std.testing.expectEqual(@as(usize, 1), packages.value.len);
     try std.testing.expectEqualStrings("memoryaf", packages.value[0].name);
@@ -9115,21 +9041,21 @@ test "api http server serves extension catalog reads" {
     var package_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/packages/memoryaf/versions/1.0.0" });
     defer package_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), package_resp.status);
-    var package = try std.json.parseFromSlice(metadata_mod.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
+    var package = try std.json.parseFromSlice(extension_domain.PackageManifest, std.testing.allocator, package_resp.body, .{ .ignore_unknown_fields = true });
     defer package.deinit();
     try std.testing.expectEqualStrings("sha256:abc", package.value.digest);
 
     var installed_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" });
     defer installed_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), installed_resp.status);
-    var installed = try std.json.parseFromSlice(metadata_mod.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
+    var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, installed_resp.body, .{ .ignore_unknown_fields = true });
     defer installed.deinit();
     try std.testing.expectEqualStrings("1.0.0", installed.value.package_version);
 
     var objects_resp = try server.handle(.{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf/objects" });
     defer objects_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), objects_resp.status);
-    var objects = try std.json.parseFromSlice([]metadata_mod.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
+    var objects = try std.json.parseFromSlice([]extension_domain.ExtensionMember, std.testing.allocator, objects_resp.body, .{ .ignore_unknown_fields = true });
     defer objects.deinit();
     try std.testing.expectEqual(@as(usize, 2), objects.value.len);
 
@@ -9177,7 +9103,7 @@ test "api http server validates writes against extension data shape members" {
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{.{
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{.{
                     .extension_name = "memoryaf",
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .object_kind = .data_shape,
@@ -9259,7 +9185,7 @@ test "api http server dispatches extension lifecycle mutations" {
             return .{ .metadata_group_id = 77, .metrics = .{} };
         }
 
-        fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: metadata_mod.InstallExtensionRequest) !metadata_mod.InstalledExtension {
+        fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.install_called = true;
             self.install_dry_run = req.dry_run;
@@ -9292,7 +9218,7 @@ test "api http server dispatches extension lifecycle mutations" {
     try std.testing.expectEqual(@as(u16, 200), install_resp.status);
     try std.testing.expect(source.install_called);
     try std.testing.expect(source.install_dry_run);
-    var installed = try std.json.parseFromSlice(metadata_mod.InstalledExtension, std.testing.allocator, install_resp.body, .{ .ignore_unknown_fields = true });
+    var installed = try std.json.parseFromSlice(extension_domain.InstalledExtension, std.testing.allocator, install_resp.body, .{ .ignore_unknown_fields = true });
     defer installed.deinit();
     try std.testing.expectEqualStrings("memoryaf", installed.value.name);
     try std.testing.expectEqualStrings("1.2.3", installed.value.package_version);
@@ -9314,7 +9240,7 @@ test "extension lifecycle materializes table index and enrichment members" {
             .indexes_json = "{}",
             .placement_role = "data",
         },
-        package_record: metadata_mod.PackageManifest = .{
+        package_record: extension_domain.PackageManifest = .{
             .name = "memoryaf",
             .version = "1.0.0",
             .digest = "sha256:memoryaf",
@@ -9360,11 +9286,11 @@ test "extension lifecycle materializes table index and enrichment members" {
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
         }
 
-        fn packageSlice(self: *@This()) []metadata_mod.PackageManifest {
-            return @as([*]metadata_mod.PackageManifest, @ptrCast(&self.package_record))[0..1];
+        fn packageSlice(self: *@This()) []extension_domain.PackageManifest {
+            return @as([*]extension_domain.PackageManifest, @ptrCast(&self.package_record))[0..1];
         }
 
-        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast(self.tableSlice()),
@@ -9377,7 +9303,7 @@ test "extension lifecycle materializes table index and enrichment members" {
             };
         }
 
-        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
         fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
             if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
@@ -9385,7 +9311,7 @@ test "extension lifecycle materializes table index and enrichment members" {
             self.upsert_table_count += 1;
         }
 
-        fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+        pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
             const Command = @TypeOf(command);
             if (@hasField(Command, "apply_extension_lifecycle")) {
                 const delta = command.apply_extension_lifecycle;
@@ -9426,7 +9352,7 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
             .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384},{\"name\":\"manual_embed\",\"kind\":\"embedding\",\"field\":\"summary\",\"expected_dims\":384}]}",
             .placement_role = "data",
         },
-        installed_record: metadata_mod.InstalledExtension = .{
+        installed_record: extension_domain.InstalledExtension = .{
             .name = "memoryaf",
             .package_name = "memoryaf",
             .package_version = "1.0.0",
@@ -9434,7 +9360,7 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
             .scope = .{ .kind = .table, .table_name = "memories" },
             .status = .ready,
         },
-        member_records: [2]metadata_mod.ExtensionMember = .{
+        member_records: [2]extension_domain.ExtensionMember = .{
             .{
                 .extension_name = "memoryaf",
                 .scope = .{ .kind = .table, .table_name = "memories" },
@@ -9470,15 +9396,15 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
         }
 
-        fn installedSlice(self: *@This()) []metadata_mod.InstalledExtension {
-            return @as([*]metadata_mod.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
+        fn installedSlice(self: *@This()) []extension_domain.InstalledExtension {
+            return @as([*]extension_domain.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
         }
 
-        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
             return self.member_records[0..];
         }
 
-        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast(self.tableSlice()),
@@ -9492,7 +9418,7 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
             };
         }
 
-        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
         fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
             if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
@@ -9500,7 +9426,7 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
             self.upsert_table_count += 1;
         }
 
-        fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+        pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
             const Command = @TypeOf(command);
             if (@hasField(Command, "apply_extension_lifecycle")) {
                 const delta = command.apply_extension_lifecycle;
@@ -9537,7 +9463,7 @@ test "direct index deletion rejects extension-owned indexes" {
             .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
             .placement_role = "data",
         },
-        member_record: metadata_mod.ExtensionMember = .{
+        member_record: extension_domain.ExtensionMember = .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
             .object_kind = .index,
@@ -9555,8 +9481,8 @@ test "direct index deletion rejects extension-owned indexes" {
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
         }
 
-        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
-            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
         }
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -9593,7 +9519,7 @@ test "direct index creation rejects extension-owned index names" {
             .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
             .placement_role = "data",
         },
-        member_record: metadata_mod.ExtensionMember = .{
+        member_record: extension_domain.ExtensionMember = .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
             .object_kind = .index,
@@ -9611,8 +9537,8 @@ test "direct index creation rejects extension-owned index names" {
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
         }
 
-        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
-            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
         }
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -9649,7 +9575,7 @@ test "direct schema update rejects extension-owned data shapes" {
             .schema_json = "{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"}}}",
             .placement_role = "data",
         },
-        member_record: metadata_mod.ExtensionMember = .{
+        member_record: extension_domain.ExtensionMember = .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
             .object_kind = .data_shape,
@@ -9669,8 +9595,8 @@ test "direct schema update rejects extension-owned data shapes" {
             return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table_record))[0..1];
         }
 
-        fn memberSlice(self: *@This()) []metadata_mod.ExtensionMember {
-            return @as([*]metadata_mod.ExtensionMember, @ptrCast(&self.member_record))[0..1];
+        fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
+            return @as([*]extension_domain.ExtensionMember, @ptrCast(&self.member_record))[0..1];
         }
 
         fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -9703,7 +9629,7 @@ test "direct schema update rejects extension-owned data shapes" {
 }
 
 test "extension table ownership recognizes scoped objects for table drop guards" {
-    var member_record = metadata_mod.ExtensionMember{
+    var member_record = extension_domain.ExtensionMember{
         .extension_name = "memoryaf",
         .scope = .{ .kind = .table, .table_name = "memories" },
         .object_kind = .mcp_tool,
@@ -9722,7 +9648,7 @@ test "extension table ownership recognizes scoped objects for table drop guards"
         .ranges = empty_ranges[0..],
         .stores = empty_stores[0..],
         .placement_intents = empty_placements[0..],
-        .extension_members = @as([*]metadata_mod.ExtensionMember, @ptrCast(&member_record))[0..1],
+        .extension_members = @as([*]extension_domain.ExtensionMember, @ptrCast(&member_record))[0..1],
         .split_transitions = empty_splits[0..],
         .merge_transitions = empty_merges[0..],
     };
@@ -9991,7 +9917,7 @@ test "api http server lists extension-owned mcp tools" {
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{.{
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{.{
                     .name = "memoryaf",
                     .package_name = "memoryaf",
                     .package_version = "1.0.0",
@@ -9999,7 +9925,7 @@ test "api http server lists extension-owned mcp tools" {
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .status = .ready,
                 }})[0..]),
-                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{.{
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{.{
                     .extension_name = "memoryaf",
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .object_kind = .mcp_tool,
@@ -10081,7 +10007,7 @@ test "api http server scopes mcp endpoint to one extension" {
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .installed_extensions = @constCast((&[_]metadata_mod.InstalledExtension{
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{
                     .{
                         .name = "memoryaf",
                         .package_name = "memoryaf",
@@ -10099,7 +10025,7 @@ test "api http server scopes mcp endpoint to one extension" {
                         .status = .ready,
                     },
                 })[0..]),
-                .extension_members = @constCast((&[_]metadata_mod.ExtensionMember{
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{
                     .{
                         .extension_name = "memoryaf",
                         .scope = .{ .kind = .table, .table_name = "memories" },
@@ -18847,7 +18773,7 @@ test "api http server cluster restore rejects missing extension package digest" 
         .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
     };
     defer cluster_entry.deinit(alloc);
-    const installed = [_]metadata_mod.InstalledExtension{.{
+    const installed = [_]extension_domain.InstalledExtension{.{
         .name = "memoryaf",
         .package_name = "memoryaf",
         .package_version = "1.0.0",
@@ -18861,6 +18787,7 @@ test "api http server cluster restore rejects missing extension package digest" 
         location_uri,
         &.{cluster_entry},
         &installed,
+        &.{},
         &.{},
     );
     defer cluster_manifest.deinit(alloc);
@@ -18895,7 +18822,7 @@ test "api http server cluster restore rejects missing extension package digest" 
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                .extension_packages = @constCast((&[_]metadata_mod.PackageManifest{.{
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
                     .name = "memoryaf",
                     .version = "1.0.0",
                     .digest = "sha256:target",
@@ -18955,6 +18882,151 @@ test "api http server cluster restore rejects missing extension package digest" 
     try std.testing.expectEqual(@as(u16, 400), restore_resp.status);
     try std.testing.expectEqualStrings("invalid restore request", restore_resp.body);
     try std.testing.expect(!state.restored);
+}
+
+test "api http server cluster restore rehydrates extension metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-restore", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location_uri);
+
+    var cluster_entry = backups_api.ClusterTableBackupEntry{
+        .name = try alloc.dupe(u8, "docs"),
+        .table_backup_id = try alloc.dupe(u8, "docs-snap-cluster"),
+    };
+    defer cluster_entry.deinit(alloc);
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:memory",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    }};
+    const members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .mcp_tool,
+        .object_name = "recall",
+    }};
+    const dependencies = [_]extension_domain.ExtensionDependency{.{
+        .extension_name = "memoryaf",
+        .required_extension_name = "antfly_core",
+        .package_name = "antfly_core",
+    }};
+    var cluster_manifest = try backups_api.createClusterManifestWithExtensions(
+        alloc,
+        "snap-cluster",
+        location_uri,
+        &.{cluster_entry},
+        &installed,
+        &members,
+        &dependencies,
+    );
+    defer cluster_manifest.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, backup_root_abs, &cluster_manifest);
+
+    const State = struct {
+        table_restored: bool = false,
+        installed_count: usize = 0,
+        member_count: usize = 0,
+        dependency_count: usize = 0,
+    };
+
+    const FakeSource = struct {
+        state: *State,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .restore_table = restoreTable,
+                    .restore_extensions = restoreExtensions,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{.{
+                    .name = "memoryaf",
+                    .version = "1.0.0",
+                    .digest = "sha256:memory",
+                    .install = .{ .scopes_supported = &.{.table} },
+                }})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn restoreTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, location_uri_arg: []const u8, backup_id: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(location_uri_arg.len > 0);
+            try std.testing.expectEqualStrings("docs-snap-cluster", backup_id);
+            self.state.table_restored = true;
+        }
+
+        fn restoreExtensions(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            restored_installed: []const extension_domain.InstalledExtension,
+            restored_members: []const extension_domain.ExtensionMember,
+            restored_dependencies: []const extension_domain.ExtensionDependency,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.state.installed_count = restored_installed.len;
+            self.state.member_count = restored_members.len;
+            self.state.dependency_count = restored_dependencies.len;
+        }
+    };
+
+    var state = State{};
+    var source = FakeSource{ .state = &state };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    const restore_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"backup_id\":\"snap-cluster\",\"location\":\"{s}\"}}",
+        .{location_uri},
+    );
+    defer alloc.free(restore_body);
+    var restore_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/restore",
+        .body = restore_body,
+        .content_type = "application/json",
+    });
+    defer restore_resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
+    try std.testing.expect(state.table_restored);
+    try std.testing.expectEqual(@as(usize, 1), state.installed_count);
+    try std.testing.expectEqual(@as(usize, 1), state.member_count);
+    try std.testing.expectEqual(@as(usize, 1), state.dependency_count);
 }
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {

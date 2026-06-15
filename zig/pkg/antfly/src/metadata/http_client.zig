@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_table_manager = @import("table_manager.zig");
@@ -144,6 +145,78 @@ pub const MetadataHttpClient = struct {
         body: []const u8,
     ) !void {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null);
+    }
+
+    pub fn restoreExtensions(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !void {
+        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_extension_restore, body, error.InvalidExtensionRestoreRequest, null, null);
+    }
+
+    pub fn installExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+        body: []const u8,
+    ) !std.json.Parsed(extension_domain.InstalledExtension) {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ routes.Routes.internal_extensions_prefix, name });
+        defer self.alloc.free(path);
+        return try self.requestJsonWithBody(extension_domain.InstalledExtension, base_uri, .POST, path, body, error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
+    }
+
+    pub fn updateExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+        body: []const u8,
+    ) !std.json.Parsed(extension_domain.InstalledExtension) {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ routes.Routes.internal_extensions_prefix, name, routes.Routes.internal_extension_update_suffix });
+        defer self.alloc.free(path);
+        return try self.requestJsonWithBody(extension_domain.InstalledExtension, base_uri, .POST, path, body, error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
+    }
+
+    pub fn dropExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+        body: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ routes.Routes.internal_extensions_prefix, name, routes.Routes.internal_extension_drop_suffix });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .POST, path, body, error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
+    }
+
+    pub fn enableExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+    ) !std.json.Parsed(extension_domain.InstalledExtension) {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ routes.Routes.internal_extensions_prefix, name, routes.Routes.internal_extension_enable_suffix });
+        defer self.alloc.free(path);
+        return try self.requestJsonWithBody(extension_domain.InstalledExtension, base_uri, .POST, path, "{}", error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
+    }
+
+    pub fn disableExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+    ) !std.json.Parsed(extension_domain.InstalledExtension) {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ routes.Routes.internal_extensions_prefix, name, routes.Routes.internal_extension_disable_suffix });
+        defer self.alloc.free(path);
+        return try self.requestJsonWithBody(extension_domain.InstalledExtension, base_uri, .POST, path, "{}", error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
+    }
+
+    pub fn configureExtension(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        name: []const u8,
+        body: []const u8,
+    ) !std.json.Parsed(extension_domain.InstalledExtension) {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ routes.Routes.internal_extensions_prefix, name, routes.Routes.internal_extension_config_suffix });
+        defer self.alloc.free(path);
+        return try self.requestJsonWithBody(extension_domain.InstalledExtension, base_uri, .PUT, path, body, error.InvalidExtensionLifecycleRequest, error.ExtensionNotInstalled, error.ExtensionAlreadyInstalled);
     }
 
     pub fn createTable(
@@ -317,6 +390,31 @@ pub const MetadataHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
+    }
+
+    fn requestJsonWithBody(
+        self: *MetadataHttpClient,
+        comptime T: type,
+        base_uri: []const u8,
+        method: http_common.Method,
+        path: []const u8,
+        body: []const u8,
+        bad_request_err: ?anyerror,
+        not_found_err: ?anyerror,
+        conflict_err: ?anyerror,
+    ) !std.json.Parsed(T) {
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetry(.{
+            .method = method,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+        });
+        defer resp.deinit(self.alloc);
+        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
+        return try parseJson(T, self.alloc, resp.body);
     }
 
     fn requestNoBody(

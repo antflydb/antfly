@@ -252,6 +252,20 @@ def test_extension_package_routes_match_swarm_and_distributed(extension_server: 
     assert [package["name"] for package in packages] == ["memoryaf"]
     assert packages[0]["version"] == "1.0.0"
 
+    dry_run = _check_response(
+        session.post(
+            f"{base_url}/extensions/v1/installed/memoryaf",
+            json={"version": "1.0.0", "scope": {"kind": "cluster"}, "dry_run": True},
+            timeout=10,
+        )
+    )
+    assert dry_run["name"] == "memoryaf"
+    assert dry_run["package_version"] == "1.0.0"
+    assert dry_run["scope"]["kind"] == "cluster"
+
+    installed_after_dry_run = _check_response(session.get(f"{base_url}/extensions/v1/installed", timeout=10))
+    assert all(extension.get("name") != "memoryaf" for extension in installed_after_dry_run)
+
     if extension_server.mode == "distributed":
         return
 

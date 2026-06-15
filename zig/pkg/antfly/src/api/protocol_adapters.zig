@@ -15,7 +15,7 @@
 const std = @import("std");
 const routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
@@ -165,7 +165,7 @@ const mcp_tool_specs = [_]McpToolSpec{
 };
 
 const ExtensionMcpTool = struct {
-    member: *const metadata_mod.ExtensionMember,
+    member: *const extension_domain.ExtensionMember,
     description: []u8,
     input_schema_json: []u8,
 
@@ -356,7 +356,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
     };
     const ExtensionToolContext = struct {
-        member: *const metadata_mod.ExtensionMember,
+        member: *const extension_domain.ExtensionMember,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -506,7 +506,7 @@ fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_
     return null;
 }
 
-fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const metadata_mod.ExtensionMember) !ExtensionMcpTool {
+fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember) !ExtensionMcpTool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
 
@@ -545,7 +545,7 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const meta
     };
 }
 
-fn extensionRuntimeMemberVisible(installed_extensions: []const metadata_mod.InstalledExtension, extension_name: []const u8) bool {
+fn extensionRuntimeMemberVisible(installed_extensions: []const extension_domain.InstalledExtension, extension_name: []const u8) bool {
     for (installed_extensions) |installed| {
         if (!std.mem.eql(u8, installed.name, extension_name)) continue;
         return installed.status == .ready;

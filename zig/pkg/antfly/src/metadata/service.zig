@@ -17,6 +17,7 @@ const std = @import("std");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
@@ -1237,13 +1238,13 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
     }
 
-    pub fn upsertExtensionPackage(self: *MetadataService, record: metadata_mod.PackageManifest) !void {
+    pub fn upsertExtensionPackage(self: *MetadataService, record: extension_domain.PackageManifest) !void {
         try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
     }
 
     pub fn syncExtensionPackageStore(self: *MetadataService, io: std.Io, root_path: []const u8) !usize {
-        const entries = try metadata_mod.scanPackageStoreAlloc(self.alloc, io, root_path);
-        defer metadata_mod.freePackageStoreEntries(self.alloc, entries);
+        const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer extension_domain.freePackageStoreEntries(self.alloc, entries);
         for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
         return entries.len;
     }
@@ -1474,42 +1475,42 @@ pub const MetadataService = struct {
         store.freeReplicationSourceStatuses(alloc, records);
     }
 
-    pub fn listProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.PackageManifest {
+    pub fn listProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionPackages(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.PackageManifest) void {
+    pub fn freeProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.PackageManifest) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionPackages(alloc, records);
     }
 
-    pub fn listProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.InstalledExtension {
+    pub fn listProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.InstalledExtension {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listInstalledExtensions(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.InstalledExtension) void {
+    pub fn freeProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.InstalledExtension) void {
         const store = self.projectedStore() orelse return;
         store.freeInstalledExtensions(alloc, records);
     }
 
-    pub fn listProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionMember {
+    pub fn listProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionMember {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionMembers(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionMember) void {
+    pub fn freeProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionMember) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionMembers(alloc, records);
     }
 
-    pub fn listProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionDependency {
+    pub fn listProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionDependency {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionDependencies(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionDependency) void {
+    pub fn freeProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionDependency) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionDependencies(alloc, records);
     }
@@ -2508,13 +2509,13 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
     }
 
-    pub fn upsertExtensionPackage(self: *MetadataHttpService, record: metadata_mod.PackageManifest) !void {
+    pub fn upsertExtensionPackage(self: *MetadataHttpService, record: extension_domain.PackageManifest) !void {
         try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
     }
 
     pub fn syncExtensionPackageStore(self: *MetadataHttpService, io: std.Io, root_path: []const u8) !usize {
-        const entries = try metadata_mod.scanPackageStoreAlloc(self.alloc, io, root_path);
-        defer metadata_mod.freePackageStoreEntries(self.alloc, entries);
+        const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer extension_domain.freePackageStoreEntries(self.alloc, entries);
         for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
         return entries.len;
     }
@@ -3046,50 +3047,50 @@ pub const MetadataHttpService = struct {
         store.freeShuffleJoinLeases(alloc, records);
     }
 
-    pub fn listProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.PackageManifest {
+    pub fn listProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionPackages(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.PackageManifest) void {
+    pub fn freeProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.PackageManifest) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionPackages(alloc, records);
     }
 
-    pub fn listProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.InstalledExtension {
+    pub fn listProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.InstalledExtension {
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listInstalledExtensions(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.InstalledExtension) void {
+    pub fn freeProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.InstalledExtension) void {
         const store = self.projectedStore() orelse return;
         store.freeInstalledExtensions(alloc, records);
     }
 
-    pub fn listProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionMember {
+    pub fn listProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionMember {
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionMembers(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionMember) void {
+    pub fn freeProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionMember) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionMembers(alloc, records);
     }
 
-    pub fn listProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_mod.ExtensionDependency {
+    pub fn listProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionDependency {
         self.lockRuntime();
         defer self.unlockRuntime();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listExtensionDependencies(alloc, self.metadata_group_id);
     }
 
-    pub fn freeProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_mod.ExtensionDependency) void {
+    pub fn freeProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionDependency) void {
         const store = self.projectedStore() orelse return;
         store.freeExtensionDependencies(alloc, records);
     }

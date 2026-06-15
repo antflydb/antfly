@@ -21,7 +21,6 @@ const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const tables_api = @import("tables.zig");
 const common_secrets = @import("../common/secrets.zig");
-const metadata_mod = @import("../metadata/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
@@ -351,8 +350,9 @@ pub const ClusterBackupManifest = struct {
     location: []const u8,
     antfly_version: []const u8,
     tables: []const ClusterTableBackupEntry,
-    installed_extensions: []metadata_mod.InstalledExtension = &.{},
-    extension_members: []metadata_mod.ExtensionMember = &.{},
+    installed_extensions: []extension_domain.InstalledExtension = &.{},
+    extension_members: []extension_domain.ExtensionMember = &.{},
+    extension_dependencies: []extension_domain.ExtensionDependency = &.{},
 
     pub fn deinit(self: *ClusterBackupManifest, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.backup_id));
@@ -374,6 +374,11 @@ pub const ClusterBackupManifest = struct {
             owned.deinitOwned(alloc);
         }
         if (self.extension_members.len > 0) alloc.free(@constCast(self.extension_members));
+        for (self.extension_dependencies) |dependency| {
+            var owned = dependency;
+            owned.deinitOwned(alloc);
+        }
+        if (self.extension_dependencies.len > 0) alloc.free(@constCast(self.extension_dependencies));
         self.* = undefined;
     }
 };
@@ -847,7 +852,7 @@ pub fn createClusterManifest(
     location: []const u8,
     table_entries: []const ClusterTableBackupEntry,
 ) !ClusterBackupManifest {
-    return try createClusterManifestWithExtensions(alloc, backup_id, location, table_entries, &.{}, &.{});
+    return try createClusterManifestWithExtensions(alloc, backup_id, location, table_entries, &.{}, &.{}, &.{});
 }
 
 pub fn createClusterManifestWithExtensions(
@@ -855,8 +860,9 @@ pub fn createClusterManifestWithExtensions(
     backup_id: []const u8,
     location: []const u8,
     table_entries: []const ClusterTableBackupEntry,
-    installed_extensions: []const metadata_mod.InstalledExtension,
-    extension_members: []const metadata_mod.ExtensionMember,
+    installed_extensions: []const extension_domain.InstalledExtension,
+    extension_members: []const extension_domain.ExtensionMember,
+    extension_dependencies: []const extension_domain.ExtensionDependency,
 ) !ClusterBackupManifest {
     const owned_entries = try alloc.alloc(ClusterTableBackupEntry, table_entries.len);
     var initialized: usize = 0;
@@ -875,6 +881,8 @@ pub fn createClusterManifestWithExtensions(
     errdefer freeInstalledExtensions(alloc, owned_installed);
     const owned_members = try cloneExtensionMembers(alloc, extension_members);
     errdefer freeExtensionMembers(alloc, owned_members);
+    const owned_dependencies = try cloneExtensionDependencies(alloc, extension_dependencies);
+    errdefer freeExtensionDependencies(alloc, owned_dependencies);
 
     return .{
         .backup_id = try alloc.dupe(u8, backup_id),
@@ -884,6 +892,7 @@ pub fn createClusterManifestWithExtensions(
         .tables = owned_entries,
         .installed_extensions = owned_installed,
         .extension_members = owned_members,
+        .extension_dependencies = owned_dependencies,
     };
 }
 
@@ -1251,6 +1260,8 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
     errdefer freeInstalledExtensions(alloc, installed_extensions);
     const extension_members = try cloneExtensionMembers(alloc, manifest.extension_members);
     errdefer freeExtensionMembers(alloc, extension_members);
+    const extension_dependencies = try cloneExtensionDependencies(alloc, manifest.extension_dependencies);
+    errdefer freeExtensionDependencies(alloc, extension_dependencies);
 
     return .{
         .format_version = manifest.format_version,
@@ -1261,11 +1272,12 @@ fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupM
         .tables = tables,
         .installed_extensions = installed_extensions,
         .extension_members = extension_members,
+        .extension_dependencies = extension_dependencies,
     };
 }
 
-fn cloneInstalledExtensions(alloc: std.mem.Allocator, extensions: []const metadata_mod.InstalledExtension) ![]metadata_mod.InstalledExtension {
-    const out = try alloc.alloc(metadata_mod.InstalledExtension, extensions.len);
+fn cloneInstalledExtensions(alloc: std.mem.Allocator, extensions: []const extension_domain.InstalledExtension) ![]extension_domain.InstalledExtension {
+    const out = try alloc.alloc(extension_domain.InstalledExtension, extensions.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |*extension| extension.deinitOwned(alloc);
@@ -1291,13 +1303,13 @@ fn cloneInstalledExtensions(alloc: std.mem.Allocator, extensions: []const metada
     return out;
 }
 
-fn freeInstalledExtensions(alloc: std.mem.Allocator, extensions: []metadata_mod.InstalledExtension) void {
+fn freeInstalledExtensions(alloc: std.mem.Allocator, extensions: []extension_domain.InstalledExtension) void {
     for (extensions) |*extension| extension.deinitOwned(alloc);
     if (extensions.len > 0) alloc.free(extensions);
 }
 
-fn cloneExtensionMembers(alloc: std.mem.Allocator, members: []const metadata_mod.ExtensionMember) ![]metadata_mod.ExtensionMember {
-    const out = try alloc.alloc(metadata_mod.ExtensionMember, members.len);
+fn cloneExtensionMembers(alloc: std.mem.Allocator, members: []const extension_domain.ExtensionMember) ![]extension_domain.ExtensionMember {
+    const out = try alloc.alloc(extension_domain.ExtensionMember, members.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |*member| member.deinitOwned(alloc);
@@ -1323,9 +1335,28 @@ fn cloneExtensionMembers(alloc: std.mem.Allocator, members: []const metadata_mod
     return out;
 }
 
-fn freeExtensionMembers(alloc: std.mem.Allocator, members: []metadata_mod.ExtensionMember) void {
+fn freeExtensionMembers(alloc: std.mem.Allocator, members: []extension_domain.ExtensionMember) void {
     for (members) |*member| member.deinitOwned(alloc);
     if (members.len > 0) alloc.free(members);
+}
+
+fn cloneExtensionDependencies(alloc: std.mem.Allocator, dependencies: []const extension_domain.ExtensionDependency) ![]extension_domain.ExtensionDependency {
+    const out = try alloc.alloc(extension_domain.ExtensionDependency, dependencies.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*dependency| dependency.deinitOwned(alloc);
+        alloc.free(out);
+    }
+    for (dependencies, 0..) |dependency, i| {
+        out[i] = try extension_domain.cloneExtensionDependencyAlloc(alloc, dependency);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeExtensionDependencies(alloc: std.mem.Allocator, dependencies: []extension_domain.ExtensionDependency) void {
+    for (dependencies) |*dependency| dependency.deinitOwned(alloc);
+    if (dependencies.len > 0) alloc.free(dependencies);
 }
 
 fn cloneExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) ![]extension_domain.Capability {
@@ -1611,7 +1642,7 @@ test "cluster backup manifest round trips extension metadata" {
         .name = "memories",
         .table_backup_id = "memories-snap",
     }};
-    const installed = [_]metadata_mod.InstalledExtension{.{
+    const installed = [_]extension_domain.InstalledExtension{.{
         .name = "memoryaf",
         .package_name = "memoryaf",
         .package_version = "1.0.0",
@@ -1620,7 +1651,7 @@ test "cluster backup manifest round trips extension metadata" {
         .granted_capabilities = &.{.{ .name = "read:table", .scope = "memories" }},
         .status = .ready,
     }};
-    const members = [_]metadata_mod.ExtensionMember{
+    const members = [_]extension_domain.ExtensionMember{
         .{
             .extension_name = "memoryaf",
             .scope = .{ .kind = .table, .table_name = "memories" },
@@ -1648,6 +1679,12 @@ test "cluster backup manifest round trips extension metadata" {
         &tables,
         &installed,
         &members,
+        &.{.{
+            .extension_name = "memoryaf",
+            .required_extension_name = "antfly_core",
+            .package_name = "antfly_core",
+            .version_requirement = ">=1.0.0",
+        }},
     );
     defer manifest.deinit(std.testing.allocator);
 
@@ -1663,11 +1700,13 @@ test "cluster backup manifest round trips extension metadata" {
     try std.testing.expectEqualStrings("read:table", loaded.installed_extensions[0].granted_capabilities[0].name);
     try std.testing.expectEqual(@as(usize, 2), loaded.extension_members.len);
     try std.testing.expectEqual(.data_shape, loaded.extension_members[0].object_kind);
-    try std.testing.expectEqual(metadata_mod.DataShapeKind.document, loaded.extension_members[0].shape_kind.?);
+    try std.testing.expectEqual(extension_domain.DataShapeKind.document, loaded.extension_members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"type\":\"object\"}", loaded.extension_members[0].owner_metadata_json);
     try std.testing.expectEqual(.generated_artifact, loaded.extension_members[1].object_kind);
     try std.testing.expectEqualStrings("memory_embedding_shape", loaded.extension_members[1].shape_name);
     try std.testing.expectEqualStrings("2", loaded.extension_members[1].shape_version);
+    try std.testing.expectEqual(@as(usize, 1), loaded.extension_dependencies.len);
+    try std.testing.expectEqualStrings("antfly_core", loaded.extension_dependencies[0].package_name);
 }
 
 test "backup location parsing requires absolute file uri" {

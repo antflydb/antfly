@@ -6332,7 +6332,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/InstalledExtension'
+                $ref: '#/components/schemas/DropExtensionResponse'
   /extensions/v1/installed/{name}/objects:
     get:
       tags:
@@ -18762,6 +18762,25 @@ components:
           default: '{}'
       required:
         - name
+    UpdateManifestRef:
+      type: object
+      properties:
+        from_version:
+          type: string
+          example: 1.0.0
+        to_version:
+          type: string
+          example: 1.1.0
+        path:
+          type: string
+          example: updates/1.0.0-1.1.0.json
+        digest:
+          type: string
+          example: sha256:def456
+      required:
+        - from_version
+        - to_version
+        - path
     InstallManifest:
       type: object
       properties:
@@ -18803,6 +18822,10 @@ components:
           type: string
         digest:
           type: string
+        antfly_min_version:
+          type: string
+        antfly_max_version:
+          type: string
         trusted:
           type: boolean
           default: false
@@ -18823,6 +18846,10 @@ components:
             $ref: '#/components/schemas/PackageArtifact'
         install:
           $ref: '#/components/schemas/InstallManifest'
+        updates:
+          type: array
+          items:
+            $ref: '#/components/schemas/UpdateManifestRef'
       required:
         - manifest_api_version
         - name
@@ -18935,6 +18962,17 @@ components:
         dry_run:
           type: boolean
           default: false
+    DropExtensionResponse:
+      type: object
+      properties:
+        dropped:
+          $ref: '#/components/schemas/ExtensionIdentifier'
+        dry_run:
+          type: boolean
+          default: false
+      required:
+        - dropped
+        - dry_run
     ConfigureExtensionRequest:
       type: object
       properties:
