@@ -513,11 +513,42 @@ fn appendIndexConfig(
         try out.append(alloc, ',');
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
-        const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) {
+            try appendCanonicalIndexEnrichments(alloc, out, entry.value_ptr.*);
+        } else {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
     }
     try out.append(alloc, '}');
+}
+
+fn appendCanonicalIndexEnrichments(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+) !void {
+    if (value != .array) {
+        const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+        return;
+    }
+    try out.append(alloc, '[');
+    for (value.array.items, 0..) |item, i| {
+        if (i > 0) try out.append(alloc, ',');
+        switch (item) {
+            .string => |name| try appendJsonString(alloc, out, name),
+            .object => |object| {
+                const name = object.get("name") orelse return error.InvalidTableIndexMetadata;
+                if (name != .string) return error.InvalidTableIndexMetadata;
+                try appendJsonString(alloc, out, name.string);
+            },
+            else => return error.InvalidTableIndexMetadata,
+        }
+    }
+    try out.append(alloc, ']');
 }
 
 fn canonicalIndexConfigJson(
@@ -2029,6 +2060,30 @@ test "index config map encoder injects canonical name and type" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384}") != null);
+}
+
+test "index status encoder projects inline enrichment configs as names" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json =
+            \\{"document_text":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset"},{"name":"document_chunks_v1","kind":"chunk"}]},"document_vectors":{"type":"embeddings","enrichments":[{"name":"document_chunk_dense_v1","kind":"embedding"}]}}
+            ,
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded_list = (try encodeIndexList(std.testing.allocator, &snapshot, "docs", null)).?;
+    defer std.testing.allocator.free(encoded_list);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_units_v1\",\"document_chunks_v1\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_chunk_dense_v1\"]") != null);
 }
 
 test "single index config encoder isolates requested index" {

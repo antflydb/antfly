@@ -129,6 +129,7 @@ export type {
   BatchRequest, // Now using our custom type
   BatchResult,
   CalendarInterval,
+  CdcConnection,
   ChatAgentConfig,
   ChatAgentTurnResult,
   ChatMessage,
@@ -136,7 +137,6 @@ export type {
   ChatStreamCallbacks,
   ChatToolName,
   ChatToolsConfig,
-  CdcConnection,
   // Chat types (used by retrieval agent)
   // Retrieval Agent result types
   ClassificationTransformationResult,
@@ -145,7 +145,6 @@ export type {
   ConnectedModelType,
   Connection,
   ConnectionKind,
-  InferenceProviderType,
   ConnectionStatus,
   ConnectionsResponse,
   CreateTableRequest,
@@ -153,6 +152,16 @@ export type {
   DenseEmbedding,
   DistanceRange,
   DistanceUnit,
+  DocumentArtifactChildRange,
+  DocumentArtifactManifest,
+  DocumentArtifactManifestList,
+  DocumentArtifactReprocessFailure,
+  DocumentArtifactReprocessJob,
+  DocumentArtifactReprocessJobStartRequest,
+  DocumentArtifactReprocessResponse,
+  DocumentArtifactReprocessShardCursor,
+  DocumentArtifactTableReprocessRequest,
+  DocumentArtifactTableReprocessResponse,
   // Schema types
   DocumentSchema,
   // Graph index types
@@ -173,6 +182,8 @@ export type {
   EvalSummary,
   EvaluatorName,
   EvaluatorScore,
+  ExternalIoConnection,
+  ExternalIoProtocol,
   FetchConfig,
   FilterSpec,
   GenerationConfidence,
@@ -190,8 +201,7 @@ export type {
   IndexStatus,
   IndexType,
   InferenceConnection,
-  ExternalIoConnection,
-  ExternalIoProtocol,
+  InferenceProviderType,
   // Join types
   JoinClause,
   JoinCondition,

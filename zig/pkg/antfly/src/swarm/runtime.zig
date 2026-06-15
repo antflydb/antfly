@@ -1786,6 +1786,14 @@ fn registerInternalGroupRoutes(server: anytype) !void {
     }
 }
 
+fn httpRequestHeadersFromContext(ctx: *httpx.Context) ![]const http_common.RequestHeader {
+    const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+    for (ctx.request.headers.entries.items, 0..) |entry, i| {
+        headers[i] = .{ .name = entry.name, .value = entry.value };
+    }
+    return headers;
+}
+
 fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const path = ctx.request.uri.path;
     const routes = antfly.public_api.http_routes.Routes;
@@ -1818,6 +1826,7 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const legacy_req = http_common.HttpRequest{
         .method = method,
         .uri = ctx.request.uri.raw,
+        .headers = try httpRequestHeadersFromContext(ctx),
         .authorization = ctx.header("authorization"),
         .content_type = ctx.header("content-type"),
         .body = body_data,
@@ -1847,16 +1856,11 @@ fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     const body_data = (try ctx.body()) orelse "";
-    const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(antfly.public_api.http_server.trusted_principal_header)) |trusted_principal| blk: {
-        const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
-        headers[0] = .{ .name = antfly.public_api.http_server.trusted_principal_header, .value = trusted_principal };
-        break :blk headers;
-    } else &.{};
 
     const legacy_req = http_common.HttpRequest{
         .method = method,
         .uri = ctx.request.uri.raw,
-        .headers = trusted_principal_headers,
+        .headers = try httpRequestHeadersFromContext(ctx),
         .authorization = ctx.header("authorization"),
         .content_type = ctx.header("content-type"),
         .body = body_data,
@@ -1883,16 +1887,11 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     };
 
     const body_data = (try ctx.body()) orelse "";
-    const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(antfly.public_api.http_server.trusted_principal_header)) |trusted_principal| blk: {
-        const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
-        headers[0] = .{ .name = antfly.public_api.http_server.trusted_principal_header, .value = trusted_principal };
-        break :blk headers;
-    } else &.{};
 
     const legacy_req = http_common.HttpRequest{
         .method = method,
         .uri = ctx.request.uri.raw,
-        .headers = trusted_principal_headers,
+        .headers = try httpRequestHeadersFromContext(ctx),
         .authorization = ctx.header("authorization"),
         .content_type = ctx.header("content-type"),
         .body = body_data,
@@ -2341,6 +2340,23 @@ test "swarm runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{}, null));
     try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
+}
+
+test "swarm bridge header conversion preserves protocol headers" {
+    const alloc = std.testing.allocator;
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
+    defer request.deinit();
+    try request.setHeader("Mcp-Session-Id", "session-123");
+
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    const headers = try httpRequestHeadersFromContext(&ctx);
+    defer alloc.free(headers);
+
+    const req = http_common.HttpRequest{ .method = .POST, .uri = request.uri.raw, .headers = headers };
+    try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {

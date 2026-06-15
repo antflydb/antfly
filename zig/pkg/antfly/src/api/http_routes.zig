@@ -103,11 +103,11 @@ pub const Routes = struct {
     pub const artifacts_suffix = "/artifacts";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
-    pub const reprocess_suffix = ":reprocess";
+    pub const reprocess_suffix = "/reprocess";
     pub const reprocess_jobs_suffix = "/reprocess-jobs";
     pub const reprocess_jobs_marker = "/reprocess-jobs/";
-    pub const advance_suffix = ":advance";
-    pub const cancel_suffix = ":cancel";
+    pub const advance_suffix = "/advance";
+    pub const cancel_suffix = "/cancel";
     pub const placement_update_suffix = ":placement";
     pub const child_range_batch_suffix = ":child-range-batch";
 
@@ -1232,11 +1232,11 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", artifacts.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", artifacts.key);
     try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts") == null);
-    const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
+    const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
     try std.testing.expectEqualStrings("docs", reprocess.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
     try std.testing.expectEqualStrings("document_units_v1", reprocess.artifact_name);
-    const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1:reprocess").?;
+    const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1/reprocess").?;
     try std.testing.expectEqualStrings("docs", table_reprocess.table_name);
     try std.testing.expectEqualStrings("document_units_v1", table_reprocess.artifact_name);
     const table_reprocess_jobs = Routes.matchTableArtifactReprocessJobs("/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
@@ -1244,12 +1244,12 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("document_units_v1", table_reprocess_jobs.artifact_name);
     const table_reprocess_job = Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
     try std.testing.expectEqualStrings("42", table_reprocess_job.job_id);
-    const table_reprocess_job_advance = Routes.matchTableArtifactReprocessJobAdvance("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance").?;
+    const table_reprocess_job_advance = Routes.matchTableArtifactReprocessJobAdvance("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance").?;
     try std.testing.expectEqualStrings("42", table_reprocess_job_advance.job_id);
-    const table_reprocess_job_cancel = Routes.matchTableArtifactReprocessJobCancel("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:cancel").?;
+    const table_reprocess_job_cancel = Routes.matchTableArtifactReprocessJobCancel("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/cancel").?;
     try std.testing.expectEqualStrings("42", table_reprocess_job_cancel.job_id);
-    try std.testing.expect(Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42:advance") == null);
-    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
+    try std.testing.expect(Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance") == null);
+    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1/reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);
@@ -1324,7 +1324,7 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", group_artifacts.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", group_artifacts.key);
     try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts") == null);
-    const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:reprocess").?;
+    const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
     const group_placement_update = Routes.matchGroupDocumentArtifactPlacementUpdate("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement").?;
@@ -1335,10 +1335,10 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("document_units_v1", group_child_range_batch.artifact_name);
     try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement") == null);
     try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch") == null);
-    const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1:reprocess").?;
+    const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1/reprocess").?;
     try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
     try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);
-    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1:reprocess") == null);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1/reprocess") == null);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;

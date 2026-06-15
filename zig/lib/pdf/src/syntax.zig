@@ -284,6 +284,9 @@ pub const Scanner = struct {
     fn readArray(self: *Scanner) anyerror!Object {
         var items = std.ArrayList(Object).empty;
         defer items.deinit(self.alloc);
+        errdefer {
+            for (items.items) |*item| item.deinit(self.alloc);
+        }
 
         while (true) {
             var tok = try self.readToken();
@@ -291,10 +294,15 @@ pub const Scanner = struct {
             if (tok == .eof) return error.UnexpectedEof;
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, "]")) break;
             try self.unreadToken(try cloneToken(self.alloc, tok));
-            try items.append(self.alloc, try self.readObject());
+            var item = try self.readObject();
+            errdefer item.deinit(self.alloc);
+            try items.append(self.alloc, item);
+            item = .null;
         }
 
-        return .{ .array = try items.toOwnedSlice(self.alloc) };
+        const owned = try items.toOwnedSlice(self.alloc);
+        items = .empty;
+        return .{ .array = owned };
     }
 
     fn readDictOrStream(self: *Scanner) anyerror!Object {
@@ -395,10 +403,11 @@ pub const Scanner = struct {
                         return .{ .keyword = try self.alloc.dupe(u8, "<<") };
                     }
                 }
+                if (!self.nextStartsHexString()) return .{ .keyword = try self.alloc.dupe(u8, "<") };
                 return .{ .string = try self.readHexString() };
             },
             '(' => return .{ .string = try self.readLiteralString() },
-            '[', ']', '{', '}' => {
+            '[', ']', '{', '}', ')' => {
                 var buf: [1]u8 = .{c};
                 return .{ .keyword = try self.alloc.dupe(u8, &buf) };
             },
@@ -410,7 +419,7 @@ pub const Scanner = struct {
                         return .{ .keyword = try self.alloc.dupe(u8, ">>") };
                     }
                 }
-                return error.UnexpectedDelimiter;
+                return .{ .keyword = try self.alloc.dupe(u8, ">") };
             },
             else => {
                 if (isDelim(c)) return error.UnexpectedDelimiter;
@@ -439,17 +448,33 @@ pub const Scanner = struct {
         }
     }
 
+    fn nextStartsHexString(self: *const Scanner) bool {
+        var i = self.pos;
+        while (i < self.bytes.len and isSpace(self.bytes[i])) : (i += 1) {}
+        if (i >= self.bytes.len) return false;
+        return self.bytes[i] == '>' or unhex(self.bytes[i]) != null;
+    }
+
     fn readHexString(self: *Scanner) anyerror![]u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
 
         while (true) {
-            const c = self.readSkippingSpace() orelse return error.UnexpectedEof;
+            const c = self.readSkippingSpace() orelse break;
             if (c == '>') break;
-            const c2 = self.readSkippingSpace() orelse return error.UnexpectedEof;
-            if (c2 == '>') return error.MalformedHexString;
-            const hi = unhex(c) orelse return error.MalformedHexString;
-            const lo = unhex(c2) orelse return error.MalformedHexString;
+            const hi = unhex(c) orelse break;
+            const c2 = self.readSkippingSpace() orelse {
+                try out.append(self.alloc, hi << 4);
+                break;
+            };
+            if (c2 == '>') {
+                try out.append(self.alloc, hi << 4);
+                break;
+            }
+            const lo = unhex(c2) orelse {
+                try out.append(self.alloc, hi << 4);
+                break;
+            };
             try out.append(self.alloc, (hi << 4) | lo);
         }
         return try out.toOwnedSlice(self.alloc);
@@ -499,14 +524,13 @@ pub const Scanner = struct {
                             if (x > 255) return error.InvalidOctalEscape;
                             try out.append(self.alloc, @intCast(x));
                         },
-                        else => return error.InvalidEscapeSequence,
+                        else => try out.append(self.alloc, escaped),
                     }
                 },
                 else => try out.append(self.alloc, c),
             }
         }
 
-        if (depth != 0) return error.UnexpectedEof;
         return try out.toOwnedSlice(self.alloc);
     }
 
@@ -521,10 +545,27 @@ pub const Scanner = struct {
                 break;
             }
             if (c == '#') {
-                const hi_c = self.readByte() orelse return error.MalformedName;
-                const lo_c = self.readByte() orelse return error.MalformedName;
-                const hi = unhex(hi_c) orelse return error.MalformedName;
-                const lo = unhex(lo_c) orelse return error.MalformedName;
+                const hi_c = self.readByte() orelse {
+                    try out.append(self.alloc, '#');
+                    break;
+                };
+                const lo_c = self.readByte() orelse {
+                    try out.append(self.alloc, '#');
+                    try out.append(self.alloc, hi_c);
+                    break;
+                };
+                const hi = unhex(hi_c) orelse {
+                    try out.append(self.alloc, '#');
+                    try out.append(self.alloc, hi_c);
+                    try out.append(self.alloc, lo_c);
+                    continue;
+                };
+                const lo = unhex(lo_c) orelse {
+                    try out.append(self.alloc, '#');
+                    try out.append(self.alloc, hi_c);
+                    try out.append(self.alloc, lo_c);
+                    continue;
+                };
                 try out.append(self.alloc, (hi << 4) | lo);
                 continue;
             }
@@ -692,6 +733,127 @@ fn isReal(s: []const u8) bool {
         if (!std.ascii.isDigit(c)) return false;
     }
     return dots == 1;
+}
+
+test "scanner returns unterminated literal string prefix" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "(abc");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .string);
+    try std.testing.expectEqualStrings("abc", tok.string);
+}
+
+test "scanner preserves unknown literal string escapes" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "(a\\qb)");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .string);
+    try std.testing.expectEqualStrings("aqb", tok.string);
+}
+
+test "scanner keeps malformed name escapes literal" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "/A#6$B /C#");
+    defer scanner.deinit();
+
+    {
+        var tok = try scanner.readLexeme();
+        defer tok.deinit(alloc);
+        try std.testing.expect(tok == .name);
+        try std.testing.expectEqualStrings("A#6$B", tok.name);
+    }
+
+    {
+        var tok = try scanner.readLexeme();
+        defer tok.deinit(alloc);
+        try std.testing.expect(tok == .name);
+        try std.testing.expectEqualStrings("C#", tok.name);
+    }
+}
+
+test "scanner treats non-hex less-than as keyword" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "<K");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .keyword);
+    try std.testing.expectEqualStrings("<", tok.keyword);
+}
+
+test "scanner returns unterminated hex string prefix" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "<AB");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .string);
+    try std.testing.expectEqualSlices(u8, &.{0xAB}, tok.string);
+}
+
+test "scanner terminates malformed hex strings with decoded prefix" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "<ABZ>");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .string);
+    try std.testing.expectEqualSlices(u8, &.{0xAB}, tok.string);
+}
+
+test "scanner accepts odd-length hex strings" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "<ABC>");
+    defer scanner.deinit();
+
+    var tok = try scanner.readLexeme();
+    defer tok.deinit(alloc);
+    try std.testing.expect(tok == .string);
+    try std.testing.expectEqualSlices(u8, &.{ 0xAB, 0xC0 }, tok.string);
+}
+
+test "scanner tokenizes standalone closing delimiters" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, ") > >>");
+    defer scanner.deinit();
+
+    {
+        var tok = try scanner.readLexeme();
+        defer tok.deinit(alloc);
+        try std.testing.expect(tok == .keyword);
+        try std.testing.expectEqualStrings(")", tok.keyword);
+    }
+
+    {
+        var tok = try scanner.readLexeme();
+        defer tok.deinit(alloc);
+        try std.testing.expect(tok == .keyword);
+        try std.testing.expectEqualStrings(">", tok.keyword);
+    }
+
+    {
+        var tok = try scanner.readLexeme();
+        defer tok.deinit(alloc);
+        try std.testing.expect(tok == .keyword);
+        try std.testing.expectEqualStrings(">>", tok.keyword);
+    }
+}
+
+test "scanner cleans partial array objects on parse error" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(alloc, "[(abc");
+    defer scanner.deinit();
+
+    try std.testing.expectError(error.UnexpectedEof, scanner.readObject());
 }
 
 test "scanner tokenizes strings names and numbers" {

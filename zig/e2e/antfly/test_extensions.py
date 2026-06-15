@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
@@ -39,42 +38,10 @@ from conftest import (
 )
 from helpers import wait_until
 
+pytestmark = pytest.mark.slow
 
-def _write_memoryaf_package(store_root: Path) -> None:
-    manifest_dir = store_root / "memoryaf" / "1.0.0"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    (manifest_dir / "extension.json").write_text(
-        json.dumps(
-            {
-                "manifest_api_version": "extensions/v1",
-                "name": "memoryaf",
-                "version": "1.0.0",
-                "kind": "extension",
-                "description": "E2E memory extension package",
-                "digest": "sha256:e2e",
-                "install": {
-                    "scopes_supported": ["cluster", "table"],
-                    "shapes": [
-                        {
-                            "name": "recall_request",
-                            "kind": "tool_schema",
-                            "version": "1",
-                            "schema_json": '{"type":"object","properties":{"query":{"type":"string"}}}',
-                        }
-                    ],
-                    "objects": [
-                        {
-                            "kind": "mcp_tool",
-                            "name": "recall",
-                            "shape": "recall_request",
-                            "config_json": '{"handler":"antfly_api_template"}',
-                        }
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+MEMORYAF_VERSION = "0.0.1"
+MEMORYAF_PACKAGE_STORE = REPO_ROOT.parent / "extensions"
 
 
 class _ExtensionProcess:
@@ -84,8 +51,9 @@ class _ExtensionProcess:
         self.host = "127.0.0.1"
         self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
         self.root = Path(self.tempdir.name)
-        self.package_store = self.root / "extensions"
-        _write_memoryaf_package(self.package_store)
+        self.package_store = MEMORYAF_PACKAGE_STORE
+        if not (self.package_store / "memoryaf" / MEMORYAF_VERSION / "extension.json").exists():
+            raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
 
         self.public_port = find_free_port()
         self.metadata_raft_port = find_free_port()
@@ -249,18 +217,19 @@ def test_extension_package_routes_match_swarm_and_distributed(extension_server: 
 
     packages = wait_until(projected_packages, timeout_s=10.0, interval_s=0.25)
     assert packages is not None, f"memoryaf package was not projected\n{extension_server.debug_logs()}"
-    assert [package["name"] for package in packages] == ["memoryaf"]
-    assert packages[0]["version"] == "1.0.0"
+    memoryaf_package = next(package for package in packages if package["name"] == "memoryaf")
+    assert memoryaf_package["version"] == MEMORYAF_VERSION
+    assert memoryaf_package["artifacts"][0]["kind"] == "wasm"
 
     dry_run = _check_response(
         session.post(
             f"{base_url}/extensions/v1/installed/memoryaf",
-            json={"version": "1.0.0", "scope": {"kind": "cluster"}, "dry_run": True},
+            json={"version": MEMORYAF_VERSION, "scope": {"kind": "cluster"}, "dry_run": True},
             timeout=10,
         )
     )
     assert dry_run["name"] == "memoryaf"
-    assert dry_run["package_version"] == "1.0.0"
+    assert dry_run["package_version"] == MEMORYAF_VERSION
     assert dry_run["scope"]["kind"] == "cluster"
 
     installed_after_dry_run = _check_response(session.get(f"{base_url}/extensions/v1/installed", timeout=10))
@@ -272,20 +241,45 @@ def test_extension_package_routes_match_swarm_and_distributed(extension_server: 
     installed = _check_response(
         session.post(
             f"{base_url}/extensions/v1/installed/memoryaf",
-            json={"version": "1.0.0", "scope": {"kind": "cluster"}},
+            json={"version": MEMORYAF_VERSION, "scope": {"kind": "cluster"}},
             timeout=10,
         )
     )
     assert installed["name"] == "memoryaf"
-    assert installed["package_version"] == "1.0.0"
+    assert installed["package_version"] == MEMORYAF_VERSION
     assert installed["scope"]["kind"] == "cluster"
     assert isinstance(installed["installed_at_epoch_ms"], int)
     assert installed["installed_at_epoch_ms"] > 1_700_000_000_000
 
     objects = _check_response(session.get(f"{base_url}/extensions/v1/installed/memoryaf/objects", timeout=10))
     object_kinds = {(obj["object_kind"], obj["object_name"]) for obj in objects}
-    assert ("data_shape", "recall_request") in object_kinds
-    assert ("mcp_tool", "recall") in object_kinds
+    assert ("data_shape", "memory_record") in object_kinds
+    assert ("generated_artifact", "memory_embedding") in object_kinds
+    assert ("mcp_tool", "store_memory") in object_kinds
+    assert ("mcp_tool", "search_memories") in object_kinds
+    assert ("mcp_tool", "list_memories") in object_kinds
 
     old_mcp_route = session.get(f"{base_url}/mcp/extensions/memoryaf", timeout=10)
     assert old_mcp_route.status_code == 404
+
+    mcp_endpoint = f"{base_url}/mcp/v1/extensions/memoryaf"
+    initialize = session.post(
+        mcp_endpoint,
+        json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        timeout=10,
+    )
+    init_response = _check_response(initialize)
+    assert init_response["jsonrpc"] == "2.0"
+    mcp_session_id = initialize.headers["Mcp-Session-Id"]
+
+    tools = _check_response(
+        session.post(
+            mcp_endpoint,
+            headers={"Mcp-Session-Id": mcp_session_id},
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            timeout=10,
+        )
+    )
+    tool_names = {tool["name"] for tool in tools["result"]["tools"]}
+    assert {"store_memory", "search_memories", "list_memories"}.issubset(tool_names)
+    assert "create_table" not in tool_names

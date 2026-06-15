@@ -27,6 +27,7 @@ import {
   Bot,
   ClipboardCheck,
   FileInput,
+  FileStack,
   KeyRound,
   Library,
   Mic,
@@ -35,6 +36,7 @@ import {
   Plug,
   Plus,
   Repeat2,
+  RotateCw,
   ScanLine,
   Scissors,
   Search,
@@ -68,7 +70,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
   const navigate = useNavigate();
   const { state: sidebarState, toggleSidebar, isMobile } = useSidebar();
   const { hasPermission } = useAuth();
-  const { tables, selectedTable, setSelectedTable } = useTable();
+  const { tables, selectedTable, setSelectedTable, graphIndexes, isLoadingIndexes } = useTable();
   const showLocalAdminRoutes = !isExternalAuthMode();
   const showAdmin = showLocalAdminRoutes && hasPermission("*", "*", "admin");
 
@@ -286,8 +288,8 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       isActive={isTableSection("graph")}
-                      tooltip="Graph"
-                      disabled={!selectedTable}
+                      tooltip={graphIndexes.length > 0 ? "Graph" : "Create a graph index first"}
+                      disabled={!selectedTable || (!isLoadingIndexes && graphIndexes.length === 0)}
                       className="disabled:opacity-50"
                       onClick={() => navigateTableSection("graph")}
                     >
@@ -325,6 +327,30 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     >
                       <FileInput className="size-4" />
                       <span>Manual Entry</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("artifacts")}
+                      tooltip="Artifacts"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("artifacts")}
+                    >
+                      <FileStack className="size-4" />
+                      <span>Artifacts</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("reprocess")}
+                      tooltip="Reprocess"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("reprocess")}
+                    >
+                      <RotateCw className="size-4" />
+                      <span>Reprocess</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 </SidebarMenu>

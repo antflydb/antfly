@@ -2266,6 +2266,10 @@ pub fn build(b: *std.Build) void {
             "artifact reprocess job store recovers durable jobs and reseeds ids",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
     const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
@@ -2601,6 +2605,10 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"common config"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
@@ -2810,6 +2818,10 @@ pub fn build(b: *std.Build) void {
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
@@ -3321,6 +3333,10 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
@@ -3357,6 +3373,10 @@ pub fn build(b: *std.Build) void {
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
             "artifact operations apply source document row filter visibility",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
@@ -3835,6 +3855,10 @@ pub fn build(b: *std.Build) void {
             "hbc cache shrinks to resource budget under pressure",
             "provisioned group storage derives all resource budgets",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
@@ -4026,6 +4050,10 @@ pub fn build(b: *std.Build) void {
             "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
     const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
@@ -4156,8 +4184,13 @@ pub fn build(b: *std.Build) void {
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
+    wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
 
@@ -4223,8 +4256,13 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
+    persistent_test_mod.addImport("structlog", structlog_mod);
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
 
@@ -4288,9 +4326,14 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
+    index_manager_test_mod.addImport("structlog", structlog_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
         .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
 
@@ -4359,6 +4402,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_pdf", pdf_mod);
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
+    db_test_mod.addImport("structlog", structlog_mod);
 
     const db_split_sim_default_filters = [_][]const u8{
         "db split sim default workload stays green",
@@ -4399,6 +4443,10 @@ pub fn build(b: *std.Build) void {
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
@@ -4452,6 +4500,10 @@ pub fn build(b: *std.Build) void {
             "dirty runtime status refresh finishes expired auto bulk before collecting leases",
             "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
             "provisioned table write source deinit drains restore repair jobs",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
@@ -6172,6 +6224,10 @@ pub fn build(b: *std.Build) void {
     });
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");

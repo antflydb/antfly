@@ -48,6 +48,8 @@ const tableSections = new Set([
   "faceted",
   "bulk",
   "document-builder",
+  "artifacts",
+  "reprocess",
 ]);
 
 function TableSectionRedirect({ section, fallback = "/" }: { section: string; fallback?: string }) {
@@ -154,6 +156,14 @@ function AppContent() {
                         <Route
                           path="/ingest/manual"
                           element={<TableSectionRedirect section="document-builder" />}
+                        />
+                        <Route
+                          path="/ingest/artifacts"
+                          element={<TableSectionRedirect section="artifacts" />}
+                        />
+                        <Route
+                          path="/ingest/reprocess"
+                          element={<TableSectionRedirect section="reprocess" />}
                         />
                         {showLocalAdminRoutes && (
                           <Route
@@ -266,11 +276,11 @@ function App() {
         <ApiConfigProvider>
           <AuthProvider>
             <GeneratorPreferenceProvider>
-              <CommandPaletteProvider>
-                <TableProvider>
+              <TableProvider>
+                <CommandPaletteProvider>
                   <AppContent />
-                </TableProvider>
-              </CommandPaletteProvider>
+                </CommandPaletteProvider>
+              </TableProvider>
             </GeneratorPreferenceProvider>
           </AuthProvider>
         </ApiConfigProvider>
