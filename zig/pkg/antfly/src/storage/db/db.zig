@@ -19155,13 +19155,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 .compact_text_segment_threshold = null,
                 .defer_text_compaction = true,
             };
-            const delete_keys = if (batch.deleted_keys.len == 0)
-                batch.overwritten_doc_keys
-            else if (batch.overwritten_doc_keys.len == 0)
-                batch.deleted_keys
-            else
-                try collectCombinedDeleteKeys(ctx.alloc, batch.deleted_keys, batch.overwritten_doc_keys);
-            defer if (batch.deleted_keys.len > 0 and batch.overwritten_doc_keys.len > 0) ctx.alloc.free(delete_keys);
+            const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
+            defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
 
             const missing_required = try applyTextDocumentsForIndex(
                 ctx.alloc,
@@ -19927,11 +19922,30 @@ fn collectDocumentWritesProfiled(
     };
 }
 
-fn collectCombinedDeleteKeys(alloc: Allocator, deleted_keys: []const []const u8, overwritten_doc_keys: []const []const u8) ![]const []const u8 {
-    const combined = try alloc.alloc([]const u8, deleted_keys.len + overwritten_doc_keys.len);
-    @memcpy(combined[0..deleted_keys.len], deleted_keys);
-    @memcpy(combined[deleted_keys.len..], overwritten_doc_keys);
-    return combined;
+fn appendUniqueBorrowedKey(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+) !void {
+    if (key.len == 0) return;
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, key)) return;
+    }
+    try out.append(alloc, key);
+}
+
+fn collectTextReplayDeleteKeys(alloc: Allocator, batch: derived_types.DerivedBatch) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+
+    for (batch.deleted_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
+    for (batch.overwritten_doc_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
+    for (batch.documents) |doc| {
+        if (doc.action != .upsert) continue;
+        try appendUniqueBorrowedKey(alloc, &keys, doc.key);
+    }
+
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn denseEmbeddingDocKeySet(
@@ -37165,6 +37179,31 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
     try std.testing.expectEqual(@as(usize, 0), writes.missing_required);
     try std.testing.expectEqualStrings("doc:z", writes.items[0].key);
     try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", writes.items[0].value);
+}
+
+test "text replay delete keys include upserted derived document keys" {
+    const alloc = std.testing.allocator;
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}" },
+        .{ .key = "ignored", .action = .delete },
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}" },
+    };
+    const deleted = [_][]const u8{"deleted:1"};
+    const overwritten = [_][]const u8{ "chunk:1", "overwritten:1" };
+    const batch = derived_types.DerivedBatch{
+        .documents = &docs,
+        .deleted_keys = &deleted,
+        .overwritten_doc_keys = &overwritten,
+    };
+
+    const keys = try collectTextReplayDeleteKeys(alloc, batch);
+    defer alloc.free(keys);
+
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqualStrings("deleted:1", keys[0]);
+    try std.testing.expectEqualStrings("chunk:1", keys[1]);
+    try std.testing.expectEqualStrings("overwritten:1", keys[2]);
 }
 
 test "db replay respects per-index applied watermarks" {
