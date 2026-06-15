@@ -105,7 +105,9 @@ Current status:
   now record those probe counters from base/delta membership checks, and the
   write comparison summary carries them through with
   `posting_base_member_probe_skip_rate` so block-level pruning is visible in
-  benchmark output.
+  benchmark output. Canonical base/delta single-member checks now use that
+  streaming probe, so after-block negative membership tests can skip encoded
+  blocks without decoding their member payloads.
 - `SearchScratch` already groups fixed query arrays into `query_storage`; cold
   scratch retention now also releases query, distance, member-id, vector-batch,
   and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,

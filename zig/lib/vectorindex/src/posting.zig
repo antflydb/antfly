@@ -2369,7 +2369,7 @@ pub const PostingStore = struct {
         };
         const base_header = try PostingFormat.decodeBaseHeader(base_data);
         const present_in_base = if (shouldSortBaseMembers(index)) present: {
-            const probe = try PostingFormat.baseContainsSortedMemberProbeStrict(base_data, vector_id);
+            const probe = try PostingFormat.baseContainsSortedMemberProbe(base_data, vector_id);
             notePostingBaseMemberProbe(index, probe);
             break :present probe.found;
         } else try PostingFormat.baseContainsMemberStrict(base_data, vector_id);
@@ -5997,6 +5997,48 @@ test "posting store segment backend hooks route posting persistence" {
     try std.testing.expectEqual(@as(usize, 2), folded.materialized_member_count);
     try std.testing.expectEqual(@as(u64, 2), folded.next_generation);
     try std.testing.expectEqual(@as(u64, 0), index.cursor_open_count);
+}
+
+test "posting store sorted membership probe skips encoded blocks" {
+    const alloc = std.testing.allocator;
+    var index = PostingPersistenceTestIndex{
+        .alloc = alloc,
+        .config = .{
+            .dims = 2,
+            .posting_storage_mode = .base_delta,
+            .posting_backend = .segments,
+            .posting_base_member_block_size = 16,
+        },
+    };
+    defer index.deinit();
+    var txn = struct {}{};
+
+    var members: [33]VectorId = undefined;
+    for (&members, 0..) |*member, i| member.* = @as(VectorId, @intCast(i + 1)) * 10;
+
+    try PostingStore.saveBaseAndCentroidDirectoryRecord(&index, &txn, .{
+        .posting_id = 17,
+        .generation = 1,
+        .members = members[0..],
+    }, .{
+        .posting_id = 17,
+        .generation = 1,
+        .mutation_version = 1,
+        .payload_version = 1,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = members.len,
+        .bounds_radius = 1.0,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+
+    try std.testing.expect(!try PostingStore.containsBaseDeltaMember(&index, &txn, 17, 999, isNotFoundForPostingPersistenceTest));
+    try std.testing.expectEqual(@as(u64, 1), index.write_profile.posting_base_member_probe_calls);
+    try std.testing.expectEqual(@as(u64, 3), index.write_profile.posting_base_member_probe_blocks_seen);
+    try std.testing.expectEqual(@as(u64, 3), index.write_profile.posting_base_member_probe_blocks_skipped_by_max);
+    try std.testing.expectEqual(@as(u64, 0), index.write_profile.posting_base_member_probe_blocks_decoded);
+    try std.testing.expectEqual(@as(u64, 0), index.write_profile.posting_base_member_probe_members_decoded);
 }
 
 test "posting store query member copy overlays base and delta tail in shadow mode" {
