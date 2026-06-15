@@ -1089,8 +1089,16 @@ pub const PostingFormat = struct {
         return try baseContainsSortedMemberProbeWithValidation(data, vector_id, false);
     }
 
+    pub fn baseContainsSortedMemberProbeWithHeader(data: []const u8, header: PostingBaseHeader, vector_id: VectorId) !BaseMemberProbeStats {
+        return try baseContainsSortedMemberProbeWithHeaderValidation(data, header, vector_id, false);
+    }
+
     pub fn baseContainsSortedMemberProbeStrict(data: []const u8, vector_id: VectorId) !BaseMemberProbeStats {
         return try baseContainsSortedMemberProbeWithValidation(data, vector_id, true);
+    }
+
+    pub fn baseContainsSortedMemberProbeStrictWithHeader(data: []const u8, header: PostingBaseHeader, vector_id: VectorId) !BaseMemberProbeStats {
+        return try baseContainsSortedMemberProbeWithHeaderValidation(data, header, vector_id, true);
     }
 
     pub fn baseContainsMemberStrict(data: []const u8, vector_id: VectorId) !bool {
@@ -1105,6 +1113,10 @@ pub const PostingFormat = struct {
 
     fn baseContainsSortedMemberProbeWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !BaseMemberProbeStats {
         const header = try decodeBaseHeader(data);
+        return try baseContainsSortedMemberProbeWithHeaderValidation(data, header, vector_id, strict_validation);
+    }
+
+    fn baseContainsSortedMemberProbeWithHeaderValidation(data: []const u8, header: PostingBaseHeader, vector_id: VectorId, strict_validation: bool) !BaseMemberProbeStats {
         var pos: usize = base_header_size;
         var remaining_members = header.member_count;
         var stats = BaseMemberProbeStats{};
@@ -2369,7 +2381,7 @@ pub const PostingStore = struct {
         };
         const base_header = try PostingFormat.decodeBaseHeader(base_data);
         const present_in_base = if (shouldSortBaseMembers(index)) present: {
-            const probe = try PostingFormat.baseContainsSortedMemberProbe(base_data, vector_id);
+            const probe = try PostingFormat.baseContainsSortedMemberProbeWithHeader(base_data, base_header, vector_id);
             notePostingBaseMemberProbe(index, probe);
             break :present probe.found;
         } else try PostingFormat.baseContainsMemberStrict(base_data, vector_id);
@@ -4493,6 +4505,8 @@ test "posting base sorted membership streams without full materialization" {
     try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 170));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 99));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 999));
+    const header = try PostingFormat.decodeBaseHeader(encoded);
+    try std.testing.expect((try PostingFormat.baseContainsSortedMemberProbeWithHeader(encoded, header, 170)).found);
     const negative_probe = try PostingFormat.baseContainsSortedMemberProbe(encoded, 999);
     try std.testing.expect(!negative_probe.found);
     try std.testing.expectEqual(@as(usize, 3), negative_probe.blocks_seen);
