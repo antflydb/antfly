@@ -21342,6 +21342,7 @@ const Parser = struct {
         if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekInitcapFunctionCall() or self.peekKeyword("trim") or self.peekTrimVariantFunctionCall()) return try self.parseConflictCaseFoldExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekKeyword("replace")) return try self.parseConflictReplaceExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekKeyword("regexp_replace")) return try self.parseConflictRegexpReplaceExpressionAlloc(column, insert_columns, expected_type);
+        if (self.peekRegexpMatchFunctionCall()) return try self.parseConflictRegexpMatchExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekRegexpSubstrFunctionCall()) return try self.parseConflictRegexpSubstrExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekRegexpCountFunctionCall()) return try self.parseConflictRegexpCountExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekRegexpInstrFunctionCall()) return try self.parseConflictRegexpInstrExpressionAlloc(column, insert_columns, expected_type);
@@ -21486,6 +21487,7 @@ const Parser = struct {
             self.peekTrimVariantFunctionCall() or
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
+            self.peekRegexpMatchFunctionCall() or
             self.peekRegexpSubstrFunctionCall() or
             self.peekRegexpCountFunctionCall() or
             self.peekRegexpInstrFunctionCall() or
@@ -22425,6 +22427,51 @@ const Parser = struct {
         return .{
             .kind = .regexp_count,
             .operands = operands,
+        };
+    }
+
+    fn parseConflictRegexpMatchExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) !db_mod.types.RelationalRowsExpression {
+        if (expected_type) |field_type| if (field_type != .boolean) return error.UnsupportedSqlShape;
+        if (!self.matchRegexpMatchFunctionKeyword()) return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+        errdefer {
+            for (operands.items) |operand| freeExpression(self.alloc, operand);
+            operands.deinit(self.alloc);
+        }
+
+        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeExpression(self.alloc, source);
+        try self.validateTextRowExpression(source);
+        try operands.append(self.alloc, source);
+        source_transferred = true;
+
+        try self.expect(.comma);
+        const pattern = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
+        var pattern_transferred = false;
+        errdefer if (!pattern_transferred) freeExpression(self.alloc, pattern);
+        try self.validateTextRowExpression(pattern);
+        try operands.append(self.alloc, pattern);
+        pattern_transferred = true;
+
+        if (self.match(.comma) != null) {
+            const case_insensitive = try self.parseConflictRowExpressionAlloc(column, insert_columns, .boolean);
+            var case_transferred = false;
+            errdefer if (!case_transferred) freeExpression(self.alloc, case_insensitive);
+            try self.validateBooleanRowExpression(case_insensitive);
+            try operands.append(self.alloc, case_insensitive);
+            case_transferred = true;
+        }
+        try self.expect(.rparen);
+        return .{
+            .kind = .regexp_match,
+            .operands = try operands.toOwnedSlice(self.alloc),
         };
     }
 
@@ -61721,6 +61768,7 @@ const AppParityCorpusCoverage = struct {
     conflict_uuid_generation_update: bool = false,
     conflict_text_expression_update: bool = false,
     conflict_regexp_replace_expression_update: bool = false,
+    conflict_regexp_match_expression_update: bool = false,
     conflict_jsonb_update: bool = false,
     conflict_jsonb_concat_update: bool = false,
     conflict_guard_where: bool = false,
@@ -63121,6 +63169,10 @@ const AppParityCorpusCoverage = struct {
             self.conflict_regexp_replace_expression_update = self.conflict_regexp_replace_expression_update or
                 std.mem.indexOf(u8, entry.sql, "regexp_replace(excluded.status") != null and
                     appParityPlanHasNonZeroToken(entry.plan, "transforms=");
+            self.conflict_regexp_match_expression_update = self.conflict_regexp_match_expression_update or
+                (std.mem.indexOf(u8, entry.sql, "regexp_like(excluded.status") != null or
+                    std.mem.indexOf(u8, entry.sql, "regexp_match(excluded.status") != null) and
+                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_nested_text_expression_update = self.conflict_nested_text_expression_update or
                 std.mem.indexOf(u8, entry.sql, "length(lower(excluded.next_status || '-' || status))") != null or
                 std.mem.indexOf(u8, entry.sql, "char_length(lower(excluded.next_status || '-' || status))") != null or
@@ -63510,6 +63562,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.conflict_uuid_generation_update);
         try std.testing.expect(self.conflict_text_expression_update);
         try std.testing.expect(self.conflict_regexp_replace_expression_update);
+        try std.testing.expect(self.conflict_regexp_match_expression_update);
         try std.testing.expect(self.conflict_nested_text_expression_update);
         try std.testing.expect(self.conflict_jsonb_update);
         try std.testing.expect(self.conflict_jsonb_concat_update);
@@ -67379,6 +67432,16 @@ test "postgres sql adapter classifies application parity corpus" {
             .resolver_version = 47,
             .returning_rows = &.{"{\"id\":\"u1\",\"status\":\"ACTIVE_USER_#\"}"},
             .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ACTIVE_USER_2026') ON CONFLICT (id) DO UPDATE SET status = regexp_replace(excluded.status, '[0-9]+', '#', 'g') RETURNING id, status",
+        },
+        .{
+            .name = "conflict regexp like expression update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"enabled\":false}",
+            .resolver_version = 48,
+            .returning_rows = &.{"{\"id\":\"u1\",\"enabled\":true}"},
+            .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ACTIVE_USER_2026') ON CONFLICT (id) DO UPDATE SET enabled = regexp_like(excluded.status, '^active_', true) RETURNING id, enabled",
         },
         .{
             .name = "conflict uuid generation update",
@@ -74373,6 +74436,22 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     try std.testing.expectEqualStrings("\"A\"", regexp_substr_patch.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), regexp_substr_patch.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"A\"}", regexp_substr_patch.batch.returning_rows[0]);
+
+    var regexp_match_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER') ON CONFLICT (email) DO UPDATE SET enabled = regexp_like(excluded.next_status, '^active_', true) RETURNING id, enabled",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_match_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_match_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_match_patch.batch.transformed);
+    try std.testing.expectEqualStrings("enabled", regexp_match_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("true", regexp_match_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_match_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"enabled\":true}", regexp_match_patch.batch.returning_rows[0]);
 
     var ascii_patch = try lowerInsertWithResolverAlloc(
         alloc,
