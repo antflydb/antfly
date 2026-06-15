@@ -24730,6 +24730,22 @@ pub const DB = struct {
                 const count = try relationalRowsRegexpCountText(alloc, source.value.string, pattern.value.string);
                 break :blk try std.fmt.allocPrint(alloc, "{d}", .{count});
             },
+            .regexp_substr => blk: {
+                if (expression.operands.len != 2) return error.InvalidQueryRequest;
+                const source_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+                defer alloc.free(source_json);
+                const pattern_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
+                defer alloc.free(pattern_json);
+                var source = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidQueryRequest;
+                defer source.deinit();
+                var pattern = std.json.parseFromSlice(std.json.Value, alloc, pattern_json, .{}) catch return error.InvalidQueryRequest;
+                defer pattern.deinit();
+                if (source.value == .null or pattern.value == .null) break :blk try alloc.dupe(u8, "null");
+                if (source.value != .string or pattern.value != .string) return error.InvalidQueryRequest;
+                const matched = try relationalRowsRegexpSubstrTextAlloc(alloc, source.value.string, pattern.value.string) orelse break :blk try alloc.dupe(u8, "null");
+                defer alloc.free(matched);
+                break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = matched }, .{});
+            },
             .regexp_instr => blk: {
                 if (expression.operands.len != 2) return error.InvalidQueryRequest;
                 const source_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
@@ -26256,6 +26272,15 @@ pub const DB = struct {
         if (span.end <= span.start) return error.InvalidQueryRequest;
         const codepoints_before = std.unicode.utf8CountCodepoints(source[0..span.start]) catch return error.InvalidQueryRequest;
         return codepoints_before + 1;
+    }
+
+    fn relationalRowsRegexpSubstrTextAlloc(alloc: Allocator, source: []const u8, pattern: []const u8) !?[]u8 {
+        var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidQueryRequest;
+        defer compiled.deinit();
+
+        const span = relationalRowsRegexpFindLeftmostMatch(&compiled, source, 0) orelse return null;
+        if (span.end <= span.start) return error.InvalidQueryRequest;
+        return try alloc.dupe(u8, source[span.start..span.end]);
     }
 
     fn relationalRowsAsciiLowerTextAlloc(alloc: Allocator, source: []const u8) ![]u8 {

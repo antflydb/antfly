@@ -2589,8 +2589,9 @@ fn relationalRowsExpressionType(
             }
             return .text;
         },
-        .regexp_replace => {
-            if (expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidSchemaUpdateRequest;
+        .regexp_replace, .regexp_substr => {
+            if (expression.kind == .regexp_replace and expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidSchemaUpdateRequest;
+            if (expression.kind == .regexp_substr and expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
             for (expression.operands) |operand| {
                 if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
             }
@@ -4671,6 +4672,7 @@ fn parseRelationalRowsExpressionKind(op: []const u8) !storage_schema.RelationalR
     if (std.mem.eql(u8, op, "rtrim")) return .rtrim;
     if (std.mem.eql(u8, op, "replace")) return .replace;
     if (std.mem.eql(u8, op, "regexp_replace")) return .regexp_replace;
+    if (std.mem.eql(u8, op, "regexp_substr")) return .regexp_substr;
     if (std.mem.eql(u8, op, "translate")) return .translate;
     if (std.mem.eql(u8, op, "substring") or std.mem.eql(u8, op, "substr")) return .substring;
     if (std.mem.eql(u8, op, "overlay")) return .overlay;
@@ -4749,6 +4751,7 @@ fn validateRelationalRowsExpressionArity(kind: storage_schema.RelationalRowsExpr
         .trim, .ltrim, .rtrim => if (len != 1 and len != 2) return error.InvalidSchemaUpdateRequest,
         .replace, .translate, .split_part => if (len != 3) return error.InvalidSchemaUpdateRequest,
         .regexp_replace => if (len != 3 and len != 4) return error.InvalidSchemaUpdateRequest,
+        .regexp_substr => if (len != 2) return error.InvalidSchemaUpdateRequest,
         .substring => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
         .overlay => if (len != 3 and len != 4) return error.InvalidSchemaUpdateRequest,
         .json_build_object => if (len % 2 != 0) return error.InvalidSchemaUpdateRequest,

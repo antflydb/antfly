@@ -4064,7 +4064,7 @@ fn rowsExpressionOutputNullableWithSources(
             }
             return expression.case_else.len == 0 or try rowsExpressionOutputNullableWithSources(alloc, schema, source_schema, expression.case_else[0]);
         },
-        .nullif, .json_extract => return true,
+        .nullif, .json_extract, .regexp_substr => return true,
         .cast => {
             if (expression.operands.len != 1) return error.InvalidRowsRequest;
             return try rowsExpressionOutputNullableWithSources(alloc, schema, source_schema, expression.operands[0]);
@@ -4116,7 +4116,7 @@ fn rowsExpressionOutputTypeWithSources(
             };
         },
         .now, .date_trunc, .date_bin => return .datetime,
-        .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws, .json_typeof, .array_to_string, .regexp_replace => return .keyword,
+        .uuid_v4, .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .concat, .concat_ws, .json_typeof, .array_to_string, .regexp_replace, .regexp_substr => return .keyword,
         .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists => return .boolean,
         .nullif => {
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
@@ -4367,6 +4367,20 @@ fn validateRowsRegexpReplaceExpressionWithSources(
     expression: db_mod.types.RelationalRowsExpression,
 ) anyerror!void {
     if (expression.kind != .regexp_replace or (expression.operands.len != 3 and expression.operands.len != 4)) return error.InvalidRowsRequest;
+    for (expression.operands) |operand| {
+        if (try rowsExpressionIsNullLiteral(alloc, operand)) continue;
+        const operand_type = try rowsExpressionOutputTypeWithSources(alloc, schema, source_schema, operand);
+        if (operand_type != .keyword) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateRowsRegexpSubstrExpressionWithSources(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    expression: db_mod.types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind != .regexp_substr or expression.operands.len != 2) return error.InvalidRowsRequest;
     for (expression.operands) |operand| {
         if (try rowsExpressionIsNullLiteral(alloc, operand)) continue;
         const operand_type = try rowsExpressionOutputTypeWithSources(alloc, schema, source_schema, operand);
@@ -8353,6 +8367,8 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         .regexp_count
     else if (std.mem.eql(u8, op.string, "regexp_instr"))
         .regexp_instr
+    else if (std.mem.eql(u8, op.string, "regexp_substr"))
+        .regexp_substr
     else if (std.mem.eql(u8, op.string, "and") or std.mem.eql(u8, op.string, "bool_and"))
         .bool_and
     else if (std.mem.eql(u8, op.string, "or") or std.mem.eql(u8, op.string, "bool_or"))
@@ -8455,6 +8471,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
     if ((expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) and (args_value.array.items.len != 1 and args_value.array.items.len != 2)) return error.InvalidRowsRequest;
     if ((expression_kind == .replace or expression_kind == .translate) and args_value.array.items.len != 3) return error.InvalidRowsRequest;
     if (expression_kind == .regexp_replace and (args_value.array.items.len != 3 and args_value.array.items.len != 4)) return error.InvalidRowsRequest;
+    if (expression_kind == .regexp_substr and args_value.array.items.len != 2) return error.InvalidRowsRequest;
     if (expression_kind == .substring and (args_value.array.items.len != 2 and args_value.array.items.len != 3)) return error.InvalidRowsRequest;
     if (expression_kind == .overlay and (args_value.array.items.len != 3 and args_value.array.items.len != 4)) return error.InvalidRowsRequest;
     if (expression_kind == .split_part and args_value.array.items.len != 3) return error.InvalidRowsRequest;
@@ -8557,7 +8574,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
     const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands, .cast_type = cast_type, .json_path = json_path, .json_as_text = json_as_text };
     if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .array_position or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
-    if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_bin) try validateRowsDateBinExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_part) try validateRowsDatePartExpressionWithSources(alloc, schema, source_schema, expression);
@@ -8568,6 +8585,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
     if (expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) try validateRowsTrimExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .replace or expression_kind == .translate) try validateRowsReplaceExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .regexp_replace) try validateRowsRegexpReplaceExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .regexp_substr) try validateRowsRegexpSubstrExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .substring) try validateRowsSubstringExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .overlay) try validateRowsOverlayExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .split_part) try validateRowsSplitPartExpressionWithSources(alloc, schema, source_schema, expression);
@@ -9114,6 +9132,7 @@ fn validateRowsQueryTextExpressionWithSources(
             if (expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, operand);
         },
+        .regexp_substr => try validateRowsRegexpSubstrExpressionWithSources(alloc, schema, source_schema, expression),
         .substring => try validateRowsSubstringExpressionWithSources(alloc, schema, source_schema, expression),
         .overlay => try validateRowsOverlayExpressionWithSources(alloc, schema, source_schema, expression),
         .split_part => try validateRowsSplitPartExpressionWithSources(alloc, schema, source_schema, expression),
@@ -10416,6 +10435,22 @@ fn expressionValueJsonWithExplicitSourceAlloc(
             const transformed = try regexpReplaceTextAlloc(alloc, source.value.string, pattern.value.string, replacement.value.string, flags_text);
             defer alloc.free(transformed);
             break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
+        },
+        .regexp_substr => blk: {
+            if (expression.operands.len != 2) return error.InvalidRowsRequest;
+            const source_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
+            defer alloc.free(source_json);
+            const pattern_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, row, proposed_row, source_row, expression.operands[1]);
+            defer alloc.free(pattern_json);
+            var source = std.json.parseFromSlice(std.json.Value, alloc, source_json, .{}) catch return error.InvalidRowsRequest;
+            defer source.deinit();
+            var pattern = std.json.parseFromSlice(std.json.Value, alloc, pattern_json, .{}) catch return error.InvalidRowsRequest;
+            defer pattern.deinit();
+            if (source.value == .null or pattern.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (source.value != .string or pattern.value != .string) return error.InvalidRowsRequest;
+            const matched = try regexpSubstrTextAlloc(alloc, source.value.string, pattern.value.string) orelse break :blk try alloc.dupe(u8, "null");
+            defer alloc.free(matched);
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = matched }, .{});
         },
         .substring => blk: {
             if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidRowsRequest;
@@ -12868,12 +12903,31 @@ fn regexpInstrText(alloc: std.mem.Allocator, source: []const u8, pattern: []cons
     return codepoints_before + 1;
 }
 
+fn regexpSubstrTextAlloc(alloc: std.mem.Allocator, source: []const u8, pattern: []const u8) !?[]u8 {
+    var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidRowsRequest;
+    defer compiled.deinit();
+
+    const span = regexpFindLeftmostMatch(&compiled, source, 0) orelse return null;
+    if (span.end <= span.start) return error.InvalidRowsRequest;
+    return try alloc.dupe(u8, source[span.start..span.end]);
+}
+
 test "regexp_instr returns one based UTF-8 codepoint positions" {
     const alloc = std.testing.allocator;
     const text = [_]u8{ 'a', 0xc3, 0xa9, '7' };
     try std.testing.expectEqual(@as(usize, 3), try regexpInstrText(alloc, text[0..], "[0-9]"));
     try std.testing.expectEqual(@as(usize, 0), try regexpInstrText(alloc, text[0..], "z+"));
     try std.testing.expectError(error.InvalidRowsRequest, regexpInstrText(alloc, text[0..], ""));
+}
+
+test "regexp_substr returns first leftmost non-empty match" {
+    const alloc = std.testing.allocator;
+    const text = [_]u8{ 'a', 0xc3, 0xa9, '7', 'b', '8' };
+    const matched = (try regexpSubstrTextAlloc(alloc, text[0..], "[0-9]+")).?;
+    defer alloc.free(matched);
+    try std.testing.expectEqualStrings("7", matched);
+    try std.testing.expect((try regexpSubstrTextAlloc(alloc, text[0..], "z+")) == null);
+    try std.testing.expectError(error.InvalidRowsRequest, regexpSubstrTextAlloc(alloc, text[0..], ""));
 }
 
 fn asciiLowerTextAlloc(alloc: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -20020,6 +20074,7 @@ test "relational rows query contract parses public expression operator surface" 
         .{ .op = "regexp_match", .expr_json = "{\"op\":\"regexp_match\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"^[a-z]+\"},{\"value\":true}]}", .kind = .regexp_match },
         .{ .op = "regexp_count", .expr_json = "{\"op\":\"regexp_count\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"[0-9]+\"}]}", .kind = .regexp_count },
         .{ .op = "regexp_instr", .expr_json = "{\"op\":\"regexp_instr\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"[0-9]+\"}]}", .kind = .regexp_instr },
+        .{ .op = "regexp_substr", .expr_json = "{\"op\":\"regexp_substr\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"[0-9]+\"}]}", .kind = .regexp_substr },
         .{ .op = "bool_and", .expr_json = "{\"op\":\"bool_and\",\"args\":[{\"field\":\"flag\"},{\"value\":true}]}", .kind = .bool_and },
         .{ .op = "and", .expr_json = "{\"op\":\"and\",\"args\":[{\"field\":\"flag\"},{\"value\":true}]}", .kind = .bool_and },
         .{ .op = "bool_or", .expr_json = "{\"op\":\"bool_or\",\"args\":[{\"field\":\"flag\"},{\"value\":false}]}", .kind = .bool_or },

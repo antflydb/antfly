@@ -290,6 +290,7 @@ pub const RelationalRowsExpressionKind = enum {
     regexp_match,
     regexp_count,
     regexp_instr,
+    regexp_substr,
 };
 
 pub const RelationalRowsExpressionFieldSource = enum {
