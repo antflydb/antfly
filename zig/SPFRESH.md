@@ -92,7 +92,10 @@ Current status:
 - HBC maintenance paths that only need base generation/member count now use
   `PostingStore.loadBaseHeader`, while paths that need structural validation
   use `PostingStore.loadBaseStats`; both avoid decoding an owned member array
-  and keep specialized base-decode modes in live code.
+  and keep specialized base-decode modes in live code. Non-adaptive delta-tail
+  replay now also delays member-scratch growth until a live insert/replace
+  record survives the base-generation filter, so stale folded tail values do
+  not grow query/materialization scratch.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full

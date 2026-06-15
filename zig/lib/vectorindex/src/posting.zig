@@ -1467,10 +1467,16 @@ pub const PostingFormat = struct {
         base_generation: u64,
     ) !DeltaReplayResult {
         var iterator = try DeltaTailIterator.init(data);
-        try scratch.ensureMemberIdCapacity(alloc, member_count.* + iterator.recordCount());
         var result = DeltaReplayResult{};
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            switch (record.op) {
+                .insert, .replace => if (member_count.* + 1 > scratch.member_ids.len) {
+                    const doubled = scratch.member_ids.len *| 2;
+                    try scratch.ensureMemberIdCapacity(alloc, @max(member_count.* + 1, @max(doubled, @as(usize, 8))));
+                },
+                .tombstone => {},
+            }
             applyDeltaRecordToScratch(scratch, member_count, record);
             result.records += 1;
             result.max_sequence = @max(result.max_sequence, record.sequence);
@@ -4632,6 +4638,35 @@ test "posting delta tail round trips and overlays base members" {
     try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 30, 40, 10 }, materialized);
     encoded[4] = 99;
     try std.testing.expectError(error.UnsupportedPostingDeltaVersion, PostingFormat.decodeDeltaTail(alloc, encoded));
+}
+
+test "posting delta tail replay skips stale records without growing member scratch" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 1) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 1) << 32) | 2, .op = .replace, .vector_id = 50 },
+    };
+
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+    try scratch.ensureMemberIdCapacity(alloc, 1);
+    scratch.member_ids[0] = 10;
+    var member_count: usize = 1;
+
+    const result = try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(
+        alloc,
+        &scratch,
+        &member_count,
+        encoded,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.records);
+    try std.testing.expectEqual(@as(usize, 1), member_count);
+    try std.testing.expectEqual(@as(usize, 1), scratch.member_ids.len);
+    try std.testing.expectEqual(@as(VectorId, 10), scratch.member_ids[0]);
 }
 
 test "posting delta tail uses varint encoding for small single-record values" {
