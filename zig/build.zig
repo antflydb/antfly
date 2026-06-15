@@ -4419,6 +4419,10 @@ pub fn build(b: *std.Build) void {
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
