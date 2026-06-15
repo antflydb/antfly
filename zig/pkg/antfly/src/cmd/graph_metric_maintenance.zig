@@ -124,6 +124,7 @@ const ServiceMaintenanceRequestWire = struct {
     max_rounds: usize = 1,
     max_metrics_per_round: usize = 8,
     max_pages_per_round: usize = 1,
+    preserve_lease_after_tick: bool = false,
     now_ms: ?u64 = null,
 };
 
@@ -710,6 +711,7 @@ fn serviceRequestJsonFromFieldsAlloc(
         .max_rounds = max_rounds,
         .max_metrics_per_round = max_metrics_per_round,
         .max_pages_per_round = max_pages_per_round,
+        .preserve_lease_after_tick = action == .tick and cli.test_hold_after_run_ms > 0,
         .now_ms = now_ms,
     }, .{});
 }

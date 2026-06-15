@@ -117,6 +117,7 @@ pub const DocumentTransform = struct {
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
+    relational_identity_rewrites: []const RelationalIdentityRewrite = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
@@ -1135,91 +1136,16 @@ pub const RelationalRowsFieldAliasProjection = struct {
     field: []const u8,
 };
 
-pub const RelationalRowsExpressionKind = enum {
-    field,
-    value,
-    coalesce,
-    now,
-    lower,
-    upper,
-    trim,
-    replace,
-    concat,
-    length,
-    nullif,
-    greatest,
-    least,
-    abs,
-    round,
-    floor,
-    ceil,
-    add,
-    sub,
-    mul,
-    div,
-    interval_ns,
-    case,
-    cast,
-    json_extract,
-    array_length,
-    string_to_array,
-};
-
-pub const RelationalRowsExpressionFieldSource = enum {
-    row,
-    existing,
-    proposed,
-    source,
-};
-
-pub const RelationalRowsExpressionCastType = enum {
-    text,
-    numeric,
-    bool,
-};
-
-pub const RelationalRowsExpressionCondition = struct {
-    lhs: RelationalRowsExpression,
-    op: schema_mod.RelationalCheckOp,
-    rhs: []const RelationalRowsExpression = &.{},
-};
-
-pub const RelationalRowsExpressionPredicateGroup = struct {
-    conditions: []const RelationalRowsExpressionCondition = &.{},
-};
-
-pub const RelationalRowsExpressionArrayContainsPredicate = struct {
-    expression: RelationalRowsExpression,
-    value_json: []const u8,
-};
-
-pub const RelationalRowsExpressionCaseBranch = struct {
-    when: RelationalRowsExpressionCondition,
-    then: RelationalRowsExpression,
-};
-
-pub const RelationalRowsExpression = struct {
-    kind: RelationalRowsExpressionKind,
-    field: []const u8 = "",
-    field_source: RelationalRowsExpressionFieldSource = .row,
-    value_json: []const u8 = "",
-    json_path: []const u8 = "",
-    json_as_text: bool = false,
-    operands: []const RelationalRowsExpression = &.{},
-    cast_type: ?RelationalRowsExpressionCastType = null,
-    case_branches: []const RelationalRowsExpressionCaseBranch = &.{},
-    case_else: []const RelationalRowsExpression = &.{},
-};
-
-pub const RelationalRowsExpressionProjection = struct {
-    output: []const u8,
-    expression: RelationalRowsExpression,
-};
-
-pub const RelationalRowsExpressionAssignment = struct {
-    field: []const u8,
-    expression: RelationalRowsExpression,
-};
+pub const RelationalRowsExpressionKind = schema_mod.RelationalRowsExpressionKind;
+pub const RelationalRowsExpressionFieldSource = schema_mod.RelationalRowsExpressionFieldSource;
+pub const RelationalRowsExpressionCastType = schema_mod.RelationalRowsExpressionCastType;
+pub const RelationalRowsExpressionCondition = schema_mod.RelationalRowsExpressionCondition;
+pub const RelationalRowsExpressionPredicateGroup = schema_mod.RelationalRowsExpressionPredicateGroup;
+pub const RelationalRowsExpressionArrayContainsPredicate = schema_mod.RelationalRowsExpressionArrayContainsPredicate;
+pub const RelationalRowsExpressionCaseBranch = schema_mod.RelationalRowsExpressionCaseBranch;
+pub const RelationalRowsExpression = schema_mod.RelationalRowsExpression;
+pub const RelationalRowsExpressionProjection = schema_mod.RelationalRowsExpressionProjection;
+pub const RelationalRowsExpressionAssignment = schema_mod.RelationalRowsExpressionAssignment;
 
 pub const RelationalRowsTextPatternPredicate = struct {
     field: []const u8,
@@ -1232,6 +1158,26 @@ pub const RelationalRowsDocKeyRange = struct {
     start: []const u8 = "",
     end: []const u8 = "",
 };
+
+pub const RelationalRowsCollectedRow = struct {
+    key: []const u8,
+    json: []const u8,
+    version: u64,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.key));
+        alloc.free(@constCast(self.json));
+        self.* = undefined;
+    }
+};
+
+pub fn freeRelationalRowsCollectedRows(alloc: Allocator, rows: []const RelationalRowsCollectedRow) void {
+    for (rows) |row_value| {
+        var row = row_value;
+        row.deinit(alloc);
+    }
+    if (rows.len > 0) alloc.free(rows);
+}
 
 pub const RelationalRowsQueryRequest = struct {
     source_cte: []const u8 = "",
@@ -1260,6 +1206,7 @@ pub const RelationalRowsQueryRequest = struct {
     expressions: []const RelationalRowsExpressionProjection = &.{},
     select_all: bool = true,
     distinct_on: []const []const u8 = &.{},
+    distinct_on_expressions: []const RelationalRowsExpression = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     row_claim: ?RowClaimRequest = null,
     doc_key_range: ?RelationalRowsDocKeyRange = null,
@@ -1387,6 +1334,8 @@ pub const RelationalRowsQueryRequest = struct {
             freeRelationalRowsExpression(alloc, projection.expression);
         }
         if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.distinct_on_expressions) |expression| freeRelationalRowsExpression(alloc, expression);
+        if (self.distinct_on_expressions.len > 0) alloc.free(self.distinct_on_expressions);
         for (self.order_by) |order| {
             if (order.field.len > 0) alloc.free(order.field);
             if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
@@ -1420,6 +1369,56 @@ fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: Relational
     freeRelationalRowsExpression(alloc, condition.lhs);
     for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
     if (condition.rhs.len > 0) alloc.free(condition.rhs);
+}
+
+fn freeRelationalRowsExpressionAssignments(alloc: Allocator, assignments: []const RelationalRowsExpressionAssignment) void {
+    for (assignments) |assignment| {
+        alloc.free(assignment.field);
+        freeRelationalRowsExpression(alloc, assignment.expression);
+    }
+    if (assignments.len > 0) alloc.free(assignments);
+}
+
+fn freeRelationalRowsExpressionProjections(alloc: Allocator, projections: []const RelationalRowsExpressionProjection) void {
+    for (projections) |projection| {
+        alloc.free(projection.output);
+        freeRelationalRowsExpression(alloc, projection.expression);
+    }
+    if (projections.len > 0) alloc.free(projections);
+}
+
+fn freeRelationalRowsTransformOps(alloc: Allocator, operations: []const TransformOp) void {
+    for (operations) |op| {
+        alloc.free(op.path);
+        if (op.value_json) |value_json| alloc.free(value_json);
+    }
+    if (operations.len > 0) alloc.free(operations);
+}
+
+fn freeRelationalRowsOnConflict(alloc: Allocator, conflict: RelationalRowsOnConflict) void {
+    freeRelationalRowsTransformOps(alloc, conflict.operations);
+    freeRelationalRowsExpressionAssignments(alloc, conflict.patch_expressions);
+    freeRelationalRowsExpressionAssignments(alloc, conflict.increment_expressions);
+    for (conflict.json_set_expressions) |assignment| {
+        alloc.free(assignment.field);
+        for (assignment.path) |part| alloc.free(part);
+        if (assignment.path.len > 0) alloc.free(assignment.path);
+        freeRelationalRowsExpression(alloc, assignment.expression);
+    }
+    if (conflict.json_set_expressions.len > 0) alloc.free(conflict.json_set_expressions);
+    if (conflict.where_expression) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    for (conflict.where_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    if (conflict.where_expressions.len > 0) alloc.free(conflict.where_expressions);
+    for (conflict.where_any) |group| {
+        for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
+    if (conflict.where_any.len > 0) alloc.free(conflict.where_any);
+    for (conflict.where_not) |group| {
+        for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
+    if (conflict.where_not.len > 0) alloc.free(conflict.where_not);
 }
 
 pub const RelationalRowsCte = struct {
@@ -1489,13 +1488,21 @@ pub const RelationalRowsJsonSetExpressionAssignment = struct {
     expression: RelationalRowsExpression,
 };
 
+pub const RelationalRowsTemporalPortion = struct {
+    period: []const u8,
+    from_json: []const u8,
+    to_json: []const u8,
+};
+
 pub const RelationalRowsMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,
     source: RelationalRowsQueryRequest = .{},
+    rewrite_identity: bool = false,
     operations: []const TransformOp = &.{},
     patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
     increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
     json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    temporal_portion: ?RelationalRowsTemporalPortion = null,
     returning: []const []const u8 = &.{},
     returning_expressions: []const RelationalRowsExpressionProjection = &.{},
     returning_all: bool = false,
@@ -1515,6 +1522,7 @@ pub const RelationalRowsConflictTarget = struct {
     kind: RelationalRowsConflictTargetKind = .primary,
     unique_name: []const u8 = "",
     unique_predicates: []const schema_mod.RelationalCheck = &.{},
+    unique_predicate_expressions: []const RelationalRowsExpressionCondition = &.{},
 };
 
 pub const RelationalRowsOnConflict = struct {
@@ -1525,6 +1533,9 @@ pub const RelationalRowsOnConflict = struct {
     increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
     json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
     where_expression: ?RelationalRowsExpressionCondition = null,
+    where_expressions: []const RelationalRowsExpressionCondition = &.{},
+    where_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    where_not: []const RelationalRowsExpressionPredicateGroup = &.{},
 };
 
 pub const RelationalRowsInsertSourceRequest = struct {
@@ -1535,6 +1546,34 @@ pub const RelationalRowsInsertSourceRequest = struct {
     returning: []const []const u8 = &.{},
     returning_expressions: []const RelationalRowsExpressionProjection = &.{},
     returning_all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.source_table.len > 0) alloc.free(self.source_table);
+        self.source.deinit(alloc);
+        freeRelationalRowsExpressionAssignments(alloc, self.assignments);
+        if (self.on_conflict) |conflict| freeRelationalRowsOnConflict(alloc, conflict);
+        for (self.returning) |field| alloc.free(field);
+        if (self.returning.len > 0) alloc.free(self.returning);
+        freeRelationalRowsExpressionProjections(alloc, self.returning_expressions);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsInsertSourcePlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
+    insert_source: RelationalRowsInsertSourceRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
+        self.insert_source.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const RelationalRowsMutationSourceResult = struct {
@@ -1566,6 +1605,8 @@ pub const RelationalRowsWindowFunction = enum {
     avg,
     min,
     max,
+    bool_or,
+    bool_and,
 };
 
 pub const RelationalRowsWindowFrameUnit = enum {
@@ -1598,6 +1639,19 @@ pub const RelationalRowsWindowSpec = struct {
     offset: u32 = 1,
     default_json: []const u8 = "",
     frame: ?RelationalRowsWindowFrame = null,
+    filter_predicates: []const schema_mod.RelationalCheck = &.{},
+    filter_array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    filter_array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    filter_array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    filter_in_predicates: []const RelationalRowsInPredicate = &.{},
+    filter_json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    filter_json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    filter_json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    filter_text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+    filter_expressions: []const RelationalRowsExpressionCondition = &.{},
+    filter_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    filter_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    filter_not: []const RelationalRowsExpressionPredicateGroup = &.{},
 };
 
 pub const RelationalRowsWindowRequest = struct {
@@ -1622,6 +1676,69 @@ pub const RelationalRowsWindowRequest = struct {
             if (window.order_by.len > 0) alloc.free(window.order_by);
             if (window.value_expression) |expression| freeRelationalRowsExpression(alloc, expression);
             if (window.default_json.len > 0) alloc.free(window.default_json);
+            for (window.filter_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |json| alloc.free(json);
+            }
+            if (window.filter_predicates.len > 0) alloc.free(window.filter_predicates);
+            for (window.filter_array_any) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_any.len > 0) alloc.free(window.filter_array_any);
+            for (window.filter_array_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_contains.len > 0) alloc.free(window.filter_array_contains);
+            for (window.filter_array_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_eq.len > 0) alloc.free(window.filter_array_eq);
+            for (window.filter_in_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.values_json.len > 0) alloc.free(predicate.values_json);
+            }
+            if (window.filter_in_predicates.len > 0) alloc.free(window.filter_in_predicates);
+            for (window.filter_json_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_json_contains.len > 0) alloc.free(window.filter_json_contains);
+            for (window.filter_json_path_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_json_path_eq.len > 0) alloc.free(window.filter_json_path_eq);
+            for (window.filter_json_path_exists) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+            }
+            if (window.filter_json_path_exists.len > 0) alloc.free(window.filter_json_path_exists);
+            for (window.filter_text_patterns) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.pattern);
+            }
+            if (window.filter_text_patterns.len > 0) alloc.free(window.filter_text_patterns);
+            for (window.filter_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (window.filter_expressions.len > 0) alloc.free(window.filter_expressions);
+            for (window.filter_expression_array_contains) |predicate| {
+                freeRelationalRowsExpression(alloc, predicate.expression);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_expression_array_contains.len > 0) alloc.free(window.filter_expression_array_contains);
+            for (window.filter_any) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (window.filter_any.len > 0) alloc.free(window.filter_any);
+            for (window.filter_not) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (window.filter_not.len > 0) alloc.free(window.filter_not);
         }
         if (self.windows.len > 0) alloc.free(self.windows);
         for (self.select) |field| alloc.free(field);
@@ -1670,6 +1787,9 @@ pub const RelationalRowsAggregateOp = enum {
     max,
     avg,
     array_agg,
+    string_agg,
+    bool_or,
+    bool_and,
 };
 
 pub const default_relational_rows_aggregate_distinct_max_items: u32 = 65536;
@@ -1684,6 +1804,7 @@ pub const RelationalRowsAggregateSpec = struct {
     distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
     array_max_items: u32 = 0,
     array_order_by: []const RelationalRowsQueryOrder = &.{},
+    string_delimiter: ?[]const u8 = null,
     filter_predicates: []const schema_mod.RelationalCheck = &.{},
     filter_array_any: []const RelationalRowsArrayAnyPredicate = &.{},
     filter_array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
@@ -1724,6 +1845,7 @@ pub const RelationalRowsAggregateRequest = struct {
         for (self.aggregations) |aggregation| {
             alloc.free(aggregation.name);
             if (aggregation.field) |field| alloc.free(field);
+            if (aggregation.string_delimiter) |delimiter| alloc.free(delimiter);
             if (aggregation.expression) |expression| freeRelationalRowsExpression(alloc, expression);
             for (aggregation.array_order_by) |order| {
                 if (order.field.len > 0) alloc.free(order.field);
@@ -1880,6 +2002,10 @@ pub const RelationalRowsJoinRequest = struct {
     left: RelationalRowsQueryRequest = .{},
     right: RelationalRowsQueryRequest = .{},
     on: []const RelationalRowsJoinOn = &.{},
+    on_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    on_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    on_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    on_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
     match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
@@ -1898,6 +2024,23 @@ pub const RelationalRowsJoinRequest = struct {
             alloc.free(join_on.right_field);
         }
         if (self.on.len > 0) alloc.free(self.on);
+        for (self.on_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.on_expression_predicates.len > 0) alloc.free(self.on_expression_predicates);
+        for (self.on_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.on_expression_or_predicates.len > 0) alloc.free(self.on_expression_or_predicates);
+        for (self.on_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.on_expression_not_predicates.len > 0) alloc.free(self.on_expression_not_predicates);
+        for (self.on_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.on_expression_array_contains.len > 0) alloc.free(self.on_expression_array_contains);
         for (self.match_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
         if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
         for (self.match_expression_or_predicates) |group| {
@@ -1938,10 +2081,12 @@ pub const RelationalRowsJoinedMutationSourceRequest = struct {
     match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    rewrite_identity: bool = false,
     source_assignments: []const RelationalRowsJoinedMutationFieldAssignment = &.{},
     operations: []const TransformOp = &.{},
     patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
     increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
     returning: []const []const u8 = &.{},
     returning_expressions: []const RelationalRowsExpressionProjection = &.{},
     returning_all: bool = false,
@@ -1949,6 +2094,8 @@ pub const RelationalRowsJoinedMutationSourceRequest = struct {
 
 pub const RelationalRowsJoinPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    left_table: []const u8 = "",
+    right_table: []const u8 = "",
     left_ranges: []const RelationalRowsDocKeyRange = &.{},
     right_ranges: []const RelationalRowsDocKeyRange = &.{},
     join: RelationalRowsJoinRequest = .{},
@@ -1959,6 +2106,8 @@ pub const RelationalRowsJoinPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        if (self.left_table.len > 0) alloc.free(self.left_table);
+        if (self.right_table.len > 0) alloc.free(self.right_table);
         freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
         freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
         self.join.deinit(alloc);
@@ -2025,6 +2174,8 @@ pub const RelationalRowsLateralRequest = struct {
 
 pub const RelationalRowsLateralPlan = struct {
     ctes: []const RelationalRowsCte = &.{},
+    left_table: []const u8 = "",
+    right_table: []const u8 = "",
     left_ranges: []const RelationalRowsDocKeyRange = &.{},
     right_ranges: []const RelationalRowsDocKeyRange = &.{},
     lateral: RelationalRowsLateralRequest = .{},
@@ -2035,6 +2186,8 @@ pub const RelationalRowsLateralPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        if (self.left_table.len > 0) alloc.free(self.left_table);
+        if (self.right_table.len > 0) alloc.free(self.right_table);
         freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
         freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
         self.lateral.deinit(alloc);
@@ -2078,6 +2231,12 @@ pub const TransactionWrite = struct {
     value: []const u8,
 };
 
+pub const RelationalIdentityRewrite = struct {
+    old_key: []const u8,
+    new_key: []const u8,
+    value: []const u8,
+};
+
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
     expected_version: u64,
@@ -2095,6 +2254,8 @@ pub const ForeignKeyParentCheck = struct {
     parent_table: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8 = null,
+    child_period_start_json: ?[]const u8 = null,
+    child_period_end_json: ?[]const u8 = null,
     timing: Timing = .immediate,
 };
 
@@ -2187,11 +2348,14 @@ pub const UniqueConstraintMutation = struct {
     constraint_name: []const u8,
     encoded_value: []const u8,
     owner_key: []const u8,
+    temporal_start: ?[]const u8 = null,
+    temporal_end: ?[]const u8 = null,
 };
 
 pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
+    relational_identity_rewrites: []const RelationalIdentityRewrite = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     foreign_key_parent_checks: []const ForeignKeyParentCheck = &.{},
@@ -2342,14 +2506,36 @@ pub const ReturnMode = enum {
 
 pub const RowClaimMode = enum {
     for_update,
+    for_no_key_update,
+
+    pub fn isExclusiveWriteClaim(self: @This()) bool {
+        return switch (self) {
+            .for_update, .for_no_key_update => true,
+        };
+    }
+};
+
+pub const RowClaimWaitPolicy = enum {
+    wait,
+    nowait,
+    skip_locked,
 };
 
 pub const RowClaimRequest = struct {
     mode: RowClaimMode = .for_update,
+    wait_policy: RowClaimWaitPolicy = .wait,
     skip_locked: bool = false,
     lease_ms: u64 = 30_000,
     owner_id: []const u8 = "",
     txn_id: ?TxnId = null,
+
+    pub fn effectiveWaitPolicy(self: @This()) RowClaimWaitPolicy {
+        return if (self.skip_locked) .skip_locked else self.wait_policy;
+    }
+
+    pub fn effectiveSkipLocked(self: @This()) bool {
+        return self.effectiveWaitPolicy() == .skip_locked;
+    }
 };
 
 pub const NamedGraphQuery = struct {

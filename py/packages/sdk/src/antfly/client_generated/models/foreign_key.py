@@ -26,6 +26,8 @@ class ForeignKey:
         name (str | Unset): Constraint name, unique within the table schema.
         columns (list[str] | Unset): Child columns. A single scalar column is supported for ["_id"] references; ordered
             scalar tuples are supported when references.columns names a unique constraint column tuple.
+        period (str | Unset): Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)`
+            constraints.
         references (ForeignKeyReference | Unset): Parent side of a relational foreign-key constraint.
         on_delete (ForeignKeyOnDelete | Unset): Delete action. "no_action" is normalized to immediate restrictive
             behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
@@ -47,6 +49,7 @@ class ForeignKey:
 
     name: str | Unset = UNSET
     columns: list[str] | Unset = UNSET
+    period: str | Unset = UNSET
     references: ForeignKeyReference | Unset = UNSET
     on_delete: ForeignKeyOnDelete | Unset = UNSET
     on_update: ForeignKeyOnUpdate | Unset = UNSET
@@ -61,6 +64,8 @@ class ForeignKey:
         columns: list[str] | Unset = UNSET
         if not isinstance(self.columns, Unset):
             columns = self.columns
+
+        period = self.period
 
         references: dict[str, Any] | Unset = UNSET
         if not isinstance(self.references, Unset):
@@ -97,6 +102,8 @@ class ForeignKey:
             field_dict["name"] = name
         if columns is not UNSET:
             field_dict["columns"] = columns
+        if period is not UNSET:
+            field_dict["period"] = period
         if references is not UNSET:
             field_dict["references"] = references
         if on_delete is not UNSET:
@@ -122,6 +129,8 @@ class ForeignKey:
         name = d.pop("name", UNSET)
 
         columns = cast(list[str], d.pop("columns", UNSET))
+
+        period = d.pop("period", UNSET)
 
         _references = d.pop("references", UNSET)
         references: ForeignKeyReference | Unset
@@ -170,6 +179,7 @@ class ForeignKey:
         foreign_key = cls(
             name=name,
             columns=columns,
+            period=period,
             references=references,
             on_delete=on_delete,
             on_update=on_update,

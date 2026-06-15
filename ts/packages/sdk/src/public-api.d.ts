@@ -3664,6 +3664,12 @@ export interface components {
             /** @description Unique constraint name. */
             name: string;
             where?: components["schemas"]["RowsUniquePredicateGroup"];
+            /**
+             * @description Expression predicates for expression-partial unique conflict targets.
+             *     When present, the list must exactly match the named unique
+             *     constraint's stored expression predicate metadata.
+             */
+            where_expressions?: components["schemas"]["RowsExpressionCondition"][];
         };
         /** @description Primary-key or named unique constraint conflict target. */
         RowsConflictTarget: {
@@ -3752,10 +3758,21 @@ export interface components {
             json_set?: components["schemas"]["RowsJsonSetTransform"][];
             /** @description Array transforms for update operations. */
             array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            /** @description Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans. */
+            temporal_portion?: components["schemas"]["RowsTemporalPortion"];
             /** @description Fields to return from the final update image or deleted row image. `*` returns the full row. */
             returning?: string[];
             /** @description Typed row-expression projections over the final update image or deleted row image. */
             returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        /** @description Application-time temporal slice for update/delete mutation-source plans. */
+        RowsTemporalPortion: {
+            /** @description Period name declared on the relational table schema. */
+            period: string;
+            /** @description Inclusive lower bound encoded as the period start column's JSON type. */
+            from: unknown;
+            /** @description Exclusive upper bound encoded as the period end column's JSON type. */
+            to: unknown;
         };
         /** @description Target-column assignment for a typed insert-source plan. */
         RowsInsertSourceAssignment: {
@@ -3906,8 +3923,16 @@ export interface components {
              * @default for_update
              * @enum {string}
              */
-            mode?: "for_update";
-            /** @default false */
+            mode?: "for_update" | "for_no_key_update";
+            /**
+             * @default wait
+             * @enum {string}
+             */
+            wait_policy?: "wait" | "nowait" | "skip_locked";
+            /**
+             * @deprecated
+             * @default false
+             */
             skip_locked?: boolean;
             /**
              * Format: int64
@@ -3932,11 +3957,10 @@ export interface components {
         /**
          * @description Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
          *     `{ "value": ... }`, or an operator node such as
-         *     `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-         *     include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`,
-         *     `greatest`, `least`, numeric
-         *     `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
-         *     `string_to_array`, and searched `case` with `cases` and `else`.
+         *     `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+         *     operators are the shared row-local expression surface used by schema
+         *     predicates, mutation expressions, query projections, filters, grouping,
+         *     ordering, and SQL lowering.
          *     Mutation expressions may set `source` to `existing` or `proposed`; query
          *     expressions use the default row source.
          */
@@ -3944,7 +3968,7 @@ export interface components {
         RowsExpressionField: {
             field: string;
             /** @enum {string} */
-            source?: "row" | "existing" | "proposed";
+            source?: "row" | "existing" | "proposed" | "source";
         };
         RowsExpressionValue: {
             /** @description Literal JSON value for a value node. */
@@ -3952,15 +3976,15 @@ export interface components {
         };
         RowsExpressionOperator: {
             /** @enum {string} */
-            op: "now" | "coalesce" | "lower" | "upper" | "trim" | "replace" | "concat" | "length" | "nullif" | "greatest" | "least" | "abs" | "round" | "floor" | "ceil" | "add" | "sub" | "mul" | "div" | "interval_ns" | "cast" | "json_extract" | "array_length" | "string_to_array" | "case";
+            op: "now" | "coalesce" | "lower" | "upper" | "trim" | "btrim" | "ltrim" | "rtrim" | "replace" | "translate" | "substring" | "substr" | "overlay" | "split_part" | "strpos" | "left" | "right" | "lpad" | "rpad" | "repeat" | "reverse" | "starts_with" | "ends_with" | "ascii" | "chr" | "md5" | "like" | "ilike" | "bool_and" | "and" | "bool_or" | "or" | "bool_not" | "not" | "concat" | "concat_ws" | "length" | "char_length" | "character_length" | "octet_length" | "nullif" | "greatest" | "least" | "abs" | "round" | "trunc" | "floor" | "ceil" | "sqrt" | "sign" | "power" | "add" | "sub" | "mul" | "div" | "mod" | "interval_ns" | "interval_months" | "date_trunc" | "date_bin" | "date_part" | "extract" | "cast" | "json_extract" | "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path" | "jsonb_extract_path_text" | "json_typeof" | "jsonb_typeof" | "json_array_length" | "jsonb_array_length" | "array_length" | "cardinality" | "array_position" | "array_positions" | "array_append" | "array_prepend" | "array_cat" | "array_remove" | "array_replace" | "array_to_string" | "string_to_array" | "uuid_v4" | "gen_random_uuid" | "uuid_generate_v4" | "json_build_object" | "jsonb_build_object" | "to_jsonb" | "json_path_exists" | "regexp_replace" | "case";
             /** @description Operand expressions for operator nodes. */
             args?: components["schemas"]["RowsExpression"][];
             /**
              * @description Cast target for `cast`.
              * @enum {string}
              */
-            to?: "text" | "numeric" | "bool" | "boolean";
-            /** @description Structured JSON path for `json_extract`. */
+            to?: "text" | "numeric" | "bool" | "boolean" | "datetime";
+            /** @description Structured JSON path for `json_extract` and `json_path_exists`. */
             path?: unknown;
             /** @description Return JSON path extraction as text. */
             as_text?: boolean;
@@ -4152,8 +4176,10 @@ export interface components {
             field_aliases?: components["schemas"]["RowsFieldAliasProjection"][];
             /** @description Typed row-expression projections. */
             expressions?: components["schemas"]["RowsExpressionProjection"][];
-            /** @description Ordered row identity fields used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. */
+            /** @description Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`. */
             distinct_on?: string[];
+            /** @description Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match. */
+            distinct_on_expressions?: components["schemas"]["RowsExpression"][];
             order_by?: components["schemas"]["RowsQueryOrder"][];
             /** Format: int64 */
             limit?: number;
@@ -4356,23 +4382,47 @@ export interface components {
             ranges?: components["schemas"]["RowsDocKeyRange"][];
             window: components["schemas"]["RowsWindowRequest"];
         };
-        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`. */
+        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`. */
         RowsJoinPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            /** @description Optional source table for the left side. Omitted or empty uses the endpoint table. */
+            left_table?: string;
+            /** @description Optional source table for the right side. Omitted or empty uses the endpoint table. */
+            right_table?: string;
             left_ranges?: components["schemas"]["RowsDocKeyRange"][];
             right_ranges?: components["schemas"]["RowsDocKeyRange"][];
             join: components["schemas"]["RowsJoinRequest"];
         };
-        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`. */
+        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`. */
         RowsLateralPlanRequest: {
             ctes?: components["schemas"]["RowsCte"][];
+            /** @description Optional source table for the left side. Omitted or empty uses the endpoint table. */
+            left_table?: string;
+            /** @description Optional source table for the right side. Omitted or empty uses the endpoint table. */
+            right_table?: string;
             left_ranges?: components["schemas"]["RowsDocKeyRange"][];
             right_ranges?: components["schemas"]["RowsDocKeyRange"][];
             lateral: components["schemas"]["RowsLateralRequest"];
         };
+        /** @description Typed column metadata emitted by a native relational read plan. */
+        RowsResultColumn: {
+            /** @description Public result-object field name. */
+            name: string;
+            /** @description Source path represented by this result field. */
+            path: string;
+            /** @description Antfly scalar/container type for the result field. */
+            type: string;
+            /** @description Item type when `type` is `array`. */
+            array_item_type?: string | null;
+            /** @description Optional source collation metadata for source-backed text or keyword result fields. */
+            collation?: string | null;
+            /** @description Whether the result field may be null. */
+            nullable: boolean;
+        };
         RowsQueryResultSet: {
             /** Format: int64 */
             total?: number;
+            result_schema?: components["schemas"]["RowsResultColumn"][];
             rows?: {
                 [key: string]: unknown;
             }[];
@@ -4380,6 +4430,7 @@ export interface components {
         RowsAggregateResultSet: {
             /** Format: int64 */
             total_groups?: number;
+            result_schema?: components["schemas"]["RowsResultColumn"][];
             rows?: {
                 [key: string]: unknown;
             }[];
@@ -4387,6 +4438,7 @@ export interface components {
         RowsStreamResultSet: {
             /** Format: int64 */
             total_rows?: number;
+            result_schema?: components["schemas"]["RowsResultColumn"][];
             rows?: {
                 [key: string]: unknown;
             }[];
@@ -8120,6 +8172,10 @@ export interface components {
             /**
              * @description A valid JSON Schema defining the document's structure.
              *     This is used to infer indexing rules and field types.
+             *     Relational-mode scalar properties may include optional
+             *     `collation` metadata. The metadata is preserved in the
+             *     durable relational column catalog and reported on result
+             *     schemas for source-backed text/keyword fields.
              */
             schema?: {
                 [key: string]: unknown;
@@ -8196,6 +8252,8 @@ export interface components {
             table?: string;
             /** @description Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint. */
             columns?: string[];
+            /** @description Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints. */
+            period?: string;
         };
         /** @description Relational foreign-key constraint. */
         ForeignKey: {
@@ -8203,6 +8261,8 @@ export interface components {
             name?: string;
             /** @description Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple. */
             columns?: string[];
+            /** @description Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints. */
+            period?: string;
             references?: components["schemas"]["ForeignKeyReference"];
             /**
              * @description Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
@@ -8229,10 +8289,28 @@ export interface components {
              */
             validation_state?: "enforced" | "unvalidated";
         };
+        /** @description Application-time period over a start and end column. */
+        RelationalPeriod: {
+            /** @description Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans. */
+            name: string;
+            /** @description Inclusive period start column. */
+            start_column: string;
+            /** @description Exclusive period end column. */
+            end_column: string;
+            /**
+             * @description Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+             * @enum {string}
+             */
+            range_type?: "numrange" | "daterange" | "tsrange" | "tstzrange";
+        };
         /** @description Relational primary-key constraint. */
         PrimaryKey: {
+            /** @description Optional durable primary-key constraint name used by DDL and conflict-target resolution. */
+            name?: string;
             /** @description Primary-key columns. One or more ordered required non-json relational columns are supported. */
             columns?: string[];
+            /** @description Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness. */
+            without_overlaps_period?: string;
         };
         /** @description Relational unique constraint. */
         UniqueConstraint: {
@@ -8240,6 +8318,23 @@ export interface components {
             name?: string;
             /** @description Unique columns. One or more ordered non-json relational columns are supported. */
             columns?: string[];
+            /** @description Stable expression keys supported by unique-owner maintenance. */
+            expressions?: {
+                /** @enum {string} */
+                op: "lower" | "upper" | "md5";
+                field: string;
+            }[];
+            /** @description Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness. */
+            without_overlaps_period?: string;
+            /** @description Field-only partial unique predicate shorthand. */
+            where?: components["schemas"]["RowsUniquePredicateGroup"];
+            /** @description Deterministic row-expression predicates that decide whether a row participates in this unique constraint. */
+            where_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /**
+             * @description Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+             * @enum {string}
+             */
+            validation_state?: "enforced" | "unvalidated";
         };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
@@ -8296,6 +8391,10 @@ export interface components {
              *     `on_update: "restrict"` and `on_update: "no_action"` are accepted
              *     as parent-key update checks, and mutating `set_null`/`cascade`
              *     update actions are supported where owner topology is configured.
+             *     Temporal foreign keys with `period` on both child and parent
+             *     references are restrictive-only: `restrict` / `no_action` are
+             *     accepted, while mutating `set_null` / `cascade` actions are rejected
+             *     because period coverage is validated as range ownership.
              *     `match: "simple"` is the default; `full` is accepted for composite
              *     nullable references, and `partial` is rejected until row-subset
              *     parent matching is implemented.
@@ -8303,6 +8402,12 @@ export interface components {
              *     Unsupported shapes are rejected during schema validation.
              */
             foreign_keys?: components["schemas"]["ForeignKey"][];
+            /**
+             * @description Application-time period declarations over two numeric or datetime
+             *     relational columns. SQL `PERIOD FOR name (start, end)` and range
+             *     column temporal DDL lower into this metadata.
+             */
+            periods?: components["schemas"]["RelationalPeriod"][];
             /**
              * @description Relational-mode primary key over one or more ordered declared
              *     non-json relational columns. Every component must be required and

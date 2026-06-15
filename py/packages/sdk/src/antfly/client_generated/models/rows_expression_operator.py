@@ -26,17 +26,16 @@ class RowsExpressionOperator:
         args (list[RowsExpressionField | RowsExpressionOperator | RowsExpressionValue] | Unset): Operand expressions for
             operator nodes.
         to (RowsExpressionOperatorTo | Unset): Cast target for `cast`.
-        path (Any | Unset): Structured JSON path for `json_extract`.
+        path (Any | Unset): Structured JSON path for `json_extract` and `json_path_exists`.
         as_text (bool | Unset): Return JSON path extraction as text.
         cases (list[RowsExpressionCaseBranch] | Unset): Searched case branches, each with `when` and `then`.
         else_ (RowsExpressionField | RowsExpressionOperator | RowsExpressionValue | Unset): Shared typed row-expression
             AST. A node is exactly one of `{ "field": "name" }`,
             `{ "value": ... }`, or an operator node such as
-            `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators
-            include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`,
-            `greatest`, `least`, numeric
-            `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`,
-            `string_to_array`, and searched `case` with `cases` and `else`.
+            `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+            operators are the shared row-local expression surface used by schema
+            predicates, mutation expressions, query projections, filters, grouping,
+            ordering, and SQL lowering.
             Mutation expressions may set `source` to `existing` or `proposed`; query
             expressions use the default row source.
     """

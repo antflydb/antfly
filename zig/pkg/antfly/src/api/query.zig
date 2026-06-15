@@ -4655,6 +4655,152 @@ test "query merge preserves failed graph metric status across shard fan-in" {
         },
     }};
     try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &fresh_graph_metric_queries }, &.{ left, right }, 0, 10));
+
+    const hits_left_authority_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_left_authority_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.9 };
+    const hits_left_hub_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_left_hub_scores[0] = .{ .node = try alloc.dupe(u8, "doc:c"), .score = 0.75 };
+    const hits_left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    hits_left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "authority"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_authority"),
+        .scores = hits_left_authority_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_authority"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    hits_left_metrics[1] = .{
+        .name = try alloc.dupe(u8, "hub"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_hub"),
+        .scores = hits_left_hub_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_hub"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var hits_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = hits_left_metrics,
+    };
+    defer hits_left.deinit();
+
+    const hits_right_authority_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_right_authority_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const hits_right_hub_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_right_hub_scores[0] = .{ .node = try alloc.dupe(u8, "doc:d"), .score = 0.65 };
+    const hits_right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    hits_right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "authority"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_authority"),
+        .scores = hits_right_authority_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_authority"),
+            .state = .failed,
+            .published_generation = 8,
+            .edge_generation = 9,
+            .target_edge_generation = 9,
+            .building_generation = 9,
+            .retry_count = 2,
+            .last_error = try alloc.dupe(u8, "authority shard failed"),
+            .progress = 0.5,
+            .converged = true,
+        },
+    };
+    hits_right_metrics[1] = .{
+        .name = try alloc.dupe(u8, "hub"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_hub"),
+        .scores = hits_right_hub_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_hub"),
+            .state = .failed,
+            .published_generation = 8,
+            .edge_generation = 9,
+            .target_edge_generation = 9,
+            .building_generation = 9,
+            .retry_count = 2,
+            .last_error = try alloc.dupe(u8, "hub shard failed"),
+            .progress = 0.5,
+            .converged = true,
+        },
+    };
+    var hits_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = hits_right_metrics,
+    };
+    defer hits_right.deinit();
+
+    const hits_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        },
+        .{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        },
+    };
+    var hits_merged = try mergeSearchResults(alloc, .{ .graph_metric_queries = &hits_metric_queries }, &.{ hits_left, hits_right }, 0, 10);
+    defer hits_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hits_merged.graph_metric_results.len);
+    for (hits_merged.graph_metric_results) |metric_result| {
+        try std.testing.expectEqual(@as(usize, 2), metric_result.scores.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, metric_result.status.state);
+        try std.testing.expectEqual(@as(u64, 8), metric_result.status.published_generation);
+        try std.testing.expectEqual(@as(u64, 9), metric_result.status.target_edge_generation);
+        try std.testing.expectEqual(@as(u64, 9), metric_result.status.building_generation);
+        try std.testing.expectEqual(@as(u32, 2), metric_result.status.retry_count);
+    }
+
+    const fresh_hits_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        },
+        .{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &fresh_hits_metric_queries }, &.{ hits_left, hits_right }, 0, 10));
 }
 
 test "query merge requires comparable graph search metric generations across shards" {

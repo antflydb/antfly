@@ -242,6 +242,10 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn deinitPreserveLease(self: *@This()) void {
+        self.* = undefined;
+    }
+
     pub fn start(self: *@This()) !void {
         if (self.config.enabled and self.config.start_background_loop) return error.UnsupportedPlatform;
     }
@@ -324,7 +328,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
-    pub fn deinit(self: *GraphMetricRuntime) void {
+    fn stopRuntime(self: *GraphMetricRuntime) void {
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
@@ -336,7 +340,18 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             if (self.future) |*future| _ = future.await(io);
         }
         self.future = null;
+    }
+
+    pub fn deinit(self: *GraphMetricRuntime) void {
+        self.stopRuntime();
         self.ownership.deinit(self.alloc);
+        self.alloc.free(self.lease_key);
+        self.* = undefined;
+    }
+
+    pub fn deinitPreserveLease(self: *GraphMetricRuntime) void {
+        self.stopRuntime();
+        self.ownership.deinitPreserveLease(self.alloc);
         self.alloc.free(self.lease_key);
         self.* = undefined;
     }

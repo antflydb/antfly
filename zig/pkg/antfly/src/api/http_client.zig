@@ -246,20 +246,22 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
         const path = if (fields) |field_list|
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.documents_marker,
-                key,
+                routes.Routes.lookup_marker,
+                encoded_key,
                 field_list,
             })
         else
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.documents_marker,
-                key,
+                routes.Routes.lookup_marker,
+                encoded_key,
             });
         defer self.alloc.free(path);
         const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
@@ -289,20 +291,22 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
+        const encoded_key = try percentEncodePathComponent(self.alloc, key);
+        defer self.alloc.free(encoded_key);
         const suffix = if (fields) |field_list|
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}?fields={s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.documents_marker,
-                key,
+                routes.Routes.lookup_marker,
+                encoded_key,
                 field_list,
             })
         else
             try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
                 routes.Routes.tables_prefix,
                 table_name,
-                routes.Routes.documents_marker,
-                key,
+                routes.Routes.lookup_marker,
+                encoded_key,
             });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
@@ -490,6 +494,61 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupTemporalUniqueOwner(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !TablesResponse {
+        return try self.fetchGroupTemporalUniqueOwnerWithSuffix(base_uri, group_id, table_name, routes.Routes.temporal_unique_owner_suffix, body);
+    }
+
+    pub fn fetchGroupTemporalUniqueOverlapOwner(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !TablesResponse {
+        return try self.fetchGroupTemporalUniqueOwnerWithSuffix(base_uri, group_id, table_name, routes.Routes.temporal_unique_overlap_owner_suffix, body);
+    }
+
+    fn fetchGroupTemporalUniqueOwnerWithSuffix(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        suffix_name: []const u8,
+        body: []const u8,
+    ) !TablesResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            suffix_name,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }

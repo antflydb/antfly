@@ -70,6 +70,12 @@ pub const State = struct {
         self.* = undefined;
     }
 
+    pub fn deinitPreserveLease(self: *State, alloc: Allocator) void {
+        self.lease.deinit();
+        alloc.free(self.owner_id);
+        self.* = undefined;
+    }
+
     pub fn ensureLease(self: *State, now_ms: u64) !bool {
         if (!self.lease_owned) {
             self.has_lease = true;
@@ -104,6 +110,13 @@ pub const State = struct {
 
     pub fn release(self: *State) void {
         if (self.lease_owned and self.has_lease) {
+            _ = self.lease.release(self.owner_id) catch false;
+        }
+        self.has_lease = !self.lease_owned;
+    }
+
+    pub fn releaseHeldLease(self: *State) void {
+        if (self.lease_owned) {
             _ = self.lease.release(self.owner_id) catch false;
         }
         self.has_lease = !self.lease_owned;

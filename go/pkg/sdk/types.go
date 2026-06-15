@@ -215,6 +215,7 @@ type (
 	RowsMutationSourceRequest                 = oapi.RowsMutationSourceRequest
 	RowsMutationSourceRequestOp               = oapi.RowsMutationSourceRequestOp
 	RowsMutationSourceResultSet               = oapi.RowsMutationSourceResultSet
+	RowsResultColumn                          = oapi.RowsResultColumn
 	RowsQueryResultSet                        = oapi.RowsQueryResultSet
 	RowsAggregateResultSet                    = oapi.RowsAggregateResultSet
 	RowsStreamResultSet                       = oapi.RowsStreamResultSet

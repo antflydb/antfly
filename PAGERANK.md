@@ -1111,9 +1111,15 @@ Current implementation progress:
   coordinator/worker owners without exposing public job resources. Direct
   runtime-owner lease cleanup coverage now also verifies that clean runtime
   shutdown removes the durable lease record, while stale-owner shutdown after
-  takeover preserves the replacement owner's lease record. Broader
-  attempt-scoped output adoption and remote production multi-worker
-  orchestration remain future work.
+  takeover preserves the replacement owner's lease record. PageRank-style scan
+  pages now use the same attempt-scoped output adoption pattern as contribution
+  pages and degree scan pages: partial out-degree/node output is written under
+  the current page attempt, is invisible to phase aggregation until that attempt
+  completes, and stale workers cannot adopt or mutate abandoned scan output
+  after another worker reclaims the lease. Reclaimed PageRank, eigenvector, and
+  HITS scan-page tests prove abandoned scan-attempt output remains isolated
+  until the replacement attempt completes and publishes its own scan partials.
+  Broader remote production multi-worker orchestration remains future work.
 
 ### Phase 3: More Graph Metrics
 
@@ -1444,8 +1450,25 @@ Current implementation progress:
   top-k. `metric_freshness: "fresh"` is enforced again at fan-in, so a shard
   response that reports stale/building/failed status for a fresh direct metric
   request is rejected instead of being merged. This establishes the
-  deterministic direct-metric merge contract; distributed metric jobs and
-  globally comparable published generations remain future work.
+  deterministic direct-metric merge contract. Focused merge coverage now also
+  verifies paired HITS authority/hub results preserve the last compatible
+  published generation when a shard reports a failed rebuild, while `fresh`
+  fails closed. Hosted cross-range coverage now proves compatible published
+  shard generations merge through the table-read source and that unpublished or
+  incompatible shard generations are rejected before ranking. The hosted
+  table-read gate now also includes a nonuniform eight-shard degree/PageRank/
+  eigenvector layout so every shard contributes a published metric score through
+  the real cross-range reader. Four of those hosted shards are also advanced
+  into a newer building generation with unpublished high-score targets;
+  `published` fan-in still merges only the prior target scores and `fresh` fails
+  closed for all three single-vector-style metrics. Separate hosted active-stale
+  coverage still exercises direct top-k, traversal
+  projection/order/filter, and search rerank while `fresh` fails closed, plus
+  hosted compatible HITS authority/hub pair merge and incompatible remote HITS
+  pair and missing-status rejection.
+  This narrows the gap between focused CI fan-in and promotion-scale shard evidence.
+  Distributed metric jobs and promotion-scale globally comparable published
+  generations remain future work.
 - Distributed graph-query fan-in now applies the same fail-closed generation
   rule to score-bearing graph metric reads. When a graph query requests metric
   projection, metric ordering, or metric filtering, every shard must return the
@@ -1481,7 +1504,12 @@ Current implementation progress:
   score, and published metric generation used for that hit. Richer expression
   support remains future work. Search rerank coverage now also proves an active
   planned rebuild cannot leak building output: published rerank uses the prior
-  generation and reports building status, while fresh rerank fails closed.
+  generation and reports building status, while fresh rerank fails closed. The
+  table-read shard serializer now carries representable single-metric
+  `graph_metric` reads and `graph_metric_rerank` requests so hosted remote
+  shards do not silently lose those public read surfaces; multi-metric internal
+  HITS fan-in remains a merge-contract gate until a public multi-metric wire
+  shape is introduced.
 
 ### Phase 7: Compatibility and Migration
 
@@ -1717,7 +1745,12 @@ configuration, not only through manually constructed runtimes:
   or lease loss. They must also report either a runtime-owner lease acquisition
   or an explicit lease-acquisition failure, so a role summary cannot silently
   omit ownership accounting. The harness rejects any non-null `last_error_name` before
-  accepting the typed summary. The same raw-field guard now runs over both
+  accepting the typed summary. Its final release-gate summary emits required
+  and observed coverage counts for every remote-owner category, including
+  separate service multi-page coordinator-takeover and worker-pool-takeover
+  counts, before setting `remote_owner_release_gate: true`, so release tooling
+  can audit the process gate from one JSON event. The same raw-field guard now
+  runs over both
   standalone role summaries and aggregate supervisor/launcher summaries,
   recursively rejecting operational JSON fields such as metric/index names,
   target generations, job/page ids, attempt namespaces, storage paths/prefixes,
@@ -1749,7 +1782,7 @@ The remaining stages should land in this order:
 | 3. Remote process orchestration | Real coordinator and worker processes use the same durable boundaries. | Coordinators tick only build startup/barriers/publish/failure/cleanup. Workers tick only page claims and execution by index/metric name. No worker receives metric config from a caller. Communication is durable graph-index job/page state plus leases. | Killing a worker abandons only its page/runtime lease; a replacement for the same worker identity takes over after expiry without duplicating page output; duplicate/racing coordinators cannot double-publish or append incompatible phases. |
 | 4. Failure and restart matrix | PageRank becomes the reference distributed failure matrix; eigenvector and HITS catch up. | Cover reopen, expired lease, reclaimed output, same-worker cursor resume, failed page retry, exhausted attempts, publish verifier failure, cleanup resume, and prior-generation preservation across prepare, scan, initialize, contribution, reduce, convergence, publish, and cleanup. | Failed or abandoned rebuilds preserve the prior published generation or compatible HITS pair. Every output-writing phase either resumes from cursor, recomputes safely, or adopts attempt-scoped output only after completion. |
 | 5. Attempt-output policy | Attempt namespaces are used only where correctness or cost needs them. | Deterministic recompute remains the default. Use attempt-scoped output for contribution-like phases and any reduce-like phase whose partial output can be consumed too early, cannot be atomically replaced cheaply, or is too expensive to recompute at production scale. | Later phases read only adopted output. Abandoned attempts are invisible to readers and removed by cleanup. Reduce-phase adoption is added only when tests prove stale-output or recompute risk. |
-| 6. HITS paired-vector hardening | HITS becomes production-ready as the paired-vector proof. | Authority and hub stay separate named metric scores, but compatible configs share one target generation, convergence decision, failure decision, and atomic publish. Hub contribution and hub reduce/norm remain explicit retryable phases, and local lifecycle coverage now proves reclaim, failed-page/exhausted-attempt handling, publish failure, cleanup resume, parity, and stale-read behavior preserve the previous compatible pair. | Remote HITS builds are not enabled by default until promotion-scale fan-in, deployment-scale owner evidence, larger manifest restart evidence, operations evidence, and larger-graph latency all preserve the previous compatible pair. |
+| 6. HITS paired-vector hardening | HITS becomes production-ready as the paired-vector proof. | Authority and hub stay separate named metric scores, but compatible configs share one target generation, convergence decision, failure decision, and atomic publish. Hub contribution and hub reduce/norm remain explicit retryable phases, and local lifecycle coverage now proves reclaim, failed-page/exhausted-attempt handling, publish failure, cleanup resume, larger-manifest restart across reopen boundaries, parity, and stale-read behavior preserve the previous compatible pair. | Remote HITS builds are not enabled by default until promotion-scale fan-in, deployment-scale owner evidence, operations evidence, and larger-graph latency all preserve the previous compatible pair. |
 | 7. Public read and fan-in gates | Every score-bearing query path proves the same freshness contract. | Direct top-k, traversal projection/order/filter, graph search rerank, explain/profile, and cross-shard fan-in resolve scores only through complete published generations. Active job output, failed attempts, and abandoned generations stay unqueryable. | `published` reads use the latest complete generation during queued/building/failed rebuilds. `fresh` fails with `MetricNotReady` or `MetricStale`. Cross-shard direct metric and graph-search fan-in reject unsolicited or unrequested score/status surfaces, extra unrequested graph metric status names, missing, zero, stale, duplicate/ambiguous graph requests, projected metric requests, graph order metric requests, graph-search node/hit result ownership, or score-node ownership, malformed graph-search traversal/path-shape/node/hit metric payloads or internally inconsistent rerank score details, including mismatched request weights, missing-score semantics, or final-score formula, non-finite traversal distances, path weights, metric/rerank scores, or status numbers, out-of-range progress, mismatched index/metric/status identity, incompatible metadata version or edge filter, invalid state/generation combinations such as `fresh` status pointing at a newer current or target edge generation than the published scores, or incompatible published generations when comparability is required. |
 | 8. Cleanup and operations | Cleanup becomes a production invariant, not best-effort housekeeping. | V1 aggressively removes completed job namespaces, abandoned attempts, unpublished scores, manifests, pages, summaries, and old generations when snapshot-safe. Pause/resume/manual retry/priority/retention remain future admin controls. | Cleanup resumes after restart, never hides the current published generation, bounds diagnostics, and prevents unbounded storage growth without requiring a public retention knob. |
 | 9. Per-family promotion | Planned/distributed execution becomes default by metric family. | Keep local runners as deterministic CI/debug oracles. Promote degree and PageRank first, eigenvector after single-vector restart/failure parity, and HITS last after paired-vector production coverage. | Each family has local-vs-planned parity, remote-worker coverage, restart/failure coverage, cleanup coverage, public freshness coverage, cross-shard coverage, and operations docs before default promotion. |
@@ -1867,8 +1900,8 @@ with current implementation status and test coverage.
 | 1. Promote planned maintenance safely | Existing reads and writes behave the same. `runUntilIdle` and background schedulers may make bounded graph-metric progress, but unfinished planned work is resumable maintenance, not a user-visible failure. | Route scheduler-style work through one bounded planned-maintenance primitive. Keep the conservative `auto` gate: planned mode is allowed for already-active planned work and safe small cases, while broader larger-graph and multi-metric workloads remain gated until latency is proven. | Degree, PageRank, eigenvector, and paired HITS can drain through planned maintenance with tiny-budget resume coverage; default promotion waits for latency-safe budgets and query/read latency evidence. |
 | 2. Turn the runtime into production orchestration | Users still see graph-index metric status, not worker controls. Operational status can show role, owner, phase, page progress, cursor presence, and last error summaries. | Replace same-process runtime ownership with real coordinator and worker processes. Coordinators start/resume jobs, advance barriers, append dynamic iteration pages, publish, fail, and schedule cleanup. Workers only claim pages, renew leases, persist cursors, write page output, complete/fail pages, and stop. | Independent worker processes complete one generation through durable graph-index state only; killing a worker abandons only its lease; another worker reclaims after expiry; duplicate coordinators cannot double-publish or append incompatible phases. |
 | 3. Close the restart/failure matrix | `published` keeps returning the latest complete generation during queued, building, or failed rebuilds. `fresh` fails closed with `MetricNotReady` before first publish and `MetricStale` after newer graph writes. | Treat PageRank as the baseline matrix, then bring eigenvector and HITS to the same standard across prepare, scan, initialize, contribution, reduce, convergence, publish, and cleanup. Cover reopen, lease expiry, reclaimed output, failed pages, exhausted attempts, publish failure, cleanup resume, and prior-generation preservation. | Failed or abandoned builds never hide the latest published generation or compatible HITS pair. Every durable-output phase either resumes from cursor, safely recomputes, or adopts attempt-scoped output only after page completion. |
-| 4. Harden HITS paired-vector partitioning | Authority and hub remain separate named metric scores, but they publish, fail, and report compatibility as one pair for a target generation. There is no separate HITS job API. | HITS now has explicit retryable phases for authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, paired publish, and paired cleanup. Lifecycle-gated local coverage proves reclaim, exhausted attempts, publish failure, cleanup resume, paired failure preservation, paired publish idempotence, and local/planned parity. The remaining work is larger manifest restart tests, production remote-worker evidence, promotion-scale fan-in, and latency data before large remote HITS builds are enabled. | Authority and hub pages are independently retryable, but publish and failure stay atomic for the compatible pair. Either side failing preserves the previous pair. |
-| 5. Harden every public read gate | Building output is invisible through direct metric top-k, traversal projection/order/filter, search rerank, explain/profile output, and cross-shard fan-in. | Resolve all score-bearing query paths through published generation pointers and compatibility checks. Failed attempt output, abandoned generations, and active job namespaces remain unqueryable. Cross-shard merge validates compatible nonzero published generations before combining scores. The graph-metric lifecycle gate now also runs the fast-root query/profile/fan-in checks for direct metric top-k, traversal status/order/filter, rerank details, failed status preservation, malformed shard payload rejection, status-generation comparability, and profile generation reporting. The dedicated `graph-metric-fan-in-test` gate combines those fast merge/profile checks with hosted cross-range graph metric fan-in coverage. | Public e2e coverage proves `published`, `fresh`, `MetricNotReady`, and `MetricStale` behavior for direct reads, graph traversal/search integration, status, and distributed fan-in. Promotion-scale shard layouts stay a separate release gate. |
+| 4. Harden HITS paired-vector partitioning | Authority and hub remain separate named metric scores, but they publish, fail, and report compatibility as one pair for a target generation. There is no separate HITS job API. | HITS now has explicit retryable phases for authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, paired publish, and paired cleanup. Lifecycle-gated local coverage proves reclaim, exhausted attempts, publish failure, cleanup resume, larger-manifest restart across reopen boundaries, paired failure preservation, paired publish idempotence, and local/planned parity. The remaining work is production remote-worker evidence, promotion-scale fan-in, operations evidence, and latency data before large remote HITS builds are enabled. | Authority and hub pages are independently retryable, but publish and failure stay atomic for the compatible pair. Either side failing preserves the previous pair. |
+| 5. Harden every public read gate | Building output is invisible through direct metric top-k, traversal projection/order/filter, search rerank, explain/profile output, and cross-shard fan-in. | Resolve all score-bearing query paths through published generation pointers and compatibility checks. Failed attempt output, abandoned generations, and active job namespaces remain unqueryable. Cross-shard merge validates compatible nonzero published generations before combining scores. The graph-metric lifecycle gate now also runs the fast-root query/profile/fan-in checks for direct metric top-k, traversal status/order/filter, rerank details, failed status preservation, paired HITS failed-status preservation, malformed shard payload rejection, status-generation comparability, and profile generation reporting. The dedicated `graph-metric-fan-in-test` gate combines those fast merge/profile checks with hosted cross-range graph metric fan-in coverage for compatible published shard merges, unpublished and incompatible shard rejection, a nonuniform eight-shard hosted degree/PageRank/eigenvector direct merge layout with four active/stale shards that keep unpublished high-score targets invisible and make `fresh` fail closed, active-stale hosted degree/PageRank/eigenvector traversal projection/order/filter and search rerank published merge plus fresh rejection, compatible HITS authority/hub hosted merge with active/stale prior-pair preservation and fresh rejection, incompatible remote HITS pair rejection, and missing remote HITS status rejection. | Public e2e coverage proves `published`, `fresh`, `MetricNotReady`, and `MetricStale` behavior for direct reads, graph traversal/search integration, status, and distributed fan-in. Full promotion-scale shard layouts stay a separate release gate. |
 | 6. Finish cleanup and operational defaults | V1 keeps aggressive cleanup semantics: latest published generation is retained; completed, failed, abandoned, and unpublished build state is removed when snapshot-safe. Future retention is a bounded admin/debug option, not query behavior. | Make cleanup a resumable phase for old score generations, completed job namespaces, abandoned attempts, manifests, pages, summaries, and bounded failed diagnostics. Keep lease timing, backoff, max attempts, pause/resume, priority, and manual retry as internal/admin concerns until production behavior is stable. | Cleanup resumes after restart, storage does not grow without bound, diagnostics remain bounded, and no retention knob is required for correctness. |
 | 7. Promote by metric family | Public metric behavior stays stable while the executor changes behind internal gates. | Keep local runners as deterministic CI/debug oracles. Promote degree and PageRank first, eigenvector after single-vector restart/failure parity, and HITS last after paired partitioning and paired failure coverage. | Each family has local-vs-planned parity, restart, cleanup, freshness, cross-shard, operations, and remote-worker coverage before planned/distributed execution becomes the default. |
 
@@ -2099,7 +2132,7 @@ Implementation design should move one ownership boundary at a time:
 | M2. Remote ownership boundary | Users still see graph-index metric status, not job submission or worker controls. Operational status can show role, owner hash, phase, iteration, page counts, cursor presence, attempt, and last error. | Replace same-process runtime roles with independently owned coordinator and worker processes. Coordinators start builds, advance barriers, append iteration pages, publish, fail, and schedule cleanup. Workers claim page leases, renew, persist cursors, write deterministic output, complete/fail pages, and stop. | Killing a worker abandons only its page lease; another worker reclaims after expiry; duplicate coordinators cannot publish twice or append incompatible phase pages; no worker needs caller-supplied metric config. |
 | M3. Failure and restart matrix | `published` reads keep returning the prior generation during queued, building, and failed rebuilds. `fresh` fails closed until the current edge generation has published. | Finish restart, lease-expiry, reclaimed-output, exhausted-attempt, publish-failure, cleanup-resume, and prior-generation-preservation tests across PageRank first, then eigenvector, then HITS. | Every output-writing phase either resumes from cursor, recomputes safely, or adopts attempt-scoped output only after page completion. Failed builds preserve the previous generation or compatible HITS pair. |
 | M4. Attempt-scoped output policy | No user configuration. Attempt storage is an internal correctness and cost-control mechanism. | Keep deterministic recompute as the default. Use attempt namespaces only where partial output can be consumed by later phases, cannot be atomically replaced cheaply, or is too expensive to recompute at production scale. | Later phases read only adopted output; abandoned attempts are invisible to readers; cleanup removes adopted and abandoned attempt namespaces without growing storage unboundedly. |
-| M5. HITS paired-vector hardening | Authority and hub remain separate named metrics, but compatible configs publish, fail, and report freshness as one pair. | HITS now has explicit retryable authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, paired publish, and paired cleanup phases. Direct process coverage now also exhausts a killed hub-reduce page attempt sequence, fails the compatible pair once, and proves a duplicate coordinator cannot fail it again. Lifecycle-gated local coverage now covers active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, cleanup resume after reopen, failed-build preservation, publish-failure preservation, local/planned parity, and failed public-read preservation. Finish larger manifest restart tests, production remote-worker evidence, promotion-scale fan-in, and latency data before remote HITS is enabled by default. | Authority and hub pages can retry independently, while publish/failure remains atomic for the compatible pair and failed work preserves the previous pair. |
+| M5. HITS paired-vector hardening | Authority and hub remain separate named metrics, but compatible configs publish, fail, and report freshness as one pair. | HITS now has explicit retryable authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, paired publish, and paired cleanup phases. Direct process coverage now also exhausts a killed hub-reduce page attempt sequence, fails the compatible pair once, and proves a duplicate coordinator cannot fail it again. Lifecycle-gated local coverage now covers active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, cleanup resume after reopen, larger-manifest restart across reopen boundaries, failed-build preservation, publish-failure preservation, local/planned parity, and failed public-read preservation. Finish production remote-worker evidence, promotion-scale fan-in, operations evidence, and latency data before remote HITS is enabled by default. | Authority and hub pages can retry independently, while publish/failure remains atomic for the compatible pair and failed work preserves the previous pair. |
 | M6. Public read hardening | Direct top-k, traversal projection/order/filter, search rerank, explain/profile, and cross-shard fan-in all expose the same generation/freshness semantics. | Resolve every score-bearing path through published generation pointers, score metadata, and compatibility checks. Keep active job namespaces, abandoned attempts, and unpublished generations unqueryable. The lifecycle gate now includes fast-root query/profile/fan-in checks across direct metric, graph search, and rerank score surfaces, and the `graph-metric-fan-in-test` gate pairs them with hosted cross-range graph metric fan-in coverage. | Public e2e coverage proves `published`, `fresh`, `MetricNotReady`, `MetricStale`, building, failed, and cross-shard incompatible-generation behavior. Promotion-scale shard layouts remain separately qualified. |
 | M7. Cleanup and operations | V1 keeps aggressive cleanup. Future retention, pause/resume, manual retry, and priority controls are bounded admin/debug features, not query semantics. | Make cleanup a resumable phase for old score generations, completed jobs, failed/abandoned jobs, attempts, manifests, pages, summaries, and bounded diagnostics. Keep retry, lease, and backoff defaults internal until operational behavior is stable. | Cleanup resumes after restart, never deletes the current published generation, and prevents unbounded growth without requiring a user-facing retention knob. |
 | M8. Per-family promotion | Public metric behavior stays stable while the executor changes behind internal gates. | Promote degree and PageRank first, eigenvector after single-vector restart/failure parity, and HITS last after paired partitioning plus paired failure coverage. Keep local runners as CI/debug oracles until each family has release history. | Each promoted family has local-vs-planned parity, remote-worker, restart, cleanup, freshness, cross-shard, and operations coverage. |
@@ -2322,7 +2355,7 @@ Remaining delivery plan:
 | R1. Production worker ownership | Replace local drain-style execution with a real worker ownership model. Workers claim only durable page leases; the coordinator owns build startup, phase barriers, dynamic iteration planning, publish, failure, and cleanup. The first split now exists as public `GraphIndex` build ensure, metric-name worker-only page, metric-name coordinator, active-build failure, and planned-drain steps: coordinator startup creates or returns the active durable job/manifest for a target generation, worker-only page execution leaves phases and publish untouched until a coordinator step runs, coordinator/worker callers do not need to pass metric configs, the planned-drain loop alternates named workers through the metric-name worker boundary and coordinator boundary, coordinator failure requires the active lease/job pair and preserves the prior published generation or compatible HITS pair, cross-family public-boundary coverage proves degree, PageRank, eigenvector, and HITS workers cannot advance barriers or publish, public failure coverage spans all four metric families, reopened degree coordinator/worker handles can complete a generation through durable state, DB-level PageRank scheduler coverage now reopens a fresh DB handle for every coordinator, worker, and reader tick while completing the same active durable build, and DB-level PageRank/eigenvector/HITS coverage proves two fresh coordinator handles cannot duplicate a publish event or paired publish event, planned-maintenance coverage proves scheduler callers can drain background PageRank, degree, eigenvector, and paired HITS builds through one bounded primitive, tiny-budget planned-maintenance ticks now report exhaustion and resume to completion without treating unfinished work as an error, pending-work stats report queued and active graph-metric planned work for scheduler callers, role-configured runtime loops can run as combined, coordinator-only, worker-only, or worker-pool owners with role/owner identity visible in internal stats, PageRank/eigenvector/HITS split-runtime coordinator race coverage now proves lease-owned runtime coordinator roles cannot duplicate a publish event or compatible paired publish event, scheduler publish counters are emitted from coordinator sweeps rather than worker cleanup sweeps, duplicate degree coordinator ticks are idempotent across barriers and publish, PageRank/eigenvector/HITS reopened-coordinator publish-race coverage proves two separate coordinator owners still leave one publish event and one published generation or compatible pair, active split-runtime coverage proves distinct worker identities can hold independent runtime leases and complete separate active pages, duplicate worker owners for the same worker identity or worker-pool identity set are fenced before claiming page work, same-worker replacement ownership can take over after runtime lease expiry during active page work, a dead worker's scan-page lease can be reclaimed after expiry without losing published visibility, racing degree workers can lose a page lease without failing the build and retry through another worker tick, exhausted page attempts now make the coordinator record a failed active build, and status reports capped active page owner/attempt/cursor/error summaries from durable page records. Lease timeouts, attempt limits, and backoff stay internal defaults until production behavior is stable. | Remote workers can complete one generation without duplicate publish; killing a worker only reclaims its leased page; status reports active distributed page ownership without exposing raw key bytes. |
 | R2. Attempt-scoped output adoption | Keep deterministic overwrite as the default retry path, but add an executor capability for phases whose output is too expensive or risky to recompute. Degree scan and iterative contribution pages now use attempt namespaces: partial output remains invisible until page completion adopts it into the job namespace, and final cleanup removes abandoned attempt keys. Reduce phases should adopt the same capability as needed. | Page retries are safe for large contribution/reduce pages; abandoned attempts are cleaned; adoption does not expose partial output to readers; cleanup covers adopted and abandoned attempt namespaces. |
 | R3. Iterative restart matrix | Treat PageRank, eigenvector, and HITS as one restart matrix over prepare, scan, initialize, contribution, reduce, convergence, publish, and cleanup. PageRank, eigenvector, and paired HITS now include later-iteration failed-page retry plus exhausted-attempt coordinator failure after graph-index reopen that preserves the prior published generation or compatible authority/hub pair. All three iterative families also have publish-verifier failure coverage after reopen, with the coordinator recording failed build diagnostics instead of leaking an error or publishing partial output. | Restart/reopen tests exist at every phase and iteration boundary; expired/reclaimed pages either resume from cursor or recompute without stale partial output; failed rebuilds preserve the prior published generation or authority/hub pair. |
-| R4. Paired-vector completeness | Finish HITS as the paired-vector proof case. Authority and hub work share one target edge generation, compatible manifests, paired convergence metadata, and one atomic publish decision. Hub contribution and hub reduce/norm are now explicit retryable phases, hub raw contribution output is attempt-scoped, and active-rebuild authority/hub ranks stay invisible to direct top-k until paired publish. Lifecycle-gated local coverage now proves reclaim across authority/hub phases, paired publish failure, cleanup resume, failed-build preservation, exhausted hub-reduce pair failure, paired publish idempotence, and local/planned parity. The remaining work is larger manifest restart tests and true production remote-worker coverage before remote HITS builds are enabled. | HITS authority/hub output remains atomically visible; hub contribution/reduction work is partitioned into retryable pages; paired publish failure, cleanup resume, and stale-read behavior are covered. |
+| R4. Paired-vector completeness | Finish HITS as the paired-vector proof case. Authority and hub work share one target edge generation, compatible manifests, paired convergence metadata, and one atomic publish decision. Hub contribution and hub reduce/norm are now explicit retryable phases, hub raw contribution output is attempt-scoped, and active-rebuild authority/hub ranks stay invisible to direct top-k until paired publish. Lifecycle-gated local coverage now proves reclaim across authority/hub phases, paired publish failure, cleanup resume, larger-manifest restart after repeated reopen boundaries, failed-build preservation, exhausted hub-reduce pair failure, paired publish idempotence, and local/planned parity. The remaining work is true production remote-worker coverage before remote HITS builds are enabled. | HITS authority/hub output remains atomically visible; hub contribution/reduction work is partitioned into retryable pages; paired publish failure, cleanup resume, and stale-read behavior are covered. |
 | R5. Query and freshness gates | Keep the public API stable: named graph metrics, `published` freshness for latest complete output, `fresh` freshness for current edge generation, `MetricNotReady` before first publish, and `MetricStale` for stale published generations. Distributed execution must not leak building output into projections, order-by, direct top-k, search rerank, or cross-shard fan-in. | Public e2e coverage proves direct top-k, traversal projection/order/filter, search rerank, status, and cross-shard fan-in behavior for stale, fresh, failed, and building metrics. |
 | R6. Cleanup and retention hardening | Keep v1 cleanup aggressive: retain the latest published generation, remove completed job namespaces immediately when snapshot safety allows, delete failed/abandoned build output, and keep only bounded diagnostics. Future retention is an opt-in debug/admin feature, not part of query semantics. | Completed, failed, reclaimed, and abandoned jobs do not grow storage without bound; cleanup can resume after restart without hiding published output; future retention knobs remain bounded and disabled by default. |
 | R7. Promotion | Promote the planned runner by metric family behind internal gates. Local runners remain the oracle until parity, restart, cleanup, and public freshness tests pass. Promotion should be per metric kind, with PageRank and degree before eigenvector/HITS remote defaults. | CI compares local and planned output on deterministic graphs; distributed worker tests run before enabling remote workers; public docs and generated clients describe status, freshness, convergence, and failure fields. |
@@ -2536,7 +2569,7 @@ Recommended implementation order:
 | Order | Slice | Design intent |
 | --- | --- | --- |
 | 1 | Planned `degree` reduce | Done: independent scan pages are safe because scan writes per-page partials and `reduce_ranks` materializes final scores. |
-| 2 | Add real partition planning | In progress: degree scan, reduce, and cleanup pages are partitioned, initial PageRank/eigenvector/HITS phase pages are partitioned, HITS now has an explicit durable phase shape for authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, publish, and cleanup, and hub raw output is produced through attempt-scoped hub-contribution pages before hub-reduce pages normalize it. Later iterative pages are planned dynamically, and dynamic page appends update manifest page counts idempotently. HITS lifecycle-gated local coverage now includes active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, cleanup resume after reopen, failed-build preservation, publish-failure preservation, and exhausted hub-reduce pair failure. Remaining work is larger manifest restart tests and production distributed coverage. |
+| 2 | Add real partition planning | In progress: degree scan, reduce, and cleanup pages are partitioned, initial PageRank/eigenvector/HITS phase pages are partitioned, HITS now has an explicit durable phase shape for authority contribution, authority reduce/norm, hub contribution, hub reduce/norm, paired convergence, publish, and cleanup, and hub raw output is produced through attempt-scoped hub-contribution pages before hub-reduce pages normalize it. Later iterative pages are planned dynamically, and dynamic page appends update manifest page counts idempotently. HITS lifecycle-gated local coverage now includes active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, larger-manifest resume across repeated reopen boundaries, cleanup resume after reopen, failed-build preservation, publish-failure preservation, and exhausted hub-reduce pair failure. Remaining work is production distributed coverage. |
 | 3 | Add resumable cursors | In progress: degree scan pages resume from same-worker cursors, reclaimed scan pages safely recompute, and degree scan now uses an attempt namespace whose output is adopted only when the page completes; PageRank scan, contribution, reduce, convergence, and cleanup pages persist cursor progress, with PageRank, eigenvector, and HITS contribution partials now also written to attempt-scoped keys and adopted only on page completion. Contribution/reduce/convergence resume is verified across reopen on initial pages and dynamically planned later-iteration pages, cleanup prefix deletion resume is verified across reopen, later-iteration failed pages retry through the coordinator, reclaimed scan/initialize/contribution/reduce pages recompute without stale partial output, and reclaimed convergence pages recompute without stale partial summaries. Planned eigenvector now verifies contribution/reduce cursor resume after reopen, reclaimed contribution/reduce stale-output overwrite, later-iteration failed contribution/reduce/convergence page retry, cleanup cursor resume after reopen, and prior-published preservation after a failed planned rebuild. Planned HITS now verifies contribution/reduce cursor resume after reopen, later-iteration failed contribution/reduce/hub-contribution/hub-reduce/convergence pages retry through the generic worker step and advance to publish readiness, later-iteration exhausted hub-reduce attempts fail the compatible pair while preserving the prior published pair, reclaimed contribution/reduce pages overwrite stale durable authority/hub job output, reclaimed convergence pages reset stale partial summaries before recompute, and cleanup cursor progress resumes after reopen with the published pair still visible. Remaining work is broader attempt-scoped adoption for reduce phases where needed, broader expired/reclaimed partial-output coverage across all phases, and production distributed ownership. |
 | 4 | Generalize the page executor | In progress: degree, PageRank, eigenvector, and HITS use the generic metric/phase page-executor dispatch. The combined local worker helper now composes a worker-only page step with a coordinator step, the split worker/coordinator calls are exposed on `GraphIndex`, planned build startup has a public ensure call that keeps raw lease mutation internal, metric-name public worker/coordinator calls resolve configs inside the index, public failure records active-build diagnostics through the coordinator boundary, and a planned-drain primitive now composes metric-name ensure, worker-page, and coordinator calls over named worker IDs. PageRank and cross-family split-step coverage now run through public build ensure plus metric-name worker/coordinator calls, public active-build failure coverage now spans degree, PageRank, eigenvector, and HITS, degree has reopened-handle coverage across public build ensure plus worker/coordinator steps, name-only multi-worker page coverage, threaded concurrent-handle scan/reduce ownership coverage, concurrent active-page status coverage, expired-page reclaim, benign lost-lease retry behavior, and duplicate coordinator tick coverage, DB-level PageRank coverage now drives the bounded scheduler sweeps through a fresh DB handle per worker/coordinator/read tick, background PageRank, degree, eigenvector, and paired HITS can now be drained through the explicit planned-maintenance primitive, budget exhaustion is reported as a resumable result instead of an error, the graph-metric runtime can now run automatic ticks in combined/coordinator/worker/worker-pool roles, and status now summarizes active leased/failed pages from durable page records. Remaining work is true remote production worker orchestration, latency-safe default idle promotion, and broader production failure coverage. |
 | 5 | Move PageRank onto durable pages | In progress: scan/out-degree pages write durable out-degree and node intermediates, initialize pages write aggregate out-degree plus iteration-0 rank state, contribution pages write attempt-scoped durable contribution partials and adopt them into the reduce-visible namespace only on page completion, reduce pages write iteration `n + 1` ranks, check pages write convergence summaries, non-final checks dynamically plan later iterations, planned publish materializes public score output, local-vs-planned parity is covered on deterministic graphs, dynamically planned later iterations can resume after reopen, contribution/reduce/convergence pages can resume from a durable cursor after reopen on initial and later iterations, failed later-iteration pages can be retried by another worker before publish readiness, and expired scan/initialize/contribution/reduce pages can be reclaimed without stale partial output; remaining work is broader expired/reclaimed coverage and larger cleanup/failure coverage. |
@@ -2591,7 +2624,7 @@ Authoritative rest-of-work roadmap:
 
 | Milestone | Design | Implementation slices | Exit gate |
 | --- | --- | --- | --- |
-| 1. Process supervisor boundary | Keep the graph metric API unchanged while moving the role-configured runtime into independently managed process owners. Processes receive DB path, runtime owner identity, worker identity, tick budgets, and idle policy only; metric config is resolved from the graph index. | Done for the first process proof: `graph-metric-maintenance supervise` runs coordinator and worker-pool child roles in bounded rounds, captures each child JSON summary, loops while durable progress is reported, exits after global idle, and applies bounded restart policy. The full `antfly graph-metric-maintenance supervise --help` binary path builds, deterministic command tests drive one degree generation through supervisor-built child argv, and the `graph-metric-process-test` build step now runs the real `antfly` binary as spawned coordinator/worker-pool child processes against one shared DB path. `graph-metric-maintenance launch` now starts coordinator and worker-pool role processes as independently owned children in each bounded round, writes per-role JSON summaries, preserves per-role stderr for diagnosis, aggregates global idle/restart state, and uses an explicit local DB writer guard for direct file-backed launches so runtime/page leases are not confused with a storage-engine multi-writer lock. The launch proof now drains partitioned degree, bounded PageRank, eigenvector, and compatible HITS builds through independently launched coordinator and worker-pool owners. The real spawned-process harness now also parses the aggregate supervisor/launcher JSON and asserts coordinator plus worker-pool child telemetry: runtime/owner hashes, worker counts/hashes, lease-key presence, lease ownership, acquisition count, tick progress, and no last error. Standalone role-process argv is preflighted with a strict allow-list to keep only DB path, role, owner identity, worker identity, lease policy, tick budgets, and test clock/ready inputs; metric names, index names, target generations, job/page ids, metric configs, summary files, unknown flags, missing values, and local writer-lock flags are rejected before both ordinary role runs and killable long-lived role owners are spawned. Standalone role-process summaries are checked too: every coordinator, worker, and worker-pool process used by restart, lease-fencing, publish, cleanup, and reclaim proofs must report the expected role, runtime/owner hash, worker hash/count, lease-key hash, lease ownership, tick completion, and zero error ticks. Publish-boundary restart proofs now also start a second real coordinator role process after degree, PageRank, eigenvector, and compatible HITS publish, and assert it cannot republish, fail, advance phase, or append another publish event. Publish-verifier failure proofs now also start a second real coordinator role process after PageRank, eigenvector, and compatible HITS fail at publish, and assert it cannot publish, fail again, advance phase, or append another failure event. The heavier `zig-graph-metric-process-test` Make target is now wired into the full-default Zig CI job so this process-boundary evidence is enforced outside local-only runs. | Complete for process smoke: coordinator and worker processes can finish degree, PageRank, eigenvector, and compatible HITS work without worker-side metric config, and the local launch path can drain all four metric families through durable state. Remaining work moves to remote deployment orchestration and rollout gates. |
+| 1. Process supervisor boundary | Keep the graph metric API unchanged while moving the role-configured runtime into independently managed process owners. Processes receive DB path, runtime owner identity, worker identity, tick budgets, and idle policy only; metric config is resolved from the graph index. | Done for the first process proof: `graph-metric-maintenance supervise` runs coordinator and worker-pool child roles in bounded rounds, captures each child JSON summary, loops while durable progress is reported, exits after global idle, and applies bounded restart policy. The full `antfly graph-metric-maintenance supervise --help` binary path builds, deterministic command tests drive one degree generation through supervisor-built child argv, and the `graph-metric-process-test` build step now runs the real `antfly` binary as spawned coordinator/worker-pool child processes against one shared DB path. `graph-metric-maintenance launch` now starts coordinator and worker-pool role processes as independently owned children in each bounded round, writes per-role JSON summaries, preserves per-role stderr for diagnosis, aggregates global idle/restart state, and uses an explicit local DB writer guard for direct file-backed launches so runtime/page leases are not confused with a storage-engine multi-writer lock. The launch proof now drains partitioned degree, bounded PageRank, eigenvector, and compatible HITS builds through independently launched coordinator and worker-pool owners. The real spawned-process harness now also parses the aggregate supervisor/launcher JSON and asserts coordinator plus worker-pool child telemetry: runtime/owner hashes, worker counts/hashes, lease-key presence, lease ownership, acquisition count, tick progress, and no last error. Standalone role-process argv is preflighted with a strict allow-list to keep only DB path, role, owner identity, worker identity, lease policy, tick budgets, and test clock/ready inputs; metric names, index names, target generations, job/page ids, metric configs, summary files, unknown flags, missing values, and local writer-lock flags are rejected before both ordinary role runs and killable long-lived role owners are spawned. Standalone role-process summaries are checked too: every coordinator, worker, and worker-pool process used by restart, lease-fencing, publish, cleanup, and reclaim proofs must report the expected role, runtime/owner hash, worker hash/count, lease-key hash, lease ownership, tick completion, and zero error ticks. Publish-boundary restart proofs now also start a second real coordinator role process after degree, PageRank, eigenvector, and compatible HITS publish, and assert it cannot republish, fail, advance phase, or append another publish event. Publish-verifier failure proofs now also start a second real coordinator role process after PageRank, eigenvector, and compatible HITS fail at publish, and assert it cannot publish, fail again, advance phase, or append another failure event. The heavier `zig-graph-metric-distributed-release-gate` Make target is now wired into the full-default Zig CI job, so CI enforces the process-boundary harness and the all-family budgeted release-qualification smoke together instead of stopping at local-only process evidence. | Complete for process smoke: coordinator and worker processes can finish degree, PageRank, eigenvector, and compatible HITS work without worker-side metric config, and the local launch path can drain all four metric families through durable state. Remaining work moves to remote deployment orchestration and rollout gates. |
 | 2. Runtime ownership and lease hardening | Treat durable state, not process memory, as the coordination boundary. Runtime-owner leases fence processes; page leases fence page execution; page attempts fence output adoption. | The process harness now kills a coordinator owner after it has acquired its runtime lease, proves a distinct worker-pool process can continue under an independent runtime lease, proves a duplicate coordinator is fenced before the original lease expires, and proves a replacement coordinator can take over after expiry and advance durable work. It also kills a process that owns a degree scan page lease, proves a replacement worker is fenced before page-lease expiry, proves a real `antfly graph-metric-maintenance --role worker` process can reclaim and complete the page after expiry with an injected clock, and proves the stale old page attempt is rejected after replacement. Same-worker runtime fencing is now covered through real worker role processes: one owner acquires the worker runtime lease and completes a page, a duplicate owner with the same worker id is fenced before expiry, and a replacement owner with the same worker id takes over after expiry, reports runtime `takeover_count`, and completes more durable page work. Replacement coordinator takeover also reports `takeover_count`, giving operations an explicit cross-process replacement signal even when the killed owner cannot observe local `lost_leases`. PageRank now has the same process proof for first-iteration scan/out-degree, initialize, contribution, reduce, and convergence pages; dynamically planned later contribution, reduce, and convergence pages; publish through a real coordinator role process; cleanup through separate real worker role processes; cleanup-page owner death/reclaim with the published generation visible; publish-verifier failure through a real coordinator process while preserving the prior published generation; duplicate coordinator idempotence after that publish-verifier failure; and same-worker-id replacement after page-lease expiry with stale prior-attempt rejection. Remaining hardening is remote orchestration beyond a direct local DB path. | Worker loss abandons only reclaimable page work; stale owners cannot write, adopt, complete, publish, or fail the build after replacement; duplicate coordinators cannot double-publish, double-fail, or append incompatible pages/events. |
 | 3. Crash/restart harness | Make failures reproducible before promoting distributed execution. Every phase must be restartable from fresh DB handles and process boundaries. | The current degree harness now covers runtime-owner kill/takeover, scan-page owner kill/reclaim, stale scan-page attempt rejection, publish-boundary restart through a real coordinator process, and cleanup restart through separate real worker processes. PageRank process coverage now covers first-iteration scan/out-degree, initialize, contribution, reduce, and convergence owner kill, dynamically planned later contribution/reduce/convergence owner kill, before-expiry fencing, post-expiry reclaim by a real worker role, stale attempt rejection, same-worker replacement attempt fencing, drain to fresh, publish-boundary restart through a real coordinator process, cleanup restart through separate real worker processes, cleanup-page owner death/reclaim, and publish-verifier failure preserving the prior generation. | Published reads see either the prior complete generation or the newly published complete generation. Active job output, abandoned attempts, and failed generations are never queryable. |
 | 4. Distributed degree promotion | Use degree as the first production ownership proof because it exercises scan, reduce, publish, cleanup, leases, attempts, and public freshness without iterative math. | Degree now has a spawned-process restart proof for supervisor completion, coordinator runtime lease loss, worker page lease loss/reclaim, publish-boundary restart, cleanup restart, and stale attempt rejection. Remaining degree work is promotion hardening: keep local/planned parity, broaden public read-surface freshness coverage through the distributed gate, verify active/failed status page summaries from durable records, and decide the internal rollout gate. | Degree can be enabled behind an internal distributed gate with local-vs-planned parity, process crash coverage, cleanup resume coverage, and direct/traversal/search freshness coverage. |
@@ -2599,7 +2632,7 @@ Authoritative rest-of-work roadmap:
 | 6. Eigenvector parity | Eigenvector proves the single-vector iterative substrate is metric-family shaped rather than PageRank-specific. It must not add a new job system, status model, or query API. | The process harness now has eigenvector process-boundary coverage: the real `antfly graph-metric-maintenance supervise` path starts coordinator and worker-pool child roles, drains a bounded eigenvector build through durable graph-index state, and verifies the target generation becomes fresh; the independently launched coordinator/worker-pool path now drains a separate eigenvector build to fresh through the same graph-index state; separate killed-owner cases cover scan, initialize, contribution, reduce, and convergence page leases, before-expiry fencing, post-expiry reclaim by a real worker role, stale-attempt rejection, and final drain to fresh; publish/cleanup coverage prepares a build to `publish_generation`, publishes through a real coordinator role process, then completes cleanup through a separate worker role process; publish-verifier failure coverage corrupts the manifest at `publish_generation`, fails through a real coordinator process, preserves the prior generation with bounded diagnostics, and proves a second coordinator cannot fail the already-failed build again or append another failure event. The same publish-verifier failure invariant now also crosses the real HTTP service-owner path for eigenvector service coordinators. Fixed-iteration non-converged publish now also crosses the process-supervised path and verifies `converged: false`, `iterations_completed`, and positive finite delta metadata. Active-rebuild public freshness now also crosses a coordinator-owned process boundary: `published` eigenvector direct top-k, traversal projection/status, and search rerank serve the prior generation with `building` status, while `fresh` direct reads, traversal projection/order/filter, and search rerank fail closed with `MetricStale`. Graph-layer parity now also covers disconnected/reducible topology: local and planned eigenvector output match within tolerance, every score is finite, the vector remains L2-normalized, and reducible sink-chain nodes can decay to zero without invalid output. Remaining work is promotion-scale cross-shard fan-in and production rollout evidence. | Eigenvector reaches the same restart/failure/cleanup/public-read matrix as PageRank through the same graph-index metric API and distributed executor. |
 | 7. HITS paired-vector production | HITS is the paired-vector proof. Authority and hub are separate named scores, but compatible configs share one target generation, convergence decision, publish decision, failure decision, and cleanup lifecycle. | The process harness now has a first HITS process-boundary proof: a compatible manual authority/hub pair is explicitly started as a planned build, the real supervisor launches coordinator and worker-pool child roles, and both authority and hub publish the same fresh target generation with queryable top-k output. The independently launched coordinator/worker-pool path now also drains a compatible HITS pair to fresh. It also kills process-owned authority contribution, authority reduce, convergence, `hits_hub_contributions`, and `hits_hub_reduce_ranks` page owners, proves replacement workers are fenced before lease expiry, proves real worker role processes reclaim and complete those pages after expiry, rejects stale attempts, and drains the compatible pair to fresh. Paired publish/cleanup now also crosses process boundaries: a real coordinator role publishes the authority/hub pair atomically, authority remains in cleanup while hub is fresh/complete with the same generation and publish event, and separate worker role processes resume cleanup until both metrics are fresh. Publish-verifier failure now also crosses a real coordinator role process: a corrupted HITS manifest fails without publishing, both authority and hub preserve the previous generation and retained publish-failure diagnostics, and a second coordinator cannot fail the already-failed compatible pair again or append another failure event. The same paired publish-verifier failure invariant now also crosses the real HTTP service-owner path: a service-targeted coordinator fails the compatible pair without publishing, and a duplicate service coordinator cannot add another failure or publish event. Failed HITS public reads now preserve that prior compatible pair across direct top-k, traversal projection/status, and search rerank score details, while `fresh` direct, traversal projection, and rerank reads fail closed with `MetricStale`. Active-rebuild public freshness now crosses a coordinator-owned process boundary: published authority/hub top-k reads serve the prior compatible pair with `building` or compatible stale status, traversal projection/status serves prior authority/hub scores, and search rerank over HITS authority uses prior-generation score details, while fresh authority/hub direct reads, traversal projection/order/filter, and search rerank fail closed with `MetricStale`. Exhausted-attempt failure now also crosses process boundaries: repeated killed owners reclaim the same later-iteration hub-reduce page across expired leases until a real coordinator fails the compatible pair with `GraphMetricBuildPageAttemptsExhausted`, preserving the previous pair and prior top-k/direct/traversal/rerank output. Public fan-in now rejects default authority/hub status pairs with mismatched published generations or incompatible stable metadata/edge filters before merging direct metric or graph traversal/search status surfaces. Hosted cross-range fan-in now also proves compatible HITS authority/hub pairs merge for both `published` and `fresh` reads across direct metric, traversal projection/order/filter/status, and HITS authority rerank surfaces, while unpublished or mixed-generation HITS shards fail closed before those score surfaces can mix results. Real HTTP service-owner publish/cleanup and multi-page proofs now also verify paired fixed-iteration metadata for authority and hub: both publish `converged: false`, matching `iterations_completed`, and positive finite deltas when the bounded iteration limit is reached. Remaining work is promotion-scale parity, larger-graph latency, remote deployment orchestration, and promotion-scale cross-shard fan-in coverage under remote owners. Keep hub and authority phase work page-partitioned and attempt-fenced where partial output can be consumed by later phases. | Compatible HITS authority/hub output publishes atomically, either side failing preserves the previous compatible pair, and remote HITS remains disabled by default until paired restart/failure coverage matches the PageRank matrix. |
 | 8. Public read and fan-in gates | Distributed execution is not complete until every score-bearing read path uses only complete published generations and fails closed for freshness mismatches. | Current fast-root fan-in coverage now includes direct metric top-k merge, direct missing/unpublished shard rejection, direct failed-rebuild shard-status preservation with `fresh` fail-closed behavior, traversal projection/status generation checks, traversal failed-rebuild shard-status preservation with `fresh` fail-closed behavior, traversal order/filter generation checks, traversal failed-rebuild order/filter status preservation with `fresh` fail-closed behavior, duplicate graph order metric request rejection, duplicate graph-search node/hit ownership rejection, direct/traversal/rerank profile status output, failed-status profile output across direct metric top-k, traversal, and rerank surfaces, direct metric top-k merged profile status after shard fan-in, search rerank merged profile status after shard fan-in, search rerank incompatible-generation checks, rerank score details, rerank score-details arithmetic and missing-score consistency checks, rerank missing/unpublished shard-status rejection, rerank failed-rebuild shard-status preservation with `fresh` fail-closed behavior, HITS authority/hub pair compatibility rejection for direct graph metric and graph traversal/search status fan-in, and direct/traversal/rerank status-generation shape checks that reject `fresh` statuses whose current or target edge generation does not match the published score generation. DB search coverage now also proves direct graph metric top-k and search rerank return `MetricNotReady` for both `published` and `fresh` before first publish, while traversal projection/order/filter DB coverage proves not-ready, stale, building, failed, and fresh-failure behavior. Hosted cross-range coverage now also builds local shard DBs from catalog range metadata, proves compatible fresh published generations merge for `published` and `fresh` direct metric top-k, traversal projection/status/order/filter, and search rerank, proves direct graph metric fan-in and search rerank fail closed when one shard is unpublished, advances one shard to an incompatible published generation, and proves direct metric top-k, traversal projection/status/order/filter, and search rerank reject mixed-generation results. It now also includes paired HITS authority/hub in the hosted path: compatible shard generations merge for both `published` and `fresh` direct metric fan-in, traversal projection/order/filter/status fan-in, and HITS authority rerank, while unpublished or mixed-generation paired HITS shards fail closed before score mixing. It also proves cross-range traversal metric projection/status/order/filter now carries metric payloads through distributed expand/fan-in, reports graph-query metric status in query profile, and `fresh` projection fails closed on an unpublished shard. A focused `public-api-graph-metric-e2e-test` now covers public HTTP status, not-ready status/direct/projection/rerank behavior before first publish, fresh direct top-k, traversal projection, ordering, filtering, stale `published` direct top-k/projection/search rerank after a `sync_level: "write"` graph update, prior-generation rerank score details, stale rerank profile status, active-build `published` direct/projection/rerank reads with `building` status, failed-build `published` direct/projection/rerank reads with `failed` status, and `fresh` fail-closed behavior across stale, building, and failed public direct/traversal/rerank reads. The broader `public-api-parity-test` covers generated public query bodies with explicit `null` graph metric fields. The `zig-graph-metric-fan-in-test` and `zig-public-api-graph-metric-e2e-test` Make targets are now wired into PR and full-default Zig CI, so hosted fan-in and public HTTP freshness regressions are no longer local-only evidence. Remaining read-gate work is promotion-scale cross-shard generation compatibility for every read surface and, if a standalone explain API is added later, matching graph metric generation/freshness evidence there. Query profile is the current explainable read contract and already carries direct, traversal, and rerank metric status. | `published` reads use the latest complete generation; `fresh` returns `MetricNotReady` before first publish or `MetricStale` when published is behind; cross-shard fan-in rejects missing, zero, stale, or incompatible generations when comparability is required. |
-| 9. Cleanup, retention, and operations | V1 cleanup remains aggressive. Retain the latest published generation and bounded diagnostics; remove completed, failed, abandoned, unpublished, and attempt-scoped job state as soon as snapshot safety allows. Retention, pause/resume, manual retry, priority, and lease tuning are future admin controls, not query semantics. | Make cleanup process-resumable for score generations, job namespaces, manifests, pages, phase summaries, iteration summaries, attempt namespaces, failure diagnostics, and runtime-owner records. Keep operations status high level: role, owner hash, worker identity count/hash, phase, iteration, page counts, cursor presence, attempts, progress, last error, and last sweep result. Fast root coverage now includes failed planned-build cleanup of abandoned score/job namespaces plus bounded retained failure diagnostics and metric events, including old-key pruning; runtime-status cache coverage preserves graph metric runtime ownership telemetry such as owner/worker hashes, worker count, lease state, takeover count, lost leases, tick progress, and page counters across sequence-only status refreshes; graph index status now exposes that telemetry as a typed `graph_metric_runtime` OpenAPI summary on aggregate and per-shard graph index status; command summary and real spawned-process harness coverage now preserve the same role/owner/worker/lease/tick/error telemetry in supervisor/launcher output; and direct runtime-owner lease-record assertions prove clean runtime shutdown deletes the current durable owner record while stale shutdown after takeover leaves the replacement record intact. The focused `graph-metric-cleanup-test` gate now pins cleanup-page resume for PageRank/eigenvector/HITS, active-job cleanup refusal, failed planned-build abandoned namespace cleanup, bounded retained diagnostics, repeated failed non-iterative/iterative/paired cleanup, and durable runtime-owner lease cleanup. The focused `graph-metric-operations-test` gate pins the OpenAPI/runtime-status encoders, internal service maintenance boundary, command/supervisor argv contract, child runtime telemetry parsing, idle-exit behavior, and owner/worker summary fields. | Cleanup resumes after restart, never deletes the current published generation, bounds diagnostics, and prevents graph-metric control/output namespaces from growing without a public retention knob. Deployment-scale cleanup cost and storage-growth qualification remain separate release evidence. |
+| 9. Cleanup, retention, and operations | V1 cleanup remains aggressive. Retain the latest published generation and bounded diagnostics; remove completed, failed, abandoned, unpublished, and attempt-scoped job state as soon as snapshot safety allows. Retention, pause/resume, manual retry, priority, and lease tuning are future admin controls, not query semantics. | Make cleanup process-resumable for score generations, job namespaces, manifests, pages, phase summaries, iteration summaries, attempt namespaces, failure diagnostics, and runtime-owner records. Keep operations status high level: role, owner hash, worker identity count/hash, phase, iteration, page counts, cursor presence, attempts, progress, last error, and last sweep result. Fast root coverage now includes failed planned-build cleanup of abandoned score/job namespaces plus bounded retained failure diagnostics and metric events, including old-key pruning; runtime-status cache coverage preserves graph metric runtime ownership telemetry such as owner/worker hashes, worker count, lease state, takeover count, lost leases, tick progress, and page counters across sequence-only status refreshes; graph index status now exposes that telemetry as a typed `graph_metric_runtime` OpenAPI summary on aggregate and per-shard graph index status; command summary and real spawned-process harness coverage now preserve the same role/owner/worker/lease/tick/error telemetry in supervisor/launcher output; and direct runtime-owner lease-record assertions prove clean runtime shutdown deletes the current durable owner record while stale shutdown after takeover leaves the replacement record intact. The focused `graph-metric-cleanup-test` gate now pins cleanup-page resume for PageRank/eigenvector/HITS, active-job cleanup refusal, failed planned-build abandoned namespace cleanup, bounded retained diagnostics, repeated failed non-iterative/iterative/paired cleanup, and durable runtime-owner lease cleanup. The focused `graph-metric-operations-test` gate pins active build page status summaries, OpenAPI/runtime-status encoders, internal service maintenance boundary, command/supervisor argv contract, child runtime telemetry parsing, idle-exit behavior, and owner/worker summary fields. | Cleanup resumes after restart, never deletes the current published generation, bounds diagnostics, and prevents graph-metric control/output namespaces from growing without a public retention knob. Deployment-scale cleanup cost and storage-growth qualification remain separate release evidence. |
 | 10. Per-family default promotion | Promote planned/distributed execution by metric family, not all graph metrics at once. Local runners stay as CI/debug oracles until distributed parity is boring. | Keep the conservative `auto` gate, collect latency evidence, then promote degree and PageRank first, eigenvector after single-vector parity, and HITS last after paired-vector coverage. The internal auto-gate decision summary now makes the rollout boundary inspectable in tests: active planned work, eligible queued work, and ineligible queued work are counted before default or explicit auto idle paths choose planned execution or local fallback. Queued degree, small PageRank, bounded eigenvector, and active planned PageRank/degree/eigenvector/HITS all assert the planned decision before execution; larger PageRank/eigenvector, multi-metric indexes, default HITS, and incompatible HITS assert fallback before local execution. HITS opt-in is inspectable through the same counters: default HITS and incompatible opt-in pairs remain ineligible, while a compatible opt-in authority/hub pair contributes one eligible queued build before planned execution. PageRank and eigenvector threshold widening are now covered too: raising the internal iteration caps makes previously gated larger single-vector rebuilds eligible for planned execution, proves tiny-budget exhaustion leaves resumable active work, and proves the same jobs complete when the budget is widened. The focused `graph-metric-default-gate-test` now pins those conservative auto-gate, widening, fallback, HITS opt-in, and active-planned-resume decisions in PR and full-default Zig CI. Update generated clients and public docs only around stable user-facing status/freshness fields. | Each promoted family has deterministic parity, process ownership, crash/restart, cleanup, public-read, cross-shard, status, operations, latency-budget, and rollback coverage before distributed execution becomes the default. |
 
 The next PRs should be cut along these implementation slices:
@@ -3435,22 +3468,18 @@ policy. The full binary command path now builds, and command-level tests drive
 degree through supervisor-built coordinator and worker-pool child argv against
 one shared DB path. The `graph-metric-process-test` build step now runs the
 real binary through supervisor mode with spawned child roles and verifies that
-degree publishes fresh through durable DB state only. The same process test now
-kills a coordinator that holds a runtime-owner lease, proves a duplicate
-coordinator is fenced before lease expiry, proves a worker-pool owner can keep
-making independent durable progress, and proves a later coordinator can take
-over after the runtime lease expires. It also kills a process that owns a
-degree scan-page lease, proves another worker is fenced before the page lease
-expires, proves a real worker role process can reclaim and complete the page
-after expiry with an injected scheduler clock, rejects the stale old attempt,
-drains the metric to a fresh generation, publishes from a reopened coordinator
-role process at the `publish_generation` boundary, and resumes cleanup through
-separate worker role processes with the published generation visible. PageRank
-now has the same first process page-owner proof for `scan_edges_and_out_degree`:
-dead owner visibility, before-expiry fencing, post-expiry reclaim by a real
-worker role, stale attempt rejection, and drain to fresh. The next step is
-extending that same process crash/restart coverage to the remaining iterative
-PageRank phases.
+degree, PageRank, eigenvector, and compatible HITS publish fresh output through
+durable DB state only. The same process harness now kills runtime and page
+owners across coordinator, worker, and worker-pool roles; proves duplicate
+owners are fenced before lease expiry; proves replacements take over after
+expiry; rejects stale page attempts after replacement; verifies publish,
+failure, cleanup, fixed-iteration, exhausted-attempt, and same-worker fencing
+invariants; and emits a final `graph_metric_process_harness_summary` only after
+all required owner-boundary coverage categories are observed. The
+`graph-metric-distributed-release-gate` CI target now composes that process
+harness with the budgeted all-family release-qualification smoke so full-default
+CI validates the owner contract, public-read/fan-in smoke, retained-storage
+budgets, and scheduler budgets together.
 
 Remote workers should claim independent pages from durable graph-index state by
 index and metric name. They should persist cursors, complete or fail leases,
@@ -3987,7 +4016,7 @@ The implementation should move in this order:
 | 4. Eigenvector parity | Eigenvector should reuse the PageRank single-vector substrate rather than adding a metric-specific lifecycle. | Keep the existing process-boundary, fixed-iteration, active-freshness, disconnected/reducible parity, publish-failure, cleanup coverage, and DB-level production-budget parity proof. Add the same cross-shard fan-in, deployment-scale parity, and operations evidence required for PageRank before default promotion. | Eigenvector is promoted only when its restart, failure, cleanup, freshness, fan-in, status, and operations matrix is equivalent to PageRank's single-vector matrix. |
 | 5. HITS paired-vector hardening | HITS authority and hub are separate named scores but one compatible pair for target generation, convergence, failure, publish, and cleanup. | Finish paired local-vs-planned parity, larger-graph latency evidence, deployment-scale owner evidence, public read-surface coverage, and promotion-scale cross-shard fan-in coverage. Keep the default authority/hub pair compatibility guard in direct metric and graph traversal/search status fan-in plus the hosted paired-HITS `published`/`fresh` cross-range direct, traversal projection/order/filter/status, rerank evidence, and service-owner replacement proof. Keep authority/hub output attempt-scoped until page completion and publish/fail the pair atomically. | HITS stays disabled by default until either side failing preserves the previous compatible pair, paired publish is atomic, cleanup is resumable, and paired-vector restart coverage matches the PageRank quality bar. |
 | 6. Public read and fan-in gate | Distributed execution is not complete until every score-bearing read path enforces the same generation contract. | Keep hosted paired-HITS `published`/`fresh` cross-range success/failure coverage while covering direct metric top-k, graph projection, graph ordering, graph filtering, graph search rerank, query profile, any future standalone explain surface, and shard fan-in for `published`, `fresh`, not-ready, stale, active-build, failed-build, missing-generation, zero-generation, incompatible-generation, and incompatible paired-HITS status cases. | `published` reads use the latest complete generation; `fresh` returns `MetricNotReady` before first publish and `MetricStale` when published is behind; fan-in rejects missing, zero, stale, or incompatible generations when comparability is required. |
-| 7. Operations and cleanup | V1 cleanup is aggressive and bounded. Retention remains a future admin/debug option, not query semantics. | Make cleanup resumable for score generations, manifests, pages, phase summaries, iteration summaries, attempt namespaces, failure diagnostics, and runtime-owner records. Status should summarize phase, iteration, page counts, attempts, cursor presence, progress, last error, owner hash, worker identity count/hash, lease expiry, and takeover counters; cache-preservation coverage now verifies graph metric runtime ownership telemetry survives status refreshes that only carry synthetic or sequence-only table state, graph index status now exposes a typed `graph_metric_runtime` OpenAPI summary with role, owner/worker hashes, lease state, takeover/lost-lease counters, tick progress, and page counters, command-summary coverage proves standalone role processes emit the same stable ownership/progress/error fields for operators, and aggregate supervisor/launcher coverage carries that telemetry up to the orchestration summary. | Cleanup never deletes the current published generation, resumes after restart, bounds diagnostics, and prevents completed, failed, abandoned, unpublished, and attempt-scoped state from growing without a retention knob. |
+| 7. Operations and cleanup | V1 cleanup is aggressive and bounded. Retention remains a future admin/debug option, not query semantics. | Make cleanup resumable for score generations, manifests, pages, phase summaries, iteration summaries, attempt namespaces, failure diagnostics, and runtime-owner records. Status should summarize phase, iteration, page counts, attempts, cursor presence, progress, last error, owner hash, worker identity count/hash, lease expiry, and takeover counters; active-page status coverage now requires capped building payloads to include leased page state, worker identity, lease expiry, attempt, cursor/error fields, progress units, and finite aggregate progress; cache-preservation coverage now verifies graph metric runtime ownership telemetry survives status refreshes that only carry synthetic or sequence-only table state, graph index status now exposes a typed `graph_metric_runtime` OpenAPI summary with role, owner/worker hashes, lease state, takeover/lost-lease counters, tick progress, and page counters, command-summary coverage proves standalone role processes emit the same stable ownership/progress/error fields for operators, and aggregate supervisor/launcher coverage carries that telemetry up to the orchestration summary. | Cleanup never deletes the current published generation, resumes after restart, bounds diagnostics, and prevents completed, failed, abandoned, unpublished, and attempt-scoped state from growing without a retention knob. |
 | 8. Default promotion | Promote by metric family, not by executor milestone. Local runners remain deterministic CI/debug oracles until distributed parity is routine. | Widen the conservative `auto` gate one family at a time: degree, PageRank, eigenvector, then HITS. The PageRank and eigenvector auto thresholds now have explicit widen/rollback-shaped coverage: larger single-vector cases remain local under conservative caps, become planned when the caps are raised, and resume after budget exhaustion. Require release history, latency budgets, operations docs, cleanup bounds, generated-client stability, and rollback paths before each widening. | A family becomes default only after parity, process ownership, crash/restart, cleanup, public-read, fan-in, status, operations, and latency-budget evidence all pass. |
 
 The steady-state architecture for every metric family should remain:
@@ -4317,8 +4346,8 @@ explicit:
 | Metric family | Why this order | Promotion evidence |
 | --- | --- | --- |
 | Degree | Exercises the distributed mechanics without iterative convergence. | Local/planned parity, page partitioning, process replacement, stale-attempt rejection, publish idempotence, cleanup resume, active/failed status, direct/traversal/rerank freshness, two-worker service-boundary multi-page scan/reduce evidence, latency budget, storage-growth bound, rollback to local. |
-| PageRank | Reference single-vector iterative metric and primary user-facing centrality score. | DB-level production-budget local/planned parity now drains a 130-source multi-page PageRank build through one-page planned maintenance rounds and matches the local oracle. The focused lifecycle gate now also includes later-iteration exhausted-attempt preservation for the prior published generation plus failed planned-rebuild public-read preservation for direct top-k, traversal projection/order/filter/status, and search rerank while `fresh` fails with `MetricStale`. Remaining promotion evidence is deployment-scale cleanup, larger-shard fan-in, and latency evidence. |
-| Eigenvector | Proves PageRank's single-vector substrate is generic. | Same as PageRank plus documented disconnected/reducible graph behavior and fixed-iteration non-converged output. Active direct/traversal/rerank freshness now has real HTTP service-owner coverage, service-owner replacement coverage, two-worker service-boundary multi-page scan/initialize/contribution/reduce/convergence evidence, focused hosted cross-range fan-in coverage, lifecycle-gated scan/initialize/contribution/reduce/convergence reclaim coverage, cleanup resume after reopen, failed planned-build preservation, coordinator publish-failure preservation after reopen, later-iteration exhausted-attempt preservation, direct DB failed planned-rebuild public-read preservation for direct top-k, traversal projection/order/filter/status, and search rerank while `fresh` fails with `MetricStale`, and DB-level production-budget local/planned parity through one-page planned maintenance rounds; deployment-scale parity, operations evidence, promotion-scale fan-in, and latency evidence remain required. |
+| PageRank | Reference single-vector iterative metric and primary user-facing centrality score. | DB-level production-budget local/planned parity now drains a 130-source multi-page PageRank build through one-page planned maintenance rounds and matches the local oracle. The focused lifecycle gate now also includes later-iteration exhausted-attempt preservation for the prior published generation plus failed planned-rebuild public-read preservation for direct top-k, traversal projection/order/filter/status, and search rerank while `fresh` fails with `MetricStale`. Hosted fan-in now includes a nonuniform eight-shard PageRank direct merge layout with four active/stale shards that keep unpublished target scores invisible while `fresh` fails closed. Remaining promotion evidence is deployment-scale cleanup, broader hosted fan-in surfaces, and latency evidence. |
+| Eigenvector | Proves PageRank's single-vector substrate is generic. | Same as PageRank plus documented disconnected/reducible graph behavior and fixed-iteration non-converged output. Active direct/traversal/rerank freshness now has real HTTP service-owner coverage, service-owner replacement coverage, two-worker service-boundary multi-page scan/initialize/contribution/reduce/convergence evidence, focused hosted cross-range fan-in coverage including a nonuniform eight-shard direct merge with active/stale shards, lifecycle-gated scan/initialize/contribution/reduce/convergence reclaim coverage, cleanup resume after reopen, failed planned-build preservation, coordinator publish-failure preservation after reopen, later-iteration exhausted-attempt preservation, direct DB failed planned-rebuild public-read preservation for direct top-k, traversal projection/order/filter/status, and search rerank while `fresh` fails with `MetricStale`, and DB-level production-budget local/planned parity through one-page planned maintenance rounds; deployment-scale parity, broader promotion-scale fan-in, and latency evidence remain required. |
 | HITS | Highest-risk contract because two named scores share one compatible lifecycle. | Authority/hub paired parity, paired restart/reclaim/exhausted-attempt coverage, atomic compatible publish, paired failure preservation, paired cleanup, fixed-iteration metadata, public freshness, promotion-scale fan-in, larger-graph latency. Real HTTP service-owner active public-read coverage, service-owner replacement through `hits_authority`, two-worker service-boundary multi-page authority/hub contribution/reduce evidence, lifecycle-gated and direct-process killed-worker exhausted hub-reduce attempt coverage with duplicate coordinator idempotence, scan-page reclaim coverage that rejects stale partial writes, direct DB failed planned rebuild coverage for prior compatible authority/hub direct top-k, traversal projection/order/filter/status, and authority rerank with `fresh` `MetricStale`, paired service-owned fixed-iteration metadata, focused hosted fan-in, and DB-level production-budget local/planned parity now cover published/fresh, active, failed, and exhausted-attempt paired-HITS reads plus one-page-budget paired drains for direct top-k, traversal, and authority rerank. |
 
 The public/API work should stay deliberately small. The graph metric user model
@@ -4359,13 +4388,13 @@ boundary closer to production distributed execution.
 
 | Order | Backlog item | Implementation work | Verification required |
 | --- | --- | --- | --- |
-| 1 | Remote owner harness | Promote the process/runtime path from local proof to the canonical coordinator/worker harness. Owners should accept only DB path or service endpoint, role, owner id, worker identity, tick budget, idle policy, and lease policy. Metric config, target generation, page manifests, attempts, publish, failure, and cleanup stay in graph-index state. Launched child argv tests now enforce that narrow owner/budget interface and keep metric/index/job/page details out of process arguments. Command-summary tests now pin the stable role/owner/worker/lease/progress/error telemetry emitted by standalone coordinator and worker-pool processes, and aggregate supervisor/launcher summaries now preserve the same compact per-child telemetry. Standalone role summaries are now treated as a stable operational contract too: they must expose durable-progress, idle, and error tick counters; explain completed ticks as progress, idle, error, lease contention, or lease loss; prove either runtime-owner lease acquisition or explicit acquisition failure; and report `last_error_name: null` for successful owner ticks. Standalone role summaries and aggregate supervisor/launcher summaries must both omit raw metric/index names, target generations, job/page ids, attempt namespaces, storage paths/prefixes, metric configs, process ids, and local writer details. The runtime owner loop now depends on a `MaintenanceBoundary` for combined/coordinator/worker/worker-pool ticks, the internal group write API now exposes the same narrow graph metric maintenance request over HTTP with a matching client method, the command can call that service target directly through the same boundary dispatch path, service-targeted ticks now acquire/renew/take over durable runtime-owner leases before mutating graph metric state, supervisors can launch service-targeted coordinator/worker-pool children without local writer serialization, clean service shutdown releases only the current owner lease while stale releases are fenced, and degree plus bounded PageRank now drain to fresh through an in-process internal service route using service-targeted owners. Degree and bounded PageRank service-route restart/failure coverage now proves abandoned coordinator and worker-pool owners are fenced before TTL, replaced after TTL, stale releases cannot clear replacement owners, and replacement owners continue to fresh output. The spawned-process harness now preflights service-targeted owner argv as a strict endpoint/group/table target and rejects mixed or incomplete local/service targets, real HTTP killed-owner process coverage now proves the same restart/fencing path for degree and bounded PageRank, eigenvector now has service-owner replacement proof, HITS now has service-owner replacement proof with compatible pair freshness verification, real HTTP service-targeted PageRank/eigenvector/paired-HITS active-read coverage now proves the service owner path preserves prior published direct/traversal/rerank results while a rebuild is active, PageRank/eigenvector/paired-HITS publish-verifier failure preserves prior output through service-targeted coordinators, degree/PageRank/eigenvector/HITS have service-targeted publish/cleanup restart proof across coordinator publish, duplicate coordinator idempotence, and worker-pool cleanup resume, degree/PageRank/eigenvector/paired-HITS now have 130-source two-worker service multi-page proofs for non-iterative, single-vector iterative, and paired-vector iterative phase families, and direct-process page-reclaim proofs now read the durable page record to require replacement-worker completion under a newer attempt before stale-owner completion is rejected. The remaining remote adapter work is promotion-scale deployment evidence and rollout hardening rather than another owner-boundary proof. | One coordinator and multiple workers drain degree, PageRank, eigenvector, and paired HITS through durable state only. Killing a worker abandons only its page/runtime lease; replacement after expiry completes the page; stale workers cannot complete reclaimed pages; duplicate coordinators cannot publish or fail twice; and active single-vector or paired-HITS service rebuilds do not expose attempt output through public reads. |
+| 1 | Remote owner harness | Promote the process/runtime path from local proof to the canonical coordinator/worker harness. Owners should accept only DB path or service endpoint, role, owner id, worker identity, tick budget, idle policy, and lease policy. Metric config, target generation, page manifests, attempts, publish, failure, and cleanup stay in graph-index state. Launched child argv tests now enforce that narrow owner/budget interface and keep metric/index/job/page details out of process arguments. Command-summary tests now pin the stable role/owner/worker/lease/progress/error telemetry emitted by standalone coordinator and worker-pool processes, and aggregate supervisor/launcher summaries now preserve the same compact per-child telemetry. Standalone role summaries are now treated as a stable operational contract too: they must expose durable-progress, idle, and error tick counters; explain completed ticks as progress, idle, error, lease contention, or lease loss; prove either runtime-owner lease acquisition or explicit acquisition failure; and report `last_error_name: null` for successful owner ticks. Standalone role summaries and aggregate supervisor/launcher summaries must both omit raw metric/index names, target generations, job/page ids, attempt namespaces, storage paths/prefixes, metric configs, process ids, and local writer details. The runtime owner loop now depends on a `MaintenanceBoundary` for combined/coordinator/worker/worker-pool ticks, the internal group write API now exposes the same narrow graph metric maintenance request over HTTP with a matching client method, the command can call that service target directly through the same boundary dispatch path, service-targeted ticks now acquire/renew/take over durable runtime-owner leases before mutating graph metric state, supervisors can launch service-targeted coordinator/worker-pool children without local writer serialization, clean service shutdown releases only the current owner lease while stale releases are fenced, and degree plus bounded PageRank now drain to fresh through an in-process internal service route using service-targeted owners. Degree and bounded PageRank service-route restart/failure coverage now proves abandoned coordinator and worker-pool owners are fenced before TTL, replaced after TTL, stale releases cannot clear replacement owners, and replacement owners continue to fresh output. The spawned-process harness now preflights service-targeted owner argv as a strict endpoint/group/table target and rejects mixed or incomplete local/service targets, real HTTP killed-owner process coverage now proves the same restart/fencing path for degree and bounded PageRank, eigenvector now has service-owner replacement proof, HITS now has service-owner replacement proof with compatible pair freshness verification, real HTTP service-targeted PageRank/eigenvector/paired-HITS active-read coverage now proves the service owner path preserves prior published direct/traversal/rerank results while a rebuild is active, PageRank/eigenvector/paired-HITS publish-verifier failure preserves prior output through service-targeted coordinators, degree/PageRank/eigenvector/HITS have service-targeted publish/cleanup restart proof across coordinator publish, duplicate coordinator idempotence, and worker-pool cleanup resume, degree/PageRank/eigenvector/paired-HITS now have 130-source two-worker service multi-page proofs for non-iterative, single-vector iterative, and paired-vector iterative phase families, and direct-process page-reclaim proofs now read the durable page record to require replacement-worker completion under a newer attempt before stale-owner completion is rejected. The process harness now enforces and emits a final `graph_metric_process_harness_summary` JSON event with `remote_owner_release_gate: true` only after launch, service-owner restart, service publish/cleanup, service publish-failure, service multi-page worker-pool, service active-read, direct publish/cleanup, direct publish-failure, direct active-read, page-reclaim, fixed-iteration, exhausted-attempt, and same-worker fencing coverage all reach their required category counts. That event includes both required and observed counts for each category. The remaining remote adapter work is promotion-scale deployment evidence and rollout hardening rather than another owner-boundary proof. | One coordinator and multiple workers drain degree, PageRank, eigenvector, and paired HITS through durable state only. Killing a worker abandons only its page/runtime lease; replacement after expiry completes the page; stale workers cannot complete reclaimed pages; duplicate coordinators cannot publish or fail twice; and active single-vector or paired-HITS service rebuilds do not expose attempt output through public reads. |
 | 2 | Degree canary rollout | Put degree behind the first internal distributed-maintenance gate. Degree should exercise scan, reduce, publish, cleanup, page leases, runtime leases, status, and freshness without iterative convergence risk. The first gate is now implemented as an internal decision that admits only one queued/active degree build, blocks non-degree queued/active work, rejects failed/truncated page summaries, and applies a configurable control-record cap before planned rollout proceeds. Queued degree builds are now estimated against that cap before job/page records are created. Planned maintenance reports `rounds_executed`, so canary qualification can assert tight budgets exhaust resumably and expanded budgets finish within their configured round cap. That gate is now selectable through the internal `degree_canary` DB idle maintenance mode, which runs planned degree work when eligible, falls back to local maintenance when queued work is blocked before planned execution starts, and fails fast when already-active planned work is outside guardrails. Direct top-k, traversal projection, and search rerank `published`/`fresh` coverage now runs through the canary path, service-route owner path, real HTTP service owner path, and focused hosted cross-range fan-in while a planned rebuild is active. Repeated failed degree builds now also prove abandoned score/job namespaces are cleaned immediately and recent diagnostics stay bounded. `graph-metric-degree-canary-test` is now the named release gate for the canary guardrails. | Local-vs-distributed parity, process restart, stale-attempt rejection, cleanup resume, active/failed status summaries, public `published`/`fresh` behavior, scheduler latency budget, storage-growth bounds, and rollback to the local oracle all pass in CI or release qualification. |
-| 3 | PageRank production promotion | Promote PageRank after the single-vector iterative matrix is complete. Keep dynamic iteration planning, convergence summaries, fixed-iteration non-converged publish metadata, publish verification, prior-generation preservation, and cleanup as required checks. Process coverage now includes killed-worker exhausted-attempt failure for a later contribution page plus a duplicate coordinator tick that cannot fail the build twice, and service-targeted process coverage includes the active public-read contract for direct top-k, traversal projection, and search rerank. Hosted cross-range fan-in now includes an active PageRank shard that keeps the prior published generation mergeable while `fresh` fails closed, graph-level repeated failed-build coverage now proves abandoned PageRank score/job namespaces are cleaned while diagnostics stay bounded, and the lifecycle gate now includes later-iteration exhausted-attempt preservation, failed planned-rebuild public-read preservation for direct top-k/traversal/rerank, and DB-level production-budget parity: a 130-source PageRank build exhausts and resumes through one-page planned maintenance rounds, then matches the local oracle status and top-k output. Promotion still needs deployment-scale cleanup, larger-shard fan-in, and latency evidence. | Distributed PageRank matches the local oracle within tolerance, preserves the previous generation on failed rebuilds, serves prior published scores while building, fails `fresh` with `MetricStale` when stale, recovers from every phase boundary, and passes promotion-scale cross-shard fan-in checks. |
-| 4 | Eigenvector single-vector parity | Reuse the PageRank substrate for eigenvector rather than adding metric-specific job state. Eigenvector should contribute only metric math, metadata, and tolerance rules. Service-targeted process coverage now includes the active public-read contract for direct top-k, traversal projection, and search rerank, service-owner replacement coverage, two-worker service-boundary multi-page scan/initialize/contribution/reduce/convergence evidence, hosted cross-range fan-in for active eigenvector direct metric top-k/traversal/rerank while `fresh` fails closed, publish/cleanup restart and publish-verifier failure through the service owner boundary, killed-worker exhausted-attempt failure for a later contribution page plus duplicate coordinator idempotence through the process harness, lifecycle-gated later-iteration exhausted-attempt preservation, lifecycle-gated failed planned-rebuild public-read preservation for direct top-k/traversal/rerank, graph-level repeated failed-build cleanup/storage-growth proof, lifecycle-gated scan/initialize/contribution/reduce/convergence reclaim coverage, cleanup resume after reopen, failed planned-build preservation, coordinator publish-failure preservation after reopen, and DB-level production-budget parity through a 130-source one-page-budget planned drain matching the local oracle. | The eigenvector matrix still needs deployment-scale parity, promotion-scale fan-in, operations status, and latency evidence before promotion. |
-| 5 | HITS paired-vector promotion | Keep authority and hub as separate named metric scores with one compatible lifecycle. Authority and hub must share target generation, convergence decision, publish decision, failure decision, and cleanup ownership. Focused hosted fan-in, real HTTP service-owner active reads, service-owner replacement coverage, two-worker service-boundary multi-page authority/hub phase coverage, first service killed-owner timing for coordinator and scan worker-pool replacement, killed-worker exhausted hub-reduce attempt coverage through the direct process harness and focused lifecycle gate, lifecycle-gated active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, cleanup resume after reopen, failed-build preservation, publish-failure preservation, scan-page reclaim coverage that rejects stale partial writes, failed planned rebuild public-read coverage for prior compatible authority/hub output, paired fixed-iteration metadata after service-owned publish and cleanup, service-targeted publish/cleanup restart, service-targeted publish-verifier failure preservation, graph-level repeated failed-build cleanup/storage-growth proof, and DB-level production-budget parity through a 130-source one-page-budget paired drain now cover the paired-HITS `published`/`fresh` contract for direct top-k, traversal projection/order/filter/status, authority rerank, compatible pair freshness after replacement, compatible pair cleanup after publish, failed/exhausted-attempt prior-pair preservation, bounded failed-build diagnostics, and local-oracle parity under bounded scheduler budgets. | HITS remains disabled by default until promotion-scale fan-in, broader deployment-scale owner evidence, and larger-graph latency evidence all preserve the previous compatible pair. |
-| 6 | Public read-surface closeout | Treat every score-bearing read path as part of distributed correctness. Building, failed, abandoned, and attempt-scoped output must remain invisible outside status. The lifecycle gate now runs the fast-root query/profile/fan-in invariants for direct metric top-k, graph traversal/search metric status, order/filter generation checks, rerank score details, failed status preservation, malformed shard payloads, and profile generation reporting. The `graph-metric-fan-in-test` gate now combines that fast-root artifact with hosted cross-range graph metric fan-in. The `public-api-graph-metric-e2e-test` gate now combines the public graph-query e2e with the public graph metric action route plus generated OpenAPI/client contracts for graph metric status, runtime ownership summaries, active build pages, and graph metric action responses. | Direct top-k, traversal projection/order/filter/status, search rerank, query profile, hosted fan-in, public action/status routes, generated clients, and any future standalone explain surface either read compatible complete published generations or fail closed with `MetricNotReady`/`MetricStale`. Mixed shard generations, missing statuses, zero generations, incompatible edge filters, incompatible HITS pairs, and malformed score/status payloads are rejected before merging. Promotion-scale shard layouts remain the separate release gate. |
-| 7 | Operations and cleanup release gate | Make the executor safe to leave enabled. V1 keeps latest-only retention, bounded diagnostics, immediate cleanup when snapshot-safe, and deferred internal cleanup only when needed for readers. Degree, PageRank, eigenvector, and HITS now have service-boundary cleanup restart evidence after publish plus graph-level repeated-failed-build cleanup/storage-growth evidence across non-iterative, iterative, and paired-vector families. Release qualification still needs larger retained namespaces and promotion-scale storage-growth evidence under deployment-shaped owner load. | Cleanup resumes after restart for score generations, manifests, pages, phase/iteration summaries, attempts, failures, and runtime-owner records. Direct runtime-owner lease-record tests now prove clean shutdown deletes the current owner record and stale shutdown preserves a replacement owner. Status exposes stable summaries for freshness, phase/iteration progress, owner hashes, worker counts, lease state, takeover/lost-lease counters, page counters, bounded failures, and cleanup progress without raw storage keys or attempt namespaces. |
+| 3 | PageRank production promotion | Promote PageRank after the single-vector iterative matrix is complete. Keep dynamic iteration planning, convergence summaries, fixed-iteration non-converged publish metadata, publish verification, prior-generation preservation, and cleanup as required checks. Process coverage now includes killed-worker exhausted-attempt failure for a later contribution page plus a duplicate coordinator tick that cannot fail the build twice, and service-targeted process coverage includes the active public-read contract for direct top-k, traversal projection, and search rerank. Hosted cross-range fan-in now includes active PageRank shards in both the focused two-shard public-read matrix and a nonuniform eight-shard direct merge layout; both keep the prior published generation mergeable while `fresh` fails closed. Graph-level repeated failed-build coverage now proves abandoned PageRank score/job namespaces are cleaned while diagnostics stay bounded, and the lifecycle gate now includes later-iteration exhausted-attempt preservation, failed planned-rebuild public-read preservation for direct top-k/traversal/rerank, and DB-level production-budget parity: a 130-source PageRank build exhausts and resumes through one-page planned maintenance rounds, then matches the local oracle status and top-k output. Promotion still needs deployment-scale cleanup, broader hosted fan-in surfaces, and latency evidence. | Distributed PageRank matches the local oracle within tolerance, preserves the previous generation on failed rebuilds, serves prior published scores while building, fails `fresh` with `MetricStale` when stale, recovers from every phase boundary, and passes promotion-scale cross-shard fan-in checks. |
+| 4 | Eigenvector single-vector parity | Reuse the PageRank substrate for eigenvector rather than adding metric-specific job state. Eigenvector should contribute only metric math, metadata, and tolerance rules. Service-targeted process coverage now includes the active public-read contract for direct top-k, traversal projection, and search rerank, service-owner replacement coverage, two-worker service-boundary multi-page scan/initialize/contribution/reduce/convergence evidence, hosted cross-range fan-in for active eigenvector direct metric top-k/traversal/rerank while `fresh` fails closed plus nonuniform eight-shard active/stale direct merge coverage, publish/cleanup restart and publish-verifier failure through the service owner boundary, killed-worker exhausted-attempt failure for a later contribution page plus duplicate coordinator idempotence through the process harness, lifecycle-gated later-iteration exhausted-attempt preservation, lifecycle-gated failed planned-rebuild public-read preservation for direct top-k/traversal/rerank, graph-level repeated failed-build cleanup/storage-growth proof, lifecycle-gated scan/initialize/contribution/reduce/convergence reclaim coverage, cleanup resume after reopen, failed planned-build preservation, coordinator publish-failure preservation after reopen, and DB-level production-budget parity through a 130-source one-page-budget planned drain matching the local oracle. | The eigenvector matrix still needs deployment-scale parity, broader promotion-scale fan-in, and latency evidence before promotion. |
+| 5 | HITS paired-vector promotion | Keep authority and hub as separate named metric scores with one compatible lifecycle. Authority and hub must share target generation, convergence decision, publish decision, failure decision, and cleanup ownership. Focused hosted fan-in now covers active/stale compatible authority/hub direct merges that preserve the prior pair and reject `fresh`, while real HTTP service-owner active reads, service-owner replacement coverage, two-worker service-boundary multi-page authority/hub phase coverage, first service killed-owner timing for coordinator and scan worker-pool replacement, killed-worker exhausted hub-reduce attempt coverage through the direct process harness and focused lifecycle gate, lifecycle-gated active prior-pair visibility, paired publish idempotence, initialize/contribution/reduce/hub/convergence reclaim, cleanup resume after reopen, failed-build preservation, publish-failure preservation, scan-page reclaim coverage that rejects stale partial writes, failed planned rebuild public-read coverage for prior compatible authority/hub output, paired fixed-iteration metadata after service-owned publish and cleanup, service-targeted publish/cleanup restart, service-targeted publish-verifier failure preservation, graph-level repeated failed-build cleanup/storage-growth proof, and DB-level production-budget parity through a 130-source one-page-budget paired drain cover the paired-HITS `published`/`fresh` contract for direct top-k, traversal projection/order/filter/status, authority rerank, compatible pair freshness after replacement, compatible pair cleanup after publish, failed/exhausted-attempt prior-pair preservation, bounded failed-build diagnostics, and local-oracle parity under bounded scheduler budgets. | HITS remains disabled by default until promotion-scale fan-in, broader deployment-scale owner evidence, and larger-graph latency evidence all preserve the previous compatible pair. |
+| 6 | Public read-surface closeout | Treat every score-bearing read path as part of distributed correctness. Building, failed, abandoned, and attempt-scoped output must remain invisible outside status. The lifecycle gate now runs the fast-root query/profile/fan-in invariants for direct metric top-k, graph traversal/search metric status, order/filter generation checks, rerank score details, failed status preservation, paired HITS failed-status preservation, malformed shard payloads, and profile generation reporting. The `graph-metric-fan-in-test` gate now combines that fast-root artifact with hosted cross-range graph metric fan-in for compatible published generation merge, unpublished/incompatible generation rejection, nonuniform eight-shard hosted degree/PageRank/eigenvector direct merge coverage with four active/stale shards and invisible unpublished targets, active-stale hosted degree/PageRank/eigenvector traversal projection/order/filter and search rerank published merge plus fresh rejection, compatible HITS authority/hub hosted merge coverage with active/stale prior-pair preservation and fresh rejection, incompatible remote HITS pair rejection, missing remote HITS status rejection, and serializer coverage for representable single-metric shard reads/rerank. The `public-api-graph-metric-e2e-test` gate now combines the public graph-query e2e with the public graph metric action route plus generated OpenAPI/client contracts for graph metric status, runtime ownership summaries, active build pages, and graph metric action responses. | Direct top-k, traversal projection/order/filter/status, search rerank, query profile, hosted fan-in, public action/status routes, generated clients, and any future standalone explain surface either read compatible complete published generations or fail closed with `MetricNotReady`/`MetricStale`. Mixed shard generations, missing statuses, zero generations, incompatible edge filters, incompatible HITS pairs, and malformed score/status payloads are rejected before merging. Full promotion-scale shard layouts remain the separate release gate. |
+| 7 | Operations and cleanup release gate | Make the executor safe to leave enabled. V1 keeps latest-only retention, bounded diagnostics, immediate cleanup when snapshot-safe, and deferred internal cleanup only when needed for readers. Degree, PageRank, eigenvector, and HITS now have service-boundary cleanup restart evidence after publish plus graph-level repeated-failed-build cleanup/storage-growth evidence across non-iterative, iterative, and paired-vector families. The local promotion-budgeted release summary now also exposes configured/observed operations-floor evidence for active page probes, active leased/detailed status pages, terminal no-work status, untruncated work/status pagination, and finite progress. The focused operations gate now also runs the capped active-page status test that requires every reported active page to carry worker, lease, attempt, cursor/error, and progress-unit details. Release qualification still needs larger retained namespaces and promotion-scale storage-growth evidence under deployment-shaped owner load. | Cleanup resumes after restart for score generations, manifests, pages, phase/iteration summaries, attempts, failures, and runtime-owner records. Direct runtime-owner lease-record tests now prove clean shutdown deletes the current owner record and stale shutdown preserves a replacement owner. Status exposes stable summaries for freshness, phase/iteration progress, owner hashes, worker counts, lease state, takeover/lost-lease counters, page counters, bounded failures, and cleanup progress without raw storage keys or attempt namespaces. |
 | 8 | Default widening | Widen the conservative `auto` gate one family at a time: degree, PageRank, eigenvector, then HITS. Keep local runners as CI/debug oracles until distributed parity and operations evidence are routine. | A metric family becomes distributed-by-default only after parity, remote ownership, crash/restart, cleanup, public-read, fan-in, status, operations, latency-budget, generated-client, docs, and rollback checks are all green for that family. |
 
 The critical dependency is owner correctness before default promotion. A family
@@ -4388,11 +4417,20 @@ Recommended follow-up release cuts from the current checkpoint:
    multi-page service killed-owner timing proofs: killed coordinators and killed
    worker-pools fence duplicate owners before TTL, allow replacement takeover
    after TTL, and continue the same 130-source builds through publish and
-   cleanup. PageRank and paired HITS service-targeted cleanup now also have
-   killed-owner timing after publish: a cleanup worker-pool can die mid-cleanup,
-   duplicate cleanup ownership is fenced before TTL, and a replacement owner
-   takes over after TTL and finishes to fresh fixed-iteration metadata or a
-   fresh compatible HITS pair. The release-qualification harness can now reopen
+   cleanup. The process-harness summary now makes those killed-owner timing
+   proofs auditable as explicit required/observed service multi-page
+   coordinator-takeover and worker-pool-takeover counters, plus a separate
+   required/observed service cleanup-takeover counter for killed cleanup owners
+   after publish. It also breaks `remote_owner_release_gate` into
+   `service_remote_owner_release_gate`, `direct_remote_owner_release_gate`, and
+   `failure_reclaim_release_gate` so promotion tooling can tell whether missing
+   evidence is service-boundary, direct-boundary, or failure/reclaim coverage.
+   Degree, PageRank, eigenvector, and paired HITS service-targeted cleanup now
+   also have killed-owner timing after publish: a cleanup worker-pool can die
+   mid-cleanup, duplicate cleanup ownership is fenced before TTL, and a
+   replacement owner takes over after TTL and finishes to fresh scores,
+   fixed-iteration metadata, or a fresh compatible HITS pair. The
+   release-qualification harness can now reopen
    the DB handle between every progressing maintenance tick to prove durable
    resume for degree, PageRank, eigenvector, and paired HITS. The remaining work
    is to extend killed-owner evidence to promotion-scale deployments and keep
@@ -4437,13 +4475,13 @@ Recommended follow-up release cuts from the current checkpoint:
    exhausts a killed hub-reduce page attempt sequence, fails the compatible pair
    once, preserves the previous pair, and fences duplicate coordinator failure.
    This cut must still finish promotion-scale fan-in, broader deployment-scale
-   owner evidence, larger-manifest restart evidence, and larger-graph latency
+   owner evidence, operations evidence, and larger-graph latency
    before any default HITS execution is enabled.
 5. **Cleanup and storage-growth gate**: broaden the current latest-only cleanup
    proof from graph-level repeated failed builds and service-boundary cleanup
-   restart into deployment-scale qualification. PageRank and paired HITS now add
-   service-boundary killed-owner cleanup proofs after publish. Degree, PageRank,
-   eigenvector, and HITS now prove repeated failed
+   restart into deployment-scale qualification. Degree, PageRank, eigenvector,
+   and paired HITS now add service-boundary killed-owner cleanup proofs after
+   publish. Degree, PageRank, eigenvector, and HITS now prove repeated failed
    planned builds remove abandoned job namespaces and unpublished score
    generations while bounding recent diagnostics. The `graph-metric-cleanup-test`
    gate now makes that evidence explicit in CI: cleanup pages resume after
@@ -4452,21 +4490,32 @@ Recommended follow-up release cuts from the current checkpoint:
    lease cleanup is fenced. The release-qualification harness now adds
    aggregate storage-footprint evidence for degree, PageRank, eigenvector, and
    paired HITS: successful planned cleanup leaves zero durable job namespace
-   records and exactly one retained metric-control record, repeated failed
-   builds preserve the prior score-record count, remove abandoned failed job
-   namespaces, emit retained metric/control record counts, and keep retained
-   control/failure/event record counts bounded under the configured ceiling. The
-   harness now also records cleanup tick count and cleanup elapsed time from the
-   planned-maintenance/status boundary; zero cleanup ticks is valid when a tiny
-   workload finishes cleanup in the publish round, while larger iterative and
-   paired runs expose separate cleanup cost. The harness can also close and
-   reopen the planned DB between
-   nonterminal maintenance ticks to prove durable scheduler state resumes after
-   handle/owner restart boundaries. The remaining gate is larger retained
-   namespaces, abandoned attempts under deployment-shaped killed-owner churn,
-   promotion-scale cleanup cost, and promotion-scale storage growth. Larger
-   retained namespaces can be a future admin/debug option, but v1 correctness
-   should not depend on a retention knob.
+   records, zero attempt records, and exactly one retained metric-control
+   record; repeated failed builds preserve the prior score-record count, remove
+   abandoned failed job and attempt namespaces, verify retained metric-record
+   counts against published score records plus fixed per-metric metadata and
+   bounded failure diagnostics, emit retained
+   score/metric/control/job/attempt/failure/event record counts, and keep
+   retained control/failure/event record counts bounded under the configured
+   ceiling. The harness now also records cleanup tick count and cleanup elapsed
+  time from the planned-maintenance/status boundary; zero cleanup ticks is
+  valid when a tiny workload finishes cleanup in the publish round, while
+  larger iterative and paired runs expose separate cleanup cost. Promotion
+  release qualification now requires a configured cleanup latency ceiling and
+  fails the observed deployment-shaped gate when the max cleanup phase exceeds
+  that ceiling. Promotion qualification also exposes failure-churn as its own
+  configured/observed floor: the promotion profile must request the repeated
+  failed-build floor and bounded diagnostics, every completed family must
+  observe that retry volume, paired HITS must report compatible paired
+  diagnostics, and failed cleanup must leave zero job and attempt namespaces
+  with only bounded failure/event records retained. The harness can also close and
+  reopen the planned DB between
+  nonterminal maintenance ticks to prove durable scheduler state resumes after
+  handle/owner restart boundaries. The remaining gate is larger retained
+  namespaces, deployment-shaped killed-owner churn with abandoned in-flight
+  attempts, and promotion-scale storage growth under longer-running owner
+  churn. Larger retained namespaces can be a future admin/debug option, but v1
+  correctness should not depend on a retention knob.
 6. **Latency and default-widening gate**: widen `auto` one family at a time only
    after scheduler tick latency, public read latency, cleanup cost, and storage
    growth are measured. The order stays degree, PageRank, eigenvector, then
@@ -4477,11 +4526,14 @@ Recommended follow-up release cuts from the current checkpoint:
    cases and compatible opt-in HITS can use planned maintenance, larger or
    incompatible cases fall back before local execution, and threshold widening
    remains an intentional internal decision rather than an accidental default.
-   The release-qualification harness now has disabled-by-default latency budget
+   The release-qualification harness now has latency budget
    flags for local oracle publish, planned publish, cleanup, published reads,
    fail-closed fresh reads, and synthetic fan-in merge/fail-closed paths.
-   It also has disabled-by-default retained metric/control storage, page-claim,
-   cleanup-tick, executed-round, failure-retry, worker-step, and
+   The named budgeted promotion target now enables conservative public-read,
+   fresh-failure, and fan-in latency ceilings so active/failed direct,
+   traversal, rerank, paired HITS, and fan-in read paths become pass/fail
+   evidence instead of log-only measurements. It also has disabled-by-default retained score/metric/control/failure/event
+   storage, page-claim, cleanup-tick, executed-round, failure-retry, worker-step, and
    coordinator-step budget flags so promotion runs can turn observed storage and
    scheduler footprints into pass/fail gates after real baselines exist, without
    baking arbitrary timing, storage, page-count, retry-count, or role-step
@@ -4492,10 +4544,10 @@ Recommended follow-up release cuts from the current checkpoint:
    state, takeover/lost-lease counters, page counters, bounded failures, cleanup
    progress, and last error summaries. They should not see raw storage keys,
    page ids, attempt namespaces, or process-local writer details as public API.
-   The `graph-metric-operations-test` gate now makes the runtime-summary
-   OpenAPI/client shape, graph index encoders, internal service maintenance
-   route, and command/supervisor telemetry contract explicit in PR and
-   full-default Zig CI. The `public-api-graph-metric-e2e-test` gate now also
+   The `graph-metric-operations-test` gate now makes capped active-page status
+   details, the runtime-summary OpenAPI/client shape, graph index encoders,
+   internal service maintenance route, and command/supervisor telemetry contract
+   explicit in PR and full-default Zig CI. The `public-api-graph-metric-e2e-test` gate now also
    pins the public action route and generated client-facing graph metric status
    types so client drift is caught with the public graph metric read surface.
 
@@ -4546,12 +4598,15 @@ than PR unit coverage:
   namespace records, exactly one retained metric-control record remains, exactly
   one retained score generation remains for the current graph shape, repeated
   failed generations do not increase retained score records, abandoned failed
-  job namespaces are removed, retained metric/control record counts are emitted,
-  and retained failure/event records match the configured bounded retention
-  window exactly: `min(failure_repeats, max_failure_diagnostics)` failures and
+  job namespaces are removed, retained score/metric/control/failure/event
+  record counts are emitted, retained metric records match the published score
+  records plus fixed per-metric metadata overhead, and retained failure/event
+  records match the configured bounded retention window exactly:
+  `min(failure_repeats, max_failure_diagnostics)` failures and
   `min(failure_repeats + 1, max_failure_diagnostics)` events per metric, doubled
-  for compatible HITS pairs. Retained control records must stay within the
-  combined diagnostic ceiling. It
+  for compatible HITS pairs. Failed retained metric records must equal the fresh
+  retained metric-record count plus the bounded retained failure records.
+  Retained control records must stay within the combined diagnostic ceiling. It
   also verifies that terminal fresh and terminal failed statuses do not expose
   active build pages, truncated page payloads, job ids, worker ids, or cursors.
   Cleanup tick and elapsed-time evidence must agree: runs with no cleanup ticks
@@ -4596,25 +4651,42 @@ than PR unit coverage:
   queued target generation equal to the current edge generation, finite zero
   progress, and no active page payload.
   Each family run also builds a
-  synthetic two-shard direct metric fan-in probe from the published top-k
+  synthetic direct metric fan-in probe from the published top-k
   results: compatible shard payloads must merge to the same top-k ordering, an
   active/building shard with the same prior published generation must still
-  merge for `published`, the same active fan-in must fail closed for `fresh`,
-  and a deliberately incompatible published generation must fail closed through
-  the normal query merge path. Deliberately incompatible metric metadata
+  merge for `published`, a mixed active shard set with both `building` and
+  `failed` status must still merge the prior published score generation for
+  `published` while reporting the higher-severity failed status, the same active
+  fan-in must fail closed for `fresh`, and a deliberately incompatible
+  published generation must fail closed through the normal query merge path.
+  Deliberately incompatible metric metadata
   versions and edge filters must also fail closed before score mixing, proving
-  release fan-in compares metric identity as well as generation. A shard that
-  omits the requested metric result must also fail closed before score mixing.
-  The synthetic shard splitter is itself a correctness gate: shard ranges must
+  release fan-in compares metric compatibility as well as generation. Shards
+  that report mismatched index, metric, or status-name identity must fail closed
+  before score mixing. A shard that omits the requested metric result must also
+  fail closed before score mixing. A shard that duplicates a requested metric,
+  returns an unrequested metric, carries a non-finite score, reports a
+  non-finite status number, reports out-of-range progress, or reports an
+  invalid published state such as `not_ready` or `disabled` must also fail
+  closed before score mixing. The
+  synthetic shard splitter is itself a correctness gate: shard ranges must
   exactly cover the published score set in order and stay balanced to within one
   score, so increasing `--synthetic-fan-in-shards` exercises a real merge layout
-  instead of silently creating a malformed fixture.
+  instead of silently creating a malformed fixture. The active/stale fan-in
+  breadth is controlled separately by `--synthetic-fan-in-active-shards`, so
+  promotion runs can prove more than the minimum two active shard statuses while
+  keeping the same merge layout.
   HITS runs an additional paired authority/hub synthetic fan-in probe where each
   shard must provide both requested metric results; compatible pairs merge
   together, active pairs preserve the prior published generation for
-  `published`, `fresh` rejects active pairs, a missing authority/hub metric
-  result rejects, and incompatible authority/hub generation, metadata-version,
-  and edge-filter pairs reject before merge output is published.
+  `published`, mixed active pairs with failed and building shard statuses still
+  preserve the prior compatible pair for `published`, `fresh` rejects active
+  pairs, a missing authority/hub metric result rejects,
+  duplicate/unrequested/non-finite score payloads reject,
+  non-finite status numbers and out-of-range progress reject, mismatched
+  index/metric/status-name identity rejects, invalid published states reject,
+  and incompatible authority/hub generation, metadata-version, and edge-filter
+  pairs reject before merge output is published.
 - The harness emits structured JSONL for each run: graph size, edge count,
   metric family, maintenance mode, target generation, tick count, budget
   exhaustion, generated graph topology evidence, configured round/metric/page
@@ -4623,50 +4695,113 @@ than PR unit coverage:
   not-ready direct-read, rerank, traversal projection, traversal fail-closed,
   and status counts, page counts,
   phase advances, publish/failure counts, local/planned publish latency, active page probe
-  claim/reclaim flags, active status page
-  count/truncation/progress, cleanup tick count, cleanup elapsed time, DB reopen
+  claim/reclaim flags, active status page count, leased-page count,
+  detailed-page count, truncation flag, progress, cleanup tick count, cleanup elapsed time, DB reopen
   count, configured worker identity count, split worker identities that made
-  progress, configured active
+  tick progress, split worker identities that made page claim/completion
+  progress, split worker min/max page-progress counts, configured active
   mutation write count, active target generation, active generation delta,
-  HITS active paired published-result count, HITS active paired fresh-rejection
-  count, HITS active paired rerank published-result count, HITS active paired
-  rerank fresh-rejection count, HITS active paired traversal metric-result
-  count, active published-read latency, active fresh-failure latency, active
-  rerank published-read latency, active rerank fresh-failure latency, active
-  traversal published-read latency, active traversal fresh-failure latency,
+  HITS active paired published-read latency, published-result count,
+  published-score count, fresh-failure latency, fresh-rejection count, HITS
+  active paired rerank published-result count, HITS active paired rerank
+  fresh-rejection count, HITS active paired traversal metric-result
+  count, active published-read latency, active published-read result count,
+  active fresh-failure latency, active fresh-rejection count, active
+  direct top-k score count, active rerank published-read latency, active rerank
+  published-result count, active rerank fresh-failure latency, active rerank
+  fresh-rejection count, active traversal published-read latency, active
+  traversal fresh-failure latency,
   active traversal published-check count, active traversal fresh-rejection
-  count, active profile graph-metric entry count, failed-build published-read latency, failed-build fresh-failure
-  latency, failed-build rerank published-read latency, failed-build rerank
-  fresh-failure latency, failed-build traversal published-read latency,
+  count, active profile graph-metric entry count, failed-build published-read
+  latency, failed-build published-read result count, failed-build fresh-failure
+  latency, failed-build fresh-rejection count, failed-build rerank
+  published-read latency, failed-build rerank published-result count,
+  failed-build rerank fresh-failure latency, failed-build rerank
+  fresh-rejection count, failed-build traversal published-read latency,
   failed-build traversal fresh-failure latency, failed-build traversal
   published-check count, failed-build traversal fresh-rejection count,
-  failed-build profile graph-metric entry count,
+  failed-build direct top-k score count, failed-build profile graph-metric entry count,
   configured failure
   repeat count, final retry count, configured retained-diagnostic ceiling,
-  bounded recent event/failure counts, paired HITS event/failure counts, expected score
-  record count, synthetic fan-in shard count, terminal merged score count,
-  active-shard published merged score count, active-shard fresh rejection count,
-  incompatible-generation, metadata-version, edge-filter, and missing-metric
-  rejection counts, terminal fan-in merge latency,
-  active-shard published fan-in latency, active-shard fresh fail-closed latency,
-  incompatible-generation, metadata-version, edge-filter, and
-  missing-requested-metric fail-closed latencies,
-  paired HITS fan-in metric-result count, paired active-published metric-result
-  count, paired fresh/generation/metadata-version/edge-filter/missing rejection
-  counts, paired terminal/active/fresh-fail/generation-fail/metadata-fail/
-  edge-filter-fail/missing-fail fan-in latencies,
-  HITS failed paired published-result count, HITS failed paired fresh-rejection
-  count, HITS failed paired rerank published-result count, HITS failed paired
-  rerank fresh-rejection count, HITS failed paired traversal metric-result
+  bounded recent event/failure counts, retained expected-error failure-record
+  counts, retained failed-event counts, paired HITS event/failure/diagnostic
+  shape counts,
+  pre-drain/fresh/active/failed paused-metric counts, expected score
+  record count, synthetic fan-in shard count, min/max scores per synthetic
+  shard, active synthetic shard count, terminal merged score count,
+  active-shard published merged score count, mixed-active published merged score
+  count, active-shard fresh rejection count,
+  zero-generation, incompatible-generation, metadata-version, edge-filter,
+  missing-metric, duplicate-metric, extra-metric, non-finite-score,
+  non-finite-status, out-of-range-progress, identity-mismatch, and invalid-state rejection counts, terminal fan-in merge latency,
+  active-shard published fan-in latency, mixed-active published fan-in latency,
+  active-shard fresh fail-closed latency,
+  zero-generation, incompatible-generation, metadata-version, edge-filter,
+  missing-requested-metric, duplicate-metric, extra-metric, non-finite-score,
+  non-finite-status, out-of-range-progress, identity-mismatch, and invalid-state fail-closed latencies,
+  paired HITS fan-in metric-result count, paired HITS min/max scores per
+  synthetic shard, paired active synthetic shard count, paired
+  active-published metric-result count, paired mixed-active published
+  metric-result count, paired
+  fresh/zero-generation/generation/metadata-version/edge-filter/missing/duplicate/extra/non-finite/status-non-finite/progress/identity/state
+  rejection counts, paired terminal/active/mixed-active/fresh-fail/
+  zero-generation-fail/generation-fail/metadata-fail/edge-filter-fail/missing-fail/duplicate-fail/
+  extra-fail/non-finite-fail/status-non-finite-fail/progress-fail/identity-fail/state-fail fan-in latencies,
+  HITS failed paired published-read latency, published-result count,
+  published-score count, fresh-failure latency, fresh-rejection count, HITS
+  failed paired rerank published-result count, HITS failed paired rerank
+  fresh-rejection count, HITS failed paired traversal metric-result
   count, active/fresh/failed pending-work summaries, fresh/failed status page
-  counts, terminal status truncation flags, fresh/failed score, metric, and
-  control record counts, fresh/failed job-namespace counts, failed
-  failure/event record counts, and parity summary.
-  Optional disabled-by-default budget flags can fail a run when local publish,
-  planned publish, cleanup, published read, fail-closed fresh read, or synthetic
-  fan-in latency exceeds the selected release baseline; the fan-in gate is
-  `--max-fan-in-latency-ns`. Separate disabled-by-default storage gates
-  `--max-storage-metric-records` and `--max-storage-control-records` fail a run
+  counts, terminal status truncation flags, fresh convergence/non-convergence
+  counts, iterations-completed value, positive-delta count, computed-at count,
+  local/planned top-k and status parity check counts,
+  fresh/failed score, metric, control, job-namespace, and attempt-record
+  counts, failed failure/event record counts, and parity summary.
+  Those footprint fields are verified, not merely logged: expected, fresh, and
+  failed score-record counts must match the generated graph shape exactly,
+  fresh and failed metric-record counts must match score records plus fixed
+  retained metadata and bounded failed diagnostic records, fresh and failed job
+  namespace counts must be zero, fresh and failed attempt-record counts must be
+  zero, the fresh terminal state must retain exactly one metric-control record,
+  failed failure/event records must match the bounded diagnostic window exactly,
+  and failed control records must stay within that same diagnostic ceiling.
+  Repeated-failure diagnostics
+  are shape-checked too: the terminal failed status must expose a failed last
+  event, the expected `InvalidGraphMetricScore` last error, retained failure
+  records with nonzero job ids, target/score generations newer than the
+  published generation, non-idle phases, retry counts, and the expected error,
+  plus retained failed events that preserve the prior published generation and
+  carry no score count. Compatible HITS pairs must satisfy the same diagnostic
+  shape on both authority and hub.
+  The emitted graph topology and active-generation fields are also verified as
+  result-level evidence: node/edge totals, source/sink/authority counts,
+  sink/cycle/bipartite/self-edge counts, max out-degree, expected score-record
+  count, active mutation count, active target generation, and active generation
+  delta must all match the selected family and workload knobs.
+  Published metadata is a result-level gate too: degree must publish converged
+  metadata with one completed iteration, zero positive deltas, and a computed
+  timestamp; PageRank, eigenvector, and compatible HITS must publish computed
+  timestamps, bounded iteration counts at or below `--max-iterations`, and if
+  they publish non-converged output, every metric in the family must report
+  `converged: false`, positive finite delta evidence, and
+  `iterations_completed == --max-iterations`.
+  Local-oracle parity is no longer score-only: each family metric must match the
+  local oracle top-k ordering and scores, and its planned published status must
+  match the local status for published generation, edge generation, complete
+  state, metadata version, convergence flag, iteration count, and finite delta
+  within tolerance. HITS must pass the same parity checks for both authority and
+  hub.
+  Optional budget flags can fail a run when local publish, planned publish,
+  cleanup, published read, fail-closed fresh read, HITS paired direct
+  published/fresh read, or synthetic fan-in latency exceeds the selected release
+  baseline; the public-read gates are `--max-published-read-latency-ns` and
+  `--max-fresh-fail-latency-ns`, and the fan-in gate is
+  `--max-fan-in-latency-ns`. These threshold checks run after the
+  family result JSONL is emitted, so a budget failure still leaves the measured
+  evidence needed to set or adjust the baseline. Separate disabled-by-default storage gates
+  `--max-storage-score-records`, `--max-storage-metric-records`,
+  `--max-storage-control-records`, `--max-storage-attempt-records`,
+  `--max-storage-failure-records`, and `--max-storage-event-records` fail a run
   when either the fresh terminal footprint or repeated-failure footprint exceeds
   the selected release baseline. Scheduler footprint gates
   `--max-page-claims` and `--max-cleanup-ticks` fail a run when page churn or
@@ -4674,27 +4809,385 @@ than PR unit coverage:
   `--max-rounds-executed` and `--max-failure-retry-count` make bounded scheduler
   progress and bounded failed-build retry volume explicit release gates.
   `--max-worker-steps` and `--max-coordinator-steps` bound how much work each
-  runtime role consumed before publish, cleanup, and failure verification. The
+  runtime role consumed before publish, cleanup, and failure verification.
+  `--min-families-run` fails the final summary when a release run completes
+  fewer metric families than the configured floor, making all-family promotion
+  coverage an explicit gate instead of an inference from logs.
+  `--min-split-worker-identities-with-progress` and
+  `--min-split-worker-identities-with-page-progress` fail a split-mode run when
+  too few configured worker identities make tick progress or actual page
+  claim/completion progress. The budgeted promotion target sets both to the
+  four-worker promotion floor, so promotion evidence cannot pass while silently
+  serializing page ownership through fewer worker identities. The
+  harness now finishes successful runs with a
+  `graph_metric_release_qualification_summary` JSONL event that repeats the
+  configured latency/storage/scheduler budgets, marks whether any budget was
+  enabled, breaks that budget evidence into latency, storage, scheduler, and
+  coverage-floor categories, records whether the promotion profile floor was
+  enforced, and marks `deployment_shaped_release_gate` in the config row when
+  the invocation requests the promotion profile with all-family execution, split
+  ownership, reopen evidence, a four-family floor, split worker identity floors
+  at least as strict as the configured worker count, public-read/fresh/fan-in
+  latency ceilings, retained storage ceilings, and scheduler ceilings. The
+  final summary row marks the same flag only after observing all four metric
+  families, per-family split-worker progress/page-progress floors, and the
+  promotion fan-in floor: the selected shard count must be exercised for every
+  family, active/stale shard counts must reach the configured promotion floor,
+  and the observed primary plus paired-HITS layouts must be nonuniform. Worker
+  floors use the minimum observed family contribution rather than aggregate
+  worker totals. That flag is
+  release-tooling metadata for the local harness: it proves the run used and
+  satisfied the deployment-shaped local gate with all local promotion budget
+  categories enabled, but it does not replace hosted remote-owner, killed-owner,
+  or cross-range promotion evidence. The config row now aliases
+  `deployment_shaped_release_gate` as
+  `configured_deployment_shaped_release_gate`, while the summary row also emits
+  `configured_deployment_shaped_release_gate` and
+  `observed_deployment_shaped_release_gate` so rollout tooling can distinguish
+  a correctly shaped invocation from a completed promotion run that actually met
+  the observed floors. The config and summary rows also emit the component audit booleans
+  `all_family_execution`, `public_read_fan_in_latency_budgeted`,
+  `cleanup_latency_budgeted`,
+  `retained_storage_budgeted`, `promotion_scheduler_budgeted`,
+  `split_worker_progress_floor_configured`, and
+  `split_worker_page_progress_floor_configured`, and
+  `promotion_fan_in_floor_configured`, and
+  `promotion_failure_churn_floor_configured`, and
+  `promotion_operations_floor_configured`; the summary adds
+  `public_read_fan_in_latency_budget_observed`,
+  `cleanup_latency_budget_observed`, `retained_storage_budget_observed`,
+  `promotion_scheduler_budget_observed`, `split_worker_progress_floor_observed`, and
+  `split_worker_page_progress_floor_observed`, plus
+  `promotion_failure_churn_floor_observed` and
+  `promotion_operations_floor_observed`. The latency observed flag is
+  true only when published-read, fresh-fail, and fan-in latency caps are
+  configured and the max observed surfaces stay within them. The cleanup
+  latency observed flag is true only when a cleanup latency cap is configured
+  and the max observed cleanup phase stays within it. The
+  retained-storage observed flag is true only when configured score, metric,
+  control, attempt, failure, and event caps are present, every completed family
+  stayed under those caps, retained score/metric/control/failure/event record
+  counts match the expected fresh and failed generations, and cleanup left zero
+  job and attempt namespace records. The scheduler observed flag is true only
+  when page-claim, cleanup, round, retry, worker-step, and coordinator-step caps
+  are configured and the completed summary stayed within them while publishing
+  exactly the completed families. The worker observed flags are true only when
+  the matching floor was configured and every completed family met it, plus
+  `promotion_fan_in_floor_observed`, which is true only after the final summary
+  proves every completed family used the configured shard/active-shard shape and
+  the expected nonuniform primary or paired-HITS fan-in layout, and
+  `promotion_failure_churn_floor_observed`, which is true only after repeated
+  failed-build retries, bounded diagnostics, paired-HITS diagnostic records, and
+  zero retained failed job/attempt namespaces match the promotion floor. The
+  operations observed flag is true only when every completed family exposes an
+  active page probe, the reclaimed page is fenced from stale completion, active
+  status pages carry leased and detailed page counts, terminal fresh/failed work
+  is empty and untruncated, and active progress is finite in `[0, 1]`. Rollout tooling
+  can therefore tell which local promotion-gate category is absent without
+  reverse-engineering every raw knob. When
+  `--require-deployment-shaped-release-gate` is set, the harness now requires
+  the completed summary to satisfy `observed_deployment_shaped_release_gate`;
+  a correctly shaped invocation that fails to produce the observed family,
+  worker, fan-in, failure-churn, public-read latency, cleanup latency, storage,
+  or scheduler evidence fails the promotion run instead of only emitting a
+  false summary flag.
+  The summary repeats the selected workload shape for documents, fanout, top-k,
+  synthetic fan-in shards,
+  synthetic active fan-in shards, active mutation writes, workers, max
+  ticks, rounds per tick, metrics per round, pages per round, max iterations,
+  failed rebuild repeats, retained diagnostics, status pages, reopen mode, and
+  tolerance, repeats the matching promotion floor values, records the number of
+  metric families run, records explicit degree/PageRank/eigenvector/HITS family
+  counters, and reports total and maximum observed latency across those families
+  for local oracle publish, planned publish, published public reads,
+  fail-closed fresh reads, and synthetic fan-in. When a release run requests a
+  four-family summary floor, those counters are verified so a promotion summary
+  cannot pass unless each family ran exactly once. The config JSONL row
+  emits the same selected workload, floor, and budget-category fields before
+  work starts, so release tooling can classify failed or interrupted runs and
+  prove a successful promotion run used at least the required workload shape
+  from either the starting config or final summary while still retaining the
+  per-family records for diagnosis. The summary row now aggregates
+  graph-shape and active-generation
+  proof: total actual and expected graph nodes/edges, source/sink/authority
+  nodes, sink/cycle/bipartite/authority-self edge components, maximum observed
+  out-degree, total active mutation writes, and total active generation delta.
+  Those totals are verified against the configured document count, fanout,
+  active mutation count, and degree/PageRank/eigenvector/HITS family mix, so
+  promotion tooling can prove from the final row that the run exercised the
+  intended workload shape before trusting latency, storage, or public-read
+  evidence. The summary row now aggregates scheduler execution proof too:
+  maximum allowed total ticks, observed ticks, budget-exhausted family count,
+  combined/coordinator/worker-pool sweeps, maximum allowed drain scheduler
+  scans, observed drain scheduler scans, pre-drain scan totals plus maximum
+  allowed pre-drain scans, active-build observations, expected and observed
+  build starts, worker steps, coordinator decision count, coordinator steps,
+  maximum allowed page claims, page claims/completions, phase advances, expected
+  and observed publishes, expected and observed failed builds, maximum allowed
+  executed rounds, observed executed rounds, total configured worker identities,
+  total split worker identities that made tick progress, and total split worker
+  identities that made actual page claim/completion progress. These totals are
+  verified against the selected combined or split maintenance mode and selected
+  tick/round/page/metric-scan budgets for both drain and pre-drain scans, so a
+  release summary cannot pass while a combined run silently uses split-role
+  sweeps, a split run omits the coordinator-before/worker-pool/coordinator-after
+  shape, a split run reports impossible worker ownership totals, the aggregate
+  scheduler footprint exceeds the configured resumable bounds, or the run
+  finishes without build start, active-build observation, worker page,
+  coordinator, phase-advance, publish, zero-failure evidence, and
+  budget-exhaustion evidence whenever a family needed multiple ticks to finish.
+  Page-completion totals must cover phase advances, and aggregate coordinator
+  decisions must fit inside the observed coordinator step count, so the summary
+  row cannot claim publish/phase/failure decisions that were not accounted for
+  by scheduler execution.
+  When worker-identity floors are configured, the final summary also
+  verifies that each completed family contributed the required number of
+  progressing and page-progressing worker identities by checking the minimum
+  observed family counts, not only aggregate totals or per-family rows. The same summary row records total reopen count,
+  cleanup ticks, and cleanup latency. Reopen totals are verified against
+  `reopen_between_ticks`, so reopen-enabled release runs prove a DB-handle
+  boundary after every nonterminal tick, while non-reopen runs cannot report
+  synthetic reopen evidence. Cleanup tick and latency totals are verified as a
+  pair, so release tooling can distinguish no separate cleanup work from
+  measured cleanup work without relying on per-family rows. The summary latency
+  totals are verified too: successful runs must report nonzero local/planned
+  execution, public-read, fresh-failure, and fan-in latency evidence, and each
+  observed maximum must be bounded by the matching total. When latency,
+  storage, page-claim, cleanup-tick, executed-round, failed-retry, worker-step,
+  or coordinator-step ceilings are configured, the final summary re-checks
+  those ceilings against the observed maxima, so promotion tooling can trust the
+  final row without replaying every per-family record. Retained metric-record
+  expected totals are emitted next to the observed totals, along with the metric
+  slot count and fixed per-metric metadata overhead used to compute them. The
+  same storage block emits the expected fresh control-record total and the
+  failed control-record ceiling derived from retained diagnostics. Those
+  expected totals are re-checked in the final row against the generated
+  score-record count, the fixed per-metric metadata overhead, and retained
+  failed diagnostic records, so storage-growth evidence cannot pass while
+  hiding extra metric namespace entries or unbounded control records.
+  Failed-build
+  diagnostic totals are included as status-level evidence too: total retry
+  count, recent failure/event counts, retained expected-error records, retained
+  failed-event records, expected and observed storage failure/event records, and
+  the paired-HITS equivalents. Those totals are verified against
+  `failure_repeats`, `max_failure_diagnostics`, and the HITS paired-family
+  count, so final-row release evidence proves bounded diagnostics
+  were retained and shaped correctly, not only that the underlying storage
+  record counts stayed bounded. The summary row also aggregates operational
+  scheduler-state proof: total pre-drain queued builds, total fresh-terminal
+  pending work plus its active-build/page, failed-page, paused-metric, and
+  truncation components, fresh terminal status page and truncation counts, total
+  active builds, active pages, active failed-page, paused-metric, and truncation
+  components, active status pages, active page-probe claim and reclaim counts,
+  active leased pages, active detailed pages, the observed active-progress
+  range, total failed-terminal pending work plus its active-build/page,
+  failed-page, paused-metric, and truncation components, and failed terminal
+  status page and truncation counts. Those
+  totals are verified against the families that actually ran, so release
+  tooling can prove from the final row that every family started as exactly one
+  queued build, every active rebuild exercised a claim plus post-expiry reclaim
+  of a durable build page, active rebuilds exposed bounded leased page detail
+  with finite progress in `[0, 1]`, and fresh and failed terminal states left
+  no scheduler-visible work, paused metrics, truncated page summaries, or active
+  page payloads. The summary row
+  also aggregates the public read-surface proof:
+  expected and observed primary pre-publish `MetricNotReady` surfaces, expected
+  and observed paired-HITS pre-publish `MetricNotReady` surfaces, expected and
+  observed primary published-read surfaces, expected and observed primary fresh
+  rejections, total graph metric profile entries, expected and observed
+  paired-HITS published-read surfaces, expected and observed paired-HITS fresh
+  rejections, total primary fan-in rejections, and total paired-HITS fan-in
+  rejections.
+  The same final row breaks active and failed public reads down by surface:
+  direct metric reads, search rerank reads, traversal projection/order/filter
+  checks, and paired-HITS direct/rerank/traversal reads. Those read-type
+  counters are verified independently from the expected aggregate surface
+  totals, so a release summary cannot pass by exercising only one public read
+  path while reporting the expected total.
+  Direct published-read score totals are included for active and failed
+  rebuilds, including paired-HITS active and failed direct score totals, and
+  are verified against top-k and family shape. That makes prior-generation
+  preservation visible from the final row instead of requiring per-family
+  result reconstruction.
+  It also records successful fan-in merge evidence with expected and observed
+  totals: total synthetic shards, min/max shard score counts, total merged
+  primary scores, active-stale published primary scores, mixed failed/building
+  published primary scores, primary nonuniform-layout count, paired-HITS merged
+  metric results, paired active shard counts, paired active/mixed published
+  metric results, and paired HITS nonuniform-layout count. Successful fan-in
+  totals are verified against top-k, shard count, and the
+  degree/PageRank/eigenvector/HITS family mix, including whether the selected
+  workload should produce uniform or nonuniform primary and paired-HITS shard
+  layouts. Promotion summaries now expose that as a single
+  configured/observed fan-in floor so deployment-shaped runs cannot pass after
+  silently falling back to a uniform or too-small fan-in fixture. Expected
+  aggregate rejection totals are emitted next to observed
+  totals, and rejection totals are broken down by category for both primary and
+  paired-HITS fan-in: active `fresh`,
+  zero-generation, incompatible generation, metadata-version, edge-filter,
+  missing requested metric, duplicate metric, extra metric, non-finite score,
+  non-finite status number, out-of-range progress, identity mismatch, and
+  invalid published state. Those category totals are verified independently, so
+  a final summary cannot satisfy the fan-in gate by producing the right
+  aggregate rejection count while skipping one malformed or incompatible shard
+  class.
+  Those summary totals are verified against the families that actually ran, so
+  promotion tooling can prove from the final row alone that first-publish
+  direct reads, traversal reads, rerank reads, status checks, active and failed
+  read paths, profile entries, paired-HITS read paths, compatible fan-in merges,
+  active-stale fan-in preservation, mixed failed/building fan-in preservation,
+  and fan-in fail-closed paths were exercised instead of only inferring that
+  from per-family rows. The
+  summary row also aggregates local-oracle parity and published-status metadata
+  proof: expected and observed top-k parity checks, expected and observed
+  status parity checks, minimum expected and observed converged status counts,
+  non-converged published status counts, minimum expected and observed
+  positive-delta metadata counts, expected and observed computed-at metadata
+  counts, and the min/max completed-iteration counts seen across the families
+  plus the configured maximum allowed iteration count. Those totals are
+  verified against the family and metric counts, so a release summary cannot
+  pass while omitting planned-vs-local parity, computed publish timestamps,
+  bounded iteration metadata, or the non-converged positive-delta evidence
+  required for fixed-iteration iterative metrics. The summary row also
+  aggregates storage-footprint proof:
+  total metric slots, fixed retained metadata overhead per metric, total
+  expected score records, fresh and failed retained score records, expected and
+  observed fresh/failed metric-record counts, fresh and failed control record
+  counts, the expected fresh control count, the failed control-record ceiling,
+  fresh and failed job namespace counts, fresh and failed attempt-record counts,
+  and expected plus observed retained failed diagnostic failure/event records.
+  Those totals
+  are verified against the generated graph shape, the fixed retained
+  metric-record overhead, the number of metric families, the compatible HITS
+  pair multiplier, and the bounded diagnostic window, so release tooling can
+  prove from the final row that fresh and failed terminal states retained only
+  published score output plus bounded metadata, removed job and attempt
+  namespaces, kept exactly one fresh control record per family, and bounded
+  failed diagnostics across the whole run. The
+  summary row also reports the minimum split worker identities with tick
+  progress, the minimum split worker identities with page claim/completion
+  progress, the minimum per-family active-worker page progress, and the maximum
+  per-family active-worker page progress. Promotion tooling can therefore
+  reject a run where one family silently serialized all page ownership through a
+  single worker while another family supplied the maximum worker-step evidence.
+  The
   focused local target is
   `zig build graph-metric-release-qualification -- <args>`; the Make wrappers are
   `make -C zig graph-metric-release-qualification` and
-  `make zig-graph-metric-release-qualification`. The harness also accepts
-  `--profile smoke` for the small all-family resume/fan-in run used in PR
-  validation and `--profile promotion` as a larger release-run starting point.
+  `make zig-graph-metric-release-qualification`. Named profile targets are
+  also available: `zig build graph-metric-release-qualification-smoke` and
+  `make zig-graph-metric-release-qualification-smoke` run the small all-family
+  resume/fan-in profile used in PR validation. `zig build
+  graph-metric-release-qualification-smoke-budgeted` and
+  `make zig-graph-metric-release-qualification-smoke-budgeted` run the same
+  smoke workload with loose local/planned/cleanup latency runaway guards plus
+  conservative public-read, fan-in, retained-storage, page-claim, cleanup-tick,
+  executed-round, failed-retry, worker-step, coordinator-step, attempt-record,
+  and four-family summary budgets, giving PR validation a fast pass/fail
+  exercise of every release-budget category without claiming production latency
+  baselines. `zig build graph-metric-release-qualification-promotion` and
+  `make zig-graph-metric-release-qualification-promotion` run the larger
+  release-profile floor. `zig build
+  graph-metric-release-qualification-promotion-budgeted` and
+  `make zig-graph-metric-release-qualification-promotion-budgeted` run that
+  same promotion floor with conservative pass/fail budgets for published-read
+  latency, fresh-failure latency, fan-in latency, retained storage records, page
+  claims, cleanup ticks, executed rounds, failed rebuild retries, worker steps,
+  coordinator steps, and minimum split worker identity progress, plus a
+  four-family summary floor. Retained storage budgets now include explicit
+  attempt-record ceilings in addition to score, metric, control, failure, and
+  event records, while the cleanup invariant still requires zero retained
+  attempt records after fresh and failed cleanup. That target now passes
+  `--require-deployment-shaped-release-gate`, so the harness fails before
+  running if the invocation cannot emit `deployment_shaped_release_gate: true`.
+  The required shape now includes the promotion workload floor, all-family
+  execution, split/reopen ownership evidence, four-family coverage,
+  split-worker progress floors, promotion fan-in and failure-churn floors,
+  promotion operations/status floors, public-read/fresh/fan-in latency
+  ceilings, cleanup latency ceiling, retained-storage ceilings, and scheduler
+  ceilings. That makes the local
+  promotion gate summary a required shape rather than best-effort metadata
+  before deployment rollout tooling consumes the larger hosted evidence. Both
+  the starting config row and final summary row expose the component booleans
+  for all-family execution, public-read/fan-in latency budgets, cleanup latency
+  budget, retained-storage budgets, promotion scheduler budgets, promotion
+  fan-in floors, promotion failure-churn floors, and promotion operations
+  floors; the config row reports the
+  requested shape, while the summary row reports the observed result. The
+  promotion-budgeted target intentionally leaves local/planned wall-clock
+  latency thresholds disabled until deployment baselines exist, while cleanup
+  latency is now part of the deployment-shaped promotion requirement. The
+  smoke-budgeted target keeps only loose runaway guards for local, planned, and
+  cleanup phases. The argument-forwarding harness also accepts
+  `--profile smoke` and `--profile promotion` for focused family or budget
+  overrides. The local composed gate is
+  `zig build graph-metric-distributed-release-gate`, with Make wrappers
+  `make -C zig graph-metric-distributed-release-gate` and
+  `make zig-graph-metric-distributed-release-gate`. It runs the spawned
+  process-owner gate plus the budgeted smoke release-qualification profile so
+  PR and release-prep runs can verify the narrow remote-owner contract, the
+  all-family resumable/fan-in release smoke, and the fast budget surface
+  together. The process-owner summary emits a top-level
+  `remote_owner_release_gate` plus service, direct, and failure/reclaim
+  component booleans, with required/observed service cleanup-takeover counts
+  for killed degree, PageRank, eigenvector, and paired-HITS cleanup owners; the
+  release-qualification summary emits configured and observed deployment-shaped
+  local-gate booleans.
+  Together those two final JSON
+  rows are the local composed promotion evidence that rollout tooling should
+  require before looking at hosted deployment-scale artifacts. The process-owner target compiles the `antfly` child binary before
+  compiling the process harness, and the composed target runs that process
+  harness before starting the release smoke, keeping the three large Zig
+  executables out of the same parallel compile window for CI memory stability.
+  It is intentionally
+  smaller than the promotion-budgeted target and does not replace
+  deployment-scale hosted owner, fan-in, cleanup, or latency evidence. Release
+  prep can use the heavier composed target
+  `zig build graph-metric-distributed-promotion-gate`, with Make wrappers
+  `make -C zig graph-metric-distributed-promotion-gate` and
+  `make zig-graph-metric-distributed-promotion-gate`, when it needs the same
+  process-owner contract, the focused operations/status contract, the focused
+  hosted fan-in contract, and the promotion-budgeted release qualification
+  floor. That target is deliberately
+  separate from PR smoke: it keeps the same sequenced compile/run shape for CI
+  memory stability but uses the promotion profile, deployment-shaped summary
+  requirement, storage and scheduler budgets, split-worker progress floors,
+  active-page status coverage, hosted fan-in compatibility coverage, and
+  public-read/fan-in latency ceilings. The
+  `Zig Tests` workflow now runs the smaller distributed
+  release gate in `full-default`, while a separate `graph-metric-promotion` job
+  runs the heavier distributed promotion gate on manual dispatch and the daily
+  scheduled run. That keeps merge-group and push checks on the release-smoke
+  budget while still collecting promotion-shaped owner, operations/status,
+  storage, scheduler, public-read, and fan-in evidence on an explicit release
+  cadence.
   Smoke keeps `maintenance_mode: "combined"` for backward-compatible PR
   validation, while promotion starts with `maintenance_mode: "split"` so release
-  runs exercise the coordinator/worker-pool boundary by default. Profiles set
-  workload defaults only; latency, storage, page-claim, cleanup-tick,
+  runs exercise the coordinator/worker-pool boundary by default. Promotion is a
+  floor, not just a label: a `promotion` run may raise workload knobs, but it
+  cannot lower the split/reopen, document, fanout, top-k, shard, active-shard,
+  mutation, worker, iteration, failure-repeat, diagnostic, or status-page
+  evidence below the profile baseline while still emitting `profile:
+  "promotion"`. Promotion
+  also requires `top_k` not to divide evenly by the synthetic shard count, so
+  the emitted shard min/max counters prove a nonuniform merge layout instead of
+  a perfectly even fixture; `top_k` must also exceed the synthetic shard count,
+  so every shard carries score evidence. Profiles set
+  workload defaults; latency, storage, page-claim, cleanup-tick,
   executed-round, failure-retry, worker-step, and coordinator-step budgets
   remain disabled unless a release invocation provides explicit
   `--max-*-latency-ns`, `--max-storage-*-records`,
   `--max-page-claims`, `--max-cleanup-ticks`, `--max-rounds-executed`,
   `--max-failure-retry-count`, `--max-worker-steps`, or
-  `--max-coordinator-steps` thresholds. Synthetic
-  direct-metric fan-in also accepts `--synthetic-fan-in-shards`; the smoke
-  profile keeps the two-shard invariant, the CLI rejects values below two, and
-  the promotion profile starts with eight synthetic shards so release runs can
-  exercise broader merge layouts before hosted cross-range qualification. The
+  `--max-coordinator-steps` thresholds or uses the named budgeted promotion
+  target. Synthetic
+  direct-metric fan-in also accepts `--synthetic-fan-in-shards` and
+  `--synthetic-fan-in-active-shards`; the smoke profile keeps the two-shard,
+  two-active-shard invariant, the CLI rejects active-shard counts below two or
+  above the total shard count, and the promotion profile starts with
+  `top_k: 33`, eight synthetic shards, and four active/stale synthetic shards
+  so release runs exercise a broader, nonuniform merge layout before hosted
+  cross-range qualification. The
   CLI also rejects `--fanout` values larger than `--docs`, keeping generated
   cyclic source targets unique enough for graph-shape evidence to be
   meaningful. The promotion profile also starts with three active mutation
@@ -4705,15 +5198,27 @@ than PR unit coverage:
   persisted stats must match the generated node and edge counts, the edge
   generation must match the target generation, and JSONL must expose source,
   sink, authority, sink-edge, cyclic-edge, bipartite-edge, authority-self-edge,
-  and max-out-degree components for the selected family. Before drain it must
-  also see exactly one queued build for the family. Maintenance-mode evidence is
+  and max-out-degree components for the selected family. Those emitted topology
+  components must match the configured family, document count, fanout, and
+  expected score-record count exactly. The active generation fields are checked
+  as part of the same release record: active mutation writes must equal the
+  target-generation delta, and the active target generation must equal the
+  first published target plus that delta. Before drain it must also see exactly
+  one queued build for the family. Scheduler budget shape is checked before the
+  optional release-threshold gates: observed ticks must not exceed
+  `--max-ticks`, executed rounds must fit within `ticks *
+  --max-rounds-per-tick`, page claims must fit within executed rounds times
+  `--max-pages-per-round`, and pre-drain metric scans must fit inside
+  `--max-metrics-per-round`. Maintenance-mode evidence is
   a correctness gate too: combined mode must use exactly one combined sweep per
   tick and no split-role sweeps, while split mode must use the
   coordinator-before/worker-pool/coordinator-after shape for each executed
   scheduler round. Split multi-worker runs must also prove that more than one
-  configured worker identity made page progress whenever the run performs
-  multiple worker steps, so a release run cannot accidentally serialize all page
-  work through one worker while claiming a worker-pool shape. Reopen evidence is
+  configured worker identity made both tick progress and actual page
+  claim/completion progress whenever the run performs multiple worker steps, and
+  must emit a nonzero min/max page-progress range for active worker identities,
+  so a release run cannot accidentally serialize all page ownership through one
+  worker while claiming a worker-pool shape. Reopen evidence is
   checked alongside those role-shape
   counters: reopen-enabled runs must cross a DB-handle boundary after every
   nonterminal tick and disabled runs must not report synthetic reopen evidence.
@@ -4735,57 +5240,134 @@ than PR unit coverage:
   `not_ready`, expose no active build/page payload, and point their queued
   generation at the current edge generation.
   The synthetic fan-in evidence is also checked as a correctness gate: the
-  observed shard count must match the configured layout, compatible terminal and
-  active-published merges must return the expected top-k score count, fresh,
-  incompatible-generation, incompatible-metadata, incompatible-edge-filter, and
-  missing-metric probes must each reject once, and HITS must additionally prove
-  paired authority/hub result and rejection counts while non-HITS families emit
-  no paired fan-in counters.
+  observed shard count and min/max score counts must match the configured
+  non-empty balanced layout, at least two synthetic shards must be marked
+  active/building for the active-published and fresh-fail fan-in probes,
+  compatible terminal and active-published merges must return the expected
+  top-k score count, mixed-active published merges must return the expected
+  top-k score count with failed status severity, fresh,
+  zero-generation, incompatible-generation, incompatible-metadata,
+  incompatible-edge-filter, missing-metric, duplicate-metric, extra-metric,
+  non-finite-score, non-finite-status, and out-of-range-progress probes must
+  each reject once, index/metric/status-name identity probes must reject three
+  times, invalid-state probes must reject twice, and HITS must additionally prove
+  paired authority/hub shard layout, active-shard, mixed-active, result, and rejection counts while
+  non-HITS families emit no paired fan-in counters.
   Active/terminal work summaries are checked the same way: fresh and failed
   terminal states must expose no pending work or active/failed page status,
   active rebuilds must prove the page claim/reclaim probe, expose at least one
-  bounded active page with finite progress, and report one active build with
-  active pages but no failed pages. Active and failed direct reads, graph
+  bounded active page without exceeding `--max-status-pages`, expose finite
+  progress, and report one active build with active pages but no failed pages.
+  Every emitted active status page must be leased and operationally detailed:
+  its phase/iteration must match the active job, it must include a worker
+  identity, attempt number, lease expiry, bounded progress units, and no page
+  error. The result-level leased-page and detailed-page counters must both
+  match the bounded active status page count.
+  Active and failed direct reads, graph
   traversal projection/order/filter reads, and graph search rerank reads must
   preserve the prior published generation for `published` and fail closed for
-  `fresh`; traversal published checks must also return metric payloads and
-  status entries for exactly the requested metric names. Each active and failed
-  traversal gate must record three published checks and three fresh rejections.
+  `fresh`; direct top-k reads must also return exactly the requested
+  query/index/metric identity, expected status state where stable, non-empty
+  configured-`top_k` score payloads, non-empty node ids, and finite scores. Rerank
+  published checks must attach per-hit score details with the requested
+  index/metric identity, prior published generation, finite score components,
+  and consistent missing-score markers. Traversal published checks must also
+  return metric payloads and status entries for exactly the requested metric
+  names. Each active and failed traversal gate must record three published
+  checks and three fresh rejections.
   Query profile is checked as an explainable
   read-surface gate too: non-HITS families must emit three graph metric profile
   entries with exactly one direct metric source, one traversal source, and one
   rerank source, while HITS must emit four entries because traversal profile
-  includes separate authority and hub statuses. Paired HITS active and failed reads must
-  return both authority/hub published results, one paired direct fresh
-  rejection, separate authority/hub rerank fresh rejections, and paired
+  includes separate authority and hub statuses. Paired HITS active and failed
+  reads must return both authority/hub published results, exactly
+  configured-`top_k` score payloads for each side, measured paired direct
+  published and fresh-failure latencies, one paired direct fresh rejection,
+  separate authority/hub rerank fresh rejections, and paired
   traversal projection metric results, while non-HITS families must keep those
-  paired counters at zero.
+  paired counters at zero. Storage footprint evidence is a correctness gate:
+  successful and failed terminal score-record counts must match the expected
+  graph shape exactly, terminal job namespaces must be gone, successful publish
+  must retain one control record, and repeated failed rebuilds must retain only
+  the exact bounded failure/event diagnostics allowed for the family.
+- Local promotion-profile release qualification now passes for every graph
+  metric family under the CI-sized profile floor: `docs: 128`, `fanout: 4`,
+  `top_k: 33`, eight synthetic fan-in shards, three active mutation writes,
+  four split worker identities, reopen-between-ticks, eight maximum iterations,
+  five failed rebuild repeats, sixteen retained diagnostic/status slots, and a
+  four-family budgeted promotion summary floor.
+  Degree, PageRank, eigenvector, and paired HITS each prove local-oracle parity,
+  split coordinator/worker-pool sweep shape, all configured worker identities
+  making tick and page progress, active and failed `published`/`fresh` read
+  behavior, cleanup/storage footprint bounds, nonuniform synthetic fan-in
+  layout, active-shard and mixed-active `published` merge plus `fresh` rejection, zero/stale/
+  incompatible/malformed fan-in rejection, identity-mismatch rejection, and
+  invalid published-state rejection. The PageRank promotion run also proves
+  fixed-iteration non-converged metadata at the iteration cap, eigenvector
+  proves the same single-vector substrate can converge under the promotion
+  shape, and HITS proves paired authority/hub promotion-shape reads,
+  diagnostics, fan-in, compatibility, and invalid-state rejection.
+  The all-family budgeted promotion target now also passes with published-read,
+  fresh-failure, and fan-in latency capped at one second, retained storage
+  ceilings of 2500 score, 2600 metric, 32 control, one attempt record, 16
+  failure, and 20 event records, plus scheduler ceilings of 4000 page claims,
+  600 cleanup ticks, 1000 executed rounds, five failed-build retries, 7000
+  worker steps, 2000
+  coordinator steps, a four-worker minimum for both split tick progress and
+  split page claim/completion progress, and four active/stale synthetic fan-in
+  shards across primary and paired-HITS probes. Those non-local/planned/cleanup
+  latency thresholds are deliberately conservative local promotion evidence.
+  Larger HITS graphs, including the previous 1000-source stress shape, remain
+  separate performance and deployment-scale qualification rather than the
+  default CI promotion gate.
 - Promotion-scale use of the harness still needs deployment-sized graph indexes
   with one coordinator, multiple worker pools, and forced killed-owner churn at
   scan, contribution, reduce, publish, and cleanup boundaries. Reopen between
   ticks proves durable restart after each scheduler tick, but it is not a
   substitute for killing active owners while they hold leases or page attempts.
   The synthetic fan-in probe proves the release harness sees normal merge
-  compatibility behavior, but it is not a substitute for hosted cross-range
-  promotion layouts with nonuniform shard distributions and mixed active/stale
-  shard states. Increasing `--synthetic-fan-in-shards` gives the local harness a
-  cheap preflight for larger shard counts, but successful local synthetic fan-in
-  still does not replace deployment-shaped hosted fan-in evidence.
+  compatibility behavior, and the focused hosted fan-in gate now covers a
+  nonuniform eight-shard degree/PageRank/eigenvector direct merge with four
+  active/stale shards whose unpublished high-score targets stay invisible,
+  active-stale degree/PageRank/eigenvector traversal
+  projection/order/filter/search rerank published merge plus fresh rejection,
+  compatible HITS authority/hub merge with active/stale prior-pair preservation,
+  incompatible remote HITS pair rejection, and missing remote HITS status
+  rejection through the real
+  cross-range table reader. Those checks are still not a substitute for hosted
+  cross-range promotion layouts with larger shard counts, broader mixed
+  active/stale shard states across traversal/rerank surfaces and paired HITS,
+  and broader injected incompatible statuses.
+  Increasing `--synthetic-fan-in-shards` gives the local harness a cheap
+  preflight for larger shard counts, and increasing
+  `--synthetic-fan-in-active-shards` preflights broader active/stale shard
+  mixes, but successful local synthetic fan-in still does not replace
+  deployment-shaped hosted fan-in evidence.
 - Keep pass/fail gates separate from raw benchmark numbers. Correctness gates
   should require local-oracle parity, no leaked attempt output, bounded retained
   namespaces, no unbounded status payloads, and successful cleanup after owner
-  churn. Latency, retained-storage, page-claim, cleanup-tick, executed-round,
-  failure-retry, worker-step, and coordinator-step gates should initially be
+  churn. The local budgeted promotion target now enforces retained-storage,
+  page-claim, cleanup-tick, executed-round, failure-retry, worker-step,
+  coordinator-step, published-read latency, fresh-failure latency, and fan-in
+  latency ceilings as a conservative release guard. Local/planned/cleanup
+  wall-clock latency should still be
   recorded as release notes until real production baselines exist, then promoted
   to explicit harness thresholds per metric family and profile.
-- Promotion-scale fan-in should use shard layouts that are too large for the
-  focused hosted fan-in unit gate: mixed hot/cold shards, nonuniform edge
-  distributions, active stale shards, missing status injection, and compatible
-  HITS authority/hub pair checks. The release harness now has a `--fanout`
-  graph-shape knob and a `--synthetic-fan-in-shards` merge-layout knob so
-  promotion runs can move beyond pure star topologies and two-shard synthetic
-  fan-in, exercising denser PageRank/eigenvector cycles plus multi-authority
-  HITS graphs while preserving the same local-oracle parity check. Release JSONL
+- Promotion-scale fan-in should use shard layouts beyond the focused hosted
+  fan-in unit gate: larger mixed hot/cold shards, active/stale shard mixes for
+  traversal/rerank surfaces and paired HITS, and more varied incompatible HITS
+  authority/hub pair rejection. The focused hosted gate now proves nonuniform
+  eight-shard degree/PageRank/eigenvector direct fan-in with four active/stale
+  shards, active-stale degree/PageRank/eigenvector traversal/rerank fan-in,
+  compatible HITS pair fan-in with active/stale prior-pair preservation,
+  incompatible remote HITS pair rejection, and missing remote HITS status
+  rejection, while
+  the release harness has a `--fanout` graph-shape knob and a
+  `--synthetic-fan-in-shards` merge-layout knob plus a
+  `--synthetic-fan-in-active-shards` active-staleness knob so promotion runs can
+  move beyond pure star topologies and two-shard synthetic fan-in, exercising
+  denser PageRank/eigenvector cycles plus multi-authority HITS graphs while
+  preserving the same local-oracle parity check. Release JSONL
   now records the generated topology components and verifies them against graph
   index stats before metric execution, so promotion notes can distinguish larger
   graph-shape evidence from merely larger metric budgets.

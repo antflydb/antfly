@@ -762,6 +762,16 @@ pub const RowsUniquePredicate = struct {
     value: ?std.json.Value = null,
 };
 
+/// Application-time temporal slice for update/delete mutation-source plans.
+pub const RowsTemporalPortion = struct {
+    /// Period name declared on the relational table schema.
+    period: []const u8,
+    /// Inclusive lower bound encoded as the period start column's JSON type.
+    from: std.json.Value,
+    /// Exclusive upper bound encoded as the period end column's JSON type.
+    to: std.json.Value,
+};
+
 /// Source-side assignment for joined mutation-source updates.
 pub const RowsJoinedMutationSourceAssignment = struct {
     /// Declared target-side relational field to assign.
@@ -791,6 +801,7 @@ pub const RowsQueryOrderField = struct {
 /// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
     mode: ?[]const u8 = null,
+    wait_policy: ?[]const u8 = null,
     skip_locked: ?bool = null,
     lease_ms: ?i64 = null,
     owner_id: ?[]const u8 = null,
@@ -920,19 +931,20 @@ pub const RowsLateralCorrelation = struct {
     right_field: []const u8,
 };
 
-pub const RowsQueryResultSet = struct {
-    total: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
-};
-
-pub const RowsAggregateResultSet = struct {
-    total_groups: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
-};
-
-pub const RowsStreamResultSet = struct {
-    total_rows: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
+/// Typed column metadata emitted by a native relational read plan.
+pub const RowsResultColumn = struct {
+    /// Public result-object field name.
+    name: []const u8,
+    /// Source path represented by this result field.
+    path: []const u8,
+    /// Antfly scalar/container type for the result field.
+    type: []const u8,
+    /// Item type when `type` is `array`.
+    array_item_type: ?[]const u8 = null,
+    /// Optional source collation metadata for source-backed text or keyword result fields.
+    collation: ?[]const u8 = null,
+    /// Whether the result field may be null.
+    nullable: bool,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -2321,7 +2333,7 @@ pub const IndexType = enum {
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
-    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
+    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types. Relational-mode scalar properties may include optional `collation` metadata. The metadata is preserved in the durable relational column catalog and reported on result schemas for source-backed text/keyword fields.
     schema: ?std.json.Value = null,
 };
 
@@ -2390,20 +2402,30 @@ pub const ForeignKeyReference = struct {
     table: ?[]const u8 = null,
     /// Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
     columns: ?[]const []const u8 = null,
+    /// Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
+};
+
+/// Application-time period over a start and end column.
+pub const RelationalPeriod = struct {
+    /// Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+    name: []const u8,
+    /// Inclusive period start column.
+    start_column: []const u8,
+    /// Exclusive period end column.
+    end_column: []const u8,
+    /// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+    range_type: ?[]const u8 = null,
 };
 
 /// Relational primary-key constraint.
 pub const PrimaryKey = struct {
+    /// Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+    name: ?[]const u8 = null,
     /// Primary-key columns. One or more ordered required non-json relational columns are supported.
     columns: ?[]const []const u8 = null,
-};
-
-/// Relational unique constraint.
-pub const UniqueConstraint = struct {
-    /// Constraint name, unique within the table schema.
-    name: ?[]const u8 = null,
-    /// Unique columns. One or more ordered non-json relational columns are supported.
-    columns: ?[]const []const u8 = null,
+    /// Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
 };
 
 /// A floating-point number used to decrease or increase the relevance scores of a query.
@@ -3965,6 +3987,24 @@ pub const RowsAggregateHaving = struct {
     all: []const RowsAggregateHavingPredicate,
 };
 
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -4384,6 +4424,8 @@ pub const ForeignKey = struct {
     name: ?[]const u8 = null,
     /// Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
     columns: ?[]const []const u8 = null,
+    /// Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
     references: ?ForeignKeyReference = null,
     /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
     on_delete: ?[]const u8 = null,
@@ -5059,13 +5101,6 @@ pub const RowsGetResult = struct {
     version: ?i64 = null,
     /// Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
     physical_key: ?[]const u8 = null,
-};
-
-/// Declared unique constraint target for `ON CONFLICT`.
-pub const RowsConflictUniqueTarget = struct {
-    /// Unique constraint name.
-    name: []const u8,
-    where: ?RowsUniquePredicateGroup = null,
 };
 
 /// Compact COALESCE projection.
@@ -5784,13 +5819,6 @@ pub const RowsGetResultSet = struct {
     rows: ?[]const RowsGetResult = null,
 };
 
-/// Primary-key or named unique constraint conflict target.
-pub const RowsConflictTarget = struct {
-    /// Set to `true` to target the declared primary key.
-    primary: ?bool = null,
-    unique: ?RowsConflictUniqueTarget = null,
-};
-
 /// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
 pub const RowsWhere = union(enum) {
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
@@ -5976,32 +6004,6 @@ pub const ChunkerConfig = struct {
     full_text_index: ?std.json.Value = null,
 };
 
-/// Schema definition for a table with multiple document types
-pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
-    version: ?i64 = null,
-    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
-    storage_mode: ?[]const u8 = null,
-    /// Default type to use from the document_types.
-    default_type: ?[]const u8 = null,
-    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
-    enforce_types: ?bool = null,
-    /// A map of type names to their document json schemas.
-    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
-    ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
-    ttl_duration: ?[]const u8 = null,
-    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
-    dynamic_templates: ?[]const DynamicTemplate = null,
-    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
-    foreign_keys: ?[]const ForeignKey = null,
-    /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
-    primary_key: ?PrimaryKey = null,
-    /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
-    unique_constraints: ?[]const UniqueConstraint = null,
-};
-
 /// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
 pub const QueryProfile = struct {
     /// Shard-level execution statistics.
@@ -6160,12 +6162,6 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
-};
-
-/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
-pub const TableMigration = struct {
-    state: []const u8,
-    read_schema: TableSchema,
 };
 
 /// OpenAI-compatible message in a generation/chat conversation.
@@ -6386,6 +6382,12 @@ pub const Table = struct {
     replication_sources: ?[]const ReplicationSource = null,
 };
 
+/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+pub const TableMigration = struct {
+    state: []const u8,
+    read_schema: TableSchema,
+};
+
 pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
@@ -6521,6 +6523,22 @@ pub const RowsJsonSetTransform = struct {
     expr: ?RowsExpression = null,
 };
 
+/// Declared unique constraint target for `ON CONFLICT`.
+pub const RowsConflictUniqueTarget = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    where: ?RowsUniquePredicateGroup = null,
+    /// Expression predicates for expression-partial unique conflict targets. When present, the list must exactly match the named unique constraint's stored expression predicate metadata.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+/// Primary-key or named unique constraint conflict target.
+pub const RowsConflictTarget = struct {
+    /// Set to `true` to target the declared primary key.
+    primary: ?bool = null,
+    unique: ?RowsConflictUniqueTarget = null,
+};
+
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
 pub const RowsOnConflict = struct {
     target: RowsConflictTarget,
@@ -6577,6 +6595,8 @@ pub const RowsMutationSourceRequest = struct {
     json_set: ?[]const RowsJsonSetTransform = null,
     /// Array transforms for update operations.
     array_update: ?[]const RowsArrayUpdateTransform = null,
+    /// Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans.
+    temporal_portion: ?RowsTemporalPortion = null,
     /// Fields to return from the final update image or deleted row image. `*` returns the full row.
     returning: ?[]const []const u8 = null,
     /// Typed row-expression projections over the final update image or deleted row image.
@@ -6693,7 +6713,7 @@ pub const RowsQueryOrderExpression = struct {
     direction: ?[]const u8 = null,
 };
 
-/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`, `greatest`, `least`, numeric `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
 pub const RowsExpression = union(enum) {
     rows_expression_operator: *RowsExpressionOperator,
     rows_expression_field: *RowsExpressionField,
@@ -6758,7 +6778,7 @@ pub const RowsExpressionOperator = struct {
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
     to: ?[]const u8 = null,
-    /// Structured JSON path for `json_extract`.
+    /// Structured JSON path for `json_extract` and `json_path_exists`.
     path: ?std.json.Value = null,
     /// Return JSON path extraction as text.
     as_text: ?bool = null,
@@ -6815,8 +6835,10 @@ pub const RowsQueryRequest = struct {
     field_aliases: ?[]const RowsFieldAliasProjection = null,
     /// Typed row-expression projections.
     expressions: ?[]const RowsExpressionProjection = null,
-    /// Ordered row identity fields used to keep the first row per key after order_by and before pagination. The leading order_by fields must match.
+    /// Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
     distinct_on: ?[]const []const u8 = null,
+    /// Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match.
+    distinct_on_expressions: ?[]const RowsExpression = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
@@ -6975,6 +6997,8 @@ pub const RowsPlanRequest = union(enum) {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "ctes",
+            "left_table",
+            "right_table",
             "left_ranges",
             "right_ranges",
             "join",
@@ -6983,6 +7007,8 @@ pub const RowsPlanRequest = union(enum) {
         }
         if (objectHasAnyKey(source.object, &.{
             "ctes",
+            "left_table",
+            "right_table",
             "left_ranges",
             "right_ranges",
             "lateral",
@@ -7045,17 +7071,25 @@ pub const RowsWindowPlanRequest = struct {
     window: RowsWindowRequest,
 };
 
-/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
 pub const RowsJoinPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
     left_ranges: ?[]const RowsDocKeyRange = null,
     right_ranges: ?[]const RowsDocKeyRange = null,
     join: RowsJoinRequest,
 };
 
-/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
 pub const RowsLateralPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
     left_ranges: ?[]const RowsDocKeyRange = null,
     right_ranges: ?[]const RowsDocKeyRange = null,
     lateral: RowsLateralRequest,
@@ -7409,6 +7443,52 @@ pub const ReplicationRoute = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
     on_delete: ?[]const ReplicationTransformOp = null,
+};
+
+/// Relational unique constraint.
+pub const UniqueConstraint = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Unique columns. One or more ordered non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+    /// Stable expression keys supported by unique-owner maintenance.
+    expressions: ?[]const std.json.Value = null,
+    /// Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
+    /// Field-only partial unique predicate shorthand.
+    where: ?RowsUniquePredicateGroup = null,
+    /// Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+    /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+    validation_state: ?[]const u8 = null,
+};
+
+/// Schema definition for a table with multiple document types
+pub const TableSchema = struct {
+    /// Version of the schema. Used for migrations.
+    version: ?i64 = null,
+    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+    storage_mode: ?[]const u8 = null,
+    /// Default type to use from the document_types.
+    default_type: ?[]const u8 = null,
+    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
+    enforce_types: ?bool = null,
+    /// A map of type names to their document json schemas.
+    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
+    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    ttl_field: ?[]const u8 = null,
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    ttl_duration: ?[]const u8 = null,
+    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
+    dynamic_templates: ?[]const DynamicTemplate = null,
+    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. Temporal foreign keys with `period` on both child and parent references are restrictive-only: `restrict` / `no_action` are accepted, while mutating `set_null` / `cascade` actions are rejected because period coverage is validated as range ownership. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
+    foreign_keys: ?[]const ForeignKey = null,
+    /// Application-time period declarations over two numeric or datetime relational columns. SQL `PERIOD FOR name (start, end)` and range column temporal DDL lower into this metadata.
+    periods: ?[]const RelationalPeriod = null,
+    /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
+    primary_key: ?PrimaryKey = null,
+    /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
+    unique_constraints: ?[]const UniqueConstraint = null,
 };
 
 pub const ConjunctionQuery = struct {

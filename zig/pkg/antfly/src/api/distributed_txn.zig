@@ -881,7 +881,7 @@ fn addForeignKeyUpdateActionPageDownstreamParticipants(
             catalog,
             participants,
             child_table_name,
-            child_runtime_schema.relational_columns,
+            child_runtime_schema,
             child_runtime_schema.unique_constraints,
             child.child_key,
             lookup.json,
@@ -1627,6 +1627,8 @@ fn freeForeignKeyParentCheckFields(alloc: std.mem.Allocator, check: db_mod.types
     alloc.free(@constCast(check.parent_table));
     alloc.free(@constCast(check.parent_key));
     if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+    if (check.child_period_start_json) |json| alloc.free(@constCast(json));
+    if (check.child_period_end_json) |json| alloc.free(@constCast(json));
 }
 
 fn freeForeignKeyConstraintTimingOverrideFields(alloc: std.mem.Allocator, override: db_mod.types.ForeignKeyConstraintTimingOverride) void {
@@ -1656,6 +1658,8 @@ fn freeUniqueConstraintMutationFields(alloc: std.mem.Allocator, mutation: db_mod
     alloc.free(@constCast(mutation.constraint_name));
     alloc.free(@constCast(mutation.encoded_value));
     alloc.free(@constCast(mutation.owner_key));
+    if (mutation.temporal_start) |value| alloc.free(@constCast(value));
+    if (mutation.temporal_end) |value| alloc.free(@constCast(value));
 }
 
 fn ensureParticipantTxn(
@@ -1784,7 +1788,9 @@ fn addForeignKeyParentParticipants(
             const maybe_parent_key = try foreignKeyParentReferenceFromJsonAlloc(alloc, runtime_schema.relational_columns, foreign_key, write.value);
             defer if (maybe_parent_key) |parent_key| alloc.free(parent_key);
             if (maybe_parent_key) |parent_key| {
-                try addForeignKeyParentCheckParticipant(alloc, catalog, participants, table_name, runtime_schema.default_type, foreign_key, write.key, parent_key, effectiveForeignKeyParentCheckTiming(table_name, foreign_key, constraint_timing_overrides));
+                var child_period_bounds = try foreignKeyChildPeriodBoundsFromJsonAlloc(alloc, runtime_schema.periods, foreign_key, write.value);
+                defer child_period_bounds.deinit(alloc);
+                try addForeignKeyParentCheckParticipant(alloc, catalog, participants, table_name, runtime_schema.default_type, foreign_key, write.key, parent_key, child_period_bounds.start_json, child_period_bounds.end_json, effectiveForeignKeyParentCheckTiming(table_name, foreign_key, constraint_timing_overrides));
             }
 
             if (!try foreignKeyRefOwnersConfiguredForConstraint(alloc, catalog, table_name, runtime_schema.default_type, foreign_key, maybe_parent_key orelse "")) continue;
@@ -2022,7 +2028,9 @@ fn addForeignKeyTransformParticipants(
             defer if (maybe_new_parent_key) |new_parent_key| alloc.free(new_parent_key);
 
             if (maybe_new_parent_key) |parent_key| {
-                try addForeignKeyParentCheckParticipant(alloc, catalog, participants, table_name, runtime_schema.default_type, foreign_key, transform.key, parent_key, effectiveForeignKeyParentCheckTiming(table_name, foreign_key, constraint_timing_overrides));
+                var child_period_bounds = try foreignKeyChildPeriodBoundsFromJsonAlloc(alloc, runtime_schema.periods, foreign_key, final_json.?);
+                defer child_period_bounds.deinit(alloc);
+                try addForeignKeyParentCheckParticipant(alloc, catalog, participants, table_name, runtime_schema.default_type, foreign_key, transform.key, parent_key, child_period_bounds.start_json, child_period_bounds.end_json, effectiveForeignKeyParentCheckTiming(table_name, foreign_key, constraint_timing_overrides));
             }
 
             const owner_configured = (maybe_old_parent_key != null and try foreignKeyRefOwnersConfiguredForConstraint(alloc, catalog, table_name, runtime_schema.default_type, foreign_key, maybe_old_parent_key.?)) or
@@ -2279,6 +2287,8 @@ fn appendForeignKeyParentCheck(
     child_key: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8,
+    child_period_start_json: ?[]const u8,
+    child_period_end_json: ?[]const u8,
     timing: db_mod.types.ForeignKeyParentCheck.Timing,
 ) !void {
     const constraint_name = try alloc.dupe(u8, foreign_key.name);
@@ -2293,6 +2303,10 @@ fn appendForeignKeyParentCheck(
     errdefer alloc.free(parent_key_owned);
     const parent_constraint_name_owned = if (parent_constraint_name) |name| try alloc.dupe(u8, name) else null;
     errdefer if (parent_constraint_name_owned) |name| alloc.free(name);
+    const child_period_start_owned = if (child_period_start_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (child_period_start_owned) |json| alloc.free(json);
+    const child_period_end_owned = if (child_period_end_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (child_period_end_owned) |json| alloc.free(json);
     try participant.foreign_key_parent_checks.append(alloc, .{
         .constraint_name = constraint_name,
         .child_table = child_table_owned,
@@ -2300,6 +2314,8 @@ fn appendForeignKeyParentCheck(
         .parent_table = parent_table_owned,
         .parent_key = parent_key_owned,
         .parent_constraint_name = parent_constraint_name_owned,
+        .child_period_start_json = child_period_start_owned,
+        .child_period_end_json = child_period_end_owned,
         .timing = timing,
     });
 }
@@ -2312,6 +2328,8 @@ fn appendForeignKeyExternalizedParentCheck(
     child_key: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8,
+    child_period_start_json: ?[]const u8,
+    child_period_end_json: ?[]const u8,
     timing: db_mod.types.ForeignKeyParentCheck.Timing,
 ) !void {
     const constraint_name = try alloc.dupe(u8, foreign_key.name);
@@ -2326,6 +2344,10 @@ fn appendForeignKeyExternalizedParentCheck(
     errdefer alloc.free(parent_key_owned);
     const parent_constraint_name_owned = if (parent_constraint_name) |name| try alloc.dupe(u8, name) else null;
     errdefer if (parent_constraint_name_owned) |name| alloc.free(name);
+    const child_period_start_owned = if (child_period_start_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (child_period_start_owned) |json| alloc.free(json);
+    const child_period_end_owned = if (child_period_end_json) |json| try alloc.dupe(u8, json) else null;
+    errdefer if (child_period_end_owned) |json| alloc.free(json);
     try participant.foreign_key_externalized_parent_checks.append(alloc, .{
         .constraint_name = constraint_name,
         .child_table = child_table_owned,
@@ -2333,6 +2355,8 @@ fn appendForeignKeyExternalizedParentCheck(
         .parent_table = parent_table_owned,
         .parent_key = parent_key_owned,
         .parent_constraint_name = parent_constraint_name_owned,
+        .child_period_start_json = child_period_start_owned,
+        .child_period_end_json = child_period_end_owned,
         .timing = timing,
     });
 }
@@ -2755,17 +2779,13 @@ fn addUniqueConstraintOwnerParticipants(
     if (runtime_schema.storage_mode != .relational or (runtime_schema.primary_key == null and runtime_schema.unique_constraints.len == 0)) return;
     const owner_constraints = try runtimeOwnerConstraintsAlloc(alloc, runtime_schema);
     defer alloc.free(owner_constraints);
-
-    const groups = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
-    defer alloc.free(groups);
-    if (groups.len == 0) return error.UnknownGroup;
-    if (groups.len == 1) return;
+    if (!try uniqueConstraintOwnerTopologyConfigured(alloc, catalog, table_name, owner_constraints)) return;
 
     for (writes) |write| {
         if (try keyHasUniqueConstraintTransform(alloc, owner_constraints, write.key, transforms)) continue;
         var old_row = try lookupWriteRowForConstraintProof(alloc, catalog, worker, participants, table_name, write.key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, write.key, if (old_row) |row| row.json else null, write.value);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema, owner_constraints, write.key, if (old_row) |row| row.json else null, write.value);
     }
     for (deletes) |key| {
         if (findWriteValueForKey(writes, key) != null) continue;
@@ -2773,7 +2793,7 @@ fn addUniqueConstraintOwnerParticipants(
         var old_row = try lookupDeleteRowForConstraintProof(alloc, catalog, worker, participants, table_name, key, predicates);
         defer if (old_row) |*row| row.deinit(alloc);
         const old = old_row orelse continue;
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, key, old.json, null);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema, owner_constraints, key, old.json, null);
     }
     for (transforms, 0..) |transform, transform_index| {
         if (transformKeySeenBefore(transforms, transform_index)) continue;
@@ -2799,8 +2819,22 @@ fn addUniqueConstraintOwnerParticipants(
         }
         if (final_json == null and old_row == null) continue;
 
-        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema.relational_columns, owner_constraints, transform.key, if (old_row) |row| row.json else null, final_json);
+        try addUniqueConstraintOwnerMutationsForWrite(alloc, catalog, participants, table_name, runtime_schema, owner_constraints, transform.key, if (old_row) |row| row.json else null, final_json);
     }
+}
+
+fn uniqueConstraintOwnerTopologyConfigured(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    constraints: []const storage_schema.UniqueConstraint,
+) !bool {
+    for (constraints) |constraint| {
+        var resolution = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint.name, "");
+        defer resolution.deinit(alloc);
+        if (resolution.configured) return true;
+    }
+    return false;
 }
 
 fn transformTouchesUniqueConstraint(
@@ -2840,7 +2874,7 @@ fn constraintMetadataTouchesPath(constraint: storage_schema.UniqueConstraint, pa
 
 fn uniqueExpressionDependency(expression: storage_schema.UniqueExpression) []const u8 {
     return switch (expression.op) {
-        .lower, .upper => expression.field,
+        .lower, .upper, .md5 => expression.field,
     };
 }
 
@@ -2888,15 +2922,15 @@ fn addUniqueConstraintOwnerMutationsForWrite(
     catalog: table_catalog.CatalogSource,
     participants: *std.ArrayListUnmanaged(ParticipantTxn),
     table_name: []const u8,
-    columns: []const storage_schema.RelationalColumn,
+    runtime_schema: storage_schema.TableSchema,
     constraints: []const storage_schema.UniqueConstraint,
     owner_key: []const u8,
     old_json: ?[]const u8,
     new_json: ?[]const u8,
 ) !void {
-    const old_row = if (old_json) |json| try document_mapper.buildRelationalRowValueAlloc(alloc, json, columns) else null;
+    const old_row = if (old_json) |json| try document_mapper.buildRelationalRowValueAlloc(alloc, json, runtime_schema.relational_columns) else null;
     defer if (old_row) |row| alloc.free(row);
-    const new_row = if (new_json) |json| try document_mapper.buildRelationalRowValueAlloc(alloc, json, columns) else null;
+    const new_row = if (new_json) |json| try document_mapper.buildRelationalRowValueAlloc(alloc, json, runtime_schema.relational_columns) else null;
     defer if (new_row) |row| alloc.free(row);
 
     for (constraints) |constraint| {
@@ -2904,15 +2938,77 @@ fn addUniqueConstraintOwnerMutationsForWrite(
         defer if (old_value) |value| alloc.free(value);
         const new_value = if (new_row) |row| try relational_store.uniqueConstraintTupleValueAlloc(alloc, row, constraint) else null;
         defer if (new_value) |value| alloc.free(value);
-
-        if (old_value != null and new_value != null and std.mem.eql(u8, old_value.?, new_value.?)) continue;
+        var old_span = if (old_json) |json| if (constraint.without_overlaps_period) |period_name|
+            try temporalUniquePeriodSpanBytesFromJsonAlloc(alloc, runtime_schema, json, period_name)
+        else
+            null else null;
+        defer if (old_span) |*span| span.deinit(alloc);
+        var new_span = if (new_json) |json| if (constraint.without_overlaps_period) |period_name|
+            try temporalUniquePeriodSpanBytesFromJsonAlloc(alloc, runtime_schema, json, period_name)
+        else
+            null else null;
+        defer if (new_span) |*span| span.deinit(alloc);
+        if (old_value != null and new_value != null and std.mem.eql(u8, old_value.?, new_value.?) and temporalUniqueSpansEqual(old_span, new_span)) continue;
         if (old_value) |value| {
-            if (!try addUniqueConstraintOwnerDeleteParticipant(alloc, catalog, participants, table_name, constraint, value, owner_key)) return error.UnsupportedOperation;
+            if (!try addUniqueConstraintOwnerDeleteParticipant(alloc, catalog, participants, table_name, constraint, value, old_span, owner_key)) return error.UnsupportedOperation;
         }
         if (new_value) |value| {
-            if (!try addUniqueConstraintOwnerWriteParticipant(alloc, catalog, participants, table_name, constraint, value, owner_key)) return error.UnsupportedOperation;
+            if (!try addUniqueConstraintOwnerWriteParticipant(alloc, catalog, participants, table_name, constraint, value, new_span, owner_key)) return error.UnsupportedOperation;
         }
     }
+}
+
+const TemporalUniquePeriodSpanBytes = struct {
+    start: []const u8,
+    end: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.start));
+        alloc.free(@constCast(self.end));
+        self.* = undefined;
+    }
+};
+
+fn temporalUniquePeriodSpanBytesFromJsonAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    row_json: []const u8,
+    period_name: []const u8,
+) !TemporalUniquePeriodSpanBytes {
+    const period = relationalPeriodByName(runtime_schema.periods, period_name) orelse return error.InvalidTxnRequest;
+    const start_column = findRelationalColumn(runtime_schema.relational_columns, period.start_column) orelse return error.InvalidTxnRequest;
+    const end_column = findRelationalColumn(runtime_schema.relational_columns, period.end_column) orelse return error.InvalidTxnRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidTxnRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTxnRequest;
+    const start_json = if (parsed.value.object.get(period.start_column)) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false })
+    else
+        null;
+    defer if (start_json) |json| alloc.free(json);
+    const end_json = if (parsed.value.object.get(period.end_column)) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false })
+    else
+        null;
+    defer if (end_json) |json| alloc.free(json);
+    const start = try relational_store.temporalPeriodStartBoundBytesFromJsonAlloc(alloc, start_json, start_column);
+    errdefer alloc.free(start);
+    const end = try relational_store.temporalPeriodEndBoundBytesFromJsonAlloc(alloc, end_json, end_column);
+    errdefer alloc.free(end);
+    if (!(relational_store.temporalPeriodSpanBytesValid(start, end) catch return error.InvalidTxnRequest)) return error.InvalidTxnRequest;
+    return .{ .start = start, .end = end };
+}
+
+fn findRelationalColumn(columns: []const storage_schema.RelationalColumn, name: []const u8) ?storage_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+fn temporalUniqueSpansEqual(left: ?TemporalUniquePeriodSpanBytes, right: ?TemporalUniquePeriodSpanBytes) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?.start, right.?.start) and std.mem.eql(u8, left.?.end, right.?.end);
 }
 
 fn addUniqueConstraintOwnerWriteParticipant(
@@ -2922,6 +3018,7 @@ fn addUniqueConstraintOwnerWriteParticipant(
     table_name: []const u8,
     constraint: storage_schema.UniqueConstraint,
     encoded_value: []const u8,
+    temporal_span: ?TemporalUniquePeriodSpanBytes,
     owner_key: []const u8,
 ) !bool {
     var resolution = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint.name, encoded_value);
@@ -2930,7 +3027,7 @@ fn addUniqueConstraintOwnerWriteParticipant(
     if (resolution.groups.len == 0) return error.UnknownGroup;
     if (resolution.groups.len != 1) return error.TopologyChanged;
     const participant = try ensureParticipantTxn(alloc, participants, table_name, resolution.groups[0], resolution.topology_epoch);
-    try appendUniqueConstraintMutation(alloc, &participant.unique_constraint_writes, constraint.name, encoded_value, owner_key);
+    try appendUniqueConstraintMutation(alloc, &participant.unique_constraint_writes, constraint.name, encoded_value, temporal_span, owner_key);
     return true;
 }
 
@@ -2941,6 +3038,7 @@ fn addUniqueConstraintOwnerDeleteParticipant(
     table_name: []const u8,
     constraint: storage_schema.UniqueConstraint,
     encoded_value: []const u8,
+    temporal_span: ?TemporalUniquePeriodSpanBytes,
     owner_key: []const u8,
 ) !bool {
     var resolution = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint.name, encoded_value);
@@ -2949,7 +3047,7 @@ fn addUniqueConstraintOwnerDeleteParticipant(
     if (resolution.groups.len == 0) return error.UnknownGroup;
     if (resolution.groups.len != 1) return error.TopologyChanged;
     const participant = try ensureParticipantTxn(alloc, participants, table_name, resolution.groups[0], resolution.topology_epoch);
-    try appendUniqueConstraintMutation(alloc, &participant.unique_constraint_deletes, constraint.name, encoded_value, owner_key);
+    try appendUniqueConstraintMutation(alloc, &participant.unique_constraint_deletes, constraint.name, encoded_value, temporal_span, owner_key);
     return true;
 }
 
@@ -2958,6 +3056,7 @@ fn appendUniqueConstraintMutation(
     mutations: *std.ArrayListUnmanaged(db_mod.types.UniqueConstraintMutation),
     constraint_name: []const u8,
     encoded_value: []const u8,
+    temporal_span: ?TemporalUniquePeriodSpanBytes,
     owner_key: []const u8,
 ) !void {
     const constraint_name_owned = try alloc.dupe(u8, constraint_name);
@@ -2966,10 +3065,16 @@ fn appendUniqueConstraintMutation(
     errdefer alloc.free(encoded_value_owned);
     const owner_key_owned = try alloc.dupe(u8, owner_key);
     errdefer alloc.free(owner_key_owned);
+    const temporal_start_owned = if (temporal_span) |span| try alloc.dupe(u8, span.start) else null;
+    errdefer if (temporal_start_owned) |value| alloc.free(value);
+    const temporal_end_owned = if (temporal_span) |span| try alloc.dupe(u8, span.end) else null;
+    errdefer if (temporal_end_owned) |value| alloc.free(value);
     try mutations.append(alloc, .{
         .constraint_name = constraint_name_owned,
         .encoded_value = encoded_value_owned,
         .owner_key = owner_key_owned,
+        .temporal_start = temporal_start_owned,
+        .temporal_end = temporal_end_owned,
     });
 }
 
@@ -3059,6 +3164,7 @@ fn primaryKeyAsUniqueConstraint(primary_key: storage_schema.PrimaryKey) storage_
     return .{
         .name = relational_store.primary_key_constraint_name,
         .columns = primary_key.columns,
+        .without_overlaps_period = primary_key.without_overlaps_period,
     };
 }
 
@@ -3093,6 +3199,8 @@ fn addForeignKeyParentCheckParticipant(
     foreign_key: storage_schema.ForeignKey,
     child_key: []const u8,
     parent_key: []const u8,
+    child_period_start_json: ?[]const u8,
+    child_period_end_json: ?[]const u8,
     timing: db_mod.types.ForeignKeyParentCheck.Timing,
 ) !void {
     const parent_table_name = foreignKeyParentCatalogTableName(child_table_name, child_runtime_table, foreign_key);
@@ -3101,9 +3209,9 @@ fn addForeignKeyParentCheckParticipant(
         if (parent_topology_epoch == 0) return error.TableNotFound;
         const parent_group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, parent_table_name, parent_key, parent_topology_epoch)) orelse return error.UnknownGroup;
         const parent_participant = try ensureParticipantTxn(alloc, participants, parent_table_name, parent_group_id, parent_topology_epoch);
-        try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, null, timing);
+        try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, null, child_period_start_json, child_period_end_json, timing);
         const child_participant = try foreignKeyChildParticipantForKey(alloc, catalog, participants, child_table_name, child_key);
-        try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, null, timing);
+        try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, null, child_period_start_json, child_period_end_json, timing);
         return;
     }
 
@@ -3115,9 +3223,9 @@ fn addForeignKeyParentCheckParticipant(
     if (resolution.groups.len == 0) return error.UnknownGroup;
     if (resolution.groups.len != 1) return error.TopologyChanged;
     const parent_participant = try ensureParticipantTxn(alloc, participants, parent_table_name, resolution.groups[0], resolution.topology_epoch);
-    try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, parent_constraint_name, timing);
+    try appendForeignKeyParentCheck(alloc, parent_participant, foreign_key, child_table_name, child_key, parent_key, parent_constraint_name, child_period_start_json, child_period_end_json, timing);
     const child_participant = try foreignKeyChildParticipantForKey(alloc, catalog, participants, child_table_name, child_key);
-    try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, parent_constraint_name, timing);
+    try appendForeignKeyExternalizedParentCheck(alloc, child_participant, foreign_key, child_runtime_table, child_key, parent_key, parent_constraint_name, child_period_start_json, child_period_end_json, timing);
 }
 
 fn foreignKeySupportsDistributedParentDeleteCheck(foreign_key: storage_schema.ForeignKey) bool {
@@ -3433,6 +3541,47 @@ fn foreignKeyParentReferenceFromJsonAlloc(
     const row = try document_mapper.buildRelationalRowValueAlloc(alloc, value, columns);
     defer alloc.free(row);
     return try relational_store.foreignKeyReferenceValueAlloc(alloc, row, foreign_key);
+}
+
+const ForeignKeyChildPeriodBounds = struct {
+    start_json: ?[]const u8 = null,
+    end_json: ?[]const u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.start_json) |json| alloc.free(@constCast(json));
+        if (self.end_json) |json| alloc.free(@constCast(json));
+        self.* = .{};
+    }
+};
+
+fn foreignKeyChildPeriodBoundsFromJsonAlloc(
+    alloc: std.mem.Allocator,
+    periods: []const storage_schema.RelationalPeriod,
+    foreign_key: storage_schema.ForeignKey,
+    value: []const u8,
+) !ForeignKeyChildPeriodBounds {
+    const period_name = foreign_key.child_period orelse return .{};
+    const period = relationalPeriodByName(periods, period_name) orelse return error.InvalidTxnRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.InvalidTxnRequest;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTxnRequest,
+    };
+    const start_value = obj.get(period.start_column) orelse return error.InvalidTxnRequest;
+    const end_value = obj.get(period.end_column) orelse return error.InvalidTxnRequest;
+    const start_json = try std.json.Stringify.valueAlloc(alloc, start_value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(start_json);
+    const end_json = try std.json.Stringify.valueAlloc(alloc, end_value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(end_json);
+    return .{ .start_json = start_json, .end_json = end_json };
+}
+
+fn relationalPeriodByName(periods: []const storage_schema.RelationalPeriod, name: []const u8) ?storage_schema.RelationalPeriod {
+    for (periods) |period| {
+        if (std.mem.eql(u8, period.name, name)) return period;
+    }
+    return null;
 }
 
 test "foreign key action schedule ids include the mutating action" {
@@ -3878,6 +4027,16 @@ fn encodeForeignKeyParentCheck(alloc: std.mem.Allocator, check: db_mod.types.For
         defer alloc.free(encoded_name);
         try out.appendSlice(alloc, encoded_name);
     }
+    if (check.child_period_start_json) |json| {
+        const encoded_start = try std.fmt.allocPrint(alloc, ",\"child_period_start\":{s}", .{json});
+        defer alloc.free(encoded_start);
+        try out.appendSlice(alloc, encoded_start);
+    }
+    if (check.child_period_end_json) |json| {
+        const encoded_end = try std.fmt.allocPrint(alloc, ",\"child_period_end\":{s}", .{json});
+        defer alloc.free(encoded_end);
+        try out.appendSlice(alloc, encoded_end);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -3897,15 +4056,31 @@ fn encodeForeignKeyRefMutation(alloc: std.mem.Allocator, mutation: db_mod.types.
 }
 
 fn encodeUniqueConstraintMutation(alloc: std.mem.Allocator, mutation: db_mod.types.UniqueConstraintMutation) ![]u8 {
-    return try std.fmt.allocPrint(
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    const encoded = try std.fmt.allocPrint(
         alloc,
-        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"owner_key\":{f}}}",
+        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"owner_key\":{f}",
         .{
             std.json.fmt(mutation.constraint_name, .{}),
             std.json.fmt(mutation.encoded_value, .{}),
             std.json.fmt(mutation.owner_key, .{}),
         },
     );
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+    if (mutation.temporal_start) |start| {
+        const encoded_start = try std.fmt.allocPrint(alloc, ",\"temporal_start\":{f}", .{std.json.fmt(start, .{})});
+        defer alloc.free(encoded_start);
+        try out.appendSlice(alloc, encoded_start);
+    }
+    if (mutation.temporal_end) |end| {
+        const encoded_end = try std.fmt.allocPrint(alloc, ",\"temporal_end\":{f}", .{std.json.fmt(end, .{})});
+        defer alloc.free(encoded_end);
+        try out.appendSlice(alloc, encoded_end);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest) ![]u8 {
@@ -4486,6 +4661,8 @@ fn parseTxnForeignKeyParentChecks(alloc: std.mem.Allocator, value: std.json.Valu
             alloc.free(@constCast(check.parent_table));
             alloc.free(@constCast(check.parent_key));
             if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+            if (check.child_period_start_json) |json| alloc.free(@constCast(json));
+            if (check.child_period_end_json) |json| alloc.free(@constCast(json));
         }
         alloc.free(out);
     }
@@ -4504,12 +4681,23 @@ fn parseTxnForeignKeyParentChecks(alloc: std.mem.Allocator, value: std.json.Valu
             .null => null,
             else => return error.InvalidTxnRequest,
         } else null;
+        const child_period_start_json = if (obj.get("child_period_start")) |field_value|
+            try std.json.Stringify.valueAlloc(alloc, field_value, .{ .emit_null_optional_fields = false })
+        else
+            null;
+        errdefer if (child_period_start_json) |json| alloc.free(json);
+        const child_period_end_json = if (obj.get("child_period_end")) |field_value|
+            try std.json.Stringify.valueAlloc(alloc, field_value, .{ .emit_null_optional_fields = false })
+        else
+            null;
+        errdefer if (child_period_end_json) |json| alloc.free(json);
         const timing: db_mod.types.ForeignKeyParentCheck.Timing = if (obj.get("timing")) |field_value| switch (field_value) {
             .string => |name| parseForeignKeyTimingNameForConstraint(name, constraint_name) orelse return error.InvalidTxnRequest,
             else => return error.InvalidTxnRequest,
         } else .immediate;
         if (constraint_name.len == 0 or child_table.len == 0 or child_key.len == 0 or parent_table.len == 0 or parent_key.len == 0) return error.InvalidTxnRequest;
         if (parent_constraint_name) |name| if (name.len == 0) return error.InvalidTxnRequest;
+        if ((child_period_start_json == null) != (child_period_end_json == null)) return error.InvalidTxnRequest;
         out[initialized] = .{
             .constraint_name = try alloc.dupe(u8, constraint_name),
             .child_table = try alloc.dupe(u8, child_table),
@@ -4517,6 +4705,8 @@ fn parseTxnForeignKeyParentChecks(alloc: std.mem.Allocator, value: std.json.Valu
             .parent_table = try alloc.dupe(u8, parent_table),
             .parent_key = try alloc.dupe(u8, parent_key),
             .parent_constraint_name = if (parent_constraint_name) |name| try alloc.dupe(u8, name) else null,
+            .child_period_start_json = child_period_start_json,
+            .child_period_end_json = child_period_end_json,
             .timing = timing,
         };
         initialized += 1;
@@ -4532,6 +4722,8 @@ fn freeTxnForeignKeyParentChecks(alloc: std.mem.Allocator, checks: []const db_mo
         alloc.free(@constCast(check.parent_table));
         alloc.free(@constCast(check.parent_key));
         if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+        if (check.child_period_start_json) |json| alloc.free(@constCast(json));
+        if (check.child_period_end_json) |json| alloc.free(@constCast(json));
     }
     if (checks.len > 0) alloc.free(@constCast(checks));
 }
@@ -5149,6 +5341,14 @@ fn freeTxnForeignKeyRefMutations(alloc: std.mem.Allocator, mutations: []const db
     if (mutations.len > 0) alloc.free(@constCast(mutations));
 }
 
+fn optionalString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
 fn parseTxnUniqueConstraintMutations(alloc: std.mem.Allocator, value: std.json.Value) ![]const db_mod.types.UniqueConstraintMutation {
     const arr = switch (value) {
         .array => |arr| arr,
@@ -5161,6 +5361,8 @@ fn parseTxnUniqueConstraintMutations(alloc: std.mem.Allocator, value: std.json.V
             alloc.free(@constCast(mutation.constraint_name));
             alloc.free(@constCast(mutation.encoded_value));
             alloc.free(@constCast(mutation.owner_key));
+            if (mutation.temporal_start) |start| alloc.free(@constCast(start));
+            if (mutation.temporal_end) |end| alloc.free(@constCast(end));
         }
         alloc.free(out);
     }
@@ -5172,11 +5374,16 @@ fn parseTxnUniqueConstraintMutations(alloc: std.mem.Allocator, value: std.json.V
         const constraint_name = requireString(obj, "constraint_name");
         const encoded_value = requireString(obj, "encoded_value");
         const owner_key = requireString(obj, "owner_key");
+        const temporal_start = optionalString(obj, "temporal_start");
+        const temporal_end = optionalString(obj, "temporal_end");
         if (constraint_name.len == 0 or encoded_value.len == 0 or owner_key.len == 0) return error.InvalidTxnRequest;
+        if ((temporal_start == null) != (temporal_end == null)) return error.InvalidTxnRequest;
         out[initialized] = .{
             .constraint_name = try alloc.dupe(u8, constraint_name),
             .encoded_value = try alloc.dupe(u8, encoded_value),
             .owner_key = try alloc.dupe(u8, owner_key),
+            .temporal_start = if (temporal_start) |start| try alloc.dupe(u8, start) else null,
+            .temporal_end = if (temporal_end) |end| try alloc.dupe(u8, end) else null,
         };
         initialized += 1;
     }
@@ -5188,6 +5395,8 @@ fn freeTxnUniqueConstraintMutations(alloc: std.mem.Allocator, mutations: []const
         alloc.free(@constCast(mutation.constraint_name));
         alloc.free(@constCast(mutation.encoded_value));
         alloc.free(@constCast(mutation.owner_key));
+        if (mutation.temporal_start) |start| alloc.free(@constCast(start));
+        if (mutation.temporal_end) |end| alloc.free(@constCast(end));
     }
     if (mutations.len > 0) alloc.free(@constCast(mutations));
 }
@@ -5311,6 +5520,8 @@ test "txn prepare parser round-trips constraint participant intents" {
                 .parent_table = "customers",
                 .parent_key = "customer:1",
                 .parent_constraint_name = "customers_id_key",
+                .child_period_start_json = "10",
+                .child_period_end_json = "20",
                 .timing = .deferred,
             }},
             .foreign_key_parent_delete_checks = &.{.{
@@ -5397,6 +5608,8 @@ test "txn prepare parser round-trips constraint participant intents" {
     try std.testing.expectEqualStrings("customers", parsed.req.foreign_key_parent_checks[0].parent_table);
     try std.testing.expectEqualStrings("customer:1", parsed.req.foreign_key_parent_checks[0].parent_key);
     try std.testing.expectEqualStrings("customers_id_key", parsed.req.foreign_key_parent_checks[0].parent_constraint_name.?);
+    try std.testing.expectEqualStrings("10", parsed.req.foreign_key_parent_checks[0].child_period_start_json.?);
+    try std.testing.expectEqualStrings("20", parsed.req.foreign_key_parent_checks[0].child_period_end_json.?);
     try std.testing.expectEqual(db_mod.types.ForeignKeyParentCheck.Timing.deferred, parsed.req.foreign_key_parent_checks[0].timing);
     try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_parent_delete_checks.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", parsed.req.foreign_key_parent_delete_checks[0].constraint_name);
@@ -5684,7 +5897,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
             try self.begins.append(std.testing.allocator, group_id);
         }
 
@@ -7927,6 +8140,15 @@ test "distributed txn coordinator routes unique foreign key parent updates throu
                     .group_id = 9001,
                     .topology_epoch = 44,
                 }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 8,
+                    .constraint_name = "customers_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9002,
+                    .topology_epoch = 45,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -7957,7 +8179,7 @@ test "distributed txn coordinator routes unique foreign key parent updates throu
         }
 
         fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
-            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
         }
 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -7967,6 +8189,12 @@ test "distributed txn coordinator routes unique foreign key parent updates throu
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                 try std.testing.expectEqualStrings("customer:ada", req.req.writes[0].key);
                 self.parent_prepared = true;
+            } else if (group_id == 9002) {
+                try std.testing.expectEqualStrings("customers", table_name);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings("customers_email_key", req.req.unique_constraint_deletes[0].constraint_name);
+                try std.testing.expectEqualStrings("customers_email_key", req.req.unique_constraint_writes[0].constraint_name);
             } else if (group_id == 9001) {
                 try std.testing.expectEqualStrings("orders", table_name);
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
@@ -8017,8 +8245,8 @@ test "distributed txn coordinator routes unique foreign key parent updates throu
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
-    try std.testing.expectEqual(@as(usize, 1), recorder.lookup_calls);
+    try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 2), recorder.lookup_calls);
     try std.testing.expect(recorder.parent_prepared);
     try std.testing.expect(recorder.ref_owner_prepared);
 }
@@ -8078,6 +8306,15 @@ test "distributed txn coordinator schedules mutating unique foreign key parent u
                     .end_parent_key = null,
                     .group_id = 9001,
                 }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 8,
+                    .constraint_name = "customers_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9002,
+                    .topology_epoch = 45,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -8114,6 +8351,12 @@ test "distributed txn coordinator schedules mutating unique foreign key parent u
                 try std.testing.expectEqualStrings("customers", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
                 self.parent_prepared = true;
+            } else if (group_id == 9002) {
+                try std.testing.expectEqualStrings("customers", table_name);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings("customers_email_key", req.req.unique_constraint_deletes[0].constraint_name);
+                try std.testing.expectEqualStrings("customers_email_key", req.req.unique_constraint_writes[0].constraint_name);
             } else if (group_id == 9001) {
                 try std.testing.expectEqualStrings("orders", table_name);
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
@@ -8168,7 +8411,7 @@ test "distributed txn coordinator schedules mutating unique foreign key parent u
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
     try std.testing.expect(recorder.parent_prepared);
     try std.testing.expect(recorder.ref_owner_prepared);
 }
@@ -8512,7 +8755,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
         }
 
         fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
-            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
         }
 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -8525,6 +8768,11 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
                 try std.testing.expectEqualStrings("user:parent", req.req.predicates[0].key);
                 try std.testing.expectEqual(@as(u64, 5), req.req.predicates[0].expected_version);
                 self.row_prepared = true;
+            } else if (group_id == 9002) {
+                try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings("users_email_key", req.req.unique_constraint_deletes[0].constraint_name);
             } else if (group_id == 9001) {
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_delete_checks.len);
                 const check = req.req.foreign_key_parent_delete_checks[0];
@@ -8566,7 +8814,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), unversioned_result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
     try std.testing.expect(unversioned_recorder.row_prepared);
     try std.testing.expect(unversioned_recorder.owner_prepared);
 
@@ -8585,7 +8833,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
     try std.testing.expect(recorder.row_prepared);
     try std.testing.expect(recorder.owner_prepared);
 }
@@ -8642,8 +8890,8 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
                     .topology_epoch = 42,
                 }})[0..]),
                 .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
-                    .table_id = 7,
-                    .constraint_name = "users_email_key",
+                    .table_id = 8,
+                    .constraint_name = "customers_email_key",
                     .start_encoded_value = "",
                     .end_encoded_value = null,
                     .group_id = 9002,
@@ -8679,7 +8927,7 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
         }
 
         fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
-            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+            try std.testing.expectEqual(@as(usize, 3), req.participants.len);
         }
 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -8692,6 +8940,12 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
                 try std.testing.expectEqualStrings("customer:ada", req.req.predicates[0].key);
                 try std.testing.expectEqual(@as(u64, 8), req.req.predicates[0].expected_version);
                 self.parent_prepared = true;
+            } else if (group_id == 9002) {
+                try std.testing.expectEqualStrings("customers", table_name);
+                try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqualStrings("customers_email_key", req.req.unique_constraint_deletes[0].constraint_name);
             } else if (group_id == 9001) {
                 try std.testing.expectEqualStrings("docs", table_name);
                 try std.testing.expectEqual(@as(usize, 1), req.req.foreign_key_parent_delete_checks.len);
@@ -8734,7 +8988,7 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), unversioned_result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
     try std.testing.expect(unversioned_recorder.parent_prepared);
     try std.testing.expect(unversioned_recorder.owner_prepared);
 
@@ -8753,7 +9007,7 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
         }},
         null,
     );
-    try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
     try std.testing.expect(recorder.parent_prepared);
     try std.testing.expect(recorder.owner_prepared);
 }

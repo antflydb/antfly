@@ -464,6 +464,8 @@ from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
+from .relational_period import RelationalPeriod
+from .relational_period_range_type import RelationalPeriodRangeType
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_transform_op import ReplicationTransformOp
@@ -559,11 +561,14 @@ from .rows_query_plan_request import RowsQueryPlanRequest
 from .rows_query_request import RowsQueryRequest
 from .rows_query_result_set import RowsQueryResultSet
 from .rows_query_result_set_rows_item import RowsQueryResultSetRowsItem
+from .rows_result_column import RowsResultColumn
 from .rows_row_claim import RowsRowClaim
 from .rows_row_claim_mode import RowsRowClaimMode
+from .rows_row_claim_wait_policy import RowsRowClaimWaitPolicy
 from .rows_row_document import RowsRowDocument
 from .rows_stream_result_set import RowsStreamResultSet
 from .rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
+from .rows_temporal_portion import RowsTemporalPortion
 from .rows_unique_predicate import RowsUniquePredicate
 from .rows_unique_predicate_group import RowsUniquePredicateGroup
 from .rows_unique_predicate_op import RowsUniquePredicateOp
@@ -662,6 +667,9 @@ from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
 from .unique_constraint import UniqueConstraint
+from .unique_constraint_expressions_item import UniqueConstraintExpressionsItem
+from .unique_constraint_expressions_item_op import UniqueConstraintExpressionsItemOp
+from .unique_constraint_validation_state import UniqueConstraintValidationState
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
@@ -1135,6 +1143,8 @@ __all__ = (
     "QueryStrategy",
     "QueryStringQuery",
     "RegexpQuery",
+    "RelationalPeriod",
+    "RelationalPeriodRangeType",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
     "ReplicationTransformOp",
@@ -1228,11 +1238,14 @@ __all__ = (
     "RowsQueryRequest",
     "RowsQueryResultSet",
     "RowsQueryResultSetRowsItem",
+    "RowsResultColumn",
     "RowsRowClaim",
     "RowsRowClaimMode",
+    "RowsRowClaimWaitPolicy",
     "RowsRowDocument",
     "RowsStreamResultSet",
     "RowsStreamResultSetRowsItem",
+    "RowsTemporalPortion",
     "RowsUniquePredicate",
     "RowsUniquePredicateGroup",
     "RowsUniquePredicateOp",
@@ -1333,6 +1346,9 @@ __all__ = (
     "TraverseResponse",
     "TreeSearchConfig",
     "UniqueConstraint",
+    "UniqueConstraintExpressionsItem",
+    "UniqueConstraintExpressionsItemOp",
+    "UniqueConstraintValidationState",
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",

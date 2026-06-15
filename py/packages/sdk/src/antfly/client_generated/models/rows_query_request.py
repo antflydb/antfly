@@ -13,7 +13,10 @@ if TYPE_CHECKING:
     from ..models.rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
     from ..models.rows_expression_condition import RowsExpressionCondition
     from ..models.rows_expression_condition_group import RowsExpressionConditionGroup
+    from ..models.rows_expression_field import RowsExpressionField
+    from ..models.rows_expression_operator import RowsExpressionOperator
     from ..models.rows_expression_projection import RowsExpressionProjection
+    from ..models.rows_expression_value import RowsExpressionValue
     from ..models.rows_field_alias_projection import RowsFieldAliasProjection
     from ..models.rows_json_extract_projection import RowsJsonExtractProjection
     from ..models.rows_query_order_expression import RowsQueryOrderExpression
@@ -50,8 +53,11 @@ class RowsQueryRequest:
             coalesce (list[RowsCoalesceProjection] | Unset):
             field_aliases (list[RowsFieldAliasProjection] | Unset):
             expressions (list[RowsExpressionProjection] | Unset): Typed row-expression projections.
-            distinct_on (list[str] | Unset): Ordered row identity fields used to keep the first row per key after order_by
-                and before pagination. The leading order_by fields must match.
+            distinct_on (list[str] | Unset): Ordered field keys used to keep the first row per key after order_by and before
+                pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
+            distinct_on_expressions (list[RowsExpressionField | RowsExpressionOperator | RowsExpressionValue] | Unset):
+                Ordered typed row-expression keys used to keep the first row per computed key after order_by and before
+                pagination. The leading order_by expression keys must match.
             order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
             limit (int | Unset):
             offset (int | Unset):
@@ -77,6 +83,7 @@ class RowsQueryRequest:
     field_aliases: list[RowsFieldAliasProjection] | Unset = UNSET
     expressions: list[RowsExpressionProjection] | Unset = UNSET
     distinct_on: list[str] | Unset = UNSET
+    distinct_on_expressions: list[RowsExpressionField | RowsExpressionOperator | RowsExpressionValue] | Unset = UNSET
     order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
@@ -84,6 +91,8 @@ class RowsQueryRequest:
     doc_key_range: Any | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_value import RowsExpressionValue
         from ..models.rows_query_order_field import RowsQueryOrderField
         from ..models.rows_where_type_0 import RowsWhereType0
 
@@ -168,6 +177,20 @@ class RowsQueryRequest:
         if not isinstance(self.distinct_on, Unset):
             distinct_on = self.distinct_on
 
+        distinct_on_expressions: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.distinct_on_expressions, Unset):
+            distinct_on_expressions = []
+            for distinct_on_expressions_item_data in self.distinct_on_expressions:
+                distinct_on_expressions_item: dict[str, Any]
+                if isinstance(distinct_on_expressions_item_data, RowsExpressionField):
+                    distinct_on_expressions_item = distinct_on_expressions_item_data.to_dict()
+                elif isinstance(distinct_on_expressions_item_data, RowsExpressionValue):
+                    distinct_on_expressions_item = distinct_on_expressions_item_data.to_dict()
+                else:
+                    distinct_on_expressions_item = distinct_on_expressions_item_data.to_dict()
+
+                distinct_on_expressions.append(distinct_on_expressions_item)
+
         order_by: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.order_by, Unset):
             order_by = []
@@ -223,6 +246,8 @@ class RowsQueryRequest:
             field_dict["expressions"] = expressions
         if distinct_on is not UNSET:
             field_dict["distinct_on"] = distinct_on
+        if distinct_on_expressions is not UNSET:
+            field_dict["distinct_on_expressions"] = distinct_on_expressions
         if order_by is not UNSET:
             field_dict["order_by"] = order_by
         if limit is not UNSET:
@@ -243,7 +268,10 @@ class RowsQueryRequest:
         from ..models.rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
         from ..models.rows_expression_condition import RowsExpressionCondition
         from ..models.rows_expression_condition_group import RowsExpressionConditionGroup
+        from ..models.rows_expression_field import RowsExpressionField
+        from ..models.rows_expression_operator import RowsExpressionOperator
         from ..models.rows_expression_projection import RowsExpressionProjection
+        from ..models.rows_expression_value import RowsExpressionValue
         from ..models.rows_field_alias_projection import RowsFieldAliasProjection
         from ..models.rows_json_extract_projection import RowsJsonExtractProjection
         from ..models.rows_query_order_expression import RowsQueryOrderExpression
@@ -356,6 +384,43 @@ class RowsQueryRequest:
 
         distinct_on = cast(list[str], d.pop("distinct_on", UNSET))
 
+        _distinct_on_expressions = d.pop("distinct_on_expressions", UNSET)
+        distinct_on_expressions: list[RowsExpressionField | RowsExpressionOperator | RowsExpressionValue] | Unset = (
+            UNSET
+        )
+        if _distinct_on_expressions is not UNSET:
+            distinct_on_expressions = []
+            for distinct_on_expressions_item_data in _distinct_on_expressions:
+
+                def _parse_distinct_on_expressions_item(
+                    data: object,
+                ) -> RowsExpressionField | RowsExpressionOperator | RowsExpressionValue:
+                    try:
+                        if not isinstance(data, dict):
+                            raise TypeError()
+                        componentsschemas_rows_expression_type_0 = RowsExpressionField.from_dict(data)
+
+                        return componentsschemas_rows_expression_type_0
+                    except (TypeError, ValueError, AttributeError, KeyError):
+                        pass
+                    try:
+                        if not isinstance(data, dict):
+                            raise TypeError()
+                        componentsschemas_rows_expression_type_1 = RowsExpressionValue.from_dict(data)
+
+                        return componentsschemas_rows_expression_type_1
+                    except (TypeError, ValueError, AttributeError, KeyError):
+                        pass
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_rows_expression_type_2 = RowsExpressionOperator.from_dict(data)
+
+                    return componentsschemas_rows_expression_type_2
+
+                distinct_on_expressions_item = _parse_distinct_on_expressions_item(distinct_on_expressions_item_data)
+
+                distinct_on_expressions.append(distinct_on_expressions_item)
+
         _order_by = d.pop("order_by", UNSET)
         order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
         if _order_by is not UNSET:
@@ -413,6 +478,7 @@ class RowsQueryRequest:
             field_aliases=field_aliases,
             expressions=expressions,
             distinct_on=distinct_on,
+            distinct_on_expressions=distinct_on_expressions,
             order_by=order_by,
             limit=limit,
             offset=offset,

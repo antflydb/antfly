@@ -98,6 +98,44 @@ const PageLeaseSnapshot = struct {
     total_units: u64 = 0,
 };
 
+const ProcessHarnessReleaseSummary = struct {
+    launch_families: usize = 0,
+    service_owner_restart_families: usize = 0,
+    service_publish_cleanup_families: usize = 0,
+    service_publish_failure_families: usize = 0,
+    service_multipage_worker_pool_families: usize = 0,
+    service_multipage_coordinator_takeover_families: usize = 0,
+    service_multipage_worker_pool_takeover_families: usize = 0,
+    service_cleanup_takeover_families: usize = 0,
+    service_active_public_read_families: usize = 0,
+    direct_publish_cleanup_families: usize = 0,
+    direct_publish_failure_families: usize = 0,
+    direct_active_public_read_families: usize = 0,
+    direct_page_reclaim_phase_proofs: usize = 0,
+    fixed_iteration_families: usize = 0,
+    exhausted_attempt_families: usize = 0,
+    same_worker_fencing_proofs: usize = 0,
+};
+
+const required_process_harness_release_summary = ProcessHarnessReleaseSummary{
+    .launch_families = 4,
+    .service_owner_restart_families = 4,
+    .service_publish_cleanup_families = 4,
+    .service_publish_failure_families = 3,
+    .service_multipage_worker_pool_families = 4,
+    .service_multipage_coordinator_takeover_families = 4,
+    .service_multipage_worker_pool_takeover_families = 4,
+    .service_cleanup_takeover_families = 4,
+    .service_active_public_read_families = 4,
+    .direct_publish_cleanup_families = 4,
+    .direct_publish_failure_families = 3,
+    .direct_active_public_read_families = 3,
+    .direct_page_reclaim_phase_proofs = 20,
+    .fixed_iteration_families = 2,
+    .exhausted_attempt_families = 3,
+    .same_worker_fencing_proofs = 2,
+};
+
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
 
@@ -122,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const harness_exe = argv[0];
     const antfly_exe = argv[1];
+    var release_summary: ProcessHarnessReleaseSummary = .{};
 
     try verifyRoleProcessArgvPreflightSelfTest();
 
@@ -388,18 +427,22 @@ pub fn main(init: std.process.Init) !void {
     const launch_target_generation = try seedDegreeDb(alloc, launch_db_path);
     try runLaunchProcess(alloc, init.io, antfly_exe, launch_db_path, "degree");
     try verifyDegreeFresh(alloc, launch_db_path, launch_target_generation);
+    release_summary.launch_families += 1;
 
     const pagerank_launch_target_generation = try seedPageRankDb(alloc, pagerank_launch_db_path);
     try runLaunchProcess(alloc, init.io, antfly_exe, pagerank_launch_db_path, "pagerank");
     try verifyMetricFresh(alloc, pagerank_launch_db_path, "pagerank", pagerank_launch_target_generation);
+    release_summary.launch_families += 1;
 
     const eigenvector_launch_target_generation = try seedEigenvectorDb(alloc, eigenvector_launch_db_path);
     try runLaunchProcess(alloc, init.io, antfly_exe, eigenvector_launch_db_path, "eigenvector");
     try verifyMetricFresh(alloc, eigenvector_launch_db_path, "eigenvector", eigenvector_launch_target_generation);
+    release_summary.launch_families += 1;
 
     const hits_launch_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_launch_db_path);
     try runLaunchProcess(alloc, init.io, antfly_exe, hits_launch_db_path, "hits");
     try verifyHitsFresh(alloc, hits_launch_db_path, hits_launch_target_generation);
+    release_summary.launch_families += 1;
 
     _ = try seedDegreeDb(alloc, lease_db_path);
     try verifyCoordinatorLeaseExpiryTakeover(alloc, init.io, antfly_exe, lease_db_path);
@@ -407,6 +450,7 @@ pub fn main(init: std.process.Init) !void {
     const service_owner_target_generation = try seedDegreeDb(alloc, service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, service_owner_db_path, "degree", service_owner_target_generation);
     try verifyDegreeFresh(alloc, service_owner_db_path, service_owner_target_generation);
+    release_summary.service_owner_restart_families += 1;
 
     const degree_service_publish_cleanup_target_generation = try seedDegreeDb(alloc, degree_service_publish_cleanup_db_path);
     try verifyDegreeServiceTargetedPublishAndCleanupRestartProcess(
@@ -416,6 +460,8 @@ pub fn main(init: std.process.Init) !void {
         degree_service_publish_cleanup_db_path,
         degree_service_publish_cleanup_target_generation,
     );
+    release_summary.service_publish_cleanup_families += 1;
+    release_summary.service_cleanup_takeover_families += 1;
 
     const degree_service_multipage_target_generation = try seedDegreeDbWithSources(alloc, degree_service_multipage_db_path, 130);
     try verifyDegreeServiceTargetedMultiPageWorkerPoolProcess(
@@ -425,10 +471,14 @@ pub fn main(init: std.process.Init) !void {
         degree_service_multipage_db_path,
         degree_service_multipage_target_generation,
     );
+    release_summary.service_multipage_worker_pool_families += 1;
+    release_summary.service_multipage_coordinator_takeover_families += 1;
+    release_summary.service_multipage_worker_pool_takeover_families += 1;
 
     const pagerank_service_owner_target_generation = try seedPageRankDb(alloc, pagerank_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, pagerank_service_owner_db_path, "pagerank", pagerank_service_owner_target_generation);
     try verifyMetricFresh(alloc, pagerank_service_owner_db_path, "pagerank", pagerank_service_owner_target_generation);
+    release_summary.service_owner_restart_families += 1;
 
     const pagerank_service_publish_cleanup_target_generation = try seedPageRankDb(alloc, pagerank_service_publish_cleanup_db_path);
     try verifyPageRankServiceTargetedPublishAndCleanupRestartProcess(
@@ -438,6 +488,8 @@ pub fn main(init: std.process.Init) !void {
         pagerank_service_publish_cleanup_db_path,
         pagerank_service_publish_cleanup_target_generation,
     );
+    release_summary.service_publish_cleanup_families += 1;
+    release_summary.service_cleanup_takeover_families += 1;
 
     const pagerank_service_publish_failure_initial_generation = try seedPageRankDb(alloc, pagerank_service_publish_failure_db_path);
     try verifyPageRankServiceTargetedPublishVerifierFailureProcess(
@@ -447,6 +499,7 @@ pub fn main(init: std.process.Init) !void {
         pagerank_service_publish_failure_db_path,
         pagerank_service_publish_failure_initial_generation,
     );
+    release_summary.service_publish_failure_families += 1;
 
     const pagerank_service_multipage_target_generation = try seedPageRankDbWithSources(alloc, pagerank_service_multipage_db_path, 130);
     try verifyPageRankServiceTargetedMultiPageWorkerPoolProcess(
@@ -456,12 +509,16 @@ pub fn main(init: std.process.Init) !void {
         pagerank_service_multipage_db_path,
         pagerank_service_multipage_target_generation,
     );
+    release_summary.service_multipage_worker_pool_families += 1;
+    release_summary.service_multipage_coordinator_takeover_families += 1;
+    release_summary.service_multipage_worker_pool_takeover_families += 1;
 
     const eigenvector_service_owner_target_generation = try seedEigenvectorDb(alloc, eigenvector_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, eigenvector_service_owner_db_path, "eigenvector", eigenvector_service_owner_target_generation);
     try verifyMetricFresh(alloc, eigenvector_service_owner_db_path, "eigenvector", eigenvector_service_owner_target_generation);
+    release_summary.service_owner_restart_families += 1;
 
-    const eigenvector_service_publish_cleanup_target_generation = try seedEigenvectorDb(alloc, eigenvector_service_publish_cleanup_db_path);
+    const eigenvector_service_publish_cleanup_target_generation = try seedEigenvectorDbWithSources(alloc, eigenvector_service_publish_cleanup_db_path, 130);
     try verifyEigenvectorServiceTargetedPublishAndCleanupRestartProcess(
         alloc,
         init.io,
@@ -469,6 +526,8 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_service_publish_cleanup_db_path,
         eigenvector_service_publish_cleanup_target_generation,
     );
+    release_summary.service_publish_cleanup_families += 1;
+    release_summary.service_cleanup_takeover_families += 1;
 
     const eigenvector_service_publish_failure_initial_generation = try seedEigenvectorDb(alloc, eigenvector_service_publish_failure_db_path);
     try verifyEigenvectorServiceTargetedPublishVerifierFailureProcess(
@@ -478,6 +537,7 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_service_publish_failure_db_path,
         eigenvector_service_publish_failure_initial_generation,
     );
+    release_summary.service_publish_failure_families += 1;
 
     const eigenvector_service_multipage_target_generation = try seedEigenvectorDbWithSources(alloc, eigenvector_service_multipage_db_path, 130);
     try verifyEigenvectorServiceTargetedMultiPageWorkerPoolProcess(
@@ -487,10 +547,14 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_service_multipage_db_path,
         eigenvector_service_multipage_target_generation,
     );
+    release_summary.service_multipage_worker_pool_families += 1;
+    release_summary.service_multipage_coordinator_takeover_families += 1;
+    release_summary.service_multipage_worker_pool_takeover_families += 1;
 
     const hits_service_owner_target_generation = try seedHitsBackgroundDb(alloc, hits_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, hits_service_owner_db_path, "hits_authority", hits_service_owner_target_generation);
     try verifyHitsFresh(alloc, hits_service_owner_db_path, hits_service_owner_target_generation);
+    release_summary.service_owner_restart_families += 1;
 
     const hits_service_publish_cleanup_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_service_publish_cleanup_db_path);
     try verifyHitsServiceTargetedPublishAndCleanupRestartProcess(
@@ -500,6 +564,8 @@ pub fn main(init: std.process.Init) !void {
         hits_service_publish_cleanup_db_path,
         hits_service_publish_cleanup_target_generation,
     );
+    release_summary.service_publish_cleanup_families += 1;
+    release_summary.service_cleanup_takeover_families += 1;
 
     const hits_service_publish_failure_initial_generation = try seedHitsDbWithActiveBuild(alloc, hits_service_publish_failure_db_path);
     try verifyHitsServiceTargetedPublishVerifierFailureProcess(
@@ -509,6 +575,7 @@ pub fn main(init: std.process.Init) !void {
         hits_service_publish_failure_db_path,
         hits_service_publish_failure_initial_generation,
     );
+    release_summary.service_publish_failure_families += 1;
 
     const hits_service_multipage_target_generation = try seedHitsDbWithSources(alloc, hits_service_multipage_db_path, 130);
     try verifyHitsServiceTargetedMultiPageWorkerPoolProcess(
@@ -518,6 +585,9 @@ pub fn main(init: std.process.Init) !void {
         hits_service_multipage_db_path,
         hits_service_multipage_target_generation,
     );
+    release_summary.service_multipage_worker_pool_families += 1;
+    release_summary.service_multipage_coordinator_takeover_families += 1;
+    release_summary.service_multipage_worker_pool_takeover_families += 1;
 
     const degree_service_active_public_read_initial_generation = try seedDegreeSearchDb(alloc, degree_service_active_public_read_db_path);
     try verifyDegreeServiceActiveProcessPublicReadFreshness(
@@ -527,6 +597,7 @@ pub fn main(init: std.process.Init) !void {
         degree_service_active_public_read_db_path,
         degree_service_active_public_read_initial_generation,
     );
+    release_summary.service_active_public_read_families += 1;
 
     const pagerank_service_active_public_read_initial_generation = try seedPageRankSearchDb(alloc, pagerank_service_active_public_read_db_path);
     try verifyPageRankServiceActiveProcessPublicReadFreshness(
@@ -536,39 +607,51 @@ pub fn main(init: std.process.Init) !void {
         pagerank_service_active_public_read_db_path,
         pagerank_service_active_public_read_initial_generation,
     );
+    release_summary.service_active_public_read_families += 1;
 
     const worker_page_target_generation = try seedDegreeDb(alloc, worker_page_db_path);
     try verifyWorkerPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, worker_page_db_path, worker_page_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const worker_runtime_target_generation = try seedDegreeDbWithSources(alloc, worker_runtime_db_path, 130);
     try verifyWorkerRuntimeSameWorkerLeaseFencing(alloc, init.io, antfly_exe, worker_runtime_db_path, worker_runtime_target_generation);
+    release_summary.same_worker_fencing_proofs += 1;
 
     const publish_cleanup_target_generation = try seedDegreeDb(alloc, publish_cleanup_db_path);
     try verifyPublishAndCleanupRestart(alloc, init.io, antfly_exe, publish_cleanup_db_path, publish_cleanup_target_generation);
+    release_summary.direct_publish_cleanup_families += 1;
 
     const pagerank_scan_target_generation = try seedPageRankDb(alloc, pagerank_scan_db_path);
     try verifyPageRankScanPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_scan_db_path, pagerank_scan_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_initialize_target_generation = try seedPageRankDb(alloc, pagerank_initialize_db_path);
     try verifyPageRankInitializePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_initialize_db_path, pagerank_initialize_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_contribution_target_generation = try seedPageRankDb(alloc, pagerank_contribution_db_path);
     try verifyPageRankContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_contribution_db_path, pagerank_contribution_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_reduce_target_generation = try seedPageRankDb(alloc, pagerank_reduce_db_path);
     try verifyPageRankReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_reduce_db_path, pagerank_reduce_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_convergence_target_generation = try seedPageRankDb(alloc, pagerank_convergence_db_path);
     try verifyPageRankConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_convergence_db_path, pagerank_convergence_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_publish_cleanup_target_generation = try seedPageRankDb(alloc, pagerank_publish_cleanup_db_path);
     try verifyPageRankPublishAndCleanupRestart(alloc, init.io, antfly_exe, pagerank_publish_cleanup_db_path, pagerank_publish_cleanup_target_generation);
+    release_summary.direct_publish_cleanup_families += 1;
 
     const pagerank_cleanup_reclaim_target_generation = try seedPageRankDb(alloc, pagerank_cleanup_reclaim_db_path);
     try verifyPageRankCleanupPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_cleanup_reclaim_db_path, pagerank_cleanup_reclaim_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_publish_failure_initial_generation = try seedPageRankDb(alloc, pagerank_publish_failure_db_path);
     try verifyPageRankPublishVerifierFailureProcess(alloc, init.io, antfly_exe, pagerank_publish_failure_db_path, pagerank_publish_failure_initial_generation);
+    release_summary.direct_publish_failure_families += 1;
 
     const pagerank_fixed_iteration_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_fixed_iteration_db_path, 2);
     try runSupervisorProcess(alloc, init.io, antfly_exe, pagerank_fixed_iteration_db_path);
@@ -578,6 +661,7 @@ pub fn main(init: std.process.Init) !void {
         pagerank_fixed_iteration_target_generation,
         2,
     );
+    release_summary.fixed_iteration_families += 1;
 
     const pagerank_active_public_read_initial_generation = try seedPageRankSearchDb(alloc, pagerank_active_public_read_db_path);
     try verifyPageRankActiveProcessPublicReadFreshness(
@@ -587,21 +671,27 @@ pub fn main(init: std.process.Init) !void {
         pagerank_active_public_read_db_path,
         pagerank_active_public_read_initial_generation,
     );
+    release_summary.direct_active_public_read_families += 1;
 
     const pagerank_same_worker_target_generation = try seedPageRankDb(alloc, pagerank_same_worker_db_path);
     try verifyPageRankSameWorkerReplacementAttemptFence(alloc, init.io, harness_exe, antfly_exe, pagerank_same_worker_db_path, pagerank_same_worker_target_generation);
+    release_summary.same_worker_fencing_proofs += 1;
 
     const pagerank_later_contribution_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_contribution_db_path, 2);
     try verifyPageRankLaterContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_contribution_db_path, pagerank_later_contribution_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_later_reduce_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_reduce_db_path, 2);
     try verifyPageRankLaterReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_reduce_db_path, pagerank_later_reduce_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_later_convergence_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_convergence_db_path, 2);
     try verifyPageRankLaterConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_convergence_db_path, pagerank_later_convergence_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const pagerank_exhausted_attempt_initial_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_exhausted_attempt_db_path, 2);
     try verifyPageRankExhaustedAttemptProcess(alloc, init.io, harness_exe, antfly_exe, pagerank_exhausted_attempt_db_path, pagerank_exhausted_attempt_initial_generation);
+    release_summary.exhausted_attempt_families += 1;
 
     const eigenvector_supervisor_target_generation = try seedEigenvectorDb(alloc, eigenvector_supervisor_db_path);
     try runSupervisorProcess(alloc, init.io, antfly_exe, eigenvector_supervisor_db_path);
@@ -616,12 +706,15 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_fixed_iteration_target_generation,
         1,
     );
+    release_summary.fixed_iteration_families += 1;
 
     const eigenvector_publish_cleanup_target_generation = try seedEigenvectorDb(alloc, eigenvector_publish_cleanup_db_path);
     try verifyEigenvectorPublishAndCleanupRestart(alloc, init.io, antfly_exe, eigenvector_publish_cleanup_db_path, eigenvector_publish_cleanup_target_generation);
+    release_summary.direct_publish_cleanup_families += 1;
 
     const eigenvector_publish_failure_initial_generation = try seedEigenvectorDb(alloc, eigenvector_publish_failure_db_path);
     try verifyEigenvectorPublishVerifierFailureProcess(alloc, init.io, antfly_exe, eigenvector_publish_failure_db_path, eigenvector_publish_failure_initial_generation);
+    release_summary.direct_publish_failure_families += 1;
 
     const eigenvector_active_public_read_initial_generation = try seedEigenvectorSearchDb(alloc, eigenvector_active_public_read_db_path);
     try verifyEigenvectorActiveProcessPublicReadFreshness(
@@ -631,6 +724,7 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_active_public_read_db_path,
         eigenvector_active_public_read_initial_generation,
     );
+    release_summary.direct_active_public_read_families += 1;
 
     const eigenvector_service_active_public_read_initial_generation = try seedEigenvectorSearchDb(alloc, eigenvector_service_active_public_read_db_path);
     try verifyEigenvectorServiceActiveProcessPublicReadFreshness(
@@ -640,24 +734,31 @@ pub fn main(init: std.process.Init) !void {
         eigenvector_service_active_public_read_db_path,
         eigenvector_service_active_public_read_initial_generation,
     );
+    release_summary.service_active_public_read_families += 1;
 
     const eigenvector_scan_target_generation = try seedEigenvectorDb(alloc, eigenvector_scan_db_path);
     try verifyEigenvectorScanPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_scan_db_path, eigenvector_scan_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const eigenvector_initialize_target_generation = try seedEigenvectorDb(alloc, eigenvector_initialize_db_path);
     try verifyEigenvectorInitializePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_initialize_db_path, eigenvector_initialize_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const eigenvector_contribution_target_generation = try seedEigenvectorDb(alloc, eigenvector_contribution_db_path);
     try verifyEigenvectorContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_contribution_db_path, eigenvector_contribution_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const eigenvector_reduce_target_generation = try seedEigenvectorDb(alloc, eigenvector_reduce_db_path);
     try verifyEigenvectorReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_reduce_db_path, eigenvector_reduce_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const eigenvector_convergence_target_generation = try seedEigenvectorDb(alloc, eigenvector_convergence_db_path);
     try verifyEigenvectorConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_convergence_db_path, eigenvector_convergence_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const eigenvector_exhausted_attempt_initial_generation = try seedEigenvectorDbWithMaxIterations(alloc, eigenvector_exhausted_attempt_db_path, 2);
     try verifyEigenvectorExhaustedAttemptProcess(alloc, init.io, harness_exe, antfly_exe, eigenvector_exhausted_attempt_db_path, eigenvector_exhausted_attempt_initial_generation);
+    release_summary.exhausted_attempt_families += 1;
 
     const hits_supervisor_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_supervisor_db_path);
     try runSupervisorProcess(alloc, init.io, antfly_exe, hits_supervisor_db_path);
@@ -665,9 +766,11 @@ pub fn main(init: std.process.Init) !void {
 
     const hits_publish_cleanup_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_publish_cleanup_db_path);
     try verifyHitsPublishAndCleanupRestart(alloc, init.io, antfly_exe, hits_publish_cleanup_db_path, hits_publish_cleanup_target_generation);
+    release_summary.direct_publish_cleanup_families += 1;
 
     const hits_publish_failure_initial_generation = try seedHitsDbWithActiveBuild(alloc, hits_publish_failure_db_path);
     try verifyHitsPublishVerifierFailureProcess(alloc, init.io, antfly_exe, hits_publish_failure_db_path, hits_publish_failure_initial_generation);
+    release_summary.direct_publish_failure_families += 1;
 
     const hits_active_public_read_initial_generation = try seedHitsBackgroundDb(alloc, hits_active_public_read_db_path);
     try verifyHitsActiveProcessPublicReadFreshness(
@@ -677,6 +780,7 @@ pub fn main(init: std.process.Init) !void {
         hits_active_public_read_db_path,
         hits_active_public_read_initial_generation,
     );
+    release_summary.direct_active_public_read_families += 1;
 
     const hits_service_active_public_read_initial_generation = try seedHitsBackgroundDb(alloc, hits_service_active_public_read_db_path);
     try verifyHitsServiceActiveProcessPublicReadFreshness(
@@ -686,24 +790,132 @@ pub fn main(init: std.process.Init) !void {
         hits_service_active_public_read_db_path,
         hits_service_active_public_read_initial_generation,
     );
+    release_summary.service_active_public_read_families += 1;
 
     const hits_exhausted_attempt_initial_generation = try seedHitsDbWithActiveBuildMaxIterations(alloc, hits_exhausted_attempt_db_path, 2, 0.000001);
     try verifyHitsExhaustedAttemptProcess(alloc, init.io, harness_exe, antfly_exe, hits_exhausted_attempt_db_path, hits_exhausted_attempt_initial_generation);
+    release_summary.exhausted_attempt_families += 1;
 
     const hits_authority_contribution_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_authority_contribution_db_path);
     try verifyHitsAuthorityContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_authority_contribution_db_path, hits_authority_contribution_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const hits_authority_reduce_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_authority_reduce_db_path);
     try verifyHitsAuthorityReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_authority_reduce_db_path, hits_authority_reduce_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const hits_convergence_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_convergence_db_path);
     try verifyHitsConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_convergence_db_path, hits_convergence_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const hits_hub_contribution_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_hub_contribution_db_path);
     try verifyHitsHubContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_hub_contribution_db_path, hits_hub_contribution_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
 
     const hits_hub_reduce_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_hub_reduce_db_path);
     try verifyHitsHubReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_hub_reduce_db_path, hits_hub_reduce_target_generation);
+    release_summary.direct_page_reclaim_phase_proofs += 1;
+
+    try verifyProcessHarnessReleaseSummary(release_summary);
+    try emitProcessHarnessReleaseSummary(init.io, release_summary);
+}
+
+fn verifyProcessHarnessReleaseSummary(summary: ProcessHarnessReleaseSummary) !void {
+    const required = required_process_harness_release_summary;
+    if (!hasRemoteOwnerReleaseGate(summary, required)) {
+        return error.GraphMetricProcessReleaseCoverageMissing;
+    }
+}
+
+fn hasRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return hasServiceRemoteOwnerReleaseGate(summary, required) and
+        hasDirectRemoteOwnerReleaseGate(summary, required) and
+        hasFailureReclaimReleaseGate(summary, required);
+}
+
+fn hasServiceRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.launch_families == required.launch_families and
+        summary.service_owner_restart_families == required.service_owner_restart_families and
+        summary.service_publish_cleanup_families == required.service_publish_cleanup_families and
+        summary.service_publish_failure_families == required.service_publish_failure_families and
+        summary.service_multipage_worker_pool_families == required.service_multipage_worker_pool_families and
+        summary.service_multipage_coordinator_takeover_families == required.service_multipage_coordinator_takeover_families and
+        summary.service_multipage_worker_pool_takeover_families == required.service_multipage_worker_pool_takeover_families and
+        summary.service_cleanup_takeover_families == required.service_cleanup_takeover_families and
+        summary.service_active_public_read_families == required.service_active_public_read_families;
+}
+
+fn hasDirectRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.direct_publish_cleanup_families == required.direct_publish_cleanup_families and
+        summary.direct_publish_failure_families == required.direct_publish_failure_families and
+        summary.direct_active_public_read_families == required.direct_active_public_read_families and
+        summary.fixed_iteration_families == required.fixed_iteration_families;
+}
+
+fn hasFailureReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
+    return summary.direct_page_reclaim_phase_proofs == required.direct_page_reclaim_phase_proofs and
+        summary.exhausted_attempt_families == required.exhausted_attempt_families and
+        summary.same_worker_fencing_proofs == required.same_worker_fencing_proofs;
+}
+
+fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSummary) !void {
+    const required = required_process_harness_release_summary;
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const out = &stdout_writer.interface;
+    defer out.flush() catch {};
+
+    try out.print(
+        "{{\"event\":\"graph_metric_process_harness_summary\",\"remote_owner_release_gate\":{},\"service_remote_owner_release_gate\":{},\"direct_remote_owner_release_gate\":{},\"failure_reclaim_release_gate\":{}",
+        .{
+            hasRemoteOwnerReleaseGate(summary, required),
+            hasServiceRemoteOwnerReleaseGate(summary, required),
+            hasDirectRemoteOwnerReleaseGate(summary, required),
+            hasFailureReclaimReleaseGate(summary, required),
+        },
+    );
+    try out.print(
+        ",\"required_launch_families\":{d},\"launch_families\":{d},\"required_service_owner_restart_families\":{d},\"service_owner_restart_families\":{d},\"required_service_publish_cleanup_families\":{d},\"service_publish_cleanup_families\":{d},\"required_service_publish_failure_families\":{d},\"service_publish_failure_families\":{d},\"required_service_multipage_worker_pool_families\":{d},\"service_multipage_worker_pool_families\":{d},\"required_service_multipage_coordinator_takeover_families\":{d},\"service_multipage_coordinator_takeover_families\":{d},\"required_service_multipage_worker_pool_takeover_families\":{d},\"service_multipage_worker_pool_takeover_families\":{d},\"required_service_cleanup_takeover_families\":{d},\"service_cleanup_takeover_families\":{d},\"required_service_active_public_read_families\":{d},\"service_active_public_read_families\":{d}",
+        .{
+            required.launch_families,
+            summary.launch_families,
+            required.service_owner_restart_families,
+            summary.service_owner_restart_families,
+            required.service_publish_cleanup_families,
+            summary.service_publish_cleanup_families,
+            required.service_publish_failure_families,
+            summary.service_publish_failure_families,
+            required.service_multipage_worker_pool_families,
+            summary.service_multipage_worker_pool_families,
+            required.service_multipage_coordinator_takeover_families,
+            summary.service_multipage_coordinator_takeover_families,
+            required.service_multipage_worker_pool_takeover_families,
+            summary.service_multipage_worker_pool_takeover_families,
+            required.service_cleanup_takeover_families,
+            summary.service_cleanup_takeover_families,
+            required.service_active_public_read_families,
+            summary.service_active_public_read_families,
+        },
+    );
+    try out.print(
+        ",\"required_direct_publish_cleanup_families\":{d},\"direct_publish_cleanup_families\":{d},\"required_direct_publish_failure_families\":{d},\"direct_publish_failure_families\":{d},\"required_direct_active_public_read_families\":{d},\"direct_active_public_read_families\":{d},\"required_direct_page_reclaim_phase_proofs\":{d},\"direct_page_reclaim_phase_proofs\":{d},\"required_fixed_iteration_families\":{d},\"fixed_iteration_families\":{d},\"required_exhausted_attempt_families\":{d},\"exhausted_attempt_families\":{d},\"required_same_worker_fencing_proofs\":{d},\"same_worker_fencing_proofs\":{d}}}\n",
+        .{
+            required.direct_publish_cleanup_families,
+            summary.direct_publish_cleanup_families,
+            required.direct_publish_failure_families,
+            summary.direct_publish_failure_families,
+            required.direct_active_public_read_families,
+            summary.direct_active_public_read_families,
+            required.direct_page_reclaim_phase_proofs,
+            summary.direct_page_reclaim_phase_proofs,
+            required.fixed_iteration_families,
+            summary.fixed_iteration_families,
+            required.exhausted_attempt_families,
+            summary.exhausted_attempt_families,
+            required.same_worker_fencing_proofs,
+            summary.same_worker_fencing_proofs,
+        },
+    );
 }
 
 fn seedDegreeDb(alloc: std.mem.Allocator, db_path: []const u8) !u64 {
@@ -4839,37 +5051,54 @@ fn verifyDegreeServiceTargetedPublishAndCleanupRestartProcess(
         try assertDuplicateCoordinatorDidNotMutate(duplicate_publish, "service degree cleanup");
         try assertOpenDbMetricPhase(alloc, &db, "degree", .cleanup_old_generations, target_generation);
 
-        const first_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+        const cleanup_ready_file = ".zig-cache/tmp/graph-metric-process-service-degree-publish-cleanup-worker-pool-ready";
+        std.Io.Dir.cwd().deleteFile(io, cleanup_ready_file) catch {};
+        defer std.Io.Dir.cwd().deleteFile(io, cleanup_ready_file) catch {};
+        try runAndKillServiceWorkerPoolAfterReadyWithMaxPages(
+            io,
+            antfly_exe,
+            base_uri,
+            "service-degree-publish-cleanup-worker-pool",
+            "service-degree-publish-cleanup-worker-pool-killed",
+            "service-process-worker-a,service-process-worker-b",
+            "200",
+            "75002",
+            "1",
+            cleanup_ready_file,
+        );
+        try assertOpenDbMetricPhase(alloc, &db, "degree", .cleanup_old_generations, target_generation);
+
+        const fenced_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
             alloc,
             io,
             antfly_exe,
             base_uri,
             "service-degree-publish-cleanup-worker-pool",
-            "service-degree-publish-cleanup-worker-pool-a",
+            "service-degree-publish-cleanup-worker-pool-replacement",
             "service-process-worker-a,service-process-worker-b",
-            "5000",
-            "75002",
+            "200",
+            "75100",
             "1",
         );
-        if (first_cleanup.result.pages_claimed != 1 or first_cleanup.result.pages_completed != 1) {
-            std.debug.print("expected first service worker-pool process to complete one degree cleanup page\n", .{});
-            return error.GraphMetricProcessProofFailed;
+        if (fenced_cleanup.durable_progressed or fenced_cleanup.stats.has_lease or fenced_cleanup.stats.lease_acquire_failures == 0) {
+            std.debug.print("expected duplicate service degree cleanup worker-pool to be fenced before lease expiry\n", .{});
+            return error.GraphMetricLeaseProofFailed;
         }
         try assertOpenDbMetricPhase(alloc, &db, "degree", .cleanup_old_generations, target_generation);
 
-        const final_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+        const takeover_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
             alloc,
             io,
             antfly_exe,
             base_uri,
             "service-degree-publish-cleanup-worker-pool",
-            "service-degree-publish-cleanup-worker-pool-b",
+            "service-degree-publish-cleanup-worker-pool-replacement",
             "service-process-worker-a,service-process-worker-b",
-            "5000",
-            "75003",
+            "200",
+            "75203",
             "1",
         );
-        if (final_cleanup.result.pages_claimed != 1 or final_cleanup.result.pages_completed != 1) {
+        if (takeover_cleanup.stats.takeover_count == 0 or takeover_cleanup.result.pages_claimed != 1 or takeover_cleanup.result.pages_completed != 1) {
             std.debug.print("expected replacement service worker-pool process to finish degree cleanup\n", .{});
             return error.GraphMetricProcessProofFailed;
         }
@@ -5618,19 +5847,80 @@ fn verifyEigenvectorServiceTargetedPublishAndCleanupRestartProcess(
         try assertDuplicateCoordinatorDidNotMutate(duplicate_publish, "service eigenvector cleanup");
         try assertOpenDbMetricPhase(alloc, &db, "eigenvector", .cleanup_old_generations, target_generation);
 
-        const cleanup = try runServiceWorkerPoolRoleProcessAt(
+        const cleanup_ready_file = ".zig-cache/tmp/graph-metric-process-service-eigenvector-publish-cleanup-worker-pool-ready";
+        std.Io.Dir.cwd().deleteFile(io, cleanup_ready_file) catch {};
+        defer std.Io.Dir.cwd().deleteFile(io, cleanup_ready_file) catch {};
+        try runAndKillServiceWorkerPoolAfterReadyWithMaxPages(
+            io,
+            antfly_exe,
+            base_uri,
+            "service-eigenvector-publish-cleanup-worker-pool",
+            "service-eigenvector-publish-cleanup-worker-pool-killed",
+            "service-process-worker-a,service-process-worker-b",
+            "200",
+            "77002",
+            "1",
+            cleanup_ready_file,
+        );
+        try assertOpenDbMetricPhase(alloc, &db, "eigenvector", .cleanup_old_generations, target_generation);
+
+        const fenced_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
             alloc,
             io,
             antfly_exe,
             base_uri,
             "service-eigenvector-publish-cleanup-worker-pool",
-            "service-eigenvector-publish-cleanup-worker-pool-a",
+            "service-eigenvector-publish-cleanup-worker-pool-replacement",
             "service-process-worker-a,service-process-worker-b",
-            "5000",
-            "77002",
+            "200",
+            "77100",
+            "4",
         );
-        if (cleanup.result.pages_claimed == 0 or cleanup.result.pages_completed == 0) {
-            std.debug.print("expected service worker-pool process to finish eigenvector cleanup\n", .{});
+        if (fenced_cleanup.durable_progressed or fenced_cleanup.stats.has_lease or fenced_cleanup.stats.lease_acquire_failures == 0) {
+            std.debug.print("expected duplicate service eigenvector cleanup worker-pool to be fenced before lease expiry\n", .{});
+            return error.GraphMetricLeaseProofFailed;
+        }
+        try assertOpenDbMetricPhase(alloc, &db, "eigenvector", .cleanup_old_generations, target_generation);
+
+        const takeover_cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+            alloc,
+            io,
+            antfly_exe,
+            base_uri,
+            "service-eigenvector-publish-cleanup-worker-pool",
+            "service-eigenvector-publish-cleanup-worker-pool-replacement",
+            "service-process-worker-a,service-process-worker-b",
+            "200",
+            "77203",
+            "4",
+        );
+        if (takeover_cleanup.stats.takeover_count == 0 or takeover_cleanup.result.pages_claimed == 0 or takeover_cleanup.result.pages_completed == 0) {
+            std.debug.print("expected replacement service eigenvector cleanup worker-pool to take over and advance cleanup\n", .{});
+            return error.GraphMetricProcessProofFailed;
+        }
+
+        var cleanup_progressed = takeover_cleanup.durable_progressed;
+        for (0..6) |i| {
+            const owner_id = try std.fmt.allocPrint(alloc, "service-eigenvector-publish-cleanup-worker-pool-final-{d}", .{i});
+            defer alloc.free(owner_id);
+            const now_ms = try std.fmt.allocPrint(alloc, "{d}", .{77204 + i});
+            defer alloc.free(now_ms);
+            const cleanup = try runServiceWorkerPoolRoleProcessAtWithMaxPages(
+                alloc,
+                io,
+                antfly_exe,
+                base_uri,
+                "service-eigenvector-publish-cleanup-worker-pool",
+                owner_id,
+                "service-process-worker-a,service-process-worker-b",
+                "5000",
+                now_ms,
+                "4",
+            );
+            cleanup_progressed = cleanup_progressed or cleanup.durable_progressed or cleanup.result.pages_claimed != 0 or cleanup.result.pages_completed != 0;
+        }
+        if (!cleanup_progressed) {
+            std.debug.print("expected service worker-pool processes to make eigenvector cleanup progress\n", .{});
             return error.GraphMetricProcessProofFailed;
         }
     }

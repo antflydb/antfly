@@ -2769,6 +2769,7 @@ pub fn build(b: *std.Build) void {
         "db single-vector failed planned rebuild preserves published public reads",
         "db paired hits failed planned rebuild preserves published public reads",
         "graph hits planned build drains partitioned paired pages across workers",
+        "graph hits larger manifest resumes across reopen boundaries",
         "graph metric failed planned build cleans abandoned scores and job namespace",
         "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
         "graph metric repeated failed iterative builds bound diagnostics and cleanup abandoned namespaces",
@@ -2803,6 +2804,7 @@ pub fn build(b: *std.Build) void {
         "query encoder emits graph metric rerank score details",
     };
     const graph_metric_operations_default_filters = [_][]const u8{
+        "graph metric status summarizes multiple active build pages with cap",
         "table runtime snapshot cache preserves graph metric runtime ownership telemetry",
         "index encoders expose graph metric runtime ownership summary",
         "index encoders expose mixed graph metric runtime roles without aggregate role",
@@ -4010,6 +4012,7 @@ pub fn build(b: *std.Build) void {
             "foreign key schema controller maintenance resumes durable action job",
             "provisioned foreign key action job drains owner range page",
             "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
+            "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
             "provisioned table write source routes cross-table rows insert source through catalog owners",
             "provisioned table write source stages relational mutation source on single owner range",
             "provisioned table write source globally plans relational mutation source across ranges",
@@ -4027,7 +4030,13 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned table read source executes relational row query plans across ranges",
+            "routed rows query plan executes over scanned owner rows with ctes",
+            "lowered sql cross-table read plans execute through routed scans",
+            "lowered sql insert source plans build batches from routed scans",
+            "lowered sql merge mutation plans build batches from routed scans",
+            "lowered relation population plans execute routed typed read sources",
             "parseRemoteSearchResult preserves fused index scores",
+            "hosted remote temporal unique owner lookup resolves point interval",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4037,8 +4046,14 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_graph_metric_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "hosted cross-range graph metric fan-in merges compatible hits pair",
             "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
+            "hosted cross-range graph metric fan-in rejects incompatible remote hits pair",
+            "hosted cross-range graph metric fan-in rejects missing remote hits status",
             "hosted cross-range graph metric fan-in merges compatible published shard generations",
+            "hosted cross-range graph metric fan-in merges active stale shard for published",
+            "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout",
+            "encode query request includes graph metric read and rerank",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4073,8 +4088,12 @@ pub fn build(b: *std.Build) void {
             "relational rows join contract",
             "relational rows lateral contract",
             "relational rows cte plan contract",
+            "relational rows read plan output metadata",
+            "relational rows cross-table join and lateral plans execute with side schemas",
             "relational rows query contract projects coalesce",
             "relational rows query contract projects generic expression",
+            "relational rows query contract parses public expression operator surface",
+            "relational rows query contract projects date_trunc",
             "relational rows query contract projects string_to_array",
             "relational rows query contract supports scalar or",
             "postgres sql adapter",
@@ -4088,7 +4107,9 @@ pub fn build(b: *std.Build) void {
             "hosted relational lateral plans fail closed when remote range topology moves during right collection",
             "relational unique owner lookup requires one active owner range",
             "relational rows mutation source updates claimed base rows transactionally",
+            "relational rows mutation source plans across injected owner ranges",
             "relational joined mutation source stages target-side updates from source rows",
+            "relational joined mutation source plans across injected owner ranges",
             "relational joined mutation source stages target updates with separate source schema",
             "db row claim lease expiry aborts stale owner and lets next claimer proceed",
             "db row claim lease expiry lets direct mutation reclaim stale owner",
@@ -4108,8 +4129,29 @@ pub fn build(b: *std.Build) void {
             "api http server executes public relational row plan endpoints",
             "relational rows joined mutation source contract parses lockable join plans",
             "relational rows joined mutation source validates target and source schemas independently",
+            "relational rows cross-table join and lateral plans execute with side schemas",
             "postgres sql adapter typed read plans execute through relational storage",
             "postgres sql adapter typed write plans execute through relational storage",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const sql_api_parity_fixture_promote_tests = b.addTest(.{
+        .root_module = api_rows_test_mod,
+        .filters = &.{
+            "postgres sql adapter classifies application parity corpus",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const sql_api_parity_fixture_check_tests = b.addTest(.{
+        .root_module = api_rows_test_mod,
+        .filters = &.{
+            "postgres sql adapter classifies application parity corpus",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4157,6 +4199,10 @@ pub fn build(b: *std.Build) void {
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_api_rows_tests = b.addRunArtifact(api_rows_tests);
     const run_sql_api_parity_tests = b.addRunArtifact(sql_api_parity_tests);
+    const run_sql_api_parity_fixture_promote_tests = b.addRunArtifact(sql_api_parity_fixture_promote_tests);
+    run_sql_api_parity_fixture_promote_tests.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
+    const run_sql_api_parity_fixture_check_tests = b.addRunArtifact(sql_api_parity_fixture_check_tests);
+    run_sql_api_parity_fixture_check_tests.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/api/fixtures/sql_api_parity_corpus.json");
     const run_api_internal_group_write_routes_tests = b.addRunArtifact(api_internal_group_write_routes_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
 
@@ -4184,6 +4230,12 @@ pub fn build(b: *std.Build) void {
 
     const sql_api_parity_test_step = b.step("sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests");
     sql_api_parity_test_step.dependOn(&run_sql_api_parity_tests.step);
+
+    const sql_api_parity_fixture_promote_step = b.step("sql-api-parity-fixture-promote", "Regenerate the SQL/API typed-plan parity fixture from the source corpus");
+    sql_api_parity_fixture_promote_step.dependOn(&run_sql_api_parity_fixture_promote_tests.step);
+
+    const sql_api_parity_fixture_check_step = b.step("sql-api-parity-fixture-check", "Check that the SQL/API typed-plan parity fixture matches the source corpus");
+    sql_api_parity_fixture_check_step.dependOn(&run_sql_api_parity_fixture_check_tests.step);
 
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4974,6 +5026,23 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
+    const db_schema_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db schema apply validates added check constraints against existing rows",
+            "db schema checks execute json row expressions in storage",
+            "db schema checks execute temporal and case row expressions in storage",
+            "db schema apply validates unvalidated check promotion",
+            "relational scalar expression partial predicates maintain indexes and unique owners",
+            "relational boolean and pattern expression partial predicates maintain indexes and unique owners",
+            "relational array and json object expression partial predicates maintain indexes and unique owners",
+            "relational temporal and case expression partial predicates maintain indexes and unique owners",
+        },
+    });
+    const run_db_schema_tests = b.addRunArtifact(db_schema_tests);
+    const db_schema_test_step = b.step("db-schema-test", "Run focused storage/db schema validation tests");
+    db_schema_test_step.dependOn(&run_db_schema_tests.step);
+
     const db_foreign_key_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
@@ -4996,6 +5065,9 @@ pub fn build(b: *std.Build) void {
             "db transaction foreign key parent delete checks support cross-table unique tuple keys",
             "db transaction foreign key parent delete checks validate child references",
             "db transaction foreign key timing override survives intent resolution",
+            "db relational temporal foreign keys require covered parent periods",
+            "db relational temporal foreign key repair rebuilds coverage refs",
+            "db relational temporal workload combines portion splits foreign key repair and owner validation",
             "db transaction foreign key set-null child actions support unique tuple parent keys",
             "db transaction foreign key cascade child actions support unique tuple parent keys",
             "db transaction foreign key ref mutations support routed owner participants",
@@ -5017,6 +5089,22 @@ pub fn build(b: *std.Build) void {
     const run_db_foreign_key_tests = b.addRunArtifact(db_foreign_key_tests);
     const db_foreign_key_test_step = b.step("db-foreign-key-test", "Run focused storage/db foreign-key unit tests");
     db_foreign_key_test_step.dependOn(&run_db_foreign_key_tests.step);
+
+    const db_temporal_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "db relational temporal primary keys enforce without-overlaps intervals",
+            "db relational temporal foreign keys require covered parent periods",
+            "db relational temporal foreign key repair rebuilds coverage refs",
+            "db relational temporal portion mutation requires temporal primary identity",
+            "db relational temporal mutation source splits portions transactionally",
+            "db relational temporal mutation source preserves foreign key coverage",
+            "db relational temporal workload combines portion splits foreign key repair and owner validation",
+        },
+    });
+    const run_db_temporal_tests = b.addRunArtifact(db_temporal_tests);
+    const db_temporal_test_step = b.step("db-temporal-test", "Run focused storage/db application-time temporal unit tests");
+    db_temporal_test_step.dependOn(&run_db_temporal_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6258,6 +6346,107 @@ pub fn build(b: *std.Build) void {
     }
     const graph_metric_release_qualification_step = b.step("graph-metric-release-qualification", "Run graph metric release qualification JSONL harness");
     graph_metric_release_qualification_step.dependOn(&run_graph_metric_release_qualification.step);
+    const run_graph_metric_release_qualification_smoke = b.addRunArtifact(graph_metric_release_qualification);
+    run_graph_metric_release_qualification_smoke.addArgs(&.{ "--profile", "smoke" });
+    const graph_metric_release_qualification_smoke_step = b.step("graph-metric-release-qualification-smoke", "Run smoke graph metric release qualification profile");
+    graph_metric_release_qualification_smoke_step.dependOn(&run_graph_metric_release_qualification_smoke.step);
+    const graph_metric_release_qualification_smoke_budgeted_args = &.{
+        "--profile",
+        "smoke",
+        "--max-local-latency-ns",
+        "10000000000",
+        "--max-planned-latency-ns",
+        "10000000000",
+        "--max-cleanup-latency-ns",
+        "10000000000",
+        "--max-published-read-latency-ns",
+        "1000000000",
+        "--max-fresh-fail-latency-ns",
+        "1000000000",
+        "--max-fan-in-latency-ns",
+        "1000000000",
+        "--max-storage-score-records",
+        "32",
+        "--max-storage-metric-records",
+        "100",
+        "--max-storage-control-records",
+        "16",
+        "--max-storage-attempt-records",
+        "1",
+        "--max-storage-failure-records",
+        "8",
+        "--max-storage-event-records",
+        "10",
+        "--max-page-claims",
+        "100",
+        "--max-cleanup-ticks",
+        "10",
+        "--max-rounds-executed",
+        "80",
+        "--max-failure-retry-count",
+        "3",
+        "--max-worker-steps",
+        "128",
+        "--max-coordinator-steps",
+        "128",
+        "--min-families-run",
+        "4",
+    };
+    const run_graph_metric_release_qualification_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification);
+    run_graph_metric_release_qualification_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
+    const graph_metric_release_qualification_smoke_budgeted_step = b.step("graph-metric-release-qualification-smoke-budgeted", "Run smoke graph metric release qualification profile with storage and scheduler budgets");
+    graph_metric_release_qualification_smoke_budgeted_step.dependOn(&run_graph_metric_release_qualification_smoke_budgeted.step);
+    const run_graph_metric_release_qualification_promotion = b.addRunArtifact(graph_metric_release_qualification);
+    run_graph_metric_release_qualification_promotion.addArgs(&.{ "--profile", "promotion" });
+    const graph_metric_release_qualification_promotion_step = b.step("graph-metric-release-qualification-promotion", "Run promotion graph metric release qualification profile");
+    graph_metric_release_qualification_promotion_step.dependOn(&run_graph_metric_release_qualification_promotion.step);
+    const graph_metric_release_qualification_promotion_budgeted_args = &.{
+        "--profile",
+        "promotion",
+        "--max-published-read-latency-ns",
+        "1000000000",
+        "--max-fresh-fail-latency-ns",
+        "1000000000",
+        "--max-fan-in-latency-ns",
+        "1000000000",
+        "--max-cleanup-latency-ns",
+        "300000000000",
+        "--max-storage-score-records",
+        "2500",
+        "--max-storage-metric-records",
+        "2600",
+        "--max-storage-control-records",
+        "32",
+        "--max-storage-attempt-records",
+        "1",
+        "--max-storage-failure-records",
+        "16",
+        "--max-storage-event-records",
+        "20",
+        "--max-page-claims",
+        "4000",
+        "--max-cleanup-ticks",
+        "600",
+        "--max-rounds-executed",
+        "1000",
+        "--max-failure-retry-count",
+        "5",
+        "--max-worker-steps",
+        "7000",
+        "--max-coordinator-steps",
+        "2000",
+        "--min-families-run",
+        "4",
+        "--min-split-worker-identities-with-progress",
+        "4",
+        "--min-split-worker-identities-with-page-progress",
+        "4",
+        "--require-deployment-shaped-release-gate",
+    };
+    const run_graph_metric_release_qualification_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification);
+    run_graph_metric_release_qualification_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
+    const graph_metric_release_qualification_promotion_budgeted_step = b.step("graph-metric-release-qualification-promotion-budgeted", "Run promotion graph metric release qualification profile with storage and scheduler budgets");
+    graph_metric_release_qualification_promotion_budgeted_step.dependOn(&run_graph_metric_release_qualification_promotion_budgeted.step);
     const build_graph_metric_release_qualification_step = b.step("graph-metric-release-qualification-build", "Build graph metric release qualification harness without running it");
     build_graph_metric_release_qualification_step.dependOn(&graph_metric_release_qualification.step);
 
@@ -6868,11 +7057,37 @@ pub fn build(b: *std.Build) void {
             .name = "graph-metric-process-harness",
             .root_module = graph_metric_process_harness_mod,
         });
+        graph_metric_process_harness.step.dependOn(&antfly_main.step);
         const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
         run_graph_metric_process_harness.addArtifactArg(antfly_main);
         run_graph_metric_process_harness.has_side_effects = true;
+        const graph_metric_release_qualification_distributed_mod = b.createModule(.{
+            .root_source_file = b.path("bench/graph/graph_metric_release_qualification.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        graph_metric_release_qualification_distributed_mod.addImport("antfly-zig", lib_mod);
+        const graph_metric_release_qualification_distributed = b.addExecutable(.{
+            .name = "graph_metric_release_qualification_distributed",
+            .root_module = graph_metric_release_qualification_distributed_mod,
+        });
+        graph_metric_release_qualification_distributed.step.dependOn(&run_graph_metric_process_harness.step);
+        const run_graph_metric_release_qualification_distributed_smoke_budgeted = b.addRunArtifact(graph_metric_release_qualification_distributed);
+        run_graph_metric_release_qualification_distributed_smoke_budgeted.addArgs(graph_metric_release_qualification_smoke_budgeted_args);
+        run_graph_metric_release_qualification_distributed_smoke_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
+        const run_graph_metric_release_qualification_distributed_promotion_budgeted = b.addRunArtifact(graph_metric_release_qualification_distributed);
+        run_graph_metric_release_qualification_distributed_promotion_budgeted.addArgs(graph_metric_release_qualification_promotion_budgeted_args);
+        run_graph_metric_release_qualification_distributed_promotion_budgeted.step.dependOn(&run_graph_metric_process_harness.step);
         const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run spawned-process graph metric maintenance smoke test");
         graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
+        const graph_metric_distributed_release_gate_step = b.step("graph-metric-distributed-release-gate", "Run local distributed graph metric process and release qualification gates");
+        graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_process_harness.step);
+        graph_metric_distributed_release_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_smoke_budgeted.step);
+        const graph_metric_distributed_promotion_gate_step = b.step("graph-metric-distributed-promotion-gate", "Run local distributed graph metric process gate followed by promotion release qualification");
+        graph_metric_distributed_promotion_gate_step.dependOn(graph_metric_fan_in_test_step);
+        graph_metric_distributed_promotion_gate_step.dependOn(graph_metric_operations_test_step);
+        graph_metric_distributed_promotion_gate_step.dependOn(&run_graph_metric_process_harness.step);
+        graph_metric_distributed_promotion_gate_step.dependOn(&run_graph_metric_release_qualification_distributed_promotion_budgeted.step);
     }
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });

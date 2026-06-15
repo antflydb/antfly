@@ -1213,6 +1213,7 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
         },
         .drop_table => return error.UnsupportedSqlShape,
         .create_index, .drop_index, .alter_table, .create_update_policy => table.schema_json,
+        else => return error.UnsupportedSqlShape,
     };
     var applied = try relational_sql.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
     defer applied.deinit(alloc);
@@ -1240,6 +1241,7 @@ pub fn relationalSqlDdlTargetAlloc(
             .create_table => .create_table,
             .drop_table => .drop_table,
             .create_index, .drop_index, .alter_table, .create_update_policy => .update_table,
+            else => return error.UnsupportedSqlShape,
         },
         .if_exists = switch (plan) {
             .drop_table => |drop_table| drop_table.if_exists,
@@ -1260,6 +1262,7 @@ fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u
         .drop_table => |drop_table| drop_table.table_name,
         .alter_table => |alter_table| alter_table.table_name,
         .create_update_policy => |update_policy| update_policy.table_name,
+        else => null,
     };
 }
 
@@ -3472,6 +3475,28 @@ test "relational schema rejects empty column catalogs" {
         error.InvalidSchemaUpdateRequest,
         parseSchemaUpdateRequest(std.testing.allocator, "{\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"embedding\":{\"type\":\"embedding\"}}}}}}"),
     );
+}
+
+test "validated table schema parses and rejects mistyped relational expression checks" {
+    const valid_schema =
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_fee_nonnegative","expression":{"lhs":{"op":"add","args":[{"field":"amount"},{"field":"fee"}]},"op":"gte","rhs":{"value":0}}},{"name":"status_not_deleted","expression":{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"ne","rhs":{"value":"deleted"}}},{"name":"enabled_known","expression":{"lhs":{"field":"enabled"},"op":"is_not_null"}},{"name":"tag_count_nonnegative","expression":{"lhs":{"op":"array_length","args":[{"field":"tags"}]},"op":"gte","rhs":{"value":0}}},{"name":"metadata_source_present","expression":{"lhs":{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true},"op":"is_not_null"}}]}
+    ;
+    var parsed = try parseValidatedTableSchema(std.testing.allocator, valid_schema);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), parsed.checks.len);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_text_mismatch","expression":{"lhs":{"field":"amount"},"op":"eq","rhs":{"value":"open"}}}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_atom_text_mismatch","field":"amount","op":"eq","value":"open"}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"json_not_orderable","expression":{"lhs":{"field":"metadata"},"op":"gt","rhs":{"value":{"source":"api"}}}}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"boolean_operand_mismatch","expression":{"lhs":{"op":"and","args":[{"field":"enabled"},{"field":"status"}]},"op":"eq","rhs":{"value":true}}}]}
+    ));
 }
 
 test "table schema write validation rejects unknown fields when enforce_types is enabled" {

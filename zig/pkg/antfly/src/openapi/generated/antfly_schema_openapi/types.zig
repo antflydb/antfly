@@ -66,7 +66,7 @@ pub const AntflyType = enum {
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
-    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
+    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types. Relational-mode scalar properties may include optional `collation` metadata. The metadata is preserved in the durable relational column catalog and reported on result schemas for source-backed text/keyword fields.
     schema: ?std.json.Value = null,
 };
 
@@ -76,20 +76,48 @@ pub const ForeignKeyReference = struct {
     table: ?[]const u8 = null,
     /// Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
     columns: ?[]const []const u8 = null,
+    /// Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
 };
 
 /// Relational primary-key constraint.
 pub const PrimaryKey = struct {
+    /// Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+    name: ?[]const u8 = null,
     /// Primary-key columns. One or more ordered required non-json relational columns are supported.
     columns: ?[]const []const u8 = null,
+    /// Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
 };
 
-/// Relational unique constraint.
-pub const UniqueConstraint = struct {
-    /// Constraint name, unique within the table schema.
-    name: ?[]const u8 = null,
-    /// Unique columns. One or more ordered non-json relational columns are supported.
-    columns: ?[]const []const u8 = null,
+/// Application-time period over a start and end column.
+pub const RelationalPeriod = struct {
+    /// Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+    name: []const u8,
+    /// Inclusive period start column.
+    start_column: []const u8,
+    /// Exclusive period end column.
+    end_column: []const u8,
+    /// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+    range_type: ?[]const u8 = null,
+};
+
+/// Predicate atom that must match a partial unique constraint definition.
+pub const RowsUniquePredicate = struct {
+    field: []const u8,
+    op: []const u8,
+    /// Predicate comparison value. Omit for null-test operators.
+    value: ?std.json.Value = null,
+};
+
+pub const RowsExpressionField = struct {
+    field: []const u8,
+    source: ?[]const u8 = null,
+};
+
+pub const RowsExpressionValue = struct {
+    /// Literal JSON value for a value node.
+    value: std.json.Value,
 };
 
 /// Field mapping to apply when a dynamic template matches
@@ -113,6 +141,8 @@ pub const ForeignKey = struct {
     name: ?[]const u8 = null,
     /// Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
     columns: ?[]const []const u8 = null,
+    /// Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
     references: ?ForeignKeyReference = null,
     /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
     on_delete: ?[]const u8 = null,
@@ -126,6 +156,11 @@ pub const ForeignKey = struct {
     match: ?[]const u8 = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
     validation_state: ?[]const u8 = null,
+};
+
+/// Conjunction of partial-unique predicate atoms.
+pub const RowsUniquePredicateGroup = struct {
+    all: []const RowsUniquePredicate,
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
@@ -163,10 +198,117 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
-    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
+    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. Temporal foreign keys with `period` on both child and parent references are restrictive-only: `restrict` / `no_action` are accepted, while mutating `set_null` / `cascade` actions are rejected because period coverage is validated as range ownership. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
     foreign_keys: ?[]const ForeignKey = null,
+    /// Application-time period declarations over two numeric or datetime relational columns. SQL `PERIOD FOR name (start, end)` and range column temporal DDL lower into this metadata.
+    periods: ?[]const RelationalPeriod = null,
     /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
     primary_key: ?PrimaryKey = null,
     /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
     unique_constraints: ?[]const UniqueConstraint = null,
+};
+
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering.
+pub const RowsExpression = union(enum) {
+    rows_expression_operator: *RowsExpressionOperator,
+    rows_expression_field: *RowsExpressionField,
+    rows_expression_value: *RowsExpressionValue,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed.value;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "op",
+            "args",
+            "to",
+            "path",
+            "as_text",
+            "cases",
+            "else",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionOperator, allocator, source, options)) |parsed| return .{ .rows_expression_operator = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "source",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionField, allocator, source, options)) |parsed| return .{ .rows_expression_field = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_expression_operator => |v| try jw.write(v.*),
+            .rows_expression_field => |v| try jw.write(v.*),
+            .rows_expression_value => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsExpressionOperator = struct {
+    op: []const u8,
+    /// Operand expressions for operator nodes.
+    args: ?[]const RowsExpression = null,
+    /// Cast target for `cast`.
+    to: ?[]const u8 = null,
+    /// Structured JSON path for `json_extract` and `json_path_exists`.
+    path: ?std.json.Value = null,
+    /// Return JSON path extraction as text.
+    as_text: ?bool = null,
+    /// Searched case branches, each with `when` and `then`.
+    cases: ?[]const RowsExpressionCaseBranch = null,
+    /// Fallback expression for searched `case`.
+    @"else": ?std.json.Value = null,
+};
+
+pub const RowsExpressionCaseBranch = struct {
+    when: RowsExpressionCondition,
+    then: RowsExpression,
+};
+
+/// Computed expression predicate over the shared row-expression AST.
+pub const RowsExpressionCondition = struct {
+    lhs: RowsExpression,
+    op: []const u8,
+    rhs: ?RowsExpression = null,
+};
+
+/// Relational unique constraint.
+pub const UniqueConstraint = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Unique columns. One or more ordered non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+    /// Stable expression keys supported by unique-owner maintenance.
+    expressions: ?[]const std.json.Value = null,
+    /// Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
+    /// Field-only partial unique predicate shorthand.
+    where: ?RowsUniquePredicateGroup = null,
+    /// Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+    /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+    validation_state: ?[]const u8 = null,
 };

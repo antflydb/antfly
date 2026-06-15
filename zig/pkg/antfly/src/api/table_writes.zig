@@ -2795,6 +2795,13 @@ pub const TableWriteSource = struct {
             metric_name: []const u8,
             action: []const u8,
         ) anyerror!?db_mod.types.GraphMetricStatus = null,
+        graph_metric_maintenance_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+        ) anyerror!?[]u8 = null,
         drop_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3288,6 +3295,17 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.GraphMetricStatus {
         const fn_ptr = self.vtable.graph_metric_action orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
+    }
+
+    pub fn graphMetricMaintenanceGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.graph_metric_maintenance_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
     }
 
     pub fn dropTable(
@@ -6786,6 +6804,7 @@ pub const BoundTableWriteSource = struct {
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .graph_metric_action = graphMetricAction,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
@@ -6844,6 +6863,19 @@ pub const BoundTableWriteSource = struct {
             .stats = try self.db.runtimeStatusStatsConsistent(alloc),
         };
         return .{ .items = items };
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        _ = group_id;
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
     }
 
     fn foreignKeyIntegrity(
@@ -9328,6 +9360,28 @@ pub const ProvisionedTableWriteSource = struct {
         return try leased.db.runLsmMaintenanceStepBestEffort();
     }
 
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+        if (!self.local_db_mutex.tryLock()) return 0;
+        var leased = blk: {
+            defer self.local_db_mutex.unlock();
+            const cache = self.write_cache orelse return 0;
+            for (cache.entries.items) |entry| {
+                if (entry.bulk_ingest_session_open) continue;
+                if (entry.db.hasActiveDenseBulkWork()) continue;
+                var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+                defer leases.deinit(std.heap.page_allocator);
+                try cache.appendRuntimeStatusLeaseForEntryLocked(std.heap.page_allocator, entry, &leases);
+                break :blk leases.items[0];
+            }
+            return 0;
+        };
+        defer {
+            const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
+            leased.deinit(release_alloc);
+        }
+        return try leased.db.runDensePostingMaintenanceForIdleBestEffort();
+    }
+
     pub fn finishExpiredAutoBulkIngestBestEffort(self: *ProvisionedTableWriteSource) bool {
         return self.tryFinishExpiredAutoBulkIngest() orelse false;
     }
@@ -9493,6 +9547,27 @@ pub const ProvisionedTableWriteSource = struct {
         if (!self.local_db_mutex.tryLock()) return 0;
         defer self.local_db_mutex.unlock();
         return if (self.write_cache) |cache| cache.maxLsmMaintenanceScoreLocked() else 0;
+    }
+
+    pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *ProvisionedTableWriteSource) ?u64 {
+        if (!self.local_db_mutex.tryLock()) return null;
+        defer self.local_db_mutex.unlock();
+        var best: ?u64 = null;
+        if (self.write_cache) |cache| {
+            for (cache.entries.items) |entry| {
+                if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                    best = if (best) |current| @min(current, candidate) else candidate;
+                }
+            }
+        }
+        if (self.startup_write_cache) |cache| {
+            for (cache.entries.items) |entry| {
+                if (entry.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                    best = if (best) |current| @min(current, candidate) else candidate;
+                }
+            }
+        }
+        return best;
     }
 
     pub fn hasActiveBulkIngestSession(self: *ProvisionedTableWriteSource) bool {
@@ -10456,6 +10531,28 @@ pub const ProvisionedTableWriteSource = struct {
         cache.abortBulkIngestLocked(table_name);
     }
 
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        var db = openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime) catch |err| switch (err) {
+            error.FileNotFound => return error.UnknownGroup,
+            else => return err,
+        };
+        defer db.close();
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    }
+
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
@@ -10465,6 +10562,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .drop_table = dropTable,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
@@ -10767,6 +10865,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
         if (self.write_cache == null) return false;
         if (group.transforms.items.len != 0) return false;
+        if (group.relational_identity_rewrites.items.len != 0) return false;
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
         return switch (req.sync_level) {
             .propose, .write => true,
@@ -10896,7 +10995,7 @@ pub const ProvisionedTableWriteSource = struct {
                 while (take < queue.entries.items.len and take < provisioned_write_coalesce_max_waiters) : (take += 1) {
                     const candidate = queue.entries.items[take];
                     if (!coalesceCompatibleEntry(first, candidate)) break;
-                    const candidate_ops = candidate.group.writes.items.len + candidate.group.deletes.items.len;
+                    const candidate_ops = candidate.group.writes.items.len + candidate.group.deletes.items.len + candidate.group.relational_identity_rewrites.items.len;
                     if (take > 0 and ops + candidate_ops > provisioned_write_coalesce_max_ops) break;
                     ops += candidate_ops;
                 }
@@ -10954,6 +11053,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         };
         for (entries) |entry| {
+            std.debug.assert(entry.group.relational_identity_rewrites.items.len == 0);
             for (entry.group.writes.items) |write| merged.writes.appendAssumeCapacity(write);
             for (entry.group.deletes.items) |key| merged.deletes.appendAssumeCapacity(key);
         }
@@ -11125,6 +11225,13 @@ pub const ProvisionedTableWriteSource = struct {
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
+        for (req.relational_identity_rewrites) |rewrite| {
+            const old_group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, rewrite.old_key) orelse return null;
+            const new_group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, rewrite.new_key) orelse return null;
+            if (old_group_id != new_group_id) return error.UnsupportedOperation;
+            const group = try ensureGroupBatch(alloc, &grouped, old_group_id);
+            try group.relational_identity_rewrites.append(alloc, rewrite);
+        }
         for (req.transforms) |transform| {
             const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
@@ -11136,6 +11243,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try batcher.batchGroup(alloc, group.group_id, table_name, .{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
+                    .relational_identity_rewrites = group.relational_identity_rewrites.items,
                     .transforms = group.transforms.items,
                     .sync_level = req.sync_level,
                 });
@@ -14198,6 +14306,13 @@ pub const HostedProvisionedTableWriteSource = struct {
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
             try group.deletes.append(alloc, key);
         }
+        for (req.relational_identity_rewrites) |rewrite| {
+            const old_group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, rewrite.old_key) orelse return null;
+            const new_group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, rewrite.new_key) orelse return null;
+            if (old_group_id != new_group_id) return error.UnsupportedOperation;
+            const group = try ensureGroupBatch(alloc, &grouped, old_group_id);
+            try group.relational_identity_rewrites.append(alloc, rewrite);
+        }
         for (req.transforms) |transform| {
             const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
             const group = try ensureGroupBatch(alloc, &grouped, group_id);
@@ -14220,6 +14335,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         try cached.db.batch(.{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
+                            .relational_identity_rewrites = group.relational_identity_rewrites.items,
                             .transforms = group.transforms.items,
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
@@ -14230,6 +14346,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
+                        if (group.relational_identity_rewrites.items.len != 0) return error.UnsupportedOperation;
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
@@ -14262,6 +14379,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 try cached.db.batch(.{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
+                    .relational_identity_rewrites = group.relational_identity_rewrites.items,
                     .transforms = group.transforms.items,
                     .graph_writes = req.graph_writes,
                     .graph_deletes = req.graph_deletes,
@@ -16406,11 +16524,13 @@ const GroupBatch = struct {
     group_id: u64,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    relational_identity_rewrites: std.ArrayListUnmanaged(db_mod.types.RelationalIdentityRewrite) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
 
     fn deinit(self: *GroupBatch, alloc: std.mem.Allocator) void {
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
+        self.relational_identity_rewrites.deinit(alloc);
         self.transforms.deinit(alloc);
         self.* = undefined;
     }
@@ -16439,6 +16559,27 @@ fn cloneWriteCoalesceGroupBatch(
         cloned.deletes.appendAssumeCapacity(owned_key);
     }
 
+    try cloned.relational_identity_rewrites.ensureTotalCapacity(alloc, group.relational_identity_rewrites.items.len);
+    for (group.relational_identity_rewrites.items) |rewrite| {
+        const old_key = try alloc.dupe(u8, rewrite.old_key);
+        var old_key_owned = true;
+        errdefer if (old_key_owned) alloc.free(old_key);
+        const new_key = try alloc.dupe(u8, rewrite.new_key);
+        var new_key_owned = true;
+        errdefer if (new_key_owned) alloc.free(new_key);
+        const value = try alloc.dupe(u8, rewrite.value);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        cloned.relational_identity_rewrites.appendAssumeCapacity(.{
+            .old_key = old_key,
+            .new_key = new_key,
+            .value = value,
+        });
+        old_key_owned = false;
+        new_key_owned = false;
+        value_owned = false;
+    }
+
     return cloned;
 }
 
@@ -16448,6 +16589,11 @@ fn freeWriteCoalesceGroupBatch(alloc: std.mem.Allocator, group: *GroupBatch) voi
         alloc.free(write.value);
     }
     for (group.deletes.items) |key| alloc.free(key);
+    for (group.relational_identity_rewrites.items) |rewrite| {
+        alloc.free(@constCast(rewrite.old_key));
+        alloc.free(@constCast(rewrite.new_key));
+        alloc.free(@constCast(rewrite.value));
+    }
     group.deinit(alloc);
 }
 
@@ -16495,6 +16641,7 @@ fn applyGroupBatchUnchecked(
     try db.batch(.{
         .writes = group.writes.items,
         .deletes = group.deletes.items,
+        .relational_identity_rewrites = group.relational_identity_rewrites.items,
         .transforms = group.transforms.items,
         .graph_writes = req.graph_writes,
         .graph_deletes = req.graph_deletes,
@@ -22911,6 +23058,97 @@ test "provisioned table write source routes batch writes across ranges" {
     var right = (try right_db.lookup(alloc, "doc:z", .{})).?;
     defer right.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
+}
+
+test "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-identity-rewrite-routing";
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        calls: usize = 0,
+        group_id: u64 = 0,
+        identity_rewrites: usize = 0,
+
+        fn batcher(self: *@This()) RaftBatcher {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch_group = batchGroup,
+                    .batch_group_local = batchGroupLocal,
+                },
+            };
+        }
+
+        fn batchGroup(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
+            try std.testing.expectEqual(@as(usize, 1), req.relational_identity_rewrites.len);
+            try std.testing.expectEqualStrings("doc:a", req.relational_identity_rewrites[0].old_key);
+            try std.testing.expectEqualStrings("doc:b", req.relational_identity_rewrites[0].new_key);
+            self.calls += 1;
+            self.group_id = group_id;
+            self.identity_rewrites = req.relational_identity_rewrites.len;
+        }
+
+        fn batchGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var recorder = Recorder{};
+    var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    _ = source.withRaftBatcher(recorder.batcher());
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "doc:a",
+            .new_key = "doc:b",
+            .value = "{\"id\":\"doc:b\"}",
+        }},
+    });
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 7001), recorder.group_id);
+    try std.testing.expectEqual(@as(usize, 1), recorder.identity_rewrites);
+
+    try std.testing.expectError(error.UnsupportedOperation, source.source().batch(alloc, "docs", .{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "doc:a",
+            .new_key = "doc:z",
+            .value = "{\"id\":\"doc:z\"}",
+        }},
+    }));
 }
 
 const ProvisionedWriteCoalesceTestCatalog = struct {

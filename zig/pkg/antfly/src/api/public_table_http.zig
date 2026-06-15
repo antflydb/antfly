@@ -1676,7 +1676,6 @@ test "public table backup handler rejects portable format" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("unsupported backup format", resp.body);
-    try std.testing.expectEqualStrings("portable table backups are not supported; omit format or use native", resp.body);
 }
 
 test "public table restore handler maps target already exists" {

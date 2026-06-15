@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
     from ..models.foreign_key import ForeignKey
     from ..models.primary_key import PrimaryKey
+    from ..models.relational_period import RelationalPeriod
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.unique_constraint import UniqueConstraint
 
@@ -55,11 +56,18 @@ class TableSchema:
             `on_update: "restrict"` and `on_update: "no_action"` are accepted
             as parent-key update checks, and mutating `set_null`/`cascade`
             update actions are supported where owner topology is configured.
+            Temporal foreign keys with `period` on both child and parent
+            references are restrictive-only: `restrict` / `no_action` are
+            accepted, while mutating `set_null` / `cascade` actions are rejected
+            because period coverage is validated as range ownership.
             `match: "simple"` is the default; `full` is accepted for composite
             nullable references, and `partial` is rejected until row-subset
             parent matching is implemented.
             Cross-table unique targets require routed parent-table unique participants.
             Unsupported shapes are rejected during schema validation.
+        periods (list[RelationalPeriod] | Unset): Application-time period declarations over two numeric or datetime
+            relational columns. SQL `PERIOD FOR name (start, end)` and range
+            column temporal DDL lower into this metadata.
         primary_key (PrimaryKey | Unset): Relational primary-key constraint.
         unique_constraints (list[UniqueConstraint] | Unset): Relational-mode unique constraints over one or more ordered
             declared
@@ -77,6 +85,7 @@ class TableSchema:
     ttl_duration: str | Unset = UNSET
     dynamic_templates: list[DynamicTemplate] | Unset = UNSET
     foreign_keys: list[ForeignKey] | Unset = UNSET
+    periods: list[RelationalPeriod] | Unset = UNSET
     primary_key: PrimaryKey | Unset = UNSET
     unique_constraints: list[UniqueConstraint] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -114,6 +123,13 @@ class TableSchema:
                 foreign_keys_item = foreign_keys_item_data.to_dict()
                 foreign_keys.append(foreign_keys_item)
 
+        periods: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.periods, Unset):
+            periods = []
+            for periods_item_data in self.periods:
+                periods_item = periods_item_data.to_dict()
+                periods.append(periods_item)
+
         primary_key: dict[str, Any] | Unset = UNSET
         if not isinstance(self.primary_key, Unset):
             primary_key = self.primary_key.to_dict()
@@ -146,6 +162,8 @@ class TableSchema:
             field_dict["dynamic_templates"] = dynamic_templates
         if foreign_keys is not UNSET:
             field_dict["foreign_keys"] = foreign_keys
+        if periods is not UNSET:
+            field_dict["periods"] = periods
         if primary_key is not UNSET:
             field_dict["primary_key"] = primary_key
         if unique_constraints is not UNSET:
@@ -158,6 +176,7 @@ class TableSchema:
         from ..models.dynamic_template import DynamicTemplate
         from ..models.foreign_key import ForeignKey
         from ..models.primary_key import PrimaryKey
+        from ..models.relational_period import RelationalPeriod
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.unique_constraint import UniqueConstraint
 
@@ -204,6 +223,15 @@ class TableSchema:
 
                 foreign_keys.append(foreign_keys_item)
 
+        _periods = d.pop("periods", UNSET)
+        periods: list[RelationalPeriod] | Unset = UNSET
+        if _periods is not UNSET:
+            periods = []
+            for periods_item_data in _periods:
+                periods_item = RelationalPeriod.from_dict(periods_item_data)
+
+                periods.append(periods_item)
+
         _primary_key = d.pop("primary_key", UNSET)
         primary_key: PrimaryKey | Unset
         if isinstance(_primary_key, Unset):
@@ -230,6 +258,7 @@ class TableSchema:
             ttl_duration=ttl_duration,
             dynamic_templates=dynamic_templates,
             foreign_keys=foreign_keys,
+            periods=periods,
             primary_key=primary_key,
             unique_constraints=unique_constraints,
         )

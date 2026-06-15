@@ -270,6 +270,7 @@ export type {
   RowsMutationSourceResultSet,
   RowsNumericIncrement,
   RowsOnConflict,
+  RowsResultColumn,
   RowsJoinPlanRequest,
   RowsLateralPlanRequest,
   RowsPlanRequest,

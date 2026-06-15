@@ -47,6 +47,9 @@ const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
+const relational_rows_api = @import("relational_rows.zig");
+const relational_sql_api = @import("relational_sql.zig");
+const schema_api = @import("../schema/mod.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const http_client = @import("http_client.zig");
@@ -106,6 +109,39 @@ pub const BackgroundTextStatsResponse = struct {
 
     pub fn deinit(self: *BackgroundTextStatsResponse, alloc: std.mem.Allocator) void {
         db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, self.background_fields);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredSqlReadPlanResult = union(enum) {
+    query: db_mod.types.RelationalRowsQueryResult,
+    aggregate: db_mod.types.RelationalRowsAggregateResult,
+    window: db_mod.types.RelationalRowsWindowResult,
+    join: db_mod.types.RelationalRowsJoinResult,
+    lateral: db_mod.types.RelationalRowsJoinResult,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .query => |*result| result.deinit(alloc),
+            .aggregate => |*result| result.deinit(alloc),
+            .window => |*result| result.deinit(alloc),
+            .join => |*result| result.deinit(alloc),
+            .lateral => |*result| result.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LoweredRelationPopulationRowsResult = struct {
+    mode: relational_sql_api.RelationPopulationMode,
+    target_table_name: []const u8,
+    rows: [][]const u8 = &.{},
+    total: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.target_table_name));
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
         self.* = undefined;
     }
 };
@@ -1213,6 +1249,46 @@ pub const TableReadSource = struct {
             encoded_value: []const u8,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?[]u8 = null,
+        relational_temporal_unique_owner_lookup: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            encoded_point: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?[]u8 = null,
+        relational_temporal_unique_overlap_owner_lookup: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            encoded_start: []const u8,
+            encoded_end: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?[]u8 = null,
+        relational_temporal_unique_owner_lookup_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            encoded_point: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?[]u8 = null,
+        relational_temporal_unique_overlap_owner_lookup_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            constraint_name: []const u8,
+            encoded_value: []const u8,
+            encoded_start: []const u8,
+            encoded_end: []const u8,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?[]u8 = null,
         rows_query_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1612,6 +1688,62 @@ pub const TableReadSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, constraint_name, encoded_value, consistency);
     }
 
+    pub fn relationalTemporalUniqueOwnerLookup(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.relational_temporal_unique_owner_lookup orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    pub fn relationalTemporalUniqueOverlapOwnerLookup(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.relational_temporal_unique_overlap_owner_lookup orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+    }
+
+    pub fn relationalTemporalUniqueOwnerLookupGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.relational_temporal_unique_owner_lookup_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    pub fn relationalTemporalUniqueOverlapOwnerLookupGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.relational_temporal_unique_overlap_owner_lookup_group_local orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+    }
+
     pub fn scanGroupLocal(
         self: TableReadSource,
         alloc: std.mem.Allocator,
@@ -1985,6 +2117,34 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
     );
 }
 
+fn lookupRelationalTemporalUniqueOverlapOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+) !?[]u8 {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_start\":{f},\"encoded_end\":{f}}}",
+        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_start, .{}), std.json.fmt(encoded_end, .{}) },
+    );
+    defer alloc.free(body);
+    var result = client.fetchGroupTemporalUniqueOverlapOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
+    defer parsed.deinit();
+    return try alloc.dupe(u8, parsed.value.owner_key);
+}
+
 pub const BoundTableReadSource = struct {
     table_name: []const u8,
     db: *db_mod.DB,
@@ -2014,6 +2174,10 @@ pub const BoundTableReadSource = struct {
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
+                .relational_temporal_unique_owner_lookup = BoundTableReadSource.relationalTemporalUniqueOwnerLookup,
+                .relational_temporal_unique_overlap_owner_lookup = BoundTableReadSource.relationalTemporalUniqueOverlapOwnerLookup,
+                .relational_temporal_unique_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
+                .relational_temporal_unique_overlap_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
@@ -2236,6 +2400,66 @@ pub const BoundTableReadSource = struct {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try lookupRelationalUniqueOwnerInDb(alloc, self.db, self.reads.group_id, self.reads.reads, constraint_name, encoded_value, consistency);
+    }
+
+    fn relationalTemporalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try lookupRelationalTemporalUniqueOwnerInDb(alloc, self.db, self.reads.group_id, self.reads.reads, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try lookupRelationalTemporalUniqueOverlapOwnerInDb(alloc, self.db, self.reads.group_id, self.reads.reads, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+    }
+
+    fn relationalTemporalUniqueOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try lookupRelationalTemporalUniqueOwnerInDb(alloc, self.db, group_id, self.reads.reads, constraint_name, encoded_value, encoded_point, consistency);
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try lookupRelationalTemporalUniqueOverlapOwnerInDb(alloc, self.db, group_id, self.reads.reads, constraint_name, encoded_value, encoded_start, encoded_end, consistency);
     }
 
     fn prepareRelationalRowsFullTableRead(self: *BoundTableReadSource, consistency: raft_mod.ReadConsistency) !void {
@@ -2539,6 +2763,15 @@ pub const ProvisionedTableReadSource = struct {
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
+                .relational_temporal_unique_owner_lookup = ProvisionedTableReadSource.relationalTemporalUniqueOwnerLookup,
+                .relational_temporal_unique_overlap_owner_lookup = ProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookup,
+                .relational_temporal_unique_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
+                .relational_temporal_unique_overlap_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
+                .rows_query_plan = rowsQueryPlan,
+                .rows_aggregate_plan = rowsAggregatePlan,
+                .rows_window_plan = rowsWindowPlan,
+                .rows_join_plan = rowsJoinPlan,
+                .rows_lateral_plan = rowsLateralPlan,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -2760,6 +2993,200 @@ pub const ProvisionedTableReadSource = struct {
             encoded_value,
             consistency,
         );
+    }
+
+    fn relationalTemporalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        return try lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
+            self.primary_lookup_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_point,
+            consistency,
+        );
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        return try lookupRelationalTemporalUniqueOverlapOwnerProvisionedHostedLocal(
+            self.primary_lookup_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_start,
+            encoded_end,
+            consistency,
+        );
+    }
+
+    fn relationalTemporalUniqueOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        return try lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
+            self.primary_lookup_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_point,
+            consistency,
+        );
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        return try lookupRelationalTemporalUniqueOverlapOwnerProvisionedHostedLocal(
+            self.primary_lookup_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_start,
+            encoded_end,
+            consistency,
+        );
+    }
+
+    fn rowsQueryPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsQueryPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsAggregatePlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsAggregatePlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsAggregateResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsAggregatePlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsWindowPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsWindowPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsWindowResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsWindowPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsJoinPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsJoinPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsJoinPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsLateralPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsLateralPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsLateralPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
     }
 
     fn preflightQueryGroupLocal(
@@ -2999,6 +3426,15 @@ pub const HostedProvisionedTableReadSource = struct {
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .relational_unique_owner_lookup = relationalUniqueOwnerLookup,
+                .relational_temporal_unique_owner_lookup = HostedProvisionedTableReadSource.relationalTemporalUniqueOwnerLookup,
+                .relational_temporal_unique_overlap_owner_lookup = HostedProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookup,
+                .relational_temporal_unique_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
+                .relational_temporal_unique_overlap_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
+                .rows_query_plan = rowsQueryPlan,
+                .rows_aggregate_plan = rowsAggregatePlan,
+                .rows_window_plan = rowsWindowPlan,
+                .rows_join_plan = rowsJoinPlan,
+                .rows_lateral_plan = rowsLateralPlan,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
@@ -3116,7 +3552,6 @@ pub const HostedProvisionedTableReadSource = struct {
             return error.UniqueOwnerTopologyUnavailable;
         };
         defer route.deinit(alloc);
-
         return switch (route) {
             .local => try lookupRelationalUniqueOwnerProvisionedHostedLocal(
                 null,
@@ -3138,6 +3573,212 @@ pub const HostedProvisionedTableReadSource = struct {
                 else => err,
             },
         };
+    }
+
+    fn relationalTemporalUniqueOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
+            return error.UniqueOwnerTopologyUnavailable;
+        };
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => try lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
+                null,
+                null,
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                constraint_name,
+                encoded_value,
+                encoded_point,
+                consistency,
+            ),
+            .remote => |remote| lookupRelationalTemporalUniqueOwnerRemote(self.executor, alloc, remote.base_uri, group_id, table_name, constraint_name, encoded_value, encoded_point) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
+            return error.UniqueOwnerTopologyUnavailable;
+        };
+        defer route.deinit(alloc);
+
+        return switch (route) {
+            .local => try lookupRelationalTemporalUniqueOverlapOwnerProvisionedHostedLocal(
+                null,
+                null,
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                constraint_name,
+                encoded_value,
+                encoded_start,
+                encoded_end,
+                consistency,
+            ),
+            .remote => |remote| lookupRelationalTemporalUniqueOverlapOwnerRemote(self.executor, alloc, remote.base_uri, group_id, table_name, constraint_name, encoded_value, encoded_start, encoded_end) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn relationalTemporalUniqueOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
+            null,
+            null,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_point,
+            consistency,
+        );
+    }
+
+    fn relationalTemporalUniqueOverlapOwnerLookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try lookupRelationalTemporalUniqueOverlapOwnerProvisionedHostedLocal(
+            null,
+            null,
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            constraint_name,
+            encoded_value,
+            encoded_start,
+            encoded_end,
+            consistency,
+        );
+    }
+
+    fn rowsQueryPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsQueryPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsAggregatePlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsAggregatePlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsAggregateResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsAggregatePlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsWindowPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsWindowPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsWindowResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsWindowPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsJoinPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsJoinPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsJoinPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsLateralPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsLateralPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsJoinResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsLateralPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
     }
 
     fn scan(
@@ -3619,6 +4260,939 @@ fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_router
         .stale => .any_active,
         .leader_lease, .read_index => .prefer_leader,
     };
+}
+
+pub fn executeLoweredSqlReadPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    plan: relational_sql_api.LoweredReadPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?LoweredSqlReadPlanResult {
+    return switch (plan) {
+        .query => |lowered| blk: {
+            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
+            defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const runtime_schema = owned_schema orelse default_schema;
+            var result = (try source.rowsQueryPlan(alloc, lowered.table_name, runtime_schema, lowered.plan, consistency)) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .query = result };
+        },
+        .aggregate => |lowered| blk: {
+            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
+            defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const runtime_schema = owned_schema orelse default_schema;
+            var result = (try source.rowsAggregatePlan(alloc, lowered.table_name, runtime_schema, lowered.plan, consistency)) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .aggregate = result };
+        },
+        .window => |lowered| blk: {
+            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
+            defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const runtime_schema = owned_schema orelse default_schema;
+            var result = (try source.rowsWindowPlan(alloc, lowered.table_name, runtime_schema, lowered.plan, consistency)) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .window = result };
+        },
+        .join => |lowered| blk: {
+            const cte_table_name = try loweredSqlReadJoinCteTableName(
+                default_table_name,
+                lowered.left_table_name,
+                lowered.right_table_name,
+                lowered.ctes.len,
+                lowered.join.left.source_cte,
+                lowered.join.right.source_cte,
+            );
+            const owned_cte_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, cte_table_name);
+            defer if (owned_cte_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const owned_left_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.left_table_name);
+            defer if (owned_left_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const owned_right_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.right_table_name);
+            defer if (owned_right_schema) |schema| storage_schema.freeSchema(alloc, schema);
+
+            const cte_schema = owned_cte_schema orelse default_schema;
+            const left_schema = owned_left_schema orelse default_schema;
+            const right_schema = owned_right_schema orelse default_schema;
+            const same_table = std.mem.eql(u8, cte_table_name, lowered.left_table_name) and
+                std.mem.eql(u8, cte_table_name, lowered.right_table_name);
+            const join_plan = lowered.asPlan();
+            var result = (try (if (same_table)
+                source.rowsJoinPlan(alloc, cte_table_name, cte_schema, join_plan, consistency)
+            else
+                rowsJoinPlanFromRoutedScansWithSchemasAlloc(alloc, source, cte_table_name, lowered.left_table_name, lowered.right_table_name, cte_schema, left_schema, right_schema, join_plan, consistency))) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .join = result };
+        },
+        .lateral => |lowered| blk: {
+            const cte_table_name = try loweredSqlReadJoinCteTableName(
+                default_table_name,
+                lowered.left_table_name,
+                lowered.right_table_name,
+                lowered.plan.ctes.len,
+                lowered.plan.lateral.left.source_cte,
+                lowered.plan.lateral.right.source_cte,
+            );
+            const owned_cte_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, cte_table_name);
+            defer if (owned_cte_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const owned_left_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.left_table_name);
+            defer if (owned_left_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const owned_right_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.right_table_name);
+            defer if (owned_right_schema) |schema| storage_schema.freeSchema(alloc, schema);
+
+            const cte_schema = owned_cte_schema orelse default_schema;
+            const left_schema = owned_left_schema orelse default_schema;
+            const right_schema = owned_right_schema orelse default_schema;
+            const same_table = std.mem.eql(u8, cte_table_name, lowered.left_table_name) and
+                std.mem.eql(u8, cte_table_name, lowered.right_table_name);
+            var result = (try (if (same_table)
+                source.rowsLateralPlan(alloc, cte_table_name, cte_schema, lowered.plan, consistency)
+            else
+                rowsLateralPlanFromRoutedScansWithSchemasAlloc(alloc, source, cte_table_name, lowered.left_table_name, lowered.right_table_name, cte_schema, left_schema, right_schema, lowered.plan, consistency))) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .lateral = result };
+        },
+    };
+}
+
+pub fn executeLoweredRelationPopulationPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    plan: relational_sql_api.LoweredRelationPopulationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?LoweredRelationPopulationRowsResult {
+    var read_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source,
+        catalog,
+        default_table_name,
+        default_schema,
+        plan.source,
+        consistency,
+    )) orelse return null;
+    defer read_result.deinit(alloc);
+
+    const extracted = takeLoweredSqlReadRows(&read_result);
+    errdefer {
+        for (extracted.rows) |row| alloc.free(@constCast(row));
+        if (extracted.rows.len > 0) alloc.free(extracted.rows);
+    }
+    const target_table_name = try alloc.dupe(u8, plan.target_table_name);
+    return .{
+        .mode = plan.mode,
+        .target_table_name = target_table_name,
+        .rows = extracted.rows,
+        .total = extracted.total,
+    };
+}
+
+const TakenLoweredSqlReadRows = struct {
+    rows: [][]const u8,
+    total: u32,
+};
+
+fn takeLoweredSqlReadRows(result: *LoweredSqlReadPlanResult) TakenLoweredSqlReadRows {
+    return switch (result.*) {
+        .query => |*query| blk: {
+            const rows = query.rows;
+            query.rows = &.{};
+            break :blk .{ .rows = rows, .total = query.total };
+        },
+        .aggregate => |*aggregate| blk: {
+            const rows = aggregate.rows;
+            aggregate.rows = &.{};
+            break :blk .{ .rows = rows, .total = aggregate.total_groups };
+        },
+        .window => |*window| blk: {
+            const rows = window.rows;
+            window.rows = &.{};
+            break :blk .{ .rows = rows, .total = window.total_rows };
+        },
+        .join => |*join| blk: {
+            const rows = join.rows;
+            join.rows = &.{};
+            break :blk .{ .rows = rows, .total = join.total_rows };
+        },
+        .lateral => |*lateral| blk: {
+            const rows = lateral.rows;
+            lateral.rows = &.{};
+            break :blk .{ .rows = rows, .total = lateral.total_rows };
+        },
+    };
+}
+
+fn catalogRuntimeSchemaUnlessDefaultAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    table_name: []const u8,
+) !?storage_schema.TableSchema {
+    if (std.mem.eql(u8, default_table_name, table_name)) return null;
+    const schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(schema_json);
+    var parsed_schema = schema_api.parseValidatedTableSchema(alloc, schema_json) catch return error.InvalidRowsRequest;
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = schema_api.deriveRuntimeTableSchema(alloc, parsed_schema) catch return error.InvalidRowsRequest;
+    errdefer storage_schema.freeSchema(alloc, runtime_schema);
+    if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidRowsRequest;
+    return runtime_schema;
+}
+
+fn loweredSqlReadJoinCteTableName(
+    default_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    cte_count: usize,
+    left_source_cte: []const u8,
+    right_source_cte: []const u8,
+) ![]const u8 {
+    if (cte_count == 0) return default_table_name;
+    if (left_source_cte.len > 0 and right_source_cte.len > 0 and
+        !std.mem.eql(u8, left_table_name, right_table_name))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (left_source_cte.len > 0) return left_table_name;
+    if (right_source_cte.len > 0) return right_table_name;
+    if (std.mem.eql(u8, left_table_name, right_table_name)) return left_table_name;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn rowsInsertSourceBatchFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    target_table_name: []const u8,
+    source_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+    conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    if (req.source.source_cte.len != 0) return error.InvalidRowsRequest;
+    if (req.source_table.len > 0 and !std.mem.eql(u8, req.source_table, source_table_name)) return error.InvalidRowsRequest;
+    const plan: db_mod.types.RelationalRowsInsertSourcePlan = .{
+        .ranges = source_ranges,
+        .insert_source = req,
+    };
+    return try rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
+        alloc,
+        source,
+        target_table_name,
+        source_table_name,
+        target_schema,
+        source_schema,
+        plan,
+        consistency,
+        conflict_resolver,
+    );
+}
+
+pub fn rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    target_table_name: []const u8,
+    source_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsInsertSourcePlan,
+    consistency: raft_mod.ReadConsistency,
+    conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(source_schema)) return error.UnsupportedRowsQuery;
+    if (plan.insert_source.source_table.len > 0 and !std.mem.eql(u8, plan.insert_source.source_table, source_table_name)) {
+        return error.InvalidRowsRequest;
+    }
+
+    var base_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, source_table_name, plan.ranges, consistency)) orelse return null;
+    defer base_rows.deinit(alloc);
+
+    return try relational_rows_api.buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
+        alloc,
+        target_table_name,
+        target_schema,
+        source_schema,
+        plan,
+        base_rows.rows,
+        conflict_resolver,
+    );
+}
+
+pub fn rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    target_table_name: []const u8,
+    source_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    plan: relational_sql_api.LoweredMergeMutationPlan,
+    target_query: db_mod.types.RelationalRowsQueryRequest,
+    target_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    source_query: db_mod.types.RelationalRowsQueryRequest,
+    source_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    const target_rows = (try collectMergeTargetRowsFromRoutedScansAlloc(
+        alloc,
+        source,
+        target_table_name,
+        target_schema,
+        target_query,
+        target_ranges,
+        consistency,
+    )) orelse return null;
+    defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_rows);
+
+    var source_rows = (try collectMergeSourceRowsFromRoutedScansAlloc(
+        alloc,
+        source,
+        source_table_name,
+        source_schema,
+        source_query,
+        source_ranges,
+        consistency,
+    )) orelse return null;
+    defer source_rows.deinit(alloc);
+
+    const merge_targets = try alloc.alloc(relational_sql_api.MergeExecutionTargetRow, target_rows.len);
+    defer alloc.free(merge_targets);
+    for (target_rows, 0..) |row, i| {
+        merge_targets[i] = .{
+            .key = row.key,
+            .json = row.json,
+            .version = row.version,
+        };
+    }
+
+    return try relational_sql_api.buildMergeMutationBatchAlloc(
+        alloc,
+        target_schema,
+        source_schema,
+        plan,
+        merge_targets,
+        source_rows.rows,
+    );
+}
+
+fn rowsQueryPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
+fn rowsAggregatePlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsAggregatePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsAggregateResult {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsAggregatePlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
+fn rowsWindowPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsWindowPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsWindowResult {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var scanned_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, table_name, plan.ranges, consistency)) orelse return null;
+    defer scanned_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.ranges = &.{};
+    return try relational_rows_api.executeRowsWindowPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, scanned_rows.rows);
+}
+
+fn rowsJoinPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsJoinPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    const left_table_name = relationalRowsEffectiveSideTable(table_name, plan.left_table);
+    const right_table_name = relationalRowsEffectiveSideTable(table_name, plan.right_table);
+    return try rowsJoinPlanFromRoutedScansWithSchemasAlloc(
+        alloc,
+        source,
+        table_name,
+        left_table_name,
+        right_table_name,
+        runtime_schema,
+        runtime_schema,
+        runtime_schema,
+        plan,
+        consistency,
+    );
+}
+
+pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    cte_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    cte_base_schema: storage_schema.TableSchema,
+    left_schema: storage_schema.TableSchema,
+    right_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsJoinPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(cte_base_schema) or
+        !relationalRowsScanPayloadCanStripSyntheticKey(left_schema) or
+        !relationalRowsScanPayloadCanStripSyntheticKey(right_schema))
+    {
+        return error.UnsupportedRowsQuery;
+    }
+
+    const empty_rows: []const []const u8 = &.{};
+    var cte_rows_storage: ?RoutedRows = null;
+    defer if (cte_rows_storage) |*rows| rows.deinit(alloc);
+    const cte_rows = if (plan.ctes.len == 0) empty_rows else blk: {
+        const cte_ranges = try routedRowsPlanRangesForJoinCtesAlloc(
+            alloc,
+            cte_table_name,
+            left_table_name,
+            right_table_name,
+            plan.join.left,
+            plan.join.right,
+            plan.left_ranges,
+            plan.right_ranges,
+        );
+        defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+        cte_rows_storage = (try collectRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_ranges, consistency)) orelse return null;
+        break :blk cte_rows_storage.?.rows;
+    };
+    var left_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, left_table_name, plan.left_ranges, consistency)) orelse return null;
+    defer left_rows.deinit(alloc);
+    var right_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, right_table_name, plan.right_ranges, consistency)) orelse return null;
+    defer right_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.left_ranges = &.{};
+    local_plan.right_ranges = &.{};
+    return try relational_rows_api.executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(alloc, cte_base_schema, left_schema, right_schema, local_plan, cte_rows, left_rows.rows, right_rows.rows);
+}
+
+fn rowsLateralPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsLateralPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    const left_table_name = relationalRowsEffectiveSideTable(table_name, plan.left_table);
+    const right_table_name = relationalRowsEffectiveSideTable(table_name, plan.right_table);
+    return try rowsLateralPlanFromRoutedScansWithSchemasAlloc(
+        alloc,
+        source,
+        table_name,
+        left_table_name,
+        right_table_name,
+        runtime_schema,
+        runtime_schema,
+        runtime_schema,
+        plan,
+        consistency,
+    );
+}
+
+pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    cte_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    cte_base_schema: storage_schema.TableSchema,
+    left_schema: storage_schema.TableSchema,
+    right_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsLateralPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(cte_base_schema) or
+        !relationalRowsScanPayloadCanStripSyntheticKey(left_schema) or
+        !relationalRowsScanPayloadCanStripSyntheticKey(right_schema))
+    {
+        return error.UnsupportedRowsQuery;
+    }
+
+    const empty_rows: []const []const u8 = &.{};
+    var cte_rows_storage: ?RoutedRows = null;
+    defer if (cte_rows_storage) |*rows| rows.deinit(alloc);
+    const cte_rows = if (plan.ctes.len == 0) empty_rows else blk: {
+        const cte_ranges = try routedRowsPlanRangesForJoinCtesAlloc(
+            alloc,
+            cte_table_name,
+            left_table_name,
+            right_table_name,
+            plan.lateral.left,
+            plan.lateral.right,
+            plan.left_ranges,
+            plan.right_ranges,
+        );
+        defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+        cte_rows_storage = (try collectRowsFromRoutedScansAlloc(alloc, source, cte_table_name, cte_ranges, consistency)) orelse return null;
+        break :blk cte_rows_storage.?.rows;
+    };
+    var left_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, left_table_name, plan.left_ranges, consistency)) orelse return null;
+    defer left_rows.deinit(alloc);
+    var right_rows = (try collectRowsFromRoutedScansAlloc(alloc, source, right_table_name, plan.right_ranges, consistency)) orelse return null;
+    defer right_rows.deinit(alloc);
+
+    var local_plan = plan;
+    local_plan.left_ranges = &.{};
+    local_plan.right_ranges = &.{};
+    return try relational_rows_api.executeRowsLateralPlanOnJsonRowsWithSchemasAlloc(alloc, cte_base_schema, left_schema, right_schema, local_plan, cte_rows, left_rows.rows, right_rows.rows);
+}
+
+fn relationalRowsEffectiveSideTable(default_table_name: []const u8, maybe_table_name: []const u8) []const u8 {
+    return if (maybe_table_name.len == 0) default_table_name else maybe_table_name;
+}
+
+const RoutedRows = struct {
+    rows: [][]const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+const RoutedMergeScanRows = struct {
+    rows: []db_mod.types.RelationalRowsCollectedRow,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        db_mod.types.freeRelationalRowsCollectedRows(alloc, self.rows);
+        self.* = undefined;
+    }
+};
+
+const RoutedMergeSourceRows = struct {
+    rows: [][]const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+fn collectMergeTargetRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?[]db_mod.types.RelationalRowsCollectedRow {
+    var scanned = (try collectMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, schema, ranges, consistency)) orelse return null;
+    defer scanned.deinit(alloc);
+
+    const selected = try selectMergeScanRowsAlloc(alloc, schema, req, scanned.rows);
+    errdefer db_mod.types.freeRelationalRowsCollectedRows(alloc, selected);
+
+    for (selected) |*row| {
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (!std.mem.eql(u8, lookup.json, row.json)) return error.TopologyChanged;
+        row.version = lookup.version;
+    }
+
+    return selected;
+}
+
+fn collectMergeSourceRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?RoutedMergeSourceRows {
+    var scanned = (try collectMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, schema, ranges, consistency)) orelse return null;
+    defer scanned.deinit(alloc);
+
+    const selected = try selectMergeScanRowsAlloc(alloc, schema, req, scanned.rows);
+    defer db_mod.types.freeRelationalRowsCollectedRows(alloc, selected);
+
+    const rows = try alloc.alloc([]const u8, selected.len);
+    errdefer alloc.free(rows);
+    for (selected, 0..) |*row, i| {
+        rows[i] = row.json;
+        row.json = "";
+    }
+    return .{ .rows = rows };
+}
+
+fn collectMergeScanRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?RoutedMergeScanRows {
+    if (!relationalRowsScanPayloadCanStripSyntheticKey(schema)) return error.UnsupportedRowsQuery;
+    var rows = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCollectedRow).empty;
+    errdefer {
+        for (rows.items) |row_value| {
+            var row = row_value;
+            row.deinit(alloc);
+        }
+        rows.deinit(alloc);
+    }
+
+    var budget = RoutedRowsMaterializationBudget.initDefault();
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &budget, consistency);
+    } else {
+        for (ranges) |range| {
+            saw_source = (try appendMergeScanRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &budget, consistency)) or saw_source;
+        }
+    }
+    if (!saw_source) {
+        for (rows.items) |row_value| {
+            var row = row_value;
+            row.deinit(alloc);
+        }
+        rows.deinit(alloc);
+        return null;
+    }
+
+    return .{ .rows = try rows.toOwnedSlice(alloc) };
+}
+
+fn appendMergeScanRowsFromRoutedScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    rows: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsCollectedRow),
+    budget: *RoutedRowsMaterializationBudget,
+    consistency: raft_mod.ReadConsistency,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        errdefer {
+            var owned = row;
+            owned.deinit(alloc);
+        }
+        try budget.account(row.json);
+        try rows.append(alloc, row);
+    }
+    return true;
+}
+
+fn mergeScanRowFromScanLineAlloc(alloc: std.mem.Allocator, line: []const u8) !db_mod.types.RelationalRowsCollectedRow {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRemoteResponse;
+    const key_value = parsed.value.object.get("key") orelse return error.InvalidRemoteResponse;
+    if (key_value != .string) return error.InvalidRemoteResponse;
+    const key = try alloc.dupe(u8, key_value.string);
+    errdefer alloc.free(key);
+    if (parsed.value.object.fetchOrderedRemove("key") == null) return error.InvalidRemoteResponse;
+    const json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    errdefer alloc.free(json);
+    return .{ .key = key, .json = json, .version = 0 };
+}
+
+fn selectMergeScanRowsAlloc(
+    alloc: std.mem.Allocator,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    scanned: []const db_mod.types.RelationalRowsCollectedRow,
+) ![]db_mod.types.RelationalRowsCollectedRow {
+    if (req.source_cte.len != 0 or req.row_claim != null) return error.UnsupportedRowsQuery;
+    const row_jsons = try alloc.alloc([]const u8, scanned.len);
+    defer alloc.free(row_jsons);
+    for (scanned, 0..) |row, i| row_jsons[i] = row.json;
+
+    var filter_req = req;
+    filter_req.select = &.{};
+    filter_req.json_extract = &.{};
+    filter_req.array_length = &.{};
+    filter_req.coalesce = &.{};
+    filter_req.field_aliases = &.{};
+    filter_req.expressions = &.{};
+    filter_req.select_all = true;
+    var filtered = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, schema, filter_req, row_jsons);
+    defer filtered.deinit(alloc);
+
+    var used = try alloc.alloc(bool, scanned.len);
+    defer alloc.free(used);
+    @memset(used, false);
+
+    var out = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCollectedRow).empty;
+    errdefer {
+        for (out.items) |row_value| {
+            var row = row_value;
+            row.deinit(alloc);
+        }
+        out.deinit(alloc);
+    }
+    try out.ensureUnusedCapacity(alloc, filtered.rows.len);
+    for (filtered.rows) |selected_json| {
+        var matched_index: ?usize = null;
+        for (scanned, 0..) |row, i| {
+            if (used[i]) continue;
+            if (!std.mem.eql(u8, row.json, selected_json)) continue;
+            matched_index = i;
+            break;
+        }
+        const index = matched_index orelse return error.TopologyChanged;
+        used[index] = true;
+        const key = try alloc.dupe(u8, scanned[index].key);
+        errdefer alloc.free(key);
+        const json = try alloc.dupe(u8, scanned[index].json);
+        errdefer alloc.free(json);
+        out.appendAssumeCapacity(.{
+            .key = key,
+            .json = json,
+            .version = scanned[index].version,
+        });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?RoutedRows {
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    var budget = RoutedRowsMaterializationBudget.initDefault();
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try appendRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &rows, &budget, consistency);
+    } else {
+        for (ranges) |range| {
+            saw_source = (try appendRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &rows, &budget, consistency)) or saw_source;
+        }
+    }
+    if (!saw_source) {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+        return null;
+    }
+
+    return .{ .rows = try rows.toOwnedSlice(alloc) };
+}
+
+fn appendRowsFromRoutedScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    rows: *std.ArrayListUnmanaged([]const u8),
+    budget: *RoutedRowsMaterializationBudget,
+    consistency: raft_mod.ReadConsistency,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const row = try rowJsonFromScanLineAlloc(alloc, line);
+        errdefer alloc.free(row);
+        try budget.account(row);
+        try rows.append(alloc, row);
+    }
+    return true;
+}
+
+const RoutedRowsMaterializationBudget = struct {
+    max_rows: u64,
+    max_bytes: u64,
+    rows: u64 = 0,
+    bytes: u64 = 2,
+
+    fn initDefault() RoutedRowsMaterializationBudget {
+        return .init(db_mod.types.default_relational_rows_cte_max_rows, db_mod.types.default_relational_rows_cte_max_bytes);
+    }
+
+    fn init(max_rows: u64, max_bytes: u64) RoutedRowsMaterializationBudget {
+        return .{
+            .max_rows = max_rows,
+            .max_bytes = max_bytes,
+        };
+    }
+
+    fn account(self: *RoutedRowsMaterializationBudget, row_json: []const u8) !void {
+        if (self.rows >= self.max_rows) return error.UnsupportedRowsQuery;
+        var next_bytes = self.bytes;
+        if (self.rows > 0) next_bytes = std.math.add(u64, next_bytes, 1) catch return error.UnsupportedRowsQuery;
+        next_bytes = std.math.add(u64, next_bytes, @intCast(row_json.len)) catch return error.UnsupportedRowsQuery;
+        if (next_bytes > self.max_bytes) return error.UnsupportedRowsQuery;
+        self.rows += 1;
+        self.bytes = next_bytes;
+    }
+};
+
+test "routed rows materialization budget fails closed on row and byte caps" {
+    var row_budget = RoutedRowsMaterializationBudget.init(2, 128);
+    try row_budget.account("{\"id\":\"a\"}");
+    try row_budget.account("{\"id\":\"b\"}");
+    try std.testing.expectError(error.UnsupportedRowsQuery, row_budget.account("{\"id\":\"c\"}"));
+
+    var byte_budget = RoutedRowsMaterializationBudget.init(8, 16);
+    try byte_budget.account("{\"id\":\"a\"}");
+    try std.testing.expectError(error.UnsupportedRowsQuery, byte_budget.account("{\"id\":\"b\"}"));
+}
+
+fn routedRowsPlanRangesForJoinAlloc(
+    alloc: std.mem.Allocator,
+    left_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const db_mod.types.RelationalRowsDocKeyRange {
+    if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+    if (left_ranges.len == 0) return &.{};
+    const sorted = try alloc.alloc(db_mod.types.RelationalRowsDocKeyRange, left_ranges.len + right_ranges.len);
+    defer alloc.free(sorted);
+    @memcpy(sorted[0..left_ranges.len], left_ranges);
+    @memcpy(sorted[left_ranges.len..], right_ranges);
+    std.sort.pdq(db_mod.types.RelationalRowsDocKeyRange, sorted, {}, routedRowsDocKeyRangeLessThan);
+
+    var out = std.ArrayListUnmanaged(db_mod.types.RelationalRowsDocKeyRange).empty;
+    errdefer out.deinit(alloc);
+    for (sorted) |range| {
+        if (out.items.len == 0) {
+            try out.append(alloc, range);
+            continue;
+        }
+        const last = &out.items[out.items.len - 1];
+        if (routedRowsDocKeyRangesOverlapOrTouch(last.*, range)) {
+            last.end = routedRowsDocKeyRangeMaxEnd(last.end, range.end);
+        } else {
+            try out.append(alloc, range);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn routedRowsPlanRangesForJoinCtesAlloc(
+    alloc: std.mem.Allocator,
+    cte_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    left_query: db_mod.types.RelationalRowsQueryRequest,
+    right_query: db_mod.types.RelationalRowsQueryRequest,
+    left_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const db_mod.types.RelationalRowsDocKeyRange {
+    if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+    if (left_ranges.len == 0) return &.{};
+
+    const include_left = left_query.source_cte.len != 0 or std.mem.eql(u8, left_table_name, cte_table_name);
+    const include_right = right_query.source_cte.len != 0 or std.mem.eql(u8, right_table_name, cte_table_name);
+    if (include_left and include_right) return try routedRowsPlanRangesForJoinAlloc(alloc, left_ranges, right_ranges);
+    if (include_left) return try cloneRowsPlanRangesAlloc(alloc, left_ranges);
+    if (include_right) return try cloneRowsPlanRangesAlloc(alloc, right_ranges);
+    return &.{};
+}
+
+fn cloneRowsPlanRangesAlloc(
+    alloc: std.mem.Allocator,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const db_mod.types.RelationalRowsDocKeyRange {
+    if (ranges.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsDocKeyRange, ranges.len);
+    @memcpy(out, ranges);
+    return out;
+}
+
+fn routedRowsDocKeyRangesOverlapOrTouch(lhs: db_mod.types.RelationalRowsDocKeyRange, rhs: db_mod.types.RelationalRowsDocKeyRange) bool {
+    if (lhs.end.len == 0) return true;
+    if (rhs.start.len == 0) return true;
+    return std.mem.order(u8, rhs.start, lhs.end) != .gt;
+}
+
+fn routedRowsDocKeyRangeMaxEnd(lhs: []const u8, rhs: []const u8) []const u8 {
+    if (lhs.len == 0 or rhs.len == 0) return "";
+    return if (std.mem.order(u8, lhs, rhs) == .lt) rhs else lhs;
+}
+
+fn routedRowsDocKeyRangeLessThan(_: void, lhs: db_mod.types.RelationalRowsDocKeyRange, rhs: db_mod.types.RelationalRowsDocKeyRange) bool {
+    if (lhs.start.len == 0) return rhs.start.len != 0;
+    if (rhs.start.len == 0) return false;
+    const start_order = std.mem.order(u8, lhs.start, rhs.start);
+    if (start_order != .eq) return start_order == .lt;
+    if (lhs.end.len == 0) return false;
+    if (rhs.end.len == 0) return true;
+    return std.mem.order(u8, lhs.end, rhs.end) == .lt;
+}
+
+fn rowJsonFromScanLineAlloc(alloc: std.mem.Allocator, line: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRemoteResponse;
+    if (parsed.value.object.fetchOrderedRemove("key") == null) return error.InvalidRemoteResponse;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn relationalRowsScanPayloadCanStripSyntheticKey(schema: storage_schema.TableSchema) bool {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, "key")) return false;
+        if (std.mem.eql(u8, column.path, "key")) return false;
+    }
+    return true;
 }
 
 const TextStatsFanoutSlot = struct {
@@ -4793,6 +6367,49 @@ fn lookupRelationalUniqueOwnerInDb(
     };
 }
 
+fn lookupRelationalTemporalUniqueOwnerInDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    reads: raft_mod.FeatureReads,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    const prefix = try db_mod.internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(prefix);
+    const upper = try db_mod.internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
+    defer if (upper) |buf| alloc.free(buf);
+    reads.prepareScanWithConsistency(group_id, prefix, if (upper) |buf| buf else "", .{}, consistency) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try db.lookupRelationalTemporalUniqueOwner(alloc, constraint_name, encoded_value, encoded_point);
+}
+
+fn lookupRelationalTemporalUniqueOverlapOwnerInDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    reads: raft_mod.FeatureReads,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    const prefix = try db_mod.internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(prefix);
+    const upper = try db_mod.internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
+    defer if (upper) |buf| alloc.free(buf);
+    reads.prepareScanWithConsistency(group_id, prefix, if (upper) |buf| buf else "", .{}, consistency) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try db.lookupRelationalTemporalUniqueOverlapOwner(alloc, constraint_name, encoded_value, encoded_start, encoded_end);
+}
+
 fn lookupRelationalUniqueOwnerProvisionedLocal(
     primary_lookup_db: ?PrimaryLookupDbSource,
     cache: ?*ProvisionedTableReadCache,
@@ -4841,6 +6458,150 @@ fn lookupRelationalUniqueOwnerProvisionedLocal(
     return try lookupRelationalUniqueOwnerInDb(alloc, &db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, consistency);
 }
 
+fn lookupRelationalTemporalUniqueOwnerProvisionedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    if (primary_lookup_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+            var lease = lease_value;
+            defer lease.release(alloc);
+            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+            return try lookupRelationalTemporalUniqueOwnerInDb(alloc, lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_point, consistency);
+        }
+    }
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    if (cache) |cached| {
+        if (cached.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name)) |db_lease_value| {
+            var db_lease = db_lease_value;
+            defer db_lease.release();
+            return try lookupRelationalTemporalUniqueOwnerInDb(alloc, db_lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_point, consistency);
+        }
+    }
+
+    var db = try openProvisionedLookupDbForTable(
+        alloc,
+        path,
+        if (cache) |cached| cached.lsm_cache else null,
+        lsm_root_generation,
+        if (cache) |cached| cached.resource_manager else null,
+        backend_runtime,
+        identity_namespace,
+    );
+    defer db.close();
+    return try lookupRelationalTemporalUniqueOwnerInDb(alloc, &db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_point, consistency);
+}
+
+fn lookupRelationalTemporalUniqueOverlapOwnerProvisionedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    if (primary_lookup_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+            var lease = lease_value;
+            defer lease.release(alloc);
+            try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
+            return try lookupRelationalTemporalUniqueOverlapOwnerInDb(alloc, lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+        }
+    }
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    if (cache) |cached| {
+        if (cached.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name)) |db_lease_value| {
+            var db_lease = db_lease_value;
+            defer db_lease.release();
+            return try lookupRelationalTemporalUniqueOverlapOwnerInDb(alloc, db_lease.db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+        }
+    }
+
+    var db = try openProvisionedLookupDbForTable(
+        alloc,
+        path,
+        if (cache) |cached| cached.lsm_cache else null,
+        lsm_root_generation,
+        if (cache) |cached| cached.resource_manager else null,
+        backend_runtime,
+        identity_namespace,
+    );
+    defer db.close();
+    return try lookupRelationalTemporalUniqueOverlapOwnerInDb(alloc, &db, group_id, raft_mod.FeatureReads.init(requester), constraint_name, encoded_value, encoded_start, encoded_end, consistency);
+}
+
+fn lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    return lookupRelationalTemporalUniqueOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, encoded_point, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try lookupRelationalTemporalUniqueOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, encoded_point, .stale),
+        else => err,
+    };
+}
+
+fn lookupRelationalTemporalUniqueOverlapOwnerProvisionedHostedLocal(
+    primary_lookup_db: ?PrimaryLookupDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?[]u8 {
+    return lookupRelationalTemporalUniqueOverlapOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, encoded_start, encoded_end, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try lookupRelationalTemporalUniqueOverlapOwnerProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, constraint_name, encoded_value, encoded_start, encoded_end, .stale),
+        else => err,
+    };
+}
+
 fn lookupRelationalUniqueOwnerProvisionedHostedLocal(
     primary_lookup_db: ?PrimaryLookupDbSource,
     cache: ?*ProvisionedTableReadCache,
@@ -4876,6 +6637,33 @@ fn lookupRelationalUniqueOwnerRemote(
     var lookup = (try lookupRemote(executor, alloc, base_uri, group_id, table_name, key, .{})) orelse return null;
     defer lookup.deinit(alloc);
     return try alloc.dupe(u8, lookup.json);
+}
+
+fn lookupRelationalTemporalUniqueOwnerRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+) !?[]u8 {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"encoded_value\":{f},\"encoded_point\":{f}}}",
+        .{ std.json.fmt(constraint_name, .{}), std.json.fmt(encoded_value, .{}), std.json.fmt(encoded_point, .{}) },
+    );
+    defer alloc.free(body);
+    var result = client.fetchGroupTemporalUniqueOwner(base_uri, group_id, table_name, body) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    var parsed = std.json.parseFromSlice(struct { owner_key: []const u8 }, alloc, result.body, .{}) catch return error.InvalidRemoteResponse;
+    defer parsed.deinit();
+    return try alloc.dupe(u8, parsed.value.owner_key);
 }
 
 fn lookupProvisionedLocal(
@@ -12185,7 +13973,7 @@ fn queryRemote(
         defer alloc.free(body);
         var result = try client.fetchGroupVectorWorker(base_uri, group_id, table_name, body);
         defer result.deinit(alloc);
-        var parsed = try parseRemoteSearchResult(alloc, result.body);
+        var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
         parsed.identity_read_generation = req.identity_read_generation;
         return parsed;
     }
@@ -12193,9 +13981,16 @@ fn queryRemote(
     defer alloc.free(body);
     var result = try client.fetchGroupQuery(base_uri, group_id, table_name, body);
     defer result.deinit(alloc);
-    var parsed = try parseRemoteSearchResult(alloc, result.body);
+    var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
     parsed.identity_read_generation = req.identity_read_generation;
     return parsed;
+}
+
+fn parseRemoteSearchResultForHostedQuery(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResult(alloc, body) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.UnsupportedQueryRequest,
+    };
 }
 
 fn preflightRemote(
@@ -12458,6 +14253,12 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     if (req.graph_queries.len > 0) {
         try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
     }
+    if (req.graph_metric_queries.len > 0) {
+        try appendGraphMetricQueryField(alloc, &out, &first, req.graph_metric_queries);
+    }
+    if (req.graph_metric_rerank) |rerank| {
+        try appendGraphMetricRerankField(alloc, &out, &first, rerank);
+    }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
             .@"union" => "union",
@@ -12608,6 +14409,50 @@ fn appendGraphQueriesField(
         try out.append(alloc, ':');
         try appendGraphQueryValue(alloc, out, graph_query.query);
     }
+    try out.append(alloc, '}');
+}
+
+fn appendGraphMetricQueryField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    queries: []const db_mod.types.NamedGraphMetricQuery,
+) !void {
+    if (queries.len != 1) return;
+    const named = queries[0];
+
+    try appendJsonFieldName(alloc, out, first, "graph_metric");
+    try out.append(alloc, '{');
+    var metric_first = true;
+    try appendJsonFieldString(alloc, out, &metric_first, "name", named.name);
+    try appendJsonFieldString(alloc, out, &metric_first, "index", named.query.index_name);
+    try appendJsonFieldString(alloc, out, &metric_first, "metric", named.query.metric_name);
+    try appendJsonFieldU32(alloc, out, &metric_first, "top_k", named.query.top_k);
+    try appendJsonFieldString(alloc, out, &metric_first, "metric_freshness", switch (named.query.freshness) {
+        .published => "published",
+        .fresh => "fresh",
+    });
+    try out.append(alloc, '}');
+}
+
+fn appendGraphMetricRerankField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    rerank: db_mod.types.GraphMetricRerank,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "graph_metric_rerank");
+    try out.append(alloc, '{');
+    var rerank_first = true;
+    try appendJsonFieldString(alloc, out, &rerank_first, "index", rerank.index_name);
+    try appendJsonFieldString(alloc, out, &rerank_first, "metric", rerank.metric_name);
+    try appendJsonFieldF64(alloc, out, &rerank_first, "base_weight", rerank.base_weight);
+    try appendJsonFieldF64(alloc, out, &rerank_first, "weight", rerank.weight);
+    try appendJsonFieldF64(alloc, out, &rerank_first, "missing_score", rerank.missing_score);
+    try appendJsonFieldString(alloc, out, &rerank_first, "metric_freshness", switch (rerank.freshness) {
+        .published => "published",
+        .fresh => "fresh",
+    });
     try out.append(alloc, '}');
 }
 
@@ -13749,6 +15594,1024 @@ fn appendScanLine(
         try out.append(alloc, '}');
     }
     try out.append(alloc, '\n');
+}
+
+test "routed rows query plan executes over scanned owner rows with ctes" {
+    const alloc = std.testing.allocator;
+
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                    .rows_aggregate_plan = rowsAggregatePlan,
+                    .rows_window_plan = rowsWindowPlan,
+                    .rows_join_plan = rowsJoinPlan,
+                    .rows_lateral_plan = rowsLateralPlan,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, "n"))
+                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n"
+                else if (std.mem.eql(u8, from_key, "n") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                else if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"a\",\"id\":\"a\",\"status\":\"open\",\"amount\":1}\n{\"key\":\"b\",\"id\":\"b\",\"status\":\"closed\",\"amount\":9}\n{\"key\":\"z\",\"id\":\"z\",\"status\":\"open\",\"amount\":7}\n"
+                else
+                    return error.UnexpectedRange
+            else if (std.mem.eql(u8, table_name, "customers"))
+                if (std.mem.eql(u8, from_key, "") and std.mem.eql(u8, to_key, ""))
+                    "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+                else
+                    return error.UnexpectedRange
+            else if (std.mem.eql(u8, table_name, "oversized")) {
+                try std.testing.expectEqualStrings("", from_key);
+                try std.testing.expectEqualStrings("", to_key);
+                var out = std.ArrayListUnmanaged(u8).empty;
+                errdefer out.deinit(scan_alloc);
+                const line = "{\"key\":\"x\",\"id\":\"x\",\"status\":\"open\",\"amount\":1}\n";
+                var index: usize = 0;
+                while (index <= db_mod.types.default_relational_rows_cte_max_rows) : (index += 1) {
+                    try out.appendSlice(scan_alloc, line);
+                }
+                return .{ .ndjson = try out.toOwnedSlice(scan_alloc) };
+            } else return error.TableNotFound;
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn rowsQueryPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsAggregatePlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsAggregatePlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsAggregateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsAggregatePlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsWindowPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsWindowPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsWindowResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsWindowPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsJoinPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsJoinPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsJoinResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsJoinPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+
+        fn rowsLateralPlan(
+            ptr: *anyopaque,
+            plan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsLateralPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsJoinResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try rowsLateralPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+        }
+    };
+
+    var fake = FakeRoutedSource{};
+    var source = fake.source();
+    const cte_select = [_][]const u8{ "id", "amount", "status" };
+    const cte_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "status_open",
+        .field = "status",
+        .value_json = "\"open\"",
+    }};
+    const ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = "open_rows",
+        .query = .{
+            .predicates = cte_predicates[0..],
+            .select = cte_select[0..],
+            .select_all = false,
+        },
+    }};
+    const ranges = [_]db_mod.types.RelationalRowsDocKeyRange{
+        .{ .start = "", .end = "n" },
+        .{ .start = "n", .end = "" },
+    };
+    const final_select = [_][]const u8{"id"};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "amount",
+        .direction = .desc,
+    }};
+
+    var result = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "open_rows",
+            .select = final_select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 1,
+        },
+    }, .read_index)).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\"}", result.rows[0]);
+
+    const aggregate_group_by = [_][]const u8{"status"};
+    const aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "order_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    var aggregate_result = (try source.rowsAggregatePlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "open_rows" },
+            .group_by = aggregate_group_by[0..],
+            .aggregations = aggregate_specs[0..],
+        },
+    }, .read_index)).?;
+    defer aggregate_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"open\",\"order_count\":2,\"amount_sum\":8}", aggregate_result.rows[0]);
+
+    const window_specs = [_]db_mod.types.RelationalRowsWindowSpec{.{
+        .output = "rn",
+        .function = .row_number,
+        .order_by = &.{.{ .field = "amount", .direction = .desc }},
+    }};
+    const window_select = [_][]const u8{ "id", "amount" };
+    var window_result = (try source.rowsWindowPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .window = .{
+            .source = .{ .source_cte = "open_rows" },
+            .windows = window_specs[0..],
+            .select = window_select[0..],
+            .select_all = false,
+            .order_by = &.{.{ .field = "rn", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer window_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), window_result.total_rows);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"amount\":7,\"rn\":1}", window_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":1,\"rn\":2}", window_result.rows[1]);
+
+    const join_on = [_]db_mod.types.RelationalRowsJoinOn{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    const join_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "left_id", .side = .left, .field = "id" },
+        .{ .output = "right_id", .side = .right, .field = "id" },
+    };
+    var join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+            .order_by = &.{ .{ .field = "left_id", .direction = .asc }, .{ .field = "right_id", .direction = .asc } },
+            .limit = 1,
+        },
+    }, .read_index)).?;
+    defer join_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", join_result.rows[0]);
+
+    const lateral_correlations = [_]db_mod.types.RelationalRowsLateralCorrelation{.{
+        .left_field = "status",
+        .right_field = "status",
+    }};
+    const lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "left_id", .side = .left, .field = "id" },
+        .{ .output = "latest_id", .side = .right, .field = "id" },
+        .{ .output = "latest_amount", .side = .right, .field = "amount" },
+    };
+    var lateral_result = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "id", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = lateral_select[0..],
+            .order_by = &.{.{ .field = "left_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer lateral_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), lateral_result.total_rows);
+    try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"left_id\":\"z\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[1]);
+
+    var customer_columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .nullable = false },
+        .{ .name = "name", .path = "name", .field_type = .keyword, .nullable = false },
+    };
+    const customer_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = customer_columns[0..],
+    };
+    const cross_join_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "order_id", .side = .left, .field = "id" },
+        .{ .output = "customer_name", .side = .right, .field = "name" },
+    };
+    const cross_scan_calls_before = fake.scan_calls;
+    var cross_join_result = (try rowsJoinPlanFromRoutedScansWithSchemasAlloc(alloc, source, "orders", "orders", "customers", schema, schema, customer_schema, .{
+        .right_table = "customers",
+        .join = .{
+            .left = .{},
+            .right = .{},
+            .on = join_on[0..],
+            .select = cross_join_select[0..],
+            .order_by = &.{.{ .field = "order_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer cross_join_result.deinit(alloc);
+    try std.testing.expectEqual(cross_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 3), cross_join_result.total_rows);
+    try std.testing.expectEqualStrings("{\"order_id\":\"a\",\"customer_name\":\"Ada\"}", cross_join_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"b\",\"customer_name\":\"Grace\"}", cross_join_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"z\",\"customer_name\":\"Ada\"}", cross_join_result.rows[2]);
+
+    const cross_lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "order_id", .side = .left, .field = "id" },
+        .{ .output = "matched_customer", .side = .right, .field = "name" },
+    };
+    const cross_lateral_scan_calls_before = fake.scan_calls;
+    var cross_lateral_result = (try rowsLateralPlanFromRoutedScansWithSchemasAlloc(alloc, source, "orders", "orders", "customers", schema, schema, customer_schema, .{
+        .right_table = "customers",
+        .lateral = .{
+            .left = .{ .order_by = &.{.{ .field = "id", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "name", .direction = .asc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = cross_lateral_select[0..],
+            .order_by = &.{.{ .field = "order_id", .direction = .asc }},
+        },
+    }, .read_index)).?;
+    defer cross_lateral_result.deinit(alloc);
+    try std.testing.expectEqual(cross_lateral_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 3), cross_lateral_result.total_rows);
+    try std.testing.expectEqualStrings("{\"order_id\":\"a\",\"matched_customer\":\"Ada\"}", cross_lateral_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"b\",\"matched_customer\":\"Grace\"}", cross_lateral_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"z\",\"matched_customer\":\"Ada\"}", cross_lateral_result.rows[2]);
+
+    var key_columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "key", .path = "key", .field_type = .keyword, .nullable = false },
+    };
+    const key_schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = key_columns[0..],
+    };
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "orders", key_schema, .{}, .read_index));
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsQueryPlan(alloc, "oversized", schema, .{}, .read_index));
+}
+
+test "lowered sql cross-table read plans execute through routed scans" {
+    const alloc = std.testing.allocator;
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_orders = try schema_api.parseValidatedTableSchema(alloc, orders_schema_json);
+    defer parsed_orders.deinit(alloc);
+    const orders_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_orders);
+    defer storage_schema.freeSchema(alloc, orders_schema);
+
+    var parsed_customers = try schema_api.parseValidatedTableSchema(alloc, customers_schema_json);
+    defer parsed_customers.deinit(alloc);
+    const customers_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_customers);
+    defer storage_schema.freeSchema(alloc, customers_schema);
+
+    const FakeCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json, .placement_role = "data" },
+            .{ .table_id = 8, .name = "customers", .schema_json = customers_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                "{\"key\":\"o1\",\"id\":\"o1\",\"status\":\"open\",\"customer_id\":\"c1\",\"amount\":10}\n{\"key\":\"o2\",\"id\":\"o2\",\"status\":\"closed\",\"customer_id\":\"c2\",\"amount\":5}\n"
+            else if (std.mem.eql(u8, table_name, "customers"))
+                "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+            else
+                return error.TableNotFound;
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var fake = FakeRoutedSource{};
+    var lowered = try relational_sql_api.lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
+        orders_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered.deinit(alloc);
+
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "orders",
+        orders_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    switch (result) {
+        .join => |join_result| {
+            try std.testing.expectEqual(@as(u32, 2), join_result.total_rows);
+            try std.testing.expectEqual(@as(usize, 2), join_result.rows.len);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", join_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", join_result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered sql insert source plans build batches from routed scans" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status_key":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer storage_schema.freeSchema(alloc, target_schema);
+
+    var parsed_source = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source.deinit(alloc);
+    const source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source);
+    defer storage_schema.freeSchema(alloc, source_schema);
+
+    const FakeCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 7, .name = "order_copies", .schema_json = target_schema_json, .placement_role = "data" },
+            .{ .table_id = 8, .name = "orders", .schema_json = source_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            if (!std.mem.eql(u8, table_name, "orders")) return error.TableNotFound;
+            self.scan_calls += 1;
+            const ndjson =
+                "{\"key\":\"o1\",\"id\":\"o1\",\"status\":\"OPEN\",\"amount\":10}\n" ++
+                "{\"key\":\"o2\",\"id\":\"o2\",\"status\":\"closed\",\"amount\":5}\n" ++
+                "{\"key\":\"o3\",\"id\":\"o3\",\"status\":\"OPEN\",\"amount\":7}\n";
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+    };
+
+    const NoConflictResolver = struct {
+        fn resolver() relational_rows_api.UniqueSelectorResolver {
+            return .{
+                .ptr = undefined,
+                .resolve = resolve,
+                .resolve_primary = resolvePrimary,
+            };
+        }
+
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) !?[]u8 {
+            return null;
+        }
+
+        fn resolvePrimary(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) !bool {
+            return false;
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var fake = FakeRoutedSource{};
+    var lowered = try relational_sql_api.lowerWritePlanWithCatalogAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, status, amount FROM orders WHERE status = 'OPEN') INSERT INTO order_copies (id, status_key, amount) SELECT id || '_copy' AS id, lower(status), amount FROM open_orders ORDER BY id ASC RETURNING id, status_key, amount",
+        target_schema,
+        &.{},
+        .{ .unique_resolver = NoConflictResolver.resolver() },
+        catalog.iface(),
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("order_copies", insert_source.table_name);
+            try std.testing.expectEqualStrings("orders", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            const plan: db_mod.types.RelationalRowsInsertSourcePlan = .{
+                .ctes = insert_source.ctes,
+                .insert_source = insert_source.insert_source.req,
+            };
+            var batch = (try rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                fake.source(),
+                insert_source.table_name,
+                insert_source.insert_source.req.source_table,
+                target_schema,
+                source_schema,
+                plan,
+                .read_index,
+                NoConflictResolver.resolver(),
+            )).?;
+            defer batch.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), fake.scan_calls);
+            try std.testing.expectEqual(@as(u32, 2), batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"o1_copy\",\"status_key\":\"open\",\"amount\":10}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"o3_copy\",\"status_key\":\"open\",\"amount\":7}", batch.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered sql merge mutation plans build batches from routed scans" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"target_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id","target_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_target = try schema_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target.deinit(alloc);
+    const target_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_target);
+    defer storage_schema.freeSchema(alloc, target_schema);
+
+    var parsed_source = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source.deinit(alloc);
+    const source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source);
+    defer storage_schema.freeSchema(alloc, source_schema);
+    const target_row_json = "{\"id\":\"t1\",\"status\":\"open\",\"organization_id\":\"org:1\"}";
+    const target_key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, target_row_json);
+    defer alloc.free(target_key);
+
+    const FakeCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 21, .name = "orders", .schema_json = target_schema_json, .placement_role = "data" },
+            .{ .table_id = 22, .name = "imports", .schema_json = source_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRoutedSource = struct {
+        target_key: []const u8,
+        target_row_json: []const u8,
+        scan_calls: usize = 0,
+        lookup_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_all_fields);
+            if (!std.mem.eql(u8, table_name, "orders")) return null;
+            if (!std.mem.eql(u8, key, self.target_key)) return null;
+            self.lookup_calls += 1;
+            return .{
+                .json = try lookup_alloc.dupe(u8, self.target_row_json),
+                .version = 17,
+            };
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                try std.fmt.allocPrint(scan_alloc, "{{\"key\":{f},\"id\":\"t1\",\"status\":\"open\",\"organization_id\":\"org:1\"}}\n", .{std.json.fmt(self.target_key, .{})})
+            else if (std.mem.eql(u8, table_name, "imports"))
+                try scan_alloc.dupe(u8, "{\"key\":\"import:s1\",\"id\":\"s1\",\"target_id\":\"t1\",\"status\":\"UPDATED\",\"organization_id\":\"org:1\"}\n{\"key\":\"import:s2\",\"id\":\"s2\",\"target_id\":\"new1\",\"status\":\"inserted\",\"organization_id\":\"org:2\"}\n")
+            else if (std.mem.eql(u8, table_name, "oversized_imports")) blk: {
+                var out = std.ArrayListUnmanaged(u8).empty;
+                errdefer out.deinit(scan_alloc);
+                const line = "{\"key\":\"import:s1\",\"id\":\"s1\",\"target_id\":\"t1\",\"status\":\"UPDATED\",\"organization_id\":\"org:1\"}\n";
+                var index: usize = 0;
+                while (index <= db_mod.types.default_relational_rows_cte_max_rows) : (index += 1) {
+                    try out.appendSlice(scan_alloc, line);
+                }
+                break :blk try out.toOwnedSlice(scan_alloc);
+            } else return error.TableNotFound;
+            return .{ .ndjson = ndjson };
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var lowered = try relational_sql_api.lowerWritePlanWithCatalogAlloc(
+        alloc,
+        "MERGE INTO orders AS target USING imports AS source ON target.id = source.target_id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status, organization_id) VALUES (source.target_id, upper(source.status), source.organization_id) RETURNING id, status, lower(status) AS status_key",
+        target_schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer lowered.deinit(alloc);
+
+    var fake = FakeRoutedSource{ .target_key = target_key, .target_row_json = target_row_json };
+    switch (lowered) {
+        .merge_mutation => |merge| {
+            var batch = (try rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                fake.source(),
+                "orders",
+                "imports",
+                target_schema,
+                source_schema,
+                merge,
+                .{ .select_all = true },
+                &.{},
+                .{ .select_all = true },
+                &.{},
+                .read_index,
+            )).?;
+            defer batch.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+            try std.testing.expectEqual(@as(usize, 1), fake.lookup_calls);
+            try std.testing.expectEqual(@as(u32, 1), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            var saw_target_version_predicate = false;
+            for (batch.predicates) |predicate| {
+                if (!std.mem.eql(u8, predicate.key, target_key)) continue;
+                try std.testing.expectEqual(@as(u64, 17), predicate.expected_version);
+                saw_target_version_predicate = true;
+            }
+            try std.testing.expect(saw_target_version_predicate);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"updated\",\"status_key\":\"updated\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"INSERTED\",\"status_key\":\"inserted\"}", batch.returning_rows[1]);
+
+            try std.testing.expectError(error.UnsupportedRowsQuery, rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                fake.source(),
+                "orders",
+                "oversized_imports",
+                target_schema,
+                source_schema,
+                merge,
+                .{ .select_all = true },
+                &.{},
+                .{ .select_all = true },
+                &.{},
+                .read_index,
+            ));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered relation population plans execute routed typed read sources" {
+    const alloc = std.testing.allocator;
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var parsed_orders = try schema_api.parseValidatedTableSchema(alloc, orders_schema_json);
+    defer parsed_orders.deinit(alloc);
+    const orders_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_orders);
+    defer storage_schema.freeSchema(alloc, orders_schema);
+
+    var parsed_customers = try schema_api.parseValidatedTableSchema(alloc, customers_schema_json);
+    defer parsed_customers.deinit(alloc);
+    const customers_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_customers);
+    defer storage_schema.freeSchema(alloc, customers_schema);
+
+    const FakeCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json, .placement_role = "data" },
+            .{ .table_id = 8, .name = "customers", .schema_json = customers_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRoutedSource = struct {
+        scan_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            self.scan_calls += 1;
+            const ndjson = if (std.mem.eql(u8, table_name, "orders"))
+                "{\"key\":\"o1\",\"id\":\"o1\",\"status\":\"open\",\"customer_id\":\"c1\"}\n{\"key\":\"o2\",\"id\":\"o2\",\"status\":\"closed\",\"customer_id\":\"c2\"}\n"
+            else if (std.mem.eql(u8, table_name, "customers"))
+                "{\"key\":\"c1\",\"id\":\"c1\",\"status\":\"open\",\"name\":\"Ada\"}\n{\"key\":\"c2\",\"id\":\"c2\",\"status\":\"closed\",\"name\":\"Grace\"}\n"
+            else
+                return error.TableNotFound;
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var fake = FakeRoutedSource{};
+    var lowered = try relational_sql_api.lowerRelationPopulationPlanWithCatalogAlloc(
+        alloc,
+        "CREATE TABLE order_archive AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
+        orders_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered.deinit(alloc);
+
+    var result = (try executeLoweredRelationPopulationPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "orders",
+        orders_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(relational_sql_api.RelationPopulationMode.create_table_as, result.mode);
+    try std.testing.expectEqualStrings("order_archive", result.target_table_name);
+    try std.testing.expectEqual(@as(usize, 2), fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", result.rows[1]);
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
@@ -15620,6 +18483,50 @@ test "encode query request includes named vector embeddings for routed semantic 
     try std.testing.expectEqual(@as(i64, 7), sparse.get("indices").?.array.items[1].integer);
     try std.testing.expectEqual(@as(f64, 0.4), sparse.get("values").?.array.items[0].float);
     try std.testing.expectEqual(@as(f64, 0.9), sparse.get("values").?.array.items[1].float);
+}
+
+test "encode query request includes graph metric read and rerank" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "pagerank",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 25,
+            .freshness = .fresh,
+        },
+    }};
+    const encoded = try encodeQueryRequest(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .graph_metric_queries = &graph_metric_queries,
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .fresh,
+            .base_weight = 0.5,
+            .weight = 2.5,
+            .missing_score = -0.25,
+        },
+        .limit = 25,
+    });
+    defer alloc.free(encoded);
+
+    var parsed = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed.deinit();
+    const graph_metric = parsed.value.object.get("graph_metric").?.object;
+    try std.testing.expectEqualStrings("pagerank", graph_metric.get("name").?.string);
+    try std.testing.expectEqualStrings("graph_idx", graph_metric.get("index").?.string);
+    try std.testing.expectEqualStrings("pagerank", graph_metric.get("metric").?.string);
+    try std.testing.expectEqual(@as(i64, 25), graph_metric.get("top_k").?.integer);
+    try std.testing.expectEqualStrings("fresh", graph_metric.get("metric_freshness").?.string);
+    const rerank = parsed.value.object.get("graph_metric_rerank").?.object;
+    try std.testing.expectEqualStrings("graph_idx", rerank.get("index").?.string);
+    try std.testing.expectEqualStrings("pagerank", rerank.get("metric").?.string);
+    try std.testing.expectEqual(@as(f64, 0.5), rerank.get("base_weight").?.float);
+    try std.testing.expectEqual(@as(f64, 2.5), rerank.get("weight").?.float);
+    try std.testing.expectEqual(@as(f64, -0.25), rerank.get("missing_score").?.float);
+    try std.testing.expectEqualStrings("fresh", rerank.get("metric_freshness").?.string);
 }
 
 test "encode query request includes merge config and pruner but omits reranker" {
@@ -18860,6 +21767,1856 @@ test "hosted cross-range graph query expands explicit local start keys" {
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entity:ada\"") != null);
 }
 
+test "hosted cross-range graph metric fan-in merges compatible published shard generations" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-merge";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7101);
+    defer alloc.free(left_path);
+    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7102);
+    defer alloc.free(right_path);
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+    const graph_config_json =
+        \\{"edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    ;
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7101, .range_id = 7101 },
+    });
+    defer left_db.close();
+    try left_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try left_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"left-a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"left-b\"}" },
+        },
+        .sync_level = .write,
+    });
+    try left_db.runUntilIdle();
+    var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer left_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_status.state);
+
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7102, .range_id = 7102 },
+    });
+    defer right_db.close();
+    try right_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try right_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:n", .value = "{\"title\":\"right-n\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:o\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:o", .value = "{\"title\":\"right-o\"}" },
+        },
+        .sync_level = .write,
+    });
+    try right_db.runUntilIdle();
+    var right_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer right_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_status.state);
+    try std.testing.expectEqual(left_status.published_generation, right_status.published_generation);
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7101,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7101,
+                    .namespace_range_id = 7101,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7102,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7102,
+                    .namespace_range_id = 7102,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7101, .table_id = 7, .range_id = 7101, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7102, .table_id = 7, .range_id = 7102, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    var response = (try hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 4,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    }, .read_index)).?;
+    defer response.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_metric_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"central\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"manual_degree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"doc:b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"doc:o\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"state\":\"fresh\"") != null);
+}
+
+test "hosted cross-range graph metric fan-in merges active stale shard for published" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-active-stale";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7341);
+    defer alloc.free(left_path);
+    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7342);
+    defer alloc.free(right_path);
+
+    const graph_indexes_json =
+        \\{"ft_v1":{"type":"full_text","store":true},"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+    const graph_config_json =
+        \\{"edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    ;
+
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7341, .range_id = 7341 },
+    });
+    defer left_db.close();
+    try left_db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"store\":true}" });
+    try left_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try left_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"left-a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"left-b\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try left_db.runUntilIdle();
+    var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer left_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_status.state);
+    var left_pagerank_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "pagerank");
+    defer left_pagerank_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_pagerank_status.state);
+    try std.testing.expectEqual(left_status.published_generation, left_pagerank_status.published_generation);
+    var left_eigenvector_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "eigenvector");
+    defer left_eigenvector_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, left_eigenvector_status.state);
+    try std.testing.expectEqual(left_status.published_generation, left_eigenvector_status.published_generation);
+
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7342, .range_id = 7342 },
+    });
+    defer right_db.close();
+    try right_db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"store\":true}" });
+    try right_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try right_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:n", .value = "{\"title\":\"right-n\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:o\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:o", .value = "{\"title\":\"right-o\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try right_db.runUntilIdle();
+    var right_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer right_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_status.state);
+    try std.testing.expectEqual(left_status.published_generation, right_status.published_generation);
+    var right_pagerank_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "pagerank");
+    defer right_pagerank_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_pagerank_status.state);
+    try std.testing.expectEqual(left_status.published_generation, right_pagerank_status.published_generation);
+    var right_eigenvector_status = try right_db.refreshGraphMetric(alloc, "graph_idx", "eigenvector");
+    defer right_eigenvector_status.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, right_eigenvector_status.state);
+    try std.testing.expectEqual(left_status.published_generation, right_eigenvector_status.published_generation);
+
+    try right_db.batch(.{
+        .writes = &.{.{ .key = "doc:p", .value = "{\"title\":\"right-p\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:o\",\"weight\":1.0}]}}}" }},
+        .sync_level = .full_index,
+    });
+    try right_db.runUntilIdle();
+    const active_target_generation = blk: {
+        const graph_entry = right_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        const active_metrics = [_][]const u8{ "manual_degree", "pagerank", "eigenvector" };
+        for (active_metrics) |metric_name| {
+            var building = try graph_entry.index.ensureGraphMetricPlannedBuild(metric_name, target_generation);
+            defer building.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+            try std.testing.expectEqual(target_generation, building.building_generation);
+
+            const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, "worker-prepare");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+            try std.testing.expect(prepare.claimed_page);
+            try std.testing.expect(prepare.completed_page);
+
+            const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric(metric_name);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+            try std.testing.expect(advance_prepare.advanced_phase);
+
+            const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, "worker-scan");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+            try std.testing.expect(scan.claimed_page);
+            try std.testing.expect(scan.completed_page);
+        }
+        break :blk target_generation;
+    };
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7341,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7341,
+                    .namespace_range_id = 7341,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7342,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7342,
+                    .namespace_range_id = 7342,
+                    .next_ordinal = 4,
+                    .allocated_ordinals = 3,
+                    .state_rows = 3,
+                    .live_ordinals = 3,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7341, .table_id = 7, .range_id = 7341, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7342, .table_id = 7, .range_id = 7342, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    const published_generation_needle = try std.fmt.allocPrint(alloc, "\"published_generation\":{d}", .{right_status.published_generation});
+    defer alloc.free(published_generation_needle);
+    const building_generation_needle = try std.fmt.allocPrint(alloc, "\"building_generation\":{d}", .{active_target_generation});
+    defer alloc.free(building_generation_needle);
+    const active_metrics = [_][]const u8{ "manual_degree", "pagerank", "eigenvector" };
+    for (active_metrics) |metric_name| {
+        var response = (try hosted.source().query(alloc, "docs", .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = metric_name,
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            }},
+            .limit = 0,
+        }, .read_index)).?;
+        defer response.deinit(alloc);
+
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_metric_results\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, metric_name) != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"doc:b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"doc:o\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"doc:p\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, published_generation_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, building_generation_needle) != null);
+
+        var rerank_response = (try hosted.source().query(alloc, "docs", .{
+            .index_name = "ft_v1",
+            .full_text = .{ .match_all = {} },
+            .graph_metric_rerank = .{
+                .index_name = "graph_idx",
+                .metric_name = metric_name,
+                .freshness = .published,
+                .weight = 1.0,
+            },
+            .limit = 5,
+            .include_stored = false,
+            .profile = true,
+        }, .read_index)).?;
+        defer rerank_response.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"_score_details\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"graph_metric_rerank\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"doc:b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"doc:o\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, published_generation_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, building_generation_needle) != null);
+
+        const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+            .name = metric_name,
+            .freshness = .published,
+        }};
+        const published_graph_query = graph_query_mod.GraphQuery{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{ "doc:a", "doc:n" } },
+            .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_results = 8 },
+            .metrics = &published_metric_reads,
+            .include_metric_status = true,
+        };
+        var traversal_response = (try hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "neighbors", .query = published_graph_query }},
+        }, .read_index)).?;
+        defer traversal_response.deinit(alloc);
+
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"graph_results\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"doc:b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"doc:o\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"doc:p\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"metric_status\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, published_generation_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, building_generation_needle) != null);
+
+        const published_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+            .name = metric_name,
+            .freshness = .published,
+        }};
+        var order_query = published_graph_query;
+        order_query.order_by = &published_metric_orders;
+        var order_response = (try hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "ordered", .query = order_query }},
+        }, .read_index)).?;
+        defer order_response.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, order_response.json, "\"graph_results\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, order_response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, order_response.json, published_generation_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, order_response.json, building_generation_needle) != null);
+
+        const published_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+            .name = metric_name,
+            .op = .gte,
+            .value = 0.0,
+            .freshness = .published,
+        }};
+        var filter_query = published_graph_query;
+        filter_query.where_metric = &published_metric_filters;
+        var filter_response = (try hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "filtered", .query = filter_query }},
+        }, .read_index)).?;
+        defer filter_response.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, "\"graph_results\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, "\"doc:b\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, "\"doc:o\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, published_generation_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, filter_response.json, building_generation_needle) != null);
+
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = metric_name,
+                    .top_k = 8,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        }, .read_index));
+
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .index_name = "ft_v1",
+            .full_text = .{ .match_all = {} },
+            .graph_metric_rerank = .{
+                .index_name = "graph_idx",
+                .metric_name = metric_name,
+                .freshness = .fresh,
+                .weight = 1.0,
+            },
+            .limit = 5,
+            .include_stored = false,
+        }, .read_index));
+
+        const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+            .name = metric_name,
+            .freshness = .fresh,
+        }};
+        var fresh_projection_query = published_graph_query;
+        fresh_projection_query.metrics = &fresh_metric_reads;
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "fresh_neighbors", .query = fresh_projection_query }},
+        }, .read_index));
+
+        const fresh_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+            .name = metric_name,
+            .freshness = .fresh,
+        }};
+        var fresh_order_query = published_graph_query;
+        fresh_order_query.order_by = &fresh_metric_orders;
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "fresh_ordered", .query = fresh_order_query }},
+        }, .read_index));
+
+        const fresh_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+            .name = metric_name,
+            .op = .gte,
+            .value = 0.0,
+            .freshness = .fresh,
+        }};
+        var fresh_filter_query = published_graph_query;
+        fresh_filter_query.where_metric = &fresh_metric_filters;
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .query = .{ .match_all = {} },
+            .limit = 0,
+            .graph_queries = &.{.{ .name = "fresh_filtered", .query = fresh_filter_query }},
+        }, .read_index));
+    }
+}
+
+test "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-promotion-merge";
+    const shard_count = 8;
+    const group_ids = [_]u64{ 7301, 7302, 7303, 7304, 7305, 7306, 7307, 7308 };
+    const prefixes = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    const source_counts = [_]usize{ 1, 2, 3, 1, 2, 3, 1, 2 };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+    const graph_config_json =
+        \\{"edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}},"pagerank":{"enabled":true,"kind":"pagerank","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"manual","max_iterations":2,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    ;
+    const metric_names = [_][]const u8{ "manual_degree", "pagerank", "eigenvector" };
+
+    var db_paths: [shard_count][]u8 = undefined;
+    var db_path_count: usize = 0;
+    defer {
+        for (db_paths[0..db_path_count]) |db_path| alloc.free(db_path);
+    }
+    var dbs: [shard_count]db_mod.DB = undefined;
+    var db_count: usize = 0;
+    defer {
+        for (dbs[0..db_count]) |*db| db.close();
+    }
+
+    var published_generation: u64 = 0;
+    for (group_ids, prefixes, source_counts, 0..) |group_id, prefix, source_count, shard_index| {
+        db_paths[shard_index] = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, group_id);
+        db_path_count += 1;
+        dbs[shard_index] = try db_mod.DB.open(alloc, db_paths[shard_index], .{
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = group_id },
+        });
+        db_count += 1;
+        try dbs[shard_index].addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+
+        var writes: [4]db_mod.types.BatchWrite = undefined;
+        var write_count: usize = 0;
+        var owned: [8][]u8 = undefined;
+        var owned_count: usize = 0;
+        defer {
+            for (owned[0..owned_count]) |item| alloc.free(item);
+        }
+
+        const sink_key = try std.fmt.allocPrint(alloc, "doc:{s}:target", .{prefix});
+        owned[owned_count] = sink_key;
+        owned_count += 1;
+        const sink_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"target {s}\"}}", .{prefix});
+        owned[owned_count] = sink_value;
+        owned_count += 1;
+        writes[write_count] = .{ .key = sink_key, .value = sink_value };
+        write_count += 1;
+
+        for (0..source_count) |source_index| {
+            const source_key = try std.fmt.allocPrint(alloc, "doc:{s}:source:{d}", .{ prefix, source_index });
+            owned[owned_count] = source_key;
+            owned_count += 1;
+            const source_value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"source {s}-{d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"{s}\",\"weight\":1.0}}]}}}}}}",
+                .{ prefix, source_index, sink_key },
+            );
+            owned[owned_count] = source_value;
+            owned_count += 1;
+            writes[write_count] = .{ .key = source_key, .value = source_value };
+            write_count += 1;
+        }
+
+        try dbs[shard_index].batch(.{
+            .writes = writes[0..write_count],
+            .sync_level = .write,
+        });
+        try dbs[shard_index].runUntilIdle();
+        for (metric_names) |metric_name| {
+            var status = try dbs[shard_index].refreshGraphMetric(alloc, "graph_idx", metric_name);
+            defer status.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+            if (published_generation == 0) {
+                published_generation = status.published_generation;
+            } else {
+                try std.testing.expectEqual(published_generation, status.published_generation);
+            }
+        }
+    }
+
+    const active_shard_indices = [_]usize{ 1, 3, 5, 7 };
+    for (active_shard_indices) |shard_index| {
+        const prefix = prefixes[shard_index];
+        const group_id = group_ids[shard_index];
+
+        var writes: [4]db_mod.types.BatchWrite = undefined;
+        var owned: [8][]u8 = undefined;
+        var owned_count: usize = 0;
+        defer {
+            for (owned[0..owned_count]) |item| alloc.free(item);
+        }
+
+        const active_target_key = try std.fmt.allocPrint(alloc, "doc:{s}:active-target", .{prefix});
+        owned[owned_count] = active_target_key;
+        owned_count += 1;
+        const active_target_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"active target {s}\"}}", .{prefix});
+        owned[owned_count] = active_target_value;
+        owned_count += 1;
+        writes[0] = .{ .key = active_target_key, .value = active_target_value };
+
+        for (0..3) |source_index| {
+            const source_key = try std.fmt.allocPrint(alloc, "doc:{s}:active-source:{d}", .{ prefix, source_index });
+            owned[owned_count] = source_key;
+            owned_count += 1;
+            const source_value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"active source {s}-{d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"{s}\",\"weight\":1.0}}]}}}}}}",
+                .{ prefix, source_index, active_target_key },
+            );
+            owned[owned_count] = source_value;
+            owned_count += 1;
+            writes[source_index + 1] = .{ .key = source_key, .value = source_value };
+        }
+
+        try dbs[shard_index].batch(.{
+            .writes = writes[0..],
+            .sync_level = .full_index,
+        });
+        try dbs[shard_index].runUntilIdle();
+
+        const graph_entry = dbs[shard_index].core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        try std.testing.expect(target_generation > published_generation);
+        for (metric_names) |metric_name| {
+            var building = try graph_entry.index.ensureGraphMetricPlannedBuild(metric_name, target_generation);
+            defer building.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+            try std.testing.expectEqual(target_generation, building.building_generation);
+
+            const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, "worker-prepare");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+            try std.testing.expect(prepare.claimed_page);
+            try std.testing.expect(prepare.completed_page);
+
+            const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric(metric_name);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+            try std.testing.expect(advance_prepare.advanced_phase);
+
+            const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, "worker-scan");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+            try std.testing.expect(scan.claimed_page);
+            try std.testing.expect(scan.completed_page);
+        }
+
+        _ = group_id;
+    }
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{ .group_id = 7301, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7301, .namespace_range_id = 7301, .next_ordinal = 3, .allocated_ordinals = 2, .state_rows = 2, .live_ordinals = 2, .complete = true } },
+            .{ .group_id = 7302, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7302, .namespace_range_id = 7302, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
+            .{ .group_id = 7303, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7303, .namespace_range_id = 7303, .next_ordinal = 5, .allocated_ordinals = 4, .state_rows = 4, .live_ordinals = 4, .complete = true } },
+            .{ .group_id = 7304, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7304, .namespace_range_id = 7304, .next_ordinal = 7, .allocated_ordinals = 6, .state_rows = 6, .live_ordinals = 6, .complete = true } },
+            .{ .group_id = 7305, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7305, .namespace_range_id = 7305, .next_ordinal = 4, .allocated_ordinals = 3, .state_rows = 3, .live_ordinals = 3, .complete = true } },
+            .{ .group_id = 7306, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7306, .namespace_range_id = 7306, .next_ordinal = 9, .allocated_ordinals = 8, .state_rows = 8, .live_ordinals = 8, .complete = true } },
+            .{ .group_id = 7307, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7307, .namespace_range_id = 7307, .next_ordinal = 3, .allocated_ordinals = 2, .state_rows = 2, .live_ordinals = 2, .complete = true } },
+            .{ .group_id = 7308, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7308, .namespace_range_id = 7308, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7301, .table_id = 7, .range_id = 7301, .start_key = "", .end_key = "doc:b:" },
+                    .{ .group_id = 7302, .table_id = 7, .range_id = 7302, .start_key = "doc:b:", .end_key = "doc:c:" },
+                    .{ .group_id = 7303, .table_id = 7, .range_id = 7303, .start_key = "doc:c:", .end_key = "doc:d:" },
+                    .{ .group_id = 7304, .table_id = 7, .range_id = 7304, .start_key = "doc:d:", .end_key = "doc:e:" },
+                    .{ .group_id = 7305, .table_id = 7, .range_id = 7305, .start_key = "doc:e:", .end_key = "doc:f:" },
+                    .{ .group_id = 7306, .table_id = 7, .range_id = 7306, .start_key = "doc:f:", .end_key = "doc:g:" },
+                    .{ .group_id = 7307, .table_id = 7, .range_id = 7307, .start_key = "doc:g:", .end_key = "doc:h:" },
+                    .{ .group_id = 7308, .table_id = 7, .range_id = 7308, .start_key = "doc:h:", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    const published_generation_needle = try std.fmt.allocPrint(alloc, "\"published_generation\":{d}", .{published_generation});
+    defer alloc.free(published_generation_needle);
+    for (metric_names) |metric_name| {
+        var response = (try hosted.source().query(alloc, "docs", .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = metric_name,
+                    .top_k = 32,
+                    .freshness = .published,
+                },
+            }},
+            .limit = 0,
+        }, .read_index)).?;
+        defer response.deinit(alloc);
+
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_metric_results\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, metric_name) != null);
+        for (prefixes) |prefix| {
+            const needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:target\"", .{prefix});
+            defer alloc.free(needle);
+            try std.testing.expect(std.mem.indexOf(u8, response.json, needle) != null);
+        }
+        for (active_shard_indices) |shard_index| {
+            const active_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:active-target\"", .{prefixes[shard_index]});
+            defer alloc.free(active_needle);
+            try std.testing.expect(std.mem.indexOf(u8, response.json, active_needle) == null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, response.json, "\"state\":\"building\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, published_generation_needle) != null);
+
+        try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = metric_name,
+                    .top_k = 32,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        }, .read_index));
+    }
+}
+
+test "hosted cross-range graph metric fan-in merges compatible hits pair" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-pair";
+    const shard_count = 4;
+    const group_ids = [_]u64{ 7311, 7312, 7313, 7314 };
+    const prefixes = [_][]const u8{ "j", "k", "l", "m" };
+    const hub_counts = [_]usize{ 1, 2, 3, 2 };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+    const graph_config_json =
+        \\{"edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    ;
+
+    var db_paths: [shard_count][]u8 = undefined;
+    var db_path_count: usize = 0;
+    defer {
+        for (db_paths[0..db_path_count]) |db_path| alloc.free(db_path);
+    }
+    var dbs: [shard_count]db_mod.DB = undefined;
+    var db_count: usize = 0;
+    defer {
+        for (dbs[0..db_count]) |*db| db.close();
+    }
+
+    var published_generation: u64 = 0;
+    for (group_ids, prefixes, hub_counts, 0..) |group_id, prefix, hub_count, shard_index| {
+        db_paths[shard_index] = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, group_id);
+        db_path_count += 1;
+        dbs[shard_index] = try db_mod.DB.open(alloc, db_paths[shard_index], .{
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = group_id },
+        });
+        db_count += 1;
+        try dbs[shard_index].addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+
+        var writes: [4]db_mod.types.BatchWrite = undefined;
+        var write_count: usize = 0;
+        var owned: [8][]u8 = undefined;
+        var owned_count: usize = 0;
+        defer {
+            for (owned[0..owned_count]) |item| alloc.free(item);
+        }
+
+        const authority_key = try std.fmt.allocPrint(alloc, "doc:{s}:authority", .{prefix});
+        owned[owned_count] = authority_key;
+        owned_count += 1;
+        const authority_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"authority {s}\"}}", .{prefix});
+        owned[owned_count] = authority_value;
+        owned_count += 1;
+        writes[write_count] = .{ .key = authority_key, .value = authority_value };
+        write_count += 1;
+
+        for (0..hub_count) |hub_index| {
+            const hub_key = try std.fmt.allocPrint(alloc, "doc:{s}:hub:{d}", .{ prefix, hub_index });
+            owned[owned_count] = hub_key;
+            owned_count += 1;
+            const hub_value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"hub {s}-{d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"{s}\",\"weight\":1.0}}]}}}}}}",
+                .{ prefix, hub_index, authority_key },
+            );
+            owned[owned_count] = hub_value;
+            owned_count += 1;
+            writes[write_count] = .{ .key = hub_key, .value = hub_value };
+            write_count += 1;
+        }
+
+        try dbs[shard_index].batch(.{
+            .writes = writes[0..write_count],
+            .sync_level = .write,
+        });
+        try dbs[shard_index].runUntilIdle();
+        var authority_status = try dbs[shard_index].refreshGraphMetric(alloc, "graph_idx", "hits_authority");
+        defer authority_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority_status.state);
+        var hub_status = try (dbs[shard_index].core.graphIndex("graph_idx") orelse return error.IndexNotFound).index.graphMetricStatus("hits_hub");
+        defer hub_status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_status.state);
+        try std.testing.expectEqual(authority_status.published_generation, hub_status.published_generation);
+        if (published_generation == 0) {
+            published_generation = authority_status.published_generation;
+        } else {
+            try std.testing.expectEqual(published_generation, authority_status.published_generation);
+        }
+    }
+
+    var active_target_generation: u64 = 0;
+    const active_shard_indices = [_]usize{ 1, 3 };
+    for (active_shard_indices) |shard_index| {
+        const prefix = prefixes[shard_index];
+
+        var writes: [4]db_mod.types.BatchWrite = undefined;
+        var owned: [8][]u8 = undefined;
+        var owned_count: usize = 0;
+        defer {
+            for (owned[0..owned_count]) |item| alloc.free(item);
+        }
+
+        const active_authority_key = try std.fmt.allocPrint(alloc, "doc:{s}:active-authority", .{prefix});
+        owned[owned_count] = active_authority_key;
+        owned_count += 1;
+        const active_authority_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"active authority {s}\"}}", .{prefix});
+        owned[owned_count] = active_authority_value;
+        owned_count += 1;
+        writes[0] = .{ .key = active_authority_key, .value = active_authority_value };
+
+        for (0..3) |hub_index| {
+            const active_hub_key = try std.fmt.allocPrint(alloc, "doc:{s}:active-hub:{d}", .{ prefix, hub_index });
+            owned[owned_count] = active_hub_key;
+            owned_count += 1;
+            const active_hub_value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"active hub {s}-{d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"{s}\",\"weight\":1.0}}]}}}}}}",
+                .{ prefix, hub_index, active_authority_key },
+            );
+            owned[owned_count] = active_hub_value;
+            owned_count += 1;
+            writes[hub_index + 1] = .{ .key = active_hub_key, .value = active_hub_value };
+        }
+
+        try dbs[shard_index].batch(.{
+            .writes = writes[0..],
+            .sync_level = .full_index,
+        });
+        try dbs[shard_index].runUntilIdle();
+
+        const graph_entry = dbs[shard_index].core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        const target_generation = graph_entry.index.edge_generation;
+        try std.testing.expect(target_generation > published_generation);
+        if (active_target_generation == 0) {
+            active_target_generation = target_generation;
+        } else {
+            try std.testing.expectEqual(active_target_generation, target_generation);
+        }
+
+        var building = try graph_entry.index.ensureGraphMetricPlannedBuild("hits_authority", target_generation);
+        defer building.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
+        try std.testing.expectEqual(target_generation, building.building_generation);
+
+        const prepare = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("hits_authority", "worker-prepare");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, prepare.phase);
+        try std.testing.expect(prepare.claimed_page);
+        try std.testing.expect(prepare.completed_page);
+
+        const advance_prepare = try graph_entry.index.runGraphMetricPlannedCoordinatorStepForMetric("hits_authority");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, advance_prepare.phase);
+        try std.testing.expect(advance_prepare.advanced_phase);
+
+        const scan = try graph_entry.index.runGraphMetricPlannedWorkerPageStepForMetric("hits_authority", "worker-scan");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan.phase);
+        try std.testing.expect(scan.claimed_page);
+        try std.testing.expect(scan.completed_page);
+    }
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{ .group_id = 7311, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7311, .namespace_range_id = 7311, .next_ordinal = 3, .allocated_ordinals = 2, .state_rows = 2, .live_ordinals = 2, .complete = true } },
+            .{ .group_id = 7312, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7312, .namespace_range_id = 7312, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
+            .{ .group_id = 7313, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7313, .namespace_range_id = 7313, .next_ordinal = 5, .allocated_ordinals = 4, .state_rows = 4, .live_ordinals = 4, .complete = true } },
+            .{ .group_id = 7314, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7314, .namespace_range_id = 7314, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7311, .table_id = 7, .range_id = 7311, .start_key = "", .end_key = "doc:k:" },
+                    .{ .group_id = 7312, .table_id = 7, .range_id = 7312, .start_key = "doc:k:", .end_key = "doc:l:" },
+                    .{ .group_id = 7313, .table_id = 7, .range_id = 7313, .start_key = "doc:l:", .end_key = "doc:m:" },
+                    .{ .group_id = 7314, .table_id = 7, .range_id = 7314, .start_key = "doc:m:", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    const published_generation_needle = try std.fmt.allocPrint(alloc, "\"published_generation\":{d}", .{published_generation});
+    defer alloc.free(published_generation_needle);
+    const building_generation_needle = try std.fmt.allocPrint(alloc, "\"building_generation\":{d}", .{active_target_generation});
+    defer alloc.free(building_generation_needle);
+    var response = (try hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 16,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 16,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index)).?;
+    defer response.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_metric_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"hits_authority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"hits_hub\"") != null);
+    for (prefixes) |prefix| {
+        const authority_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:authority\"", .{prefix});
+        defer alloc.free(authority_needle);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, authority_needle) != null);
+        const hub_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:hub:0\"", .{prefix});
+        defer alloc.free(hub_needle);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, hub_needle) != null);
+    }
+    for (active_shard_indices) |shard_index| {
+        const active_authority_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:active-authority\"", .{prefixes[shard_index]});
+        defer alloc.free(active_authority_needle);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, active_authority_needle) == null);
+        const active_hub_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:active-hub:0\"", .{prefixes[shard_index]});
+        defer alloc.free(active_hub_needle);
+        try std.testing.expect(std.mem.indexOf(u8, response.json, active_hub_needle) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"state\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, published_generation_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, building_generation_needle) != null);
+
+    try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 16,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 16,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index));
+}
+
+test "hosted cross-range graph metric fan-in rejects incompatible remote hits pair" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-pair-reject";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7321,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7321,
+                    .namespace_range_id = 7321,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7322,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7322,
+                    .namespace_range_id = 7322,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7321, .table_id = 7, .range_id = 7321, .start_key = "", .end_key = "doc:r:" },
+                    .{ .group_id = 7322, .table_id = 7, .range_id = 7322, .start_key = "doc:r:", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://remote.test");
+        }
+    };
+
+    const ExecutorState = struct {
+        query_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.query_calls += 1;
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7321/tables/docs/query")) {
+                return .{
+                    .status = 200,
+                    .body = try remoteHitsPairBody(alloc_inner, "q", 11, 11),
+                };
+            }
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7322/tables/docs/query")) {
+                return .{
+                    .status = 200,
+                    .body = try remoteHitsPairBody(alloc_inner, "r", 11, 12),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+
+        fn remoteHitsPairBody(
+            alloc_inner: std.mem.Allocator,
+            prefix: []const u8,
+            authority_generation: u64,
+            hub_generation: u64,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(
+                alloc_inner,
+                "{{\"responses\":[{{\"hits\":{{\"total\":0,\"hits\":[]}},\"graph_metric_results\":{{\"authority\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_authority\",\"scores\":[{{\"node\":\"doc:{s}:authority\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}},\"hub\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_hub\",\"scores\":[{{\"node\":\"doc:{s}:hub\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}}}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ prefix, authority_generation, authority_generation, authority_generation, prefix, hub_generation, hub_generation, hub_generation },
+            );
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls);
+}
+
+test "hosted cross-range graph metric fan-in rejects missing remote hits status" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-missing-status";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+    ;
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7331,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7331,
+                    .namespace_range_id = 7331,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7332,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7332,
+                    .namespace_range_id = 7332,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7331, .table_id = 7, .range_id = 7331, .start_key = "", .end_key = "doc:t:" },
+                    .{ .group_id = 7332, .table_id = 7, .range_id = 7332, .start_key = "doc:t:", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://remote.test");
+        }
+    };
+
+    const ExecutorState = struct {
+        query_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.query_calls += 1;
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7331/tables/docs/query")) {
+                return .{
+                    .status = 200,
+                    .body = try remoteHitsPairBody(alloc_inner, "s", 21),
+                };
+            }
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7332/tables/docs/query")) {
+                return .{
+                    .status = 200,
+                    .body = try remoteHitsMissingHubStatusBody(alloc_inner, "t", 21),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+
+        fn remoteHitsPairBody(
+            alloc_inner: std.mem.Allocator,
+            prefix: []const u8,
+            generation: u64,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(
+                alloc_inner,
+                "{{\"responses\":[{{\"hits\":{{\"total\":0,\"hits\":[]}},\"graph_metric_results\":{{\"authority\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_authority\",\"scores\":[{{\"node\":\"doc:{s}:authority\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}},\"hub\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_hub\",\"scores\":[{{\"node\":\"doc:{s}:hub\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}}}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ prefix, generation, generation, generation, prefix, generation, generation, generation },
+            );
+        }
+
+        fn remoteHitsMissingHubStatusBody(
+            alloc_inner: std.mem.Allocator,
+            prefix: []const u8,
+            generation: u64,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(
+                alloc_inner,
+                "{{\"responses\":[{{\"hits\":{{\"total\":0,\"hits\":[]}},\"graph_metric_results\":{{\"authority\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_authority\",\"scores\":[{{\"node\":\"doc:{s}:authority\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}},\"hub\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_hub\",\"scores\":[{{\"node\":\"doc:{s}:hub\",\"score\":1.0}}]}}}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ prefix, generation, generation, generation, prefix },
+            );
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls);
+}
+
+test "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-reject";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7201);
+    defer alloc.free(left_path);
+    const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7202);
+    defer alloc.free(right_path);
+
+    const graph_indexes_json =
+        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}}}}}
+    ;
+    const graph_config_json =
+        \\{"edge_types":[{"name":"cites"}],"metrics":{"manual_degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}}}}
+    ;
+
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7201, .range_id = 7201 },
+    });
+    defer left_db.close();
+    try left_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try left_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"left-a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"left-b\"}" },
+        },
+        .sync_level = .write,
+    });
+    try left_db.runUntilIdle();
+    var left_status = try left_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer left_status.deinit(alloc);
+
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7202, .range_id = 7202 },
+    });
+    defer right_db.close();
+    try right_db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
+    try right_db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:n", .value = "{\"title\":\"right-n\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:o\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:o", .value = "{\"title\":\"right-o\"}" },
+        },
+        .sync_level = .write,
+    });
+    try right_db.runUntilIdle();
+
+    const FakeCatalog = struct {
+        const statuses = [_]metadata_reconciler.MergedGroupStatus{
+            .{
+                .group_id = 7201,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7201,
+                    .namespace_range_id = 7201,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
+                    .complete = true,
+                },
+            },
+            .{
+                .group_id = 7202,
+                .doc_identity = .{
+                    .namespace_table_id = 7,
+                    .namespace_shard_id = 7202,
+                    .namespace_range_id = 7202,
+                    .next_ordinal = 4,
+                    .allocated_ordinals = 3,
+                    .state_rows = 3,
+                    .live_ordinals = 3,
+                    .complete = true,
+                },
+            },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = graph_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7201, .table_id = 7, .range_id = 7201, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7202, .table_id = 7, .range_id = 7202, .start_key = "m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast(statuses[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor_state = ExecutorState{};
+    var hosted = HostedProvisionedTableReadSource.init(
+        path,
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+    _ = hosted.withIo(&io_impl);
+
+    const metric_req = db_mod.types.SearchRequest{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 4,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    };
+
+    try std.testing.expectError(error.MetricNotReady, hosted.source().query(alloc, "docs", metric_req, .read_index));
+
+    var right_first = try right_db.refreshGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer right_first.deinit(alloc);
+    try std.testing.expectEqual(left_status.published_generation, right_first.published_generation);
+    try right_db.batch(.{
+        .writes = &.{.{ .key = "doc:p", .value = "{\"title\":\"right-p\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:o\",\"weight\":1.0}]}}}" }},
+        .sync_level = .write,
+    });
+    try right_db.runUntilIdle();
+    var right_second = try right_db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree");
+    defer right_second.deinit(alloc);
+    try std.testing.expect(right_second.published_generation > left_status.published_generation);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", metric_req, .read_index));
+}
+
 test "provisioned read cache keys entries by lsm root generation" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-read-cache-generation";
@@ -19923,4 +24680,114 @@ test "relational unique owner lookup requires one active owner range" {
     try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_handle_key", "h"));
     try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "users_username_key", "u"));
     try std.testing.expectError(error.UniqueOwnerTopologyUnavailable, resolveSingleUniqueOwnerGroup(std.testing.allocator, FakeCatalog.iface(), "users", "missing_key", "a"));
+}
+
+test "hosted remote temporal unique owner lookup resolves point interval" {
+    const alloc = std.testing.allocator;
+    const column = storage_schema.RelationalColumn{
+        .name = "valid_at",
+        .path = "valid_at",
+        .field_type = .numeric,
+    };
+    const point_15 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "15", column);
+    defer alloc.free(point_15);
+    const start_12 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "12", column);
+    defer alloc.free(start_12);
+    const end_18 = try db_mod.relational_store.temporalPeriodBoundBytesFromJsonAlloc(alloc, "18", column);
+    defer alloc.free(end_18);
+
+    const ExecutorState = struct {
+        point_15: []const u8,
+        start_12: []const u8,
+        end_18: []const u8,
+        point_calls: usize = 0,
+        overlap_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-owner") and req.method == .POST) {
+                var parsed = try std.json.parseFromSlice(struct {
+                    constraint_name: []const u8,
+                    encoded_value: []const u8,
+                    encoded_point: []const u8,
+                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
+                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
+                try std.testing.expectEqualStrings(self.point_15, parsed.value.encoded_point);
+                self.point_calls += 1;
+                return .{
+                    .status = 200,
+                    .content_type = try alloc_inner.dupe(u8, "application/json"),
+                    .body = try std.fmt.allocPrint(
+                        alloc_inner,
+                        "{{\"owner_key\":{f}}}",
+                        .{std.json.fmt("price:a:v2", .{})},
+                    ),
+                };
+            }
+            if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7102/tables/prices/relational-temporal-unique-overlap-owner") and req.method == .POST) {
+                var parsed = try std.json.parseFromSlice(struct {
+                    constraint_name: []const u8,
+                    encoded_value: []const u8,
+                    encoded_start: []const u8,
+                    encoded_end: []const u8,
+                }, alloc_inner, req.body, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("prices_sku_valid_time_key", parsed.value.constraint_name);
+                try std.testing.expectEqualStrings("sku:a", parsed.value.encoded_value);
+                try std.testing.expectEqualStrings(self.start_12, parsed.value.encoded_start);
+                try std.testing.expectEqualStrings(self.end_18, parsed.value.encoded_end);
+                self.overlap_calls += 1;
+                return .{
+                    .status = 200,
+                    .content_type = try alloc_inner.dupe(u8, "application/json"),
+                    .body = try std.fmt.allocPrint(
+                        alloc_inner,
+                        "{{\"owner_key\":{f}}}",
+                        .{std.json.fmt("price:a:v2", .{})},
+                    ),
+                };
+            }
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var executor = ExecutorState{ .point_15 = point_15, .start_12 = start_12, .end_18 = end_18 };
+    const owner = (try lookupRelationalTemporalUniqueOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        point_15,
+    )).?;
+    defer alloc.free(owner);
+
+    try std.testing.expectEqualStrings("price:a:v2", owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.overlap_calls);
+
+    const overlap_owner = (try lookupRelationalTemporalUniqueOverlapOwnerRemote(
+        executor.iface(),
+        alloc,
+        "http://remote.test",
+        7102,
+        "prices",
+        "prices_sku_valid_time_key",
+        "sku:a",
+        start_12,
+        end_18,
+    )).?;
+    defer alloc.free(overlap_owner);
+
+    try std.testing.expectEqualStrings("price:a:v2", overlap_owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.point_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.overlap_calls);
 }

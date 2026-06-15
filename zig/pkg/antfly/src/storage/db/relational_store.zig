@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const regex_mod = @import("antfly_regex");
 const schema_mod = @import("../schema.zig");
 const typed_dv = @import("../../section/typed_doc_values.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -32,6 +33,8 @@ const transactions_mod = @import("../transactions.zig");
 const default_max_set_null_updates: usize = 4096;
 const max_cascade_depth: usize = 64;
 const max_cascade_deletes: usize = 4096;
+const temporal_bound_neg_infinity_tag: u8 = 0xf0;
+const temporal_bound_pos_infinity_tag: u8 = 0xf1;
 pub const primary_key_constraint_name = "__antfly_primary_key__";
 
 pub const OwnedRow = struct {
@@ -58,6 +61,31 @@ pub const OwnedColumnValue = struct {
     }
 };
 
+pub const RowRewriteRename = struct {
+    old_path: []const u8,
+    new_path: []const u8,
+};
+
+pub const RowRewriteSet = struct {
+    cell: relational_row_codec.Cell,
+    only_if_missing: bool = false,
+};
+
+pub const RowRewritePlan = struct {
+    renames: []const RowRewriteRename = &.{},
+    drops: []const []const u8 = &.{},
+    sets: []const RowRewriteSet = &.{},
+};
+
+pub const RowRewriteReport = struct {
+    scanned_rows: u64 = 0,
+    rewritten_rows: u64 = 0,
+    unchanged_rows: u64 = 0,
+    renamed_cells: u64 = 0,
+    dropped_cells: u64 = 0,
+    set_cells: u64 = 0,
+};
+
 pub const ForeignKeyIntegrityMode = enum {
     validate,
     dry_run,
@@ -71,6 +99,8 @@ pub const ExternalizedForeignKeyParentCheck = struct {
     parent_table: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8 = null,
+    child_period_start_json: ?[]const u8 = null,
+    child_period_end_json: ?[]const u8 = null,
     timing: schema_mod.ForeignKeyTiming = .immediate,
 };
 
@@ -118,6 +148,18 @@ pub const SecondaryIndexRebuildReport = struct {
     indexed_rows: u64 = 0,
     deleted_entries: u64 = 0,
     written_entries: u64 = 0,
+};
+
+const PeriodBound = union(enum) {
+    neg_infinity,
+    f64_val: f64,
+    i64_val: i64,
+    pos_infinity,
+};
+
+const PeriodSpan = struct {
+    start: PeriodBound,
+    end: PeriodBound,
 };
 
 pub const ForeignKeyDeletePlanBlockReason = enum {
@@ -225,8 +267,9 @@ pub const ColumnIndexPolicy = struct {
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (!column.indexed) return false;
-            if (column.index_where.len == 0) return true;
-            return try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where);
+            if (column.index_where.len != 0 and !(try rowMatchesUniqueConstraintPredicates(alloc, row_value, column.index_where))) return false;
+            if (column.index_where_expressions.len != 0 and !(try rowMatchesExpressionConditions(alloc, row_value, column.index_where_expressions))) return false;
+            return true;
         }
         return false;
     }
@@ -258,6 +301,7 @@ pub fn primaryKeyAsUniqueConstraint(primary_key: schema_mod.PrimaryKey) schema_m
     return .{
         .name = primary_key_constraint_name,
         .columns = primary_key.columns,
+        .without_overlaps_period = primary_key.without_overlaps_period,
     };
 }
 
@@ -269,6 +313,7 @@ pub const WriteParticipant = struct {
     const PendingForeignKeyParentCheck = struct {
         foreign_key: schema_mod.ForeignKey,
         parent_key: []const u8,
+        child_span: ?PeriodSpan = null,
     };
 
     const PendingForeignKeyReferenceAbsenceCheck = struct {
@@ -291,6 +336,8 @@ pub const WriteParticipant = struct {
     foreign_keys: []const schema_mod.ForeignKey = &.{},
     primary_key: ?schema_mod.PrimaryKey = null,
     unique_constraints: []const schema_mod.UniqueConstraint = &.{},
+    relational_columns: []const schema_mod.RelationalColumn = &.{},
+    periods: []const schema_mod.RelationalPeriod = &.{},
     planned_delete_keys: []const []const u8 = &.{},
     externalized_parent_checks: []const ExternalizedForeignKeyParentCheck = &.{},
     constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride = &.{},
@@ -376,6 +423,11 @@ pub const WriteParticipant = struct {
         self.primary_key = primary_key;
     }
 
+    pub fn configurePeriods(self: *WriteParticipant, periods: []const schema_mod.RelationalPeriod, relational_columns: []const schema_mod.RelationalColumn) void {
+        self.periods = periods;
+        self.relational_columns = relational_columns;
+    }
+
     pub fn prepareUpsert(
         self: *WriteParticipant,
         table: []const u8,
@@ -386,6 +438,7 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
+        try self.validatePeriodBounds(typed_row);
         try self.preparePrimaryKeyUpsert(doc_key, typed_row);
         try self.prepareUniqueConstraintUpsert(doc_key, typed_row);
         try self.prepareForeignKeyUpsert(doc_key, typed_row);
@@ -407,6 +460,29 @@ pub const WriteParticipant = struct {
         try self.prepareForeignKeyDelete(doc_key);
         try self.preparePrimaryKeyDelete(doc_key);
         try self.prepareUniqueConstraintDelete(doc_key);
+        self.prepared = true;
+    }
+
+    pub fn prepareIdentityRewrite(
+        self: *WriteParticipant,
+        table: []const u8,
+        old_doc_key: []const u8,
+        new_doc_key: []const u8,
+        new_row: []const u8,
+        txn_id: ?transactions_mod.TxnId,
+    ) anyerror!void {
+        _ = table;
+        _ = txn_id;
+        if (self.closed) return error.ParticipantClosed;
+        if (std.mem.eql(u8, old_doc_key, new_doc_key)) return error.UnsupportedOperation;
+        try self.validatePeriodBounds(new_row);
+        const old_row = try getRawAlloc(self.alloc, self.store, old_doc_key) orelse return error.RowSelectorNotFound;
+        defer self.alloc.free(old_row);
+        try self.preparePrimaryKeyIdentityRewrite(old_doc_key, new_doc_key, old_row, new_row);
+        try self.prepareUniqueConstraintIdentityRewrite(old_doc_key, new_doc_key, old_row, new_row);
+        try self.prepareForeignKeyIdentityRewrite(old_doc_key, new_doc_key, old_row, new_row);
+        try appendDelete(self.alloc, self.store, self.deletes, self.owned_keys, old_doc_key);
+        try appendUpsertWithColumnIndexPolicy(self.alloc, self.store, self.writes, self.deletes, self.owned_keys, self.owned_values, new_doc_key, new_row, self.column_index_policy);
         self.prepared = true;
     }
 
@@ -471,6 +547,15 @@ pub const WriteParticipant = struct {
         return foreign_key.on_delete == .no_action and self.effectiveForeignKeyTiming(foreign_key) == .deferred;
     }
 
+    fn validatePeriodBounds(self: *WriteParticipant, row_value: []const u8) !void {
+        if (self.periods.len == 0) return;
+        var row = try relational_row_codec.deserialize(self.alloc, row_value);
+        defer row.deinit(self.alloc);
+        for (self.periods) |period| {
+            if (!periodStartBeforeEnd(self.relational_columns, row.cells, period)) return error.InvalidColumnValue;
+        }
+    }
+
     fn prepareUniqueConstraintUpsert(self: *WriteParticipant, doc_key: []const u8, new_row: []const u8) !void {
         if (self.unique_constraints.len == 0) return;
         const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
@@ -479,6 +564,10 @@ pub const WriteParticipant = struct {
 
         for (self.unique_constraints) |constraint| {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
+            if (constraint.without_overlaps_period != null) {
+                try self.prepareTemporalUniqueConstraintUpsert(constraint, doc_key, old_row, new_row, final_state_deleted);
+                continue;
+            }
             const old_value = if (old_row) |row| try uniqueConstraintTupleValueAlloc(self.alloc, row, constraint) else null;
             defer if (old_value) |value| self.alloc.free(value);
             const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
@@ -512,6 +601,10 @@ pub const WriteParticipant = struct {
         const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key);
         defer if (old_row) |row| self.alloc.free(row);
+        if (primary_key.without_overlaps_period != null) {
+            try self.prepareTemporalPrimaryKeyUpsert(primary_key, constraint, doc_key, old_row, new_row, final_state_deleted);
+            return;
+        }
 
         const old_value = if (old_row) |row| try primaryKeyTupleValueAlloc(self.alloc, row, primary_key) else null;
         defer if (old_value) |value| self.alloc.free(value);
@@ -527,7 +620,7 @@ pub const WriteParticipant = struct {
             }
         }
         if (old_value) |value| {
-            try self.applySetNullUniqueForeignKeyRefs(constraint, value);
+            try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, value);
             if (new_value != null) try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, value, new_row);
             try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, value);
             try self.appendUniqueConstraintDelete(constraint, value);
@@ -539,13 +632,84 @@ pub const WriteParticipant = struct {
         }
     }
 
+    fn preparePrimaryKeyIdentityRewrite(
+        self: *WriteParticipant,
+        old_doc_key: []const u8,
+        new_doc_key: []const u8,
+        old_row: []const u8,
+        new_row: []const u8,
+    ) !void {
+        _ = old_doc_key;
+        const primary_key = self.primary_key orelse return;
+        if (primary_key.without_overlaps_period != null) return error.UnsupportedOperation;
+        const constraint = primaryKeyAsUniqueConstraint(primary_key);
+        const old_value = try primaryKeyTupleValueAlloc(self.alloc, old_row, primary_key);
+        defer self.alloc.free(old_value);
+        const new_value = try primaryKeyTupleValueAlloc(self.alloc, new_row, primary_key);
+        defer self.alloc.free(new_value);
+        if (std.mem.eql(u8, old_value, new_value)) return error.UnsupportedOperation;
+        try self.requireUniqueConstraintAvailable(constraint, new_value, new_doc_key);
+        try self.appendUniqueConstraintWrite(constraint, new_value, new_doc_key);
+        try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, old_value);
+        try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, old_value, new_row);
+        try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, old_value);
+        try self.appendUniqueConstraintDelete(constraint, old_value);
+    }
+
+    fn prepareUniqueConstraintIdentityRewrite(
+        self: *WriteParticipant,
+        old_doc_key: []const u8,
+        new_doc_key: []const u8,
+        old_row: []const u8,
+        new_row: []const u8,
+    ) !void {
+        _ = old_doc_key;
+        if (self.unique_constraints.len == 0) return;
+        for (self.unique_constraints) |constraint| {
+            if (!uniqueConstraintIsEnforced(constraint)) continue;
+            if (constraint.without_overlaps_period != null) return error.UnsupportedOperation;
+            const old_value = try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint);
+            defer if (old_value) |value| self.alloc.free(value);
+            const new_value = try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
+            defer if (new_value) |value| self.alloc.free(value);
+            if (old_value == null and new_value == null) continue;
+            if (old_value == null) {
+                try self.requireUniqueConstraintAvailable(constraint, new_value.?, new_doc_key);
+                try self.appendUniqueConstraintWrite(constraint, new_value.?, new_doc_key);
+                continue;
+            }
+            if (new_value == null) {
+                try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, old_value.?);
+                try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, old_value.?);
+                try self.appendUniqueConstraintDelete(constraint, old_value.?);
+                continue;
+            }
+            if (std.mem.eql(u8, old_value.?, new_value.?)) {
+                try self.appendUniqueConstraintWrite(constraint, new_value.?, new_doc_key);
+                continue;
+            }
+            try self.requireUniqueConstraintAvailable(constraint, new_value.?, new_doc_key);
+            try self.appendUniqueConstraintWrite(constraint, new_value.?, new_doc_key);
+            try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, old_value.?);
+            try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, old_value.?, new_row);
+            try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, old_value.?);
+            try self.appendUniqueConstraintDelete(constraint, old_value.?);
+        }
+    }
+
     fn preparePrimaryKeyDelete(self: *WriteParticipant, doc_key: []const u8) !void {
         const primary_key = self.primary_key orelse return;
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key) orelse return;
         defer self.alloc.free(old_row);
         const value = try primaryKeyTupleValueAlloc(self.alloc, old_row, primary_key);
         defer self.alloc.free(value);
-        try self.appendUniqueConstraintDelete(primaryKeyAsUniqueConstraint(primary_key), value);
+        const constraint = primaryKeyAsUniqueConstraint(primary_key);
+        if (primary_key.without_overlaps_period) |period_name| {
+            const span = try self.periodSpanForRow(old_row, period_name);
+            try self.appendTemporalUniqueConstraintDelete(constraint, value, span, doc_key);
+        } else {
+            try self.appendUniqueConstraintDelete(constraint, value);
+        }
     }
 
     fn prepareUniqueConstraintDelete(self: *WriteParticipant, doc_key: []const u8) !void {
@@ -556,7 +720,69 @@ pub const WriteParticipant = struct {
             if (!uniqueConstraintIsEnforced(constraint)) continue;
             const value = (try uniqueConstraintTupleValueAlloc(self.alloc, old_row, constraint)) orelse continue;
             defer self.alloc.free(value);
-            try self.appendUniqueConstraintDelete(constraint, value);
+            if (constraint.without_overlaps_period) |period_name| {
+                const span = try self.periodSpanForRow(old_row, period_name);
+                try self.appendTemporalUniqueConstraintDelete(constraint, value, span, doc_key);
+            } else {
+                try self.appendUniqueConstraintDelete(constraint, value);
+            }
+        }
+    }
+
+    fn prepareTemporalPrimaryKeyUpsert(
+        self: *WriteParticipant,
+        primary_key: schema_mod.PrimaryKey,
+        constraint: schema_mod.UniqueConstraint,
+        doc_key: []const u8,
+        old_row: ?[]const u8,
+        new_row: []const u8,
+        final_state_deleted: bool,
+    ) !void {
+        const period_name = primary_key.without_overlaps_period orelse return;
+        const old_value = if (old_row) |row| try primaryKeyTupleValueAlloc(self.alloc, row, primary_key) else null;
+        defer if (old_value) |value| self.alloc.free(value);
+        const old_span = if (old_row != null and old_value != null) try self.periodSpanForRow(old_row.?, period_name) else null;
+        const new_value = if (final_state_deleted) null else try primaryKeyTupleValueAlloc(self.alloc, new_row, primary_key);
+        defer if (new_value) |value| self.alloc.free(value);
+        const new_span = if (new_value != null) try self.periodSpanForRow(new_row, period_name) else null;
+        if (optionalBytesEqual(old_value, new_value) and optionalPeriodSpanEqual(old_span, new_span)) return;
+        if (new_value) |value| {
+            try self.requireTemporalUniqueConstraintAvailable(constraint, value, new_span.?, doc_key);
+            try self.appendTemporalUniqueConstraintWrite(constraint, value, new_span.?, doc_key);
+        }
+        if (old_value) |value| {
+            try self.appendTemporalUniqueConstraintDelete(constraint, value, old_span.?, doc_key);
+            try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, value);
+            if (new_value != null) try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, value, new_row);
+            try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, value);
+        }
+    }
+
+    fn prepareTemporalUniqueConstraintUpsert(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        doc_key: []const u8,
+        old_row: ?[]const u8,
+        new_row: []const u8,
+        final_state_deleted: bool,
+    ) !void {
+        const period_name = constraint.without_overlaps_period orelse return;
+        const old_value = if (old_row) |row| try uniqueConstraintTupleValueAlloc(self.alloc, row, constraint) else null;
+        defer if (old_value) |value| self.alloc.free(value);
+        const old_span = if (old_row != null and old_value != null) try self.periodSpanForRow(old_row.?, period_name) else null;
+        const new_value = if (final_state_deleted) null else try uniqueConstraintTupleValueAlloc(self.alloc, new_row, constraint);
+        defer if (new_value) |value| self.alloc.free(value);
+        const new_span = if (new_value != null) try self.periodSpanForRow(new_row, period_name) else null;
+        if (optionalBytesEqual(old_value, new_value) and optionalPeriodSpanEqual(old_span, new_span)) return;
+        if (new_value) |value| {
+            try self.requireTemporalUniqueConstraintAvailable(constraint, value, new_span.?, doc_key);
+            try self.appendTemporalUniqueConstraintWrite(constraint, value, new_span.?, doc_key);
+        }
+        if (old_value) |value| {
+            try self.appendTemporalUniqueConstraintDelete(constraint, value, old_span.?, doc_key);
+            try self.applySetNullUpdatingUniqueForeignKeyRefs(constraint, value);
+            if (new_value != null) try self.applyCascadeUpdatingUniqueForeignKeyRefs(constraint, value, new_row);
+            try self.requireNoUpdatingUniqueForeignKeyRefs(constraint, value);
         }
     }
 
@@ -615,6 +841,87 @@ pub const WriteParticipant = struct {
         try self.deletes.append(self.alloc, key);
     }
 
+    fn requireTemporalUniqueConstraintAvailable(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        encoded_value: []const u8,
+        span: PeriodSpan,
+        doc_key: []const u8,
+    ) !void {
+        const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(self.alloc, constraint.name, encoded_value);
+        defer self.alloc.free(prefix);
+
+        for (self.writes.items) |write| {
+            if (!std.mem.startsWith(u8, write.key, prefix)) continue;
+            if (containsBatchDelete(self.deletes.items, write.key)) continue;
+            if (std.mem.eql(u8, write.value, doc_key)) continue;
+            const existing_span = try decodeTemporalUniqueSpanFromKeyAlloc(self.alloc, write.key, prefix);
+            if (periodSpansOverlap(span, existing_span)) return error.UniqueConstraintViolation;
+        }
+
+        const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(self.alloc, constraint.name, encoded_value);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+        for (scanned) |entry| {
+            if (containsBatchDelete(self.deletes.items, entry.key)) continue;
+            const owner = batchWriteValue(self.writes.items, entry.key) orelse entry.value;
+            if (std.mem.eql(u8, owner, doc_key)) continue;
+            if (containsKey(self.planned_delete_keys, owner)) continue;
+            const existing_span = try decodeTemporalUniqueSpanFromKeyAlloc(self.alloc, entry.key, prefix);
+            if (periodSpansOverlap(span, existing_span)) return error.UniqueConstraintViolation;
+        }
+    }
+
+    fn appendTemporalUniqueConstraintWrite(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        encoded_value: []const u8,
+        span: PeriodSpan,
+        doc_key: []const u8,
+    ) !void {
+        const key = try temporalUniqueConstraintKeyAlloc(self.alloc, constraint, encoded_value, span, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(key);
+        const owner_value = try self.alloc.dupe(u8, doc_key);
+        var value_owned = true;
+        errdefer if (value_owned) self.alloc.free(owner_value);
+        try self.owned_keys.append(self.alloc, key);
+        key_owned = false;
+        try self.owned_values.append(self.alloc, owner_value);
+        value_owned = false;
+        try self.writes.append(self.alloc, .{ .key = key, .value = owner_value });
+    }
+
+    fn appendTemporalUniqueConstraintDelete(
+        self: *WriteParticipant,
+        constraint: schema_mod.UniqueConstraint,
+        encoded_value: []const u8,
+        span: PeriodSpan,
+        doc_key: []const u8,
+    ) !void {
+        const key = try temporalUniqueConstraintKeyAlloc(self.alloc, constraint, encoded_value, span, doc_key);
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(key);
+        try self.owned_keys.append(self.alloc, key);
+        key_owned = false;
+        try self.deletes.append(self.alloc, key);
+    }
+
+    fn periodSpanForRow(self: *WriteParticipant, row_value: []const u8, period_name: []const u8) !PeriodSpan {
+        const period = self.findPeriod(period_name) orelse return error.InvalidColumnValue;
+        var row = try relational_row_codec.deserialize(self.alloc, row_value);
+        defer row.deinit(self.alloc);
+        return try periodSpanFromCells(self.relational_columns, row.cells, period);
+    }
+
+    fn findPeriod(self: *const WriteParticipant, name: []const u8) ?schema_mod.RelationalPeriod {
+        for (self.periods) |period| {
+            if (std.mem.eql(u8, period.name, name)) return period;
+        }
+        return null;
+    }
+
     fn prepareForeignKeyUpsert(self: *WriteParticipant, doc_key: []const u8, new_row: []const u8) !void {
         if (self.foreign_keys.len == 0) return;
         const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
@@ -627,16 +934,45 @@ pub const WriteParticipant = struct {
             defer if (old_parent) |value| self.alloc.free(value);
             const new_parent = if (final_state_deleted) null else try self.foreignKeyReferenceValueAlloc(new_row, foreign_key);
             defer if (new_parent) |value| self.alloc.free(value);
-            if (optionalBytesEqual(old_parent, new_parent)) continue;
-            if (old_parent) |parent_key| try self.appendForeignKeyRefDelete(foreign_key, parent_key, doc_key);
+            const old_span = if (old_row != null and old_parent != null and foreign_key.child_period != null) try self.periodSpanForRow(old_row.?, foreign_key.child_period.?) else null;
+            const new_span = if (!final_state_deleted and new_parent != null and foreign_key.child_period != null) try self.periodSpanForRow(new_row, foreign_key.child_period.?) else null;
+            const parent_changed = !optionalBytesEqual(old_parent, new_parent);
+            if (!parent_changed and optionalPeriodSpanEqual(old_span, new_span)) continue;
+            if (old_parent) |parent_key| if (parent_changed) try self.appendForeignKeyRefDelete(foreign_key, parent_key, doc_key);
             if (new_parent) |parent_key| {
-                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key)) try self.deferForeignKeyParentCheck(foreign_key, parent_key);
-                try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
+                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key, new_span)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, new_span);
+                if (parent_changed) try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
             }
         }
     }
 
-    fn parentCheckExternalized(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey, child_key: []const u8, parent_key: []const u8) bool {
+    fn prepareForeignKeyIdentityRewrite(
+        self: *WriteParticipant,
+        old_doc_key: []const u8,
+        new_doc_key: []const u8,
+        old_row: []const u8,
+        new_row: []const u8,
+    ) !void {
+        if (self.foreign_keys.len == 0) return;
+        for (self.foreign_keys) |foreign_key| {
+            if (!foreignKeyIsEnforced(foreign_key)) continue;
+            if (foreign_key.child_period != null or foreign_key.parent_period != null) return error.UnsupportedOperation;
+            const old_parent = try self.foreignKeyReferenceValueAlloc(old_row, foreign_key);
+            defer if (old_parent) |value| self.alloc.free(value);
+            const new_parent = try self.foreignKeyReferenceValueAlloc(new_row, foreign_key);
+            defer if (new_parent) |value| self.alloc.free(value);
+            const parent_changed = !optionalBytesEqual(old_parent, new_parent);
+            const child_key_changed = !std.mem.eql(u8, old_doc_key, new_doc_key);
+            if (!parent_changed and !child_key_changed) continue;
+            if (old_parent) |parent_key| try self.appendForeignKeyRefDelete(foreign_key, parent_key, old_doc_key);
+            if (new_parent) |parent_key| {
+                if (parent_changed and !self.parentCheckExternalized(foreign_key, new_doc_key, parent_key, null)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, null);
+                try self.appendForeignKeyRefWrite(foreign_key, parent_key, new_doc_key);
+            }
+        }
+    }
+
+    fn parentCheckExternalized(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey, child_key: []const u8, parent_key: []const u8, child_span: ?PeriodSpan) bool {
         for (self.externalized_parent_checks) |check| {
             if (!std.mem.eql(u8, check.constraint_name, foreign_key.name)) continue;
             if (!std.mem.eql(u8, check.child_table, self.effectiveTableName())) continue;
@@ -644,6 +980,10 @@ pub const WriteParticipant = struct {
             if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) continue;
             if (!std.mem.eql(u8, check.parent_key, parent_key)) continue;
             if (check.timing != self.effectiveForeignKeyTiming(foreign_key)) continue;
+            if (foreign_key.child_period != null or foreign_key.parent_period != null) {
+                const span = child_span orelse continue;
+                if (!externalizedTemporalParentCheckMatchesSpan(self.alloc, check, span)) continue;
+            } else if (check.child_period_start_json != null or check.child_period_end_json != null) continue;
             if (foreignKeyReferencesPrimaryKey(foreign_key)) {
                 if (check.parent_constraint_name != null) continue;
             } else {
@@ -765,7 +1105,7 @@ pub const WriteParticipant = struct {
         const current_parent = (try self.foreignKeyReferenceValueAlloc(row, foreign_key)) orelse return;
         defer self.alloc.free(current_parent);
         if (!std.mem.eql(u8, current_parent, parent_key)) return;
-        try self.prepareCascadeForeignKeyChild(child_key);
+        try self.prepareCascadeForeignKeyChild(foreign_key, parent_key, child_key);
     }
 
     pub fn prepareCascadeForeignKeyUpdateChildAction(
@@ -803,11 +1143,11 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_delete != .set_null) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             try self.applySetNullForeignKeyRefsForIdentity(foreign_key, encoded_value);
         }
     }
@@ -855,6 +1195,7 @@ pub const WriteParticipant = struct {
         const current_parent = (try self.foreignKeyReferenceValueAlloc(row, foreign_key)) orelse return;
         defer self.alloc.free(current_parent);
         if (!std.mem.eql(u8, current_parent, parent_key)) return;
+        if (try self.temporalForeignKeyChildRemainsCovered(foreign_key, parent_key, child_key)) return;
         if (self.set_null_update_count >= self.set_null_update_limit) return error.ForeignKeyViolation;
         self.set_null_update_count += 1;
 
@@ -894,11 +1235,11 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) anyerror!void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_delete != .cascade) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             try self.applyCascadeForeignKeyRefsForIdentity(foreign_key, encoded_value);
         }
     }
@@ -925,7 +1266,7 @@ pub const WriteParticipant = struct {
             if (containsBatchDelete(self.deletes.items, write.key)) continue;
             var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, write.key)) orelse continue;
             defer decoded.deinit(self.alloc);
-            try self.prepareCascadeForeignKeyChild(decoded.child_key);
+            try self.prepareCascadeForeignKeyChild(foreign_key, parent_key, decoded.child_key);
         }
 
         const scanned = try self.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
@@ -934,13 +1275,19 @@ pub const WriteParticipant = struct {
             if (containsBatchDelete(self.deletes.items, entry.key)) continue;
             var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, entry.key)) orelse continue;
             defer decoded.deinit(self.alloc);
-            try self.prepareCascadeForeignKeyChild(decoded.child_key);
+            try self.prepareCascadeForeignKeyChild(foreign_key, parent_key, decoded.child_key);
         }
     }
 
-    fn prepareCascadeForeignKeyChild(self: *WriteParticipant, child_key: []const u8) anyerror!void {
+    fn prepareCascadeForeignKeyChild(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        parent_key: []const u8,
+        child_key: []const u8,
+    ) anyerror!void {
         if (containsKey(self.planned_delete_keys, child_key)) return;
         if (try self.isRowDeletePlanned(child_key)) return;
+        if (try self.temporalForeignKeyChildRemainsCovered(foreign_key, parent_key, child_key)) return;
         if (self.cascade_depth >= max_cascade_depth) return error.ForeignKeyViolation;
         if (self.cascade_delete_count >= max_cascade_deletes) return error.ForeignKeyViolation;
 
@@ -954,6 +1301,7 @@ pub const WriteParticipant = struct {
         self: *WriteParticipant,
         foreign_key: schema_mod.ForeignKey,
         parent_key: []const u8,
+        child_span: ?PeriodSpan,
     ) !void {
         const parent_key_owned = try self.alloc.dupe(u8, parent_key);
         var parent_key_transferred = false;
@@ -961,13 +1309,14 @@ pub const WriteParticipant = struct {
         try self.pending_fk_parent_checks.append(self.alloc, .{
             .foreign_key = foreign_key,
             .parent_key = parent_key_owned,
+            .child_span = child_span,
         });
         parent_key_transferred = true;
     }
 
     fn validatePendingForeignKeyParentChecks(self: *WriteParticipant) !void {
         for (self.pending_fk_parent_checks.items) |check| {
-            try self.requireForeignKeyParentExists(check.foreign_key, check.parent_key);
+            try self.requireForeignKeyParentExists(check.foreign_key, check.parent_key, check.child_span);
         }
     }
 
@@ -1008,7 +1357,11 @@ pub const WriteParticipant = struct {
         self.pending_fk_reference_absence_checks = .empty;
     }
 
-    fn requireForeignKeyParentExists(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8) !void {
+    fn requireForeignKeyParentExists(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8, child_span: ?PeriodSpan) !void {
+        if (foreign_key.child_period != null or foreign_key.parent_period != null) {
+            const span = child_span orelse return error.ForeignKeyViolation;
+            return try self.requireForeignKeyTemporalParentCovers(foreign_key, parent_key, span);
+        }
         if (!foreignKeyReferencesPrimaryKey(foreign_key)) {
             const parent_constraint = self.findParentTupleConstraint(foreign_key.parent_columns) orelse return error.ForeignKeyViolation;
             return try self.requireForeignKeyUniqueParentExists(parent_constraint, parent_key);
@@ -1024,6 +1377,65 @@ pub const WriteParticipant = struct {
             return;
         }
         return error.ForeignKeyViolation;
+    }
+
+    fn requireForeignKeyTemporalParentCovers(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        parent_key: []const u8,
+        child_span: PeriodSpan,
+    ) !void {
+        const parent_period = foreign_key.parent_period orelse return error.ForeignKeyViolation;
+        const parent_constraint = self.findParentTupleConstraint(foreign_key.parent_columns) orelse return error.ForeignKeyViolation;
+        if (parent_constraint.without_overlaps_period == null or
+            !std.mem.eql(u8, parent_constraint.without_overlaps_period.?, parent_period))
+        {
+            return error.ForeignKeyViolation;
+        }
+
+        var covered_end = child_span.start;
+        var matched_any = false;
+        while (periodBoundLessThan(covered_end, child_span.end)) {
+            const next = try self.findTemporalParentCoverageEnd(parent_constraint, parent_key, covered_end, child_span.end);
+            if (next == null) return error.ForeignKeyViolation;
+            if (!periodBoundLessThan(covered_end, next.?)) return error.ForeignKeyViolation;
+            covered_end = next.?;
+            matched_any = true;
+        }
+        if (!matched_any or !periodBoundEqual(covered_end, child_span.end)) return error.ForeignKeyViolation;
+    }
+
+    fn findTemporalParentCoverageEnd(
+        self: *WriteParticipant,
+        parent_constraint: schema_mod.UniqueConstraint,
+        parent_key: []const u8,
+        needed_start: PeriodBound,
+        child_end: PeriodBound,
+    ) !?PeriodBound {
+        const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(self.alloc, parent_constraint.name, parent_key);
+        defer self.alloc.free(prefix);
+
+        var best: ?PeriodBound = null;
+        for (self.writes.items) |write| {
+            if (!std.mem.startsWith(u8, write.key, prefix)) continue;
+            if (containsBatchDelete(self.deletes.items, write.key)) continue;
+            if (containsKey(self.planned_delete_keys, write.value)) continue;
+            const span = try decodeTemporalUniqueSpanFromKeyAlloc(self.alloc, write.key, prefix);
+            best = temporalCoverageCandidateEnd(best, needed_start, child_end, span);
+        }
+
+        const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(self.alloc, parent_constraint.name, parent_key);
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scanned = try self.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+        for (scanned) |entry| {
+            if (containsBatchDelete(self.deletes.items, entry.key)) continue;
+            const owner = batchWriteValue(self.writes.items, entry.key) orelse entry.value;
+            if (containsKey(self.planned_delete_keys, owner)) continue;
+            const span = try decodeTemporalUniqueSpanFromKeyAlloc(self.alloc, entry.key, prefix);
+            best = temporalCoverageCandidateEnd(best, needed_start, child_end, span);
+        }
+        return best;
     }
 
     fn findParentTupleConstraint(self: *const WriteParticipant, columns: []const []const u8) ?schema_mod.UniqueConstraint {
@@ -1078,11 +1490,11 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyDeleteActionRestricts(foreign_key)) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             if (self.foreignKeyDefersNoActionDelete(foreign_key)) {
                 try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
             } else {
@@ -1096,11 +1508,11 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) !void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!foreignKeyUpdateActionRestricts(foreign_key)) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             if (self.foreignKeyDefersNoActionUpdate(foreign_key)) {
                 try self.deferForeignKeyReferenceAbsenceCheck(foreign_key, encoded_value);
             } else {
@@ -1114,11 +1526,11 @@ pub const WriteParticipant = struct {
         constraint: schema_mod.UniqueConstraint,
         encoded_value: []const u8,
     ) anyerror!void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_update != .set_null) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             try self.applySetNullForeignKeyRefsForIdentity(foreign_key, encoded_value);
         }
     }
@@ -1129,11 +1541,11 @@ pub const WriteParticipant = struct {
         old_encoded_value: []const u8,
         new_parent_row: []const u8,
     ) anyerror!void {
-        if (!uniqueConstraintCanBackForeignKey(constraint)) return;
+        if (!uniqueConstraintCanBackForeignKeyReferenceChecks(constraint)) return;
         for (self.foreign_keys) |foreign_key| {
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (foreign_key.on_update != .cascade) continue;
-            if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) continue;
+            if (!foreignKeyReferencesConstraintForRefCheck(foreign_key, constraint)) continue;
             try self.applyCascadeUpdateForeignKeyRefsForIdentity(foreign_key, old_encoded_value, new_parent_row);
         }
     }
@@ -1246,6 +1658,7 @@ pub const WriteParticipant = struct {
             var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, write.key)) orelse continue;
             defer decoded.deinit(self.alloc);
             if (containsKey(self.planned_delete_keys, decoded.child_key)) continue;
+            if (try self.temporalForeignKeyChildRemainsCovered(foreign_key, parent_key, decoded.child_key)) continue;
             return error.ForeignKeyViolation;
         }
 
@@ -1256,8 +1669,31 @@ pub const WriteParticipant = struct {
             var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, entry.key)) orelse continue;
             defer decoded.deinit(self.alloc);
             if (containsKey(self.planned_delete_keys, decoded.child_key)) continue;
+            if (try self.temporalForeignKeyChildRemainsCovered(foreign_key, parent_key, decoded.child_key)) continue;
             return error.ForeignKeyViolation;
         }
+    }
+
+    fn temporalForeignKeyChildRemainsCovered(
+        self: *WriteParticipant,
+        foreign_key: schema_mod.ForeignKey,
+        parent_key: []const u8,
+        child_key: []const u8,
+    ) !bool {
+        if (foreign_key.child_period == null or foreign_key.parent_period == null) return false;
+        const row = (try self.getPendingOrStoredRawRowAlloc(child_key)) orelse return false;
+        defer self.alloc.free(row);
+
+        const current_parent = (try self.foreignKeyReferenceValueAlloc(row, foreign_key)) orelse return false;
+        defer self.alloc.free(current_parent);
+        if (!std.mem.eql(u8, current_parent, parent_key)) return true;
+
+        const span = try self.periodSpanForRow(row, foreign_key.child_period.?);
+        self.requireForeignKeyTemporalParentCovers(foreign_key, parent_key, span) catch |err| switch (err) {
+            error.ForeignKeyViolation => return false,
+            else => return err,
+        };
+        return true;
     }
 
     fn appendForeignKeyRefWrite(self: *WriteParticipant, foreign_key: schema_mod.ForeignKey, parent_key: []const u8, child_key: []const u8) !void {
@@ -1326,7 +1762,26 @@ fn uniqueConstraintIsEnforced(constraint: schema_mod.UniqueConstraint) bool {
 }
 
 fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
-    return uniqueConstraintIsEnforced(constraint) and constraint.where.len == 0 and constraint.expressions.len == 0;
+    return uniqueConstraintIsEnforced(constraint) and
+        constraint.where.len == 0 and
+        constraint.expressions.len == 0 and
+        constraint.without_overlaps_period == null;
+}
+
+fn uniqueConstraintCanBackForeignKeyReferenceChecks(constraint: schema_mod.UniqueConstraint) bool {
+    return uniqueConstraintIsEnforced(constraint) and
+        constraint.where.len == 0 and
+        constraint.expressions.len == 0;
+}
+
+fn foreignKeyReferencesConstraintForRefCheck(foreign_key: schema_mod.ForeignKey, constraint: schema_mod.UniqueConstraint) bool {
+    if (!stringSlicesEqual(foreign_key.parent_columns, constraint.columns)) return false;
+    if (constraint.without_overlaps_period) |period| {
+        return foreign_key.parent_period != null and
+            foreign_key.child_period != null and
+            std.mem.eql(u8, foreign_key.parent_period.?, period);
+    }
+    return foreign_key.parent_period == null and foreign_key.child_period == null;
 }
 
 fn foreignKeyParentExists(
@@ -1363,6 +1818,83 @@ fn foreignKeyParentExists(
         return true;
     }
     return false;
+}
+
+fn foreignKeyParentExistsForChildRow(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
+    row_value: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+    primary_key: ?schema_mod.PrimaryKey,
+    unique_constraints: []const schema_mod.UniqueConstraint,
+    parent_key: []const u8,
+) !bool {
+    if (foreign_key.child_period == null and foreign_key.parent_period == null) {
+        return try foreignKeyParentExists(alloc, store, foreign_key, primary_key, unique_constraints, parent_key);
+    }
+    const child_period = foreign_key.child_period orelse return false;
+    const parent_period = foreign_key.parent_period orelse return false;
+    const child_span = try periodSpanForRowWithCatalog(alloc, columns, periods, row_value, child_period);
+    const parent_constraint = if (primary_key) |key|
+        if (stringSlicesEqual(key.columns, foreign_key.parent_columns)) primaryKeyAsUniqueConstraint(key) else findUniqueConstraintByColumns(unique_constraints, foreign_key.parent_columns) orelse return false
+    else
+        findUniqueConstraintByColumns(unique_constraints, foreign_key.parent_columns) orelse return false;
+    if (parent_constraint.without_overlaps_period == null or
+        !std.mem.eql(u8, parent_constraint.without_overlaps_period.?, parent_period))
+    {
+        return false;
+    }
+    return try temporalForeignKeyParentCovers(alloc, store, parent_constraint, parent_key, child_span);
+}
+
+fn temporalForeignKeyParentCovers(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    parent_constraint: schema_mod.UniqueConstraint,
+    parent_key: []const u8,
+    child_span: PeriodSpan,
+) !bool {
+    var covered_end = child_span.start;
+    var matched_any = false;
+    while (periodBoundLessThan(covered_end, child_span.end)) {
+        const next = try temporalForeignKeyParentCoverageEnd(alloc, store, parent_constraint, parent_key, covered_end, child_span.end);
+        if (next == null) return false;
+        if (!periodBoundLessThan(covered_end, next.?)) return false;
+        covered_end = next.?;
+        matched_any = true;
+    }
+    return matched_any and periodBoundEqual(covered_end, child_span.end);
+}
+
+fn temporalForeignKeyParentCoverageEnd(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    parent_constraint: schema_mod.UniqueConstraint,
+    parent_key: []const u8,
+    needed_start: PeriodBound,
+    child_end: PeriodBound,
+) !?PeriodBound {
+    const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(alloc, parent_constraint.name, parent_key);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, parent_constraint.name, parent_key);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var best: ?PeriodBound = null;
+    for (scanned) |entry| {
+        const parent_row = try getRawAlloc(alloc, store, entry.value);
+        if (parent_row) |raw| {
+            alloc.free(raw);
+        } else {
+            continue;
+        }
+        const span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, entry.key, prefix);
+        best = temporalCoverageCandidateEnd(best, needed_start, child_end, span);
+    }
+    return best;
 }
 
 pub fn foreignKeyReferenceValueAlloc(alloc: Allocator, row_value: []const u8, foreign_key: schema_mod.ForeignKey) !?[]u8 {
@@ -1647,8 +2179,477 @@ fn findCellInRow(cells: []const relational_row_codec.Cell, path: []const u8) ?re
     return null;
 }
 
+fn periodStartBeforeEnd(
+    columns: []const schema_mod.RelationalColumn,
+    cells: []const relational_row_codec.Cell,
+    period: schema_mod.RelationalPeriod,
+) bool {
+    const span = periodSpanFromCells(columns, cells, period) catch return false;
+    return periodBoundLessThan(span.start, span.end);
+}
+
+fn periodSpanFromCells(
+    columns: []const schema_mod.RelationalColumn,
+    cells: []const relational_row_codec.Cell,
+    period: schema_mod.RelationalPeriod,
+) !PeriodSpan {
+    const start_column = findRelationalColumn(columns, period.start_column) orelse return error.InvalidColumnValue;
+    const end_column = findRelationalColumn(columns, period.end_column) orelse return error.InvalidColumnValue;
+    if (start_column.field_type != end_column.field_type) return error.InvalidColumnValue;
+    const start = try periodStartBoundFromCell(findCellInRow(cells, period.start_column), start_column);
+    const end = try periodEndBoundFromCell(findCellInRow(cells, period.end_column), end_column);
+    const span: PeriodSpan = .{ .start = start, .end = end };
+    if (!periodBoundLessThan(span.start, span.end)) return error.InvalidColumnValue;
+    return span;
+}
+
+fn periodStartBoundFromCell(cell: ?relational_row_codec.Cell, column: schema_mod.RelationalColumn) !PeriodBound {
+    return if (cell) |present| try periodBoundFromCell(present, column) else if (column.nullable) .neg_infinity else error.InvalidColumnValue;
+}
+
+fn periodEndBoundFromCell(cell: ?relational_row_codec.Cell, column: schema_mod.RelationalColumn) !PeriodBound {
+    return if (cell) |present| try periodBoundFromCell(present, column) else if (column.nullable) .pos_infinity else error.InvalidColumnValue;
+}
+
+fn periodBoundFromCell(cell: relational_row_codec.Cell, column: schema_mod.RelationalColumn) !PeriodBound {
+    return switch (column.field_type) {
+        .numeric => if (cell.value_type == .f64_val) .{ .f64_val = cell.value.f64_val } else error.InvalidColumnValue,
+        .datetime => if (cell.value_type == .u64_val) .{ .i64_val = @as(i64, @bitCast(cell.value.u64_val)) } else error.InvalidColumnValue,
+        else => error.InvalidColumnValue,
+    };
+}
+
+fn findRelationalColumn(columns: []const schema_mod.RelationalColumn, name: []const u8) ?schema_mod.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name) or std.mem.eql(u8, column.path, name)) return column;
+    }
+    return null;
+}
+
+fn periodBoundLessThan(left: PeriodBound, right: PeriodBound) bool {
+    return switch (left) {
+        .neg_infinity => right != .neg_infinity,
+        .f64_val => |value| switch (right) {
+            .neg_infinity => false,
+            .f64_val => |other| value < other,
+            .pos_infinity => true,
+            else => false,
+        },
+        .i64_val => |value| switch (right) {
+            .neg_infinity => false,
+            .i64_val => |other| value < other,
+            .pos_infinity => true,
+            else => false,
+        },
+        .pos_infinity => false,
+    };
+}
+
+fn periodSpansOverlap(left: PeriodSpan, right: PeriodSpan) bool {
+    return periodBoundLessThan(left.start, right.end) and periodBoundLessThan(right.start, left.end);
+}
+
+fn periodSpanContainsPoint(span: PeriodSpan, point: PeriodBound) bool {
+    return !periodBoundLessThan(point, span.start) and periodBoundLessThan(point, span.end);
+}
+
+fn temporalCoverageCandidateEnd(current_best: ?PeriodBound, needed_start: PeriodBound, child_end: PeriodBound, parent_span: PeriodSpan) ?PeriodBound {
+    if (periodBoundLessThan(needed_start, parent_span.start)) return current_best;
+    if (!periodBoundLessThan(needed_start, parent_span.end)) return current_best;
+    const candidate = if (periodBoundLessThan(child_end, parent_span.end)) child_end else parent_span.end;
+    if (current_best) |best| {
+        return if (periodBoundLessThan(best, candidate)) candidate else best;
+    }
+    return candidate;
+}
+
+fn optionalPeriodSpanEqual(left: ?PeriodSpan, right: ?PeriodSpan) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return periodBoundEqual(left.?.start, right.?.start) and periodBoundEqual(left.?.end, right.?.end);
+}
+
+fn externalizedTemporalParentCheckMatchesSpan(
+    alloc: Allocator,
+    check: ExternalizedForeignKeyParentCheck,
+    span: PeriodSpan,
+) bool {
+    const start_json = check.child_period_start_json orelse return false;
+    const end_json = check.child_period_end_json orelse return false;
+    const start = periodBoundFromJsonAlloc(alloc, start_json, span.start) catch return false;
+    const end = periodBoundFromJsonAlloc(alloc, end_json, span.end) catch return false;
+    return periodBoundEqual(start, span.start) and periodBoundEqual(end, span.end);
+}
+
+fn periodBoundFromJsonAlloc(alloc: Allocator, json: []const u8, expected: PeriodBound) !PeriodBound {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidColumnValue;
+    defer parsed.deinit();
+    return switch (expected) {
+        .neg_infinity => switch (parsed.value) {
+            .null => .neg_infinity,
+            else => error.InvalidColumnValue,
+        },
+        .f64_val => switch (parsed.value) {
+            .integer => |value| .{ .f64_val = @floatFromInt(value) },
+            .float => |value| .{ .f64_val = value },
+            else => error.InvalidColumnValue,
+        },
+        .i64_val => switch (parsed.value) {
+            .integer => |value| .{ .i64_val = value },
+            else => error.InvalidColumnValue,
+        },
+        .pos_infinity => switch (parsed.value) {
+            .null => .pos_infinity,
+            else => error.InvalidColumnValue,
+        },
+    };
+}
+
+fn periodBoundEqual(left: PeriodBound, right: PeriodBound) bool {
+    return switch (left) {
+        .neg_infinity => right == .neg_infinity,
+        .f64_val => |value| switch (right) {
+            .f64_val => |other| value == other,
+            else => false,
+        },
+        .i64_val => |value| switch (right) {
+            .i64_val => |other| value == other,
+            else => false,
+        },
+        .pos_infinity => right == .pos_infinity,
+    };
+}
+
+fn temporalUniqueConstraintKeyAlloc(
+    alloc: Allocator,
+    constraint: schema_mod.UniqueConstraint,
+    encoded_value: []const u8,
+    span: PeriodSpan,
+    doc_key: []const u8,
+) ![]u8 {
+    const start = try periodBoundBytesAlloc(alloc, span.start);
+    defer alloc.free(start);
+    const end = try periodBoundBytesAlloc(alloc, span.end);
+    defer alloc.free(end);
+    return try internal_keys.relationalTemporalUniqueKeyAlloc(alloc, constraint.name, encoded_value, start, end, doc_key);
+}
+
+fn periodBoundBytesAlloc(alloc: Allocator, bound: PeriodBound) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    switch (bound) {
+        .neg_infinity => try out.append(alloc, temporal_bound_neg_infinity_tag),
+        .f64_val => |value| {
+            try out.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, @bitCast(value), .big);
+            try out.appendSlice(alloc, &buf);
+        },
+        .i64_val => |value| {
+            try out.append(alloc, @intFromEnum(typed_dv.ValueType.u64_val));
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, @bitCast(value), .big);
+            try out.appendSlice(alloc, &buf);
+        },
+        .pos_infinity => try out.append(alloc, temporal_bound_pos_infinity_tag),
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeTemporalUniqueSpanFromKeyAlloc(alloc: Allocator, key: []const u8, prefix: []const u8) !PeriodSpan {
+    if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidColumnValue;
+    var pos: usize = prefix.len;
+    const start_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidColumnValue;
+    const start = try internal_keys.decodeBodyAlloc(alloc, key[pos..start_term]);
+    defer alloc.free(start);
+    pos = start_term + 2;
+    const end_term = internal_keys.findComponentTerminator(key, pos) orelse return error.InvalidColumnValue;
+    const end = try internal_keys.decodeBodyAlloc(alloc, key[pos..end_term]);
+    defer alloc.free(end);
+    return .{ .start = try periodBoundFromBytes(start), .end = try periodBoundFromBytes(end) };
+}
+
+fn periodBoundFromBytes(bytes: []const u8) !PeriodBound {
+    if (bytes.len == 1 and bytes[0] == temporal_bound_neg_infinity_tag) return .neg_infinity;
+    if (bytes.len == 1 and bytes[0] == temporal_bound_pos_infinity_tag) return .pos_infinity;
+    if (bytes.len != 9) return error.InvalidColumnValue;
+    const raw = std.mem.readInt(u64, bytes[1..9], .big);
+    if (bytes[0] == @intFromEnum(typed_dv.ValueType.f64_val)) return .{ .f64_val = @bitCast(raw) };
+    if (bytes[0] == @intFromEnum(typed_dv.ValueType.u64_val)) return .{ .i64_val = @bitCast(raw) };
+    return error.InvalidColumnValue;
+}
+
+fn periodSpanForRowWithCatalog(
+    alloc: Allocator,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
+    row_value: []const u8,
+    period_name: []const u8,
+) !PeriodSpan {
+    const period = findPeriodByName(periods, period_name) orelse return error.InvalidColumnValue;
+    var row = try relational_row_codec.deserialize(alloc, row_value);
+    defer row.deinit(alloc);
+    return try periodSpanFromCells(columns, row.cells, period);
+}
+
+fn findPeriodByName(periods: []const schema_mod.RelationalPeriod, name: []const u8) ?schema_mod.RelationalPeriod {
+    for (periods) |period| {
+        if (std.mem.eql(u8, period.name, name)) return period;
+    }
+    return null;
+}
+
+fn requireTemporalUniqueAvailableInBatchAndStore(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: []const docstore_mod.KVPair,
+    deletes: []const []const u8,
+    planned_delete_keys: []const []const u8,
+    constraint: schema_mod.UniqueConstraint,
+    encoded_value: []const u8,
+    span: PeriodSpan,
+    doc_key: []const u8,
+) !void {
+    const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint.name, encoded_value);
+    defer alloc.free(prefix);
+
+    for (writes) |write| {
+        if (!std.mem.startsWith(u8, write.key, prefix)) continue;
+        if (containsBatchDelete(deletes, write.key)) continue;
+        if (std.mem.eql(u8, write.value, doc_key)) continue;
+        const existing_span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, write.key, prefix);
+        if (periodSpansOverlap(span, existing_span)) return error.UniqueConstraintViolation;
+    }
+
+    const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint.name, encoded_value);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+    for (scanned) |entry| {
+        if (containsBatchDelete(deletes, entry.key)) continue;
+        const owner = batchWriteValue(writes, entry.key) orelse entry.value;
+        if (std.mem.eql(u8, owner, doc_key)) continue;
+        if (containsKey(planned_delete_keys, owner)) continue;
+        const existing_span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, entry.key, prefix);
+        if (periodSpansOverlap(span, existing_span)) return error.UniqueConstraintViolation;
+    }
+}
+
+pub fn lookupTemporalUniqueOwnerAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+) !?[]u8 {
+    const point = try periodBoundFromBytes(encoded_point);
+    const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+    var owner: ?[]u8 = null;
+    errdefer if (owner) |value| alloc.free(value);
+    for (scanned) |entry| {
+        const span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, entry.key, prefix);
+        if (!periodSpanContainsPoint(span, point)) continue;
+        if (owner) |existing| {
+            if (!std.mem.eql(u8, existing, entry.value)) return error.UniqueConstraintViolation;
+            continue;
+        }
+        owner = try alloc.dupe(u8, entry.value);
+    }
+    return owner;
+}
+
+pub fn lookupTemporalUniqueOverlapOwnerAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+) !?[]u8 {
+    const query: PeriodSpan = .{
+        .start = try periodBoundFromBytes(encoded_start),
+        .end = try periodBoundFromBytes(encoded_end),
+    };
+    if (!periodBoundLessThan(query.start, query.end)) return error.InvalidColumnValue;
+    const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(alloc, constraint_name, encoded_value);
+    defer if (upper) |buf| alloc.free(buf);
+    const scanned = try store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+    var owner: ?[]u8 = null;
+    errdefer if (owner) |value| alloc.free(value);
+    for (scanned) |entry| {
+        const span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, entry.key, prefix);
+        if (!periodSpansOverlap(query, span)) continue;
+        if (owner) |existing| {
+            if (!std.mem.eql(u8, existing, entry.value)) return error.UniqueConstraintViolation;
+            continue;
+        }
+        owner = try alloc.dupe(u8, entry.value);
+    }
+    return owner;
+}
+
+pub fn temporalUniqueKeyContainsPointAlloc(
+    alloc: Allocator,
+    key: []const u8,
+    prefix: []const u8,
+    encoded_point: []const u8,
+) !bool {
+    const point = try periodBoundFromBytes(encoded_point);
+    const span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, key, prefix);
+    return periodSpanContainsPoint(span, point);
+}
+
+pub fn temporalUniqueKeyOverlapsSpanAlloc(
+    alloc: Allocator,
+    key: []const u8,
+    prefix: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+) !bool {
+    const query: PeriodSpan = .{
+        .start = try periodBoundFromBytes(encoded_start),
+        .end = try periodBoundFromBytes(encoded_end),
+    };
+    if (!periodBoundLessThan(query.start, query.end)) return error.InvalidColumnValue;
+    const span = try decodeTemporalUniqueSpanFromKeyAlloc(alloc, key, prefix);
+    return periodSpansOverlap(query, span);
+}
+
+pub fn temporalPeriodSpanBytesValid(encoded_start: []const u8, encoded_end: []const u8) !bool {
+    const query: PeriodSpan = .{
+        .start = try periodBoundFromBytes(encoded_start),
+        .end = try periodBoundFromBytes(encoded_end),
+    };
+    return periodBoundLessThan(query.start, query.end);
+}
+
+pub fn temporalPeriodSpanBytesOverlap(
+    left_start: []const u8,
+    left_end: []const u8,
+    right_start: []const u8,
+    right_end: []const u8,
+) !bool {
+    const left: PeriodSpan = .{
+        .start = try periodBoundFromBytes(left_start),
+        .end = try periodBoundFromBytes(left_end),
+    };
+    const right: PeriodSpan = .{
+        .start = try periodBoundFromBytes(right_start),
+        .end = try periodBoundFromBytes(right_end),
+    };
+    if (!periodBoundLessThan(left.start, left.end) or !periodBoundLessThan(right.start, right.end)) return error.InvalidColumnValue;
+    return periodSpansOverlap(left, right);
+}
+
+pub fn temporalPeriodSpanBytesContainsPoint(
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    encoded_point: []const u8,
+) !bool {
+    const span: PeriodSpan = .{
+        .start = try periodBoundFromBytes(encoded_start),
+        .end = try periodBoundFromBytes(encoded_end),
+    };
+    const point = try periodBoundFromBytes(encoded_point);
+    if (!periodBoundLessThan(span.start, span.end)) return error.InvalidColumnValue;
+    return periodSpanContainsPoint(span, point);
+}
+
+pub fn temporalPeriodBoundBytesFromJsonAlloc(
+    alloc: Allocator,
+    value_json: []const u8,
+    column: schema_mod.RelationalColumn,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed.deinit();
+    const bound: PeriodBound = switch (column.field_type) {
+        .numeric => switch (parsed.value) {
+            .integer => |value| .{ .f64_val = @floatFromInt(value) },
+            .float => |value| .{ .f64_val = value },
+            else => return error.InvalidColumnValue,
+        },
+        .datetime => switch (parsed.value) {
+            .integer => |value| .{ .i64_val = value },
+            else => return error.InvalidColumnValue,
+        },
+        else => return error.InvalidColumnValue,
+    };
+    return try periodBoundBytesAlloc(alloc, bound);
+}
+
+pub fn temporalPeriodStartBoundBytesFromJsonAlloc(
+    alloc: Allocator,
+    value_json: ?[]const u8,
+    column: schema_mod.RelationalColumn,
+) ![]u8 {
+    const bound: PeriodBound = if (value_json) |json| blk: {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidColumnValue;
+        defer parsed.deinit();
+        if (parsed.value == .null) {
+            if (!column.nullable) return error.InvalidColumnValue;
+            break :blk .neg_infinity;
+        }
+        break :blk switch (column.field_type) {
+            .numeric => switch (parsed.value) {
+                .integer => |value| .{ .f64_val = @floatFromInt(value) },
+                .float => |value| .{ .f64_val = value },
+                else => return error.InvalidColumnValue,
+            },
+            .datetime => switch (parsed.value) {
+                .integer => |value| .{ .i64_val = value },
+                else => return error.InvalidColumnValue,
+            },
+            else => return error.InvalidColumnValue,
+        };
+    } else blk: {
+        if (!column.nullable) return error.InvalidColumnValue;
+        break :blk .neg_infinity;
+    };
+    return try periodBoundBytesAlloc(alloc, bound);
+}
+
+pub fn temporalPeriodEndBoundBytesFromJsonAlloc(
+    alloc: Allocator,
+    value_json: ?[]const u8,
+    column: schema_mod.RelationalColumn,
+) ![]u8 {
+    const bound: PeriodBound = if (value_json) |json| blk: {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidColumnValue;
+        defer parsed.deinit();
+        if (parsed.value == .null) {
+            if (!column.nullable) return error.InvalidColumnValue;
+            break :blk .pos_infinity;
+        }
+        break :blk switch (column.field_type) {
+            .numeric => switch (parsed.value) {
+                .integer => |value| .{ .f64_val = @floatFromInt(value) },
+                .float => |value| .{ .f64_val = value },
+                else => return error.InvalidColumnValue,
+            },
+            .datetime => switch (parsed.value) {
+                .integer => |value| .{ .i64_val = value },
+                else => return error.InvalidColumnValue,
+            },
+            else => return error.InvalidColumnValue,
+        };
+    } else blk: {
+        if (!column.nullable) return error.InvalidColumnValue;
+        break :blk .pos_infinity;
+    };
+    return try periodBoundBytesAlloc(alloc, bound);
+}
+
 pub fn uniqueConstraintTupleValueAlloc(alloc: Allocator, row_value: []const u8, constraint: schema_mod.UniqueConstraint) !?[]u8 {
     if (!(try rowMatchesUniqueConstraintPredicates(alloc, row_value, constraint.where))) return null;
+    if (!(try rowMatchesExpressionConditions(alloc, row_value, constraint.where_expressions))) return null;
     return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions);
 }
 
@@ -1675,6 +2676,1702 @@ fn rowMatchesUniqueConstraintPredicate(alloc: Allocator, row_value: []const u8, 
             break :blk !(try cellEqualsJsonLiteral(alloc, present, value_json));
         },
     };
+}
+
+fn rowMatchesExpressionConditions(
+    alloc: Allocator,
+    row_value: []const u8,
+    conditions: []const schema_mod.RelationalRowsExpressionCondition,
+) !bool {
+    for (conditions) |condition| {
+        if (!(try rowMatchesExpressionCondition(alloc, row_value, condition))) return false;
+    }
+    return true;
+}
+
+fn rowMatchesExpressionCondition(
+    alloc: Allocator,
+    row_value: []const u8,
+    condition: schema_mod.RelationalRowsExpressionCondition,
+) !bool {
+    const lhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, condition.lhs);
+    defer alloc.free(lhs_json);
+    var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidColumnValue;
+    defer lhs.deinit();
+    return switch (condition.op) {
+        .is_null => lhs.value == .null,
+        .is_not_null => lhs.value != .null,
+        .eq, .ne, .is_distinct, .is_not_distinct => blk: {
+            if (condition.rhs.len != 1) return error.InvalidColumnValue;
+            const rhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, condition.rhs[0]);
+            defer alloc.free(rhs_json);
+            var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
+            defer rhs.deinit();
+            const equal = jsonValuesEqualExact(lhs.value, rhs.value);
+            break :blk switch (condition.op) {
+                .eq, .is_not_distinct => equal,
+                .ne, .is_distinct => !equal,
+                else => unreachable,
+            };
+        },
+        .gt, .gte, .lt, .lte => blk: {
+            if (condition.rhs.len != 1) return error.InvalidColumnValue;
+            const rhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, condition.rhs[0]);
+            defer alloc.free(rhs_json);
+            var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
+            defer rhs.deinit();
+            const comparison = compareJsonScalars(lhs.value, rhs.value) orelse return error.InvalidColumnValue;
+            break :blk switch (condition.op) {
+                .gt => comparison == .gt,
+                .gte => comparison == .gt or comparison == .eq,
+                .lt => comparison == .lt,
+                .lte => comparison == .lt or comparison == .eq,
+                else => unreachable,
+            };
+        },
+    };
+}
+
+fn rowExpressionValueJsonAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.RelationalRowsExpression,
+) anyerror![]u8 {
+    if (expression.field_source != .row) return error.InvalidColumnValue;
+    return switch (expression.kind) {
+        .field => blk: {
+            const cell = (try relational_row_codec.findCellByPath(row_value, expression.field)) orelse return try alloc.dupe(u8, "null");
+            break :blk try cellJsonValueAlloc(alloc, cell);
+        },
+        .value => try alloc.dupe(u8, expression.value_json),
+        .lower, .upper, .initcap, .md5 => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed.value != .string) return error.InvalidColumnValue;
+            const transformed = switch (expression.kind) {
+                .lower => try std.ascii.allocLowerString(alloc, parsed.value.string),
+                .upper => try std.ascii.allocUpperString(alloc, parsed.value.string),
+                .initcap => try initcapTextAlloc(alloc, parsed.value.string),
+                .md5 => try md5HexTextAlloc(alloc, parsed.value.string),
+                else => unreachable,
+            };
+            defer alloc.free(transformed);
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
+        },
+        .trim, .ltrim, .rtrim => blk: {
+            if (expression.operands.len != 1 and expression.operands.len != 2) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            if (source == null) break :blk try alloc.dupe(u8, "null");
+            var trim_set: []const u8 = &std.ascii.whitespace;
+            var trim_set_owned: ?[]u8 = null;
+            defer if (trim_set_owned) |text| alloc.free(text);
+            if (expression.operands.len == 2) {
+                trim_set_owned = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+                if (trim_set_owned == null) break :blk try alloc.dupe(u8, "null");
+                trim_set = trim_set_owned.?;
+            }
+            const transformed = try trimTextAlloc(alloc, source.?, trim_set, expression.kind != .rtrim, expression.kind != .ltrim);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .replace => blk: {
+            if (expression.operands.len != 3) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const needle = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (needle) |text| alloc.free(text);
+            const replacement = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[2]);
+            defer if (replacement) |text| alloc.free(text);
+            if (source == null or needle == null or replacement == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try replaceTextAlloc(alloc, source.?, needle.?, replacement.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .regexp_replace => blk: {
+            if (expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const pattern = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (pattern) |text| alloc.free(text);
+            const replacement = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[2]);
+            defer if (replacement) |text| alloc.free(text);
+            if (source == null or pattern == null or replacement == null) break :blk try alloc.dupe(u8, "null");
+            var flags_text: []const u8 = "";
+            var flags_owned: ?[]u8 = null;
+            defer if (flags_owned) |text| alloc.free(text);
+            if (expression.operands.len == 4) {
+                flags_owned = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[3]);
+                if (flags_owned == null) break :blk try alloc.dupe(u8, "null");
+                flags_text = flags_owned.?;
+            }
+            const transformed = try regexpReplaceTextAlloc(alloc, source.?, pattern.?, replacement.?, flags_text);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .translate => blk: {
+            if (expression.operands.len != 3) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const from_set = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (from_set) |text| alloc.free(text);
+            const to_set = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[2]);
+            defer if (to_set) |text| alloc.free(text);
+            if (source == null or from_set == null or to_set == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try translateTextAlloc(alloc, source.?, from_set.?, to_set.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .substring => blk: {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const start = try rowExpressionIntegerValue(alloc, row_value, expression.operands[1]);
+            if (source == null or start == null) break :blk try alloc.dupe(u8, "null");
+            var length_count: ?i64 = null;
+            if (expression.operands.len == 3) {
+                length_count = try rowExpressionIntegerValue(alloc, row_value, expression.operands[2]);
+                if (length_count == null) break :blk try alloc.dupe(u8, "null");
+            }
+            const transformed = try substringTextAlloc(alloc, source.?, start.?, length_count);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .overlay => blk: {
+            if (expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const replacement = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (replacement) |text| alloc.free(text);
+            const start = try rowExpressionIntegerValue(alloc, row_value, expression.operands[2]);
+            if (source == null or replacement == null or start == null) break :blk try alloc.dupe(u8, "null");
+            var length_count: ?i64 = null;
+            if (expression.operands.len == 4) {
+                length_count = try rowExpressionIntegerValue(alloc, row_value, expression.operands[3]);
+                if (length_count == null) break :blk try alloc.dupe(u8, "null");
+            }
+            const transformed = try overlayTextAlloc(alloc, source.?, replacement.?, start.?, length_count);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .split_part => blk: {
+            if (expression.operands.len != 3) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const delimiter = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (delimiter) |text| alloc.free(text);
+            const field_index = try rowExpressionIntegerValue(alloc, row_value, expression.operands[2]);
+            if (source == null or delimiter == null or field_index == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try splitPartTextAlloc(alloc, source.?, delimiter.?, field_index.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .left, .right => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const count = try rowExpressionIntegerValue(alloc, row_value, expression.operands[1]);
+            if (source == null or count == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try leftRightTextAlloc(alloc, source.?, count.?, expression.kind == .left);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .lpad, .rpad => blk: {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const target_count = try rowExpressionIntegerValue(alloc, row_value, expression.operands[1]);
+            if (source == null or target_count == null) break :blk try alloc.dupe(u8, "null");
+            var fill_text: []const u8 = " ";
+            var fill_owned: ?[]u8 = null;
+            defer if (fill_owned) |text| alloc.free(text);
+            if (expression.operands.len == 3) {
+                fill_owned = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[2]);
+                if (fill_owned == null) break :blk try alloc.dupe(u8, "null");
+                fill_text = fill_owned.?;
+            }
+            const transformed = try padTextAlloc(alloc, source.?, target_count.?, fill_text, expression.kind == .lpad);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .repeat => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const count = try rowExpressionIntegerValue(alloc, row_value, expression.operands[1]);
+            if (source == null or count == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try repeatTextAlloc(alloc, source.?, count.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .reverse => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            if (source == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try reverseTextAlloc(alloc, source.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .starts_with, .ends_with => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const needle = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (needle) |text| alloc.free(text);
+            if (source == null or needle == null) break :blk try alloc.dupe(u8, "null");
+            const matched = if (expression.kind == .starts_with)
+                std.mem.startsWith(u8, source.?, needle.?)
+            else
+                std.mem.endsWith(u8, source.?, needle.?);
+            break :blk try alloc.dupe(u8, if (matched) "true" else "false");
+        },
+        .like, .ilike => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            const pattern = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+            defer if (pattern) |text| alloc.free(text);
+            if (source == null or pattern == null) break :blk try alloc.dupe(u8, "null");
+            const matched = sqlLikePatternMatches(source.?, pattern.?, expression.kind == .ilike);
+            break :blk try alloc.dupe(u8, if (matched) "true" else "false");
+        },
+        .bool_and, .bool_or => blk: {
+            if (expression.operands.len < 2) return error.InvalidColumnValue;
+            var saw_null = false;
+            for (expression.operands) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+                defer parsed.deinit();
+                switch (parsed.value) {
+                    .null => saw_null = true,
+                    .bool => |value| switch (expression.kind) {
+                        .bool_and => if (!value) break :blk try alloc.dupe(u8, "false"),
+                        .bool_or => if (value) break :blk try alloc.dupe(u8, "true"),
+                        else => unreachable,
+                    },
+                    else => return error.InvalidColumnValue,
+                }
+            }
+            if (saw_null) break :blk try alloc.dupe(u8, "null");
+            break :blk try alloc.dupe(u8, if (expression.kind == .bool_and) "true" else "false");
+        },
+        .bool_not => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .bool => |value| break :blk try alloc.dupe(u8, if (value) "false" else "true"),
+                else => return error.InvalidColumnValue,
+            }
+        },
+        .length, .octet_length, .strpos, .ascii => blk: {
+            const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
+            defer if (source) |text| alloc.free(text);
+            if (source == null) break :blk try alloc.dupe(u8, "null");
+            const result: i64 = switch (expression.kind) {
+                .length => @intCast(std.unicode.utf8CountCodepoints(source.?) catch return error.InvalidColumnValue),
+                .octet_length => @intCast(source.?.len),
+                .strpos => pos: {
+                    if (expression.operands.len != 2) return error.InvalidColumnValue;
+                    const needle = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);
+                    defer if (needle) |text| alloc.free(text);
+                    if (needle == null) break :blk try alloc.dupe(u8, "null");
+                    break :pos @intCast(try strposTextCodepointPosition(source.?, needle.?));
+                },
+                .ascii => if (source.?.len == 0) 0 else @intCast(try firstUtf8Codepoint(source.?)),
+                else => unreachable,
+            };
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
+        },
+        .chr => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const codepoint = try rowExpressionIntegerValue(alloc, row_value, expression.operands[0]);
+            if (codepoint == null) break :blk try alloc.dupe(u8, "null");
+            const transformed = try codepointTextAlloc(alloc, codepoint.?);
+            defer alloc.free(transformed);
+            break :blk try jsonStringAlloc(alloc, transformed);
+        },
+        .json_extract => blk: {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidColumnValue;
+            const root_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(root_json);
+            var root = std.json.parseFromSlice(std.json.Value, alloc, root_json, .{}) catch return error.InvalidColumnValue;
+            defer root.deinit();
+            const selected = jsonValueAtDotPath(root.value, expression.json_path) orelse break :blk try alloc.dupe(u8, "null");
+            if (!expression.json_as_text) break :blk try std.json.Stringify.valueAlloc(alloc, selected.*, .{});
+            break :blk try jsonExtractTextValueJsonAlloc(alloc, selected.*);
+        },
+        .json_path_exists => blk: {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidColumnValue;
+            const root_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(root_json);
+            var root = std.json.parseFromSlice(std.json.Value, alloc, root_json, .{}) catch return error.InvalidColumnValue;
+            defer root.deinit();
+            break :blk try alloc.dupe(u8, if (jsonValueAtDotPath(root.value, expression.json_path) != null) "true" else "false");
+        },
+        .json_build_object => try rowExpressionJsonBuildObjectValueJsonAlloc(alloc, row_value, expression),
+        .to_jsonb => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            var transferred = false;
+            errdefer if (!transferred) alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            transferred = true;
+            break :blk value_json;
+        },
+        .json_typeof => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            const type_name = switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .bool => "boolean",
+                .integer, .float, .number_string => "number",
+                .string => "string",
+                .array => "array",
+                .object => "object",
+            };
+            break :blk try jsonStringAlloc(alloc, type_name);
+        },
+        .json_array_length => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .array => |array| break :blk try std.fmt.allocPrint(alloc, "{d}", .{array.items.len}),
+                else => return error.InvalidColumnValue,
+            }
+        },
+        .array_length => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .null => break :blk try alloc.dupe(u8, "null"),
+                .array => |array| break :blk try std.fmt.allocPrint(alloc, "{d}", .{array.items.len}),
+                else => return error.InvalidColumnValue,
+            }
+        },
+        .array_position => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const array_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(array_json);
+            const needle_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(needle_json);
+            var parsed_array = std.json.parseFromSlice(std.json.Value, alloc, array_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_array.deinit();
+            var parsed_needle = std.json.parseFromSlice(std.json.Value, alloc, needle_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_needle.deinit();
+            if (parsed_array.value == .null or parsed_needle.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_array.value != .array) return error.InvalidColumnValue;
+            for (parsed_array.value.array.items, 0..) |item, index| {
+                if (jsonValuesEqualExact(item, parsed_needle.value)) {
+                    break :blk try std.fmt.allocPrint(alloc, "{d}", .{index + 1});
+                }
+            }
+            break :blk try alloc.dupe(u8, "null");
+        },
+        .array_positions => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const array_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(array_json);
+            const needle_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(needle_json);
+            var parsed_array = std.json.parseFromSlice(std.json.Value, alloc, array_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_array.deinit();
+            var parsed_needle = std.json.parseFromSlice(std.json.Value, alloc, needle_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_needle.deinit();
+            if (parsed_array.value == .null or parsed_needle.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_array.value != .array) return error.InvalidColumnValue;
+            break :blk try arrayPositionsValueJsonAlloc(alloc, parsed_array.value.array.items, parsed_needle.value);
+        },
+        .array_append, .array_prepend, .array_remove => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const array_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(array_json);
+            const element_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(element_json);
+            var parsed_array = std.json.parseFromSlice(std.json.Value, alloc, array_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_array.deinit();
+            var parsed_element = std.json.parseFromSlice(std.json.Value, alloc, element_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_element.deinit();
+            if (parsed_array.value == .null or parsed_element.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_array.value != .array) return error.InvalidColumnValue;
+            break :blk try arrayElementTransformValueJsonAlloc(alloc, parsed_array.value.array.items, parsed_element.value, expression.kind);
+        },
+        .array_cat => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const left_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(left_json);
+            const right_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(right_json);
+            var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_left.deinit();
+            var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_right.deinit();
+            if (parsed_left.value == .null or parsed_right.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_left.value != .array or parsed_right.value != .array) return error.InvalidColumnValue;
+            break :blk try arrayConcatValueJsonAlloc(alloc, parsed_left.value.array.items, parsed_right.value.array.items);
+        },
+        .array_replace => blk: {
+            if (expression.operands.len != 3) return error.InvalidColumnValue;
+            const array_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(array_json);
+            const old_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(old_json);
+            const new_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[2]);
+            defer alloc.free(new_json);
+            var parsed_array = std.json.parseFromSlice(std.json.Value, alloc, array_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_array.deinit();
+            var parsed_old = std.json.parseFromSlice(std.json.Value, alloc, old_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_old.deinit();
+            var parsed_new = std.json.parseFromSlice(std.json.Value, alloc, new_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_new.deinit();
+            if (parsed_array.value == .null or parsed_old.value == .null or parsed_new.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_array.value != .array) return error.InvalidColumnValue;
+            break :blk try arrayReplaceValueJsonAlloc(alloc, parsed_array.value.array.items, parsed_old.value, parsed_new.value);
+        },
+        .array_to_string => blk: {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidColumnValue;
+            const array_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(array_json);
+            const delimiter_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(delimiter_json);
+            var parsed_array = std.json.parseFromSlice(std.json.Value, alloc, array_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_array.deinit();
+            var parsed_delimiter = std.json.parseFromSlice(std.json.Value, alloc, delimiter_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_delimiter.deinit();
+            if (parsed_array.value == .null or parsed_delimiter.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_array.value != .array or parsed_delimiter.value != .string) return error.InvalidColumnValue;
+            var null_text: ?[]const u8 = null;
+            if (expression.operands.len == 3) {
+                const null_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[2]);
+                defer alloc.free(null_json);
+                var parsed_null = std.json.parseFromSlice(std.json.Value, alloc, null_json, .{}) catch return error.InvalidColumnValue;
+                defer parsed_null.deinit();
+                if (parsed_null.value == .null) break :blk try alloc.dupe(u8, "null");
+                if (parsed_null.value != .string) return error.InvalidColumnValue;
+                null_text = parsed_null.value.string;
+            }
+            break :blk try arrayToStringValueJsonAlloc(alloc, parsed_array.value.array.items, parsed_delimiter.value.string, null_text);
+        },
+        .string_to_array => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            const delimiter_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(delimiter_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            var delimiter = std.json.parseFromSlice(std.json.Value, alloc, delimiter_json, .{}) catch return error.InvalidColumnValue;
+            defer delimiter.deinit();
+            if (parsed.value == .null or delimiter.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed.value != .string or delimiter.value != .string or delimiter.value.string.len == 0) return error.InvalidColumnValue;
+            break :blk try stringToArrayValueJsonAlloc(alloc, parsed.value.string, delimiter.value.string);
+        },
+        .concat => blk: {
+            if (expression.operands.len == 0) return error.InvalidColumnValue;
+            var joined = std.ArrayListUnmanaged(u8).empty;
+            defer joined.deinit(alloc);
+            for (expression.operands) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+                defer parsed.deinit();
+                if (parsed.value == .null) continue;
+                const text = try rowScalarJsonValueTextAlloc(alloc, parsed.value);
+                defer alloc.free(text);
+                try joined.appendSlice(alloc, text);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
+        },
+        .coalesce => blk: {
+            if (expression.operands.len == 0) return error.InvalidColumnValue;
+            for (expression.operands) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch {
+                    alloc.free(value_json);
+                    return error.InvalidColumnValue;
+                };
+                defer parsed.deinit();
+                if (parsed.value != .null) break :blk value_json;
+                alloc.free(value_json);
+            }
+            break :blk try alloc.dupe(u8, "null");
+        },
+        .nullif => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const lhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            var lhs_transferred = false;
+            errdefer if (!lhs_transferred) alloc.free(lhs_json);
+            const rhs_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(rhs_json);
+            var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidColumnValue;
+            defer lhs.deinit();
+            var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
+            defer rhs.deinit();
+            if (lhs.value != .null and rhs.value != .null and jsonValuesEqualExact(lhs.value, rhs.value)) {
+                alloc.free(lhs_json);
+                lhs_transferred = true;
+                break :blk try alloc.dupe(u8, "null");
+            }
+            lhs_transferred = true;
+            break :blk lhs_json;
+        },
+        .greatest, .least => blk: {
+            if (expression.operands.len == 0) return error.InvalidColumnValue;
+            var best_json: ?[]u8 = null;
+            errdefer if (best_json) |owned| alloc.free(owned);
+            var best_value: ?std.json.Parsed(std.json.Value) = null;
+            defer if (best_value) |*parsed| parsed.deinit();
+
+            for (expression.operands) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                var value_transferred = false;
+                errdefer if (!value_transferred) alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+                var parsed_transferred = false;
+                defer if (!parsed_transferred) parsed.deinit();
+                if (parsed.value == .null) {
+                    alloc.free(value_json);
+                    value_transferred = true;
+                    continue;
+                }
+                if (best_value) |*current| {
+                    const comparison = compareJsonScalars(parsed.value, current.value) orelse return error.InvalidColumnValue;
+                    const replace = switch (expression.kind) {
+                        .greatest => comparison == .gt,
+                        .least => comparison == .lt,
+                        else => unreachable,
+                    };
+                    if (!replace) {
+                        alloc.free(value_json);
+                        value_transferred = true;
+                        continue;
+                    }
+                    current.deinit();
+                    alloc.free(best_json.?);
+                }
+                best_json = value_json;
+                best_value = parsed;
+                value_transferred = true;
+                parsed_transferred = true;
+            }
+            break :blk if (best_json) |owned| owned else try alloc.dupe(u8, "null");
+        },
+        .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+            const value = jsonValueAsFloat(parsed.value) orelse return error.InvalidColumnValue;
+            if (expression.kind == .sqrt and value < 0) return error.InvalidColumnValue;
+            const result = switch (expression.kind) {
+                .abs => if (value < 0) -value else value,
+                .round => @round(value),
+                .trunc => @trunc(value),
+                .floor => @floor(value),
+                .ceil => @ceil(value),
+                .sqrt => @sqrt(value),
+                .sign => if (value < 0) @as(f64, -1) else if (value > 0) @as(f64, 1) else @as(f64, 0),
+                else => unreachable,
+            };
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
+        },
+        .add, .sub, .mul, .div, .mod, .power => blk: {
+            if ((expression.kind == .add or expression.kind == .mul) and expression.operands.len < 2) return error.InvalidColumnValue;
+            if ((expression.kind == .sub or expression.kind == .div or expression.kind == .mod or expression.kind == .power) and expression.operands.len != 2) return error.InvalidColumnValue;
+            if ((expression.kind == .add or expression.kind == .sub) and expression.operands.len == 2 and rowExpressionHasDirectCalendarIntervalOperand(expression)) {
+                break :blk try rowExpressionEvaluateCalendarIntervalArithmeticAlloc(alloc, row_value, expression);
+            }
+            const first_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(first_json);
+            var first = std.json.parseFromSlice(std.json.Value, alloc, first_json, .{}) catch return error.InvalidColumnValue;
+            defer first.deinit();
+            if (first.value == .null) break :blk try alloc.dupe(u8, "null");
+            var result = jsonValueAsFloat(first.value) orelse return error.InvalidColumnValue;
+            for (expression.operands[1..]) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+                defer parsed.deinit();
+                if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+                const rhs = jsonValueAsFloat(parsed.value) orelse return error.InvalidColumnValue;
+                result = switch (expression.kind) {
+                    .add => result + rhs,
+                    .sub => result - rhs,
+                    .mul => result * rhs,
+                    .div => if (rhs == 0) return error.InvalidColumnValue else result / rhs,
+                    .mod => if (rhs == 0) return error.InvalidColumnValue else result - @trunc(result / rhs) * rhs,
+                    .power => std.math.pow(f64, result, rhs),
+                    else => unreachable,
+                };
+                if (!std.math.isFinite(result)) return error.InvalidColumnValue;
+            }
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
+        },
+        .interval_ns, .interval_months => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            break :blk try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+        },
+        .date_trunc => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const unit_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(unit_json);
+            const timestamp_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(timestamp_json);
+            var parsed_unit = std.json.parseFromSlice(std.json.Value, alloc, unit_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_unit.deinit();
+            var parsed_timestamp = std.json.parseFromSlice(std.json.Value, alloc, timestamp_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_timestamp.deinit();
+            if (parsed_unit.value == .null or parsed_timestamp.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_unit.value != .string) return error.InvalidColumnValue;
+            const timestamp_ns = jsonValueAsU64(parsed_timestamp.value) orelse return error.InvalidColumnValue;
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{try rowExpressionDateTruncUtcTimestampNs(parsed_unit.value.string, timestamp_ns)});
+        },
+        .date_bin => blk: {
+            if (expression.operands.len != 3) return error.InvalidColumnValue;
+            const stride_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(stride_json);
+            const timestamp_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(timestamp_json);
+            const origin_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[2]);
+            defer alloc.free(origin_json);
+            var parsed_stride = std.json.parseFromSlice(std.json.Value, alloc, stride_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_stride.deinit();
+            var parsed_timestamp = std.json.parseFromSlice(std.json.Value, alloc, timestamp_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_timestamp.deinit();
+            var parsed_origin = std.json.parseFromSlice(std.json.Value, alloc, origin_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_origin.deinit();
+            if (parsed_stride.value == .null or parsed_timestamp.value == .null or parsed_origin.value == .null) break :blk try alloc.dupe(u8, "null");
+            const stride_ns = jsonValueAsU64(parsed_stride.value) orelse return error.InvalidColumnValue;
+            const timestamp_ns = jsonValueAsU64(parsed_timestamp.value) orelse return error.InvalidColumnValue;
+            const origin_ns = jsonValueAsU64(parsed_origin.value) orelse return error.InvalidColumnValue;
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{try rowExpressionDateBinUtcTimestampNs(stride_ns, timestamp_ns, origin_ns)});
+        },
+        .date_part => blk: {
+            if (expression.operands.len != 2) return error.InvalidColumnValue;
+            const unit_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(unit_json);
+            const timestamp_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[1]);
+            defer alloc.free(timestamp_json);
+            var parsed_unit = std.json.parseFromSlice(std.json.Value, alloc, unit_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_unit.deinit();
+            var parsed_timestamp = std.json.parseFromSlice(std.json.Value, alloc, timestamp_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_timestamp.deinit();
+            if (parsed_unit.value == .null or parsed_timestamp.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_unit.value != .string) return error.InvalidColumnValue;
+            const timestamp_ns = jsonValueAsU64(parsed_timestamp.value) orelse return error.InvalidColumnValue;
+            break :blk try rowExpressionDatePartUtcTimestampJsonAlloc(alloc, parsed_unit.value.string, timestamp_ns);
+        },
+        .cast => blk: {
+            if (expression.operands.len != 1) return error.InvalidColumnValue;
+            const cast_type = expression.cast_type orelse return error.InvalidColumnValue;
+            const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(value_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed.deinit();
+            if (parsed.value == .null) break :blk try alloc.dupe(u8, "null");
+            break :blk try castRowExpressionValueJsonAlloc(alloc, parsed.value, cast_type);
+        },
+        .concat_ws => blk: {
+            if (expression.operands.len < 2) return error.InvalidColumnValue;
+            const separator_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[0]);
+            defer alloc.free(separator_json);
+            var parsed_separator = std.json.parseFromSlice(std.json.Value, alloc, separator_json, .{}) catch return error.InvalidColumnValue;
+            defer parsed_separator.deinit();
+            if (parsed_separator.value == .null) break :blk try alloc.dupe(u8, "null");
+            if (parsed_separator.value != .string) return error.InvalidColumnValue;
+
+            var joined = std.ArrayListUnmanaged(u8).empty;
+            defer joined.deinit(alloc);
+            var emitted = false;
+            for (expression.operands[1..]) |operand| {
+                const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, operand);
+                defer alloc.free(value_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+                defer parsed.deinit();
+                if (parsed.value == .null) continue;
+                if (parsed.value != .string) return error.InvalidColumnValue;
+                if (emitted) try joined.appendSlice(alloc, parsed_separator.value.string);
+                try joined.appendSlice(alloc, parsed.value.string);
+                emitted = true;
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
+        },
+        .case => blk: {
+            if (expression.case_branches.len == 0 or expression.case_else.len != 1) return error.InvalidColumnValue;
+            for (expression.case_branches) |branch| {
+                if (try rowMatchesExpressionCondition(alloc, row_value, branch.when)) {
+                    break :blk try rowExpressionValueJsonAlloc(alloc, row_value, branch.then);
+                }
+            }
+            break :blk try rowExpressionValueJsonAlloc(alloc, row_value, expression.case_else[0]);
+        },
+        else => return error.InvalidColumnValue,
+    };
+}
+
+fn rowExpressionStringValueAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.RelationalRowsExpression,
+) anyerror!?[]u8 {
+    const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression);
+    defer alloc.free(value_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .null => null,
+        .string => |text| try alloc.dupe(u8, text),
+        else => error.InvalidColumnValue,
+    };
+}
+
+fn rowExpressionIntegerValue(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.RelationalRowsExpression,
+) anyerror!?i64 {
+    const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression);
+    defer alloc.free(value_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .null => null,
+        .integer => |integer| integer,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidColumnValue,
+        else => error.InvalidColumnValue,
+    };
+}
+
+fn jsonStringAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = value }, .{});
+}
+
+fn jsonExtractTextValueJsonAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, "null"),
+        .string => |text| try jsonStringAlloc(alloc, text),
+        else => blk: {
+            const text = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(text);
+            break :blk try jsonStringAlloc(alloc, text);
+        },
+    };
+}
+
+fn rowScalarJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, ""),
+        .string => |text| try alloc.dupe(u8, text),
+        .integer => |integer| try std.fmt.allocPrint(alloc, "{d}", .{integer}),
+        .float => |float| try std.fmt.allocPrint(alloc, "{d}", .{float}),
+        .number_string => |text| try alloc.dupe(u8, text),
+        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
+        else => error.InvalidColumnValue,
+    };
+}
+
+fn castRowExpressionValueJsonAlloc(
+    alloc: Allocator,
+    value: std.json.Value,
+    cast_type: schema_mod.RelationalRowsExpressionCastType,
+) ![]u8 {
+    return switch (cast_type) {
+        .text => blk: {
+            const text = try rowScalarJsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            break :blk try jsonStringAlloc(alloc, text);
+        },
+        .numeric => blk: {
+            const number = switch (value) {
+                .integer, .float, .number_string => jsonValueAsFloat(value) orelse return error.InvalidColumnValue,
+                .string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidColumnValue,
+                else => return error.InvalidColumnValue,
+            };
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{number});
+        },
+        .datetime => blk: {
+            const timestamp_ns = switch (value) {
+                .integer => |integer| if (integer >= 0) @as(u64, @intCast(integer)) else return error.InvalidColumnValue,
+                .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidColumnValue,
+                .string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidColumnValue,
+                else => return error.InvalidColumnValue,
+            };
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{timestamp_ns});
+        },
+        .bool => blk: {
+            const enabled = switch (value) {
+                .bool => |enabled| enabled,
+                .string => |text| if (std.mem.eql(u8, text, "true"))
+                    true
+                else if (std.mem.eql(u8, text, "false"))
+                    false
+                else
+                    return error.InvalidColumnValue,
+                else => return error.InvalidColumnValue,
+            };
+            break :blk try alloc.dupe(u8, if (enabled) "true" else "false");
+        },
+    };
+}
+
+fn rowExpressionJsonBuildObjectValueJsonAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.RelationalRowsExpression,
+) ![]u8 {
+    if (expression.operands.len % 2 != 0) return error.InvalidColumnValue;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    var index: usize = 0;
+    while (index < expression.operands.len) : (index += 2) {
+        const key_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[index]);
+        defer alloc.free(key_json);
+        var parsed_key = std.json.parseFromSlice(std.json.Value, alloc, key_json, .{}) catch return error.InvalidColumnValue;
+        defer parsed_key.deinit();
+        if (parsed_key.value != .string) return error.InvalidColumnValue;
+
+        const value_json = try rowExpressionValueJsonAlloc(alloc, row_value, expression.operands[index + 1]);
+        defer alloc.free(value_json);
+        var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidColumnValue;
+        defer parsed_value.deinit();
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(parsed_key.value.string, .{})});
+        try std.json.Stringify.value(parsed_value.value, .{}, writer);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn rowExpressionJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null => try alloc.dupe(u8, ""),
+        .string => |text| try alloc.dupe(u8, text),
+        .bool => |flag| try alloc.dupe(u8, if (flag) "true" else "false"),
+        .integer => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .float => |number| try std.fmt.allocPrint(alloc, "{d}", .{number}),
+        .number_string => |number| try alloc.dupe(u8, number),
+        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+    };
+}
+
+fn arrayPositionsValueJsonAlloc(
+    alloc: Allocator,
+    items: []const std.json.Value,
+    needle: std.json.Value,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var first = true;
+    for (items, 0..) |item, index| {
+        if (!jsonValuesEqualExact(item, needle)) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{d}", .{index + 1});
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn arrayElementTransformValueJsonAlloc(
+    alloc: Allocator,
+    items: []const std.json.Value,
+    element: std.json.Value,
+    kind: schema_mod.RelationalRowsExpressionKind,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var first = true;
+    if (kind == .array_prepend) {
+        try std.json.Stringify.value(element, .{}, writer);
+        for (items) |item| {
+            try writer.writeByte(',');
+            try std.json.Stringify.value(item, .{}, writer);
+        }
+    } else if (kind == .array_append) {
+        for (items) |item| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try std.json.Stringify.value(item, .{}, writer);
+        }
+        if (!first) try writer.writeByte(',');
+        try std.json.Stringify.value(element, .{}, writer);
+    } else if (kind == .array_remove) {
+        for (items) |item| {
+            if (jsonValuesEqualExact(item, element)) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try std.json.Stringify.value(item, .{}, writer);
+        }
+    } else return error.InvalidColumnValue;
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn arrayConcatValueJsonAlloc(
+    alloc: Allocator,
+    left_items: []const std.json.Value,
+    right_items: []const std.json.Value,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var first = true;
+    for (left_items) |item| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(item, .{}, writer);
+    }
+    for (right_items) |item| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(item, .{}, writer);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn arrayReplaceValueJsonAlloc(
+    alloc: Allocator,
+    items: []const std.json.Value,
+    old_value: std.json.Value,
+    new_value: std.json.Value,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var first = true;
+    for (items) |item| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(if (jsonValuesEqualExact(item, old_value)) new_value else item, .{}, writer);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn arrayToStringValueJsonAlloc(
+    alloc: Allocator,
+    items: []const std.json.Value,
+    delimiter: []const u8,
+    null_text: ?[]const u8,
+) ![]u8 {
+    var joined: std.Io.Writer.Allocating = .init(alloc);
+    errdefer joined.deinit();
+    const writer = &joined.writer;
+    var first = true;
+    for (items) |item| {
+        if (item == .null and null_text == null) continue;
+        if (!first) try writer.writeAll(delimiter);
+        first = false;
+        if (item == .null) {
+            try writer.writeAll(null_text.?);
+        } else {
+            const text = try rowExpressionJsonValueTextAlloc(alloc, item);
+            defer alloc.free(text);
+            try writer.writeAll(text);
+        }
+    }
+    const joined_text = try joined.toOwnedSlice();
+    defer alloc.free(joined_text);
+    return try jsonStringAlloc(alloc, joined_text);
+}
+
+fn stringToArrayValueJsonAlloc(
+    alloc: Allocator,
+    text: []const u8,
+    delimiter: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var split = std.mem.splitSequence(u8, text, delimiter);
+    var first = true;
+    while (split.next()) |part| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}", .{std.json.fmt(part, .{})});
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn rowExpressionHasDirectCalendarIntervalOperand(expression: schema_mod.RelationalRowsExpression) bool {
+    for (expression.operands) |operand| {
+        if (operand.kind == .interval_months) return true;
+    }
+    return false;
+}
+
+fn rowExpressionEvaluateCalendarIntervalArithmeticAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    expression: schema_mod.RelationalRowsExpression,
+) ![]u8 {
+    if ((expression.kind != .add and expression.kind != .sub) or expression.operands.len != 2) return error.InvalidColumnValue;
+    const lhs_is_interval = expression.operands[0].kind == .interval_months;
+    const rhs_is_interval = expression.operands[1].kind == .interval_months;
+    if (lhs_is_interval == rhs_is_interval) return error.InvalidColumnValue;
+    if (expression.kind == .sub and lhs_is_interval) return error.InvalidColumnValue;
+
+    const timestamp_expression = if (lhs_is_interval) expression.operands[1] else expression.operands[0];
+    const months_expression = if (lhs_is_interval) expression.operands[0] else expression.operands[1];
+    const timestamp_json = try rowExpressionValueJsonAlloc(alloc, row_value, timestamp_expression);
+    defer alloc.free(timestamp_json);
+    const months_json = try rowExpressionValueJsonAlloc(alloc, row_value, months_expression);
+    defer alloc.free(months_json);
+
+    var parsed_timestamp = std.json.parseFromSlice(std.json.Value, alloc, timestamp_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed_timestamp.deinit();
+    var parsed_months = std.json.parseFromSlice(std.json.Value, alloc, months_json, .{}) catch return error.InvalidColumnValue;
+    defer parsed_months.deinit();
+    if (parsed_timestamp.value == .null or parsed_months.value == .null) return try alloc.dupe(u8, "null");
+    const timestamp_ns = jsonValueAsU64(parsed_timestamp.value) orelse return error.InvalidColumnValue;
+    var months = jsonValueAsI64(parsed_months.value) orelse return error.InvalidColumnValue;
+    if (expression.kind == .sub) months = -months;
+    return try std.fmt.allocPrint(alloc, "{d}", .{try rowExpressionAddUtcMonthsToTimestampNs(timestamp_ns, months)});
+}
+
+const row_expression_ns_per_day: u64 = 86_400_000_000_000;
+const row_expression_ns_per_hour: u64 = 3_600_000_000_000;
+const row_expression_ns_per_minute: u64 = 60_000_000_000;
+const row_expression_ns_per_second: u64 = 1_000_000_000;
+const row_expression_ns_per_millisecond: u64 = 1_000_000;
+const row_expression_ns_per_microsecond: u64 = 1_000;
+
+fn rowExpressionDateTruncUtcTimestampNs(unit: []const u8, timestamp_ns: u64) !u64 {
+    if (std.ascii.eqlIgnoreCase(unit, "microsecond") or std.ascii.eqlIgnoreCase(unit, "microseconds")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_microsecond);
+    if (std.ascii.eqlIgnoreCase(unit, "millisecond") or std.ascii.eqlIgnoreCase(unit, "milliseconds")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_millisecond);
+    if (std.ascii.eqlIgnoreCase(unit, "second") or std.ascii.eqlIgnoreCase(unit, "seconds")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_second);
+    if (std.ascii.eqlIgnoreCase(unit, "minute") or std.ascii.eqlIgnoreCase(unit, "minutes")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_minute);
+    if (std.ascii.eqlIgnoreCase(unit, "hour") or std.ascii.eqlIgnoreCase(unit, "hours")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_hour);
+    if (std.ascii.eqlIgnoreCase(unit, "day") or std.ascii.eqlIgnoreCase(unit, "days")) return timestamp_ns - (timestamp_ns % row_expression_ns_per_day);
+
+    const day_count: i64 = @intCast(timestamp_ns / row_expression_ns_per_day);
+    if (std.ascii.eqlIgnoreCase(unit, "week") or std.ascii.eqlIgnoreCase(unit, "weeks")) {
+        const days_since_monday = @mod(day_count + 3, 7);
+        const start_day = day_count - days_since_monday;
+        if (start_day < 0) return error.InvalidColumnValue;
+        return std.math.mul(u64, @intCast(start_day), row_expression_ns_per_day) catch return error.InvalidColumnValue;
+    }
+
+    var civil = rowExpressionCivilFromDays(day_count);
+    if (std.ascii.eqlIgnoreCase(unit, "month") or std.ascii.eqlIgnoreCase(unit, "months")) {
+        civil.day = 1;
+    } else if (std.ascii.eqlIgnoreCase(unit, "quarter") or std.ascii.eqlIgnoreCase(unit, "quarters")) {
+        civil.month = @intCast(@divFloor(@as(u16, civil.month) - 1, 3) * 3 + 1);
+        civil.day = 1;
+    } else if (std.ascii.eqlIgnoreCase(unit, "year") or std.ascii.eqlIgnoreCase(unit, "years")) {
+        civil.month = 1;
+        civil.day = 1;
+    } else if (std.ascii.eqlIgnoreCase(unit, "decade") or std.ascii.eqlIgnoreCase(unit, "decades")) {
+        civil.year = @divFloor(civil.year, 10) * 10;
+        civil.month = 1;
+        civil.day = 1;
+    } else if (std.ascii.eqlIgnoreCase(unit, "century") or std.ascii.eqlIgnoreCase(unit, "centuries")) {
+        civil.year = @divFloor(civil.year - 1, 100) * 100 + 1;
+        civil.month = 1;
+        civil.day = 1;
+    } else if (std.ascii.eqlIgnoreCase(unit, "millennium") or std.ascii.eqlIgnoreCase(unit, "millennia") or std.ascii.eqlIgnoreCase(unit, "millenniums")) {
+        civil.year = @divFloor(civil.year - 1, 1000) * 1000 + 1;
+        civil.month = 1;
+        civil.day = 1;
+    } else return error.InvalidColumnValue;
+    const start_day = rowExpressionDaysFromCivil(civil.year, civil.month, civil.day);
+    if (start_day < 0) return error.InvalidColumnValue;
+    return std.math.mul(u64, @intCast(start_day), row_expression_ns_per_day) catch return error.InvalidColumnValue;
+}
+
+fn rowExpressionDateBinUtcTimestampNs(stride_ns: u64, timestamp_ns: u64, origin_ns: u64) !u64 {
+    if (stride_ns == 0) return error.InvalidColumnValue;
+    const stride: i128 = @intCast(stride_ns);
+    const timestamp: i128 = @intCast(timestamp_ns);
+    const origin: i128 = @intCast(origin_ns);
+    const bucket = origin + @divFloor(timestamp - origin, stride) * stride;
+    if (bucket < 0 or bucket > std.math.maxInt(u64)) return error.InvalidColumnValue;
+    return @intCast(bucket);
+}
+
+fn rowExpressionDatePartUtcTimestampJsonAlloc(alloc: Allocator, unit: []const u8, timestamp_ns: u64) ![]u8 {
+    if (std.ascii.eqlIgnoreCase(unit, "epoch")) {
+        const seconds = @as(f64, @floatFromInt(timestamp_ns)) / @as(f64, @floatFromInt(row_expression_ns_per_second));
+        return try std.fmt.allocPrint(alloc, "{d}", .{seconds});
+    }
+
+    const day_count: i64 = @intCast(timestamp_ns / row_expression_ns_per_day);
+    const day_ns = timestamp_ns % row_expression_ns_per_day;
+    const civil = rowExpressionCivilFromDays(day_count);
+    if (std.ascii.eqlIgnoreCase(unit, "year") or std.ascii.eqlIgnoreCase(unit, "years")) return try std.fmt.allocPrint(alloc, "{d}", .{civil.year});
+    if (std.ascii.eqlIgnoreCase(unit, "decade") or std.ascii.eqlIgnoreCase(unit, "decades")) return try std.fmt.allocPrint(alloc, "{d}", .{@divFloor(civil.year, 10)});
+    if (std.ascii.eqlIgnoreCase(unit, "century") or std.ascii.eqlIgnoreCase(unit, "centuries")) return try std.fmt.allocPrint(alloc, "{d}", .{@divFloor(civil.year - 1, 100) + 1});
+    if (std.ascii.eqlIgnoreCase(unit, "millennium") or std.ascii.eqlIgnoreCase(unit, "millennia") or std.ascii.eqlIgnoreCase(unit, "millenniums")) return try std.fmt.allocPrint(alloc, "{d}", .{@divFloor(civil.year - 1, 1000) + 1});
+    if (std.ascii.eqlIgnoreCase(unit, "isoyear")) return try std.fmt.allocPrint(alloc, "{d}", .{rowExpressionIsoWeekYear(day_count)});
+    if (std.ascii.eqlIgnoreCase(unit, "quarter") or std.ascii.eqlIgnoreCase(unit, "quarters")) return try std.fmt.allocPrint(alloc, "{d}", .{@divFloor(@as(u16, civil.month) + 2, 3)});
+    if (std.ascii.eqlIgnoreCase(unit, "month") or std.ascii.eqlIgnoreCase(unit, "months")) return try std.fmt.allocPrint(alloc, "{d}", .{civil.month});
+    if (std.ascii.eqlIgnoreCase(unit, "week") or std.ascii.eqlIgnoreCase(unit, "weeks")) return try std.fmt.allocPrint(alloc, "{d}", .{rowExpressionIsoWeekNumber(day_count)});
+    if (std.ascii.eqlIgnoreCase(unit, "day") or std.ascii.eqlIgnoreCase(unit, "days")) return try std.fmt.allocPrint(alloc, "{d}", .{civil.day});
+    if (std.ascii.eqlIgnoreCase(unit, "doy")) return try std.fmt.allocPrint(alloc, "{d}", .{rowExpressionDayOfYear(civil)});
+    if (std.ascii.eqlIgnoreCase(unit, "dow")) return try std.fmt.allocPrint(alloc, "{d}", .{@mod(day_count + 4, 7)});
+    if (std.ascii.eqlIgnoreCase(unit, "isodow")) return try std.fmt.allocPrint(alloc, "{d}", .{@mod(day_count + 3, 7) + 1});
+    if (std.ascii.eqlIgnoreCase(unit, "hour") or std.ascii.eqlIgnoreCase(unit, "hours")) return try std.fmt.allocPrint(alloc, "{d}", .{day_ns / row_expression_ns_per_hour});
+    if (std.ascii.eqlIgnoreCase(unit, "minute") or std.ascii.eqlIgnoreCase(unit, "minutes")) return try std.fmt.allocPrint(alloc, "{d}", .{(day_ns % row_expression_ns_per_hour) / row_expression_ns_per_minute});
+    if (std.ascii.eqlIgnoreCase(unit, "second") or std.ascii.eqlIgnoreCase(unit, "seconds")) {
+        const seconds = @as(f64, @floatFromInt(day_ns % row_expression_ns_per_minute)) / @as(f64, @floatFromInt(row_expression_ns_per_second));
+        return try std.fmt.allocPrint(alloc, "{d}", .{seconds});
+    }
+    if (std.ascii.eqlIgnoreCase(unit, "millisecond") or std.ascii.eqlIgnoreCase(unit, "milliseconds")) {
+        const milliseconds = @as(f64, @floatFromInt(day_ns % row_expression_ns_per_minute)) / @as(f64, @floatFromInt(row_expression_ns_per_millisecond));
+        return try std.fmt.allocPrint(alloc, "{d}", .{milliseconds});
+    }
+    if (std.ascii.eqlIgnoreCase(unit, "microsecond") or std.ascii.eqlIgnoreCase(unit, "microseconds")) {
+        const microseconds = @as(f64, @floatFromInt(day_ns % row_expression_ns_per_minute)) / @as(f64, @floatFromInt(row_expression_ns_per_microsecond));
+        return try std.fmt.allocPrint(alloc, "{d}", .{microseconds});
+    }
+    return error.InvalidColumnValue;
+}
+
+fn rowExpressionAddUtcMonthsToTimestampNs(timestamp_ns: u64, months_delta: i64) !u64 {
+    const day_count: i64 = @intCast(timestamp_ns / row_expression_ns_per_day);
+    const day_ns = timestamp_ns % row_expression_ns_per_day;
+    var civil = rowExpressionCivilFromDays(day_count);
+    const month_index = civil.year * 12 + @as(i64, civil.month - 1) + months_delta;
+    civil.year = @divFloor(month_index, 12);
+    civil.month = @intCast(@mod(month_index, 12) + 1);
+    const max_day = rowExpressionDaysInMonth(civil.year, civil.month);
+    if (civil.day > max_day) civil.day = max_day;
+    const out_days = rowExpressionDaysFromCivil(civil.year, civil.month, civil.day);
+    if (out_days < 0) return error.InvalidColumnValue;
+    const days_ns = std.math.mul(u64, @intCast(out_days), row_expression_ns_per_day) catch return error.InvalidColumnValue;
+    return std.math.add(u64, days_ns, day_ns) catch error.InvalidColumnValue;
+}
+
+const RowExpressionCivilDate = struct {
+    year: i64,
+    month: u8,
+    day: u8,
+};
+
+fn rowExpressionCivilFromDays(days_since_epoch: i64) RowExpressionCivilDate {
+    const z = days_since_epoch + 719468;
+    const era = @divFloor(z, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = @intCast((doe - doe / 1460 + doe / 36524 - doe / 146096) / 365);
+    var year: i64 = @as(i64, yoe) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const day: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1);
+    const month: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    if (month <= 2) year += 1;
+    return .{ .year = year, .month = month, .day = day };
+}
+
+fn rowExpressionDaysFromCivil(year_value: i64, month_value: u8, day_value: u8) i64 {
+    var year = year_value;
+    const month: i64 = month_value;
+    const day: i64 = day_value;
+    if (month <= 2) year -= 1;
+    const era = @divFloor(year, 400);
+    const yoe = year - era * 400;
+    const month_prime = month + if (month > 2) @as(i64, -3) else @as(i64, 9);
+    const doy = @divFloor(153 * month_prime + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn rowExpressionDayOfYear(civil: RowExpressionCivilDate) u16 {
+    const start = rowExpressionDaysFromCivil(civil.year, 1, 1);
+    const current = rowExpressionDaysFromCivil(civil.year, civil.month, civil.day);
+    return @intCast(current - start + 1);
+}
+
+fn rowExpressionIsoWeekYear(day_count: i64) i64 {
+    const monday_zero_dow = @mod(day_count + 3, 7);
+    const thursday_day = day_count + (3 - monday_zero_dow);
+    return rowExpressionCivilFromDays(thursday_day).year;
+}
+
+fn rowExpressionIsoWeekNumber(day_count: i64) u8 {
+    const year = rowExpressionIsoWeekYear(day_count);
+    const jan_4 = rowExpressionDaysFromCivil(year, 1, 4);
+    const week_1_monday = jan_4 - @mod(jan_4 + 3, 7);
+    return @intCast(@divFloor(day_count - week_1_monday, 7) + 1);
+}
+
+fn rowExpressionDaysInMonth(year: i64, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (rowExpressionIsLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn rowExpressionIsLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+fn sqlLikePatternMatches(text: []const u8, pattern: []const u8, case_insensitive: bool) bool {
+    return sqlLikePatternMatchesFrom(text, pattern, case_insensitive, 0, 0);
+}
+
+fn sqlLikePatternMatchesFrom(
+    text: []const u8,
+    pattern: []const u8,
+    case_insensitive: bool,
+    text_index: usize,
+    pattern_index: usize,
+) bool {
+    var ti = text_index;
+    var pi = pattern_index;
+    while (pi < pattern.len) {
+        switch (pattern[pi]) {
+            '%' => {
+                pi += 1;
+                if (pi == pattern.len) return true;
+                var next_ti = ti;
+                while (next_ti <= text.len) : (next_ti += 1) {
+                    if (sqlLikePatternMatchesFrom(text, pattern, case_insensitive, next_ti, pi)) return true;
+                }
+                return false;
+            },
+            '_' => {
+                if (ti >= text.len) return false;
+                ti += 1;
+                pi += 1;
+            },
+            else => {
+                if (ti >= text.len) return false;
+                if (!sqlLikeBytesEqual(text[ti], pattern[pi], case_insensitive)) return false;
+                ti += 1;
+                pi += 1;
+            },
+        }
+    }
+    return ti == text.len;
+}
+
+fn sqlLikeBytesEqual(lhs: u8, rhs: u8, case_insensitive: bool) bool {
+    if (!case_insensitive) return lhs == rhs;
+    return std.ascii.toLower(lhs) == std.ascii.toLower(rhs);
+}
+
+fn replaceTextAlloc(alloc: Allocator, source: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    if (needle.len == 0) return try alloc.dupe(u8, source);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, source, start, needle)) |index| {
+        try out.appendSlice(alloc, source[start..index]);
+        try out.appendSlice(alloc, replacement);
+        start = index + needle.len;
+    }
+    try out.appendSlice(alloc, source[start..]);
+    return try out.toOwnedSlice(alloc);
+}
+
+const RegexpReplaceFlags = struct {
+    global: bool = false,
+};
+
+const RegexpMatchSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn regexpReplaceTextAlloc(
+    alloc: Allocator,
+    source: []const u8,
+    pattern: []const u8,
+    replacement: []const u8,
+    flags: []const u8,
+) ![]u8 {
+    const parsed_flags = try parseRegexpReplaceFlags(flags);
+    if (std.mem.indexOfScalar(u8, replacement, '\\') != null) return error.InvalidColumnValue;
+
+    var compiled = regex_mod.compile(alloc, pattern) catch return error.InvalidColumnValue;
+    defer compiled.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = 0;
+    var replaced = false;
+    while (cursor <= source.len) {
+        const span = regexpFindLeftmostMatch(&compiled, source, cursor) orelse break;
+        if (span.end <= span.start) return error.InvalidColumnValue;
+        try out.appendSlice(alloc, source[cursor..span.start]);
+        try out.appendSlice(alloc, replacement);
+        cursor = span.end;
+        replaced = true;
+        if (!parsed_flags.global) break;
+    }
+    if (!replaced) return try alloc.dupe(u8, source);
+    try out.appendSlice(alloc, source[cursor..]);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn parseRegexpReplaceFlags(flags: []const u8) !RegexpReplaceFlags {
+    var parsed = RegexpReplaceFlags{};
+    for (flags) |flag| switch (flag) {
+        'g' => parsed.global = true,
+        else => return error.InvalidColumnValue,
+    };
+    return parsed;
+}
+
+fn regexpFindLeftmostMatch(compiled: *regex_mod.RegexAutomaton, text: []const u8, start_at: usize) ?RegexpMatchSpan {
+    if (compiled.anchored_start and start_at != 0) return null;
+    var start = start_at;
+    while (start <= text.len) : (start += 1) {
+        if (regexpMatchEndFrom(compiled, text, start)) |end| {
+            if (compiled.anchored_end and end != text.len) continue;
+            return .{ .start = start, .end = end };
+        }
+    }
+    return null;
+}
+
+fn regexpMatchEndFrom(compiled: *regex_mod.RegexAutomaton, text: []const u8, start: usize) ?usize {
+    const automaton = compiled.automaton();
+    var state = automaton.start();
+    var latest_match: ?usize = null;
+    if (automaton.isMatch(state) and (!compiled.anchored_end or start == text.len)) latest_match = start;
+    for (text[start..], 0..) |byte, offset| {
+        state = automaton.accept(state, byte);
+        if (!automaton.canMatch(state)) break;
+        if (automaton.isMatch(state)) {
+            const end = start + offset + 1;
+            if (!compiled.anchored_end or end == text.len) latest_match = end;
+        }
+    }
+    return latest_match;
+}
+
+fn substringTextAlloc(alloc: Allocator, text: []const u8, start_index: i64, length_count: ?i64) ![]u8 {
+    if (start_index < 1) return error.InvalidColumnValue;
+    if (length_count) |count| if (count < 0) return error.InvalidColumnValue;
+    const start_codepoint: usize = @intCast(start_index - 1);
+    const end_codepoint: ?usize = if (length_count) |count| start_codepoint + @as(usize, @intCast(count)) else null;
+    const start_byte = try utf8ByteOffsetForCodepointIndex(text, start_codepoint);
+    const end_byte = if (end_codepoint) |index| try utf8ByteOffsetForCodepointIndex(text, index) else text.len;
+    return try alloc.dupe(u8, text[start_byte..end_byte]);
+}
+
+fn overlayTextAlloc(alloc: Allocator, text: []const u8, replacement: []const u8, start_index: i64, length_count: ?i64) ![]u8 {
+    if (start_index < 1) return error.InvalidColumnValue;
+    if (length_count) |count| if (count < 0) return error.InvalidColumnValue;
+    try validateUtf8Text(replacement);
+    const start_codepoint: usize = @intCast(start_index - 1);
+    const replacement_codepoints = std.unicode.utf8CountCodepoints(replacement) catch return error.InvalidColumnValue;
+    const replace_count: usize = if (length_count) |count| @intCast(count) else replacement_codepoints;
+    const end_codepoint = start_codepoint + replace_count;
+    const start_byte = try utf8ByteOffsetForCodepointIndex(text, start_codepoint);
+    const end_byte = try utf8ByteOffsetForCodepointIndex(text, end_codepoint);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, text[0..start_byte]);
+    try out.appendSlice(alloc, replacement);
+    try out.appendSlice(alloc, text[end_byte..]);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn splitPartTextAlloc(alloc: Allocator, text: []const u8, delimiter: []const u8, field_index: i64) ![]u8 {
+    if (field_index == 0) return error.InvalidColumnValue;
+    if (delimiter.len == 0) return try alloc.dupe(u8, if (field_index == 1 or field_index == -1) text else "");
+
+    if (field_index > 0) {
+        var split = std.mem.splitSequence(u8, text, delimiter);
+        var current: i64 = 1;
+        while (split.next()) |part| : (current += 1) {
+            if (current == field_index) return try alloc.dupe(u8, part);
+        }
+        return try alloc.dupe(u8, "");
+    }
+
+    var parts = std.ArrayListUnmanaged([]const u8).empty;
+    defer parts.deinit(alloc);
+    var split = std.mem.splitSequence(u8, text, delimiter);
+    while (split.next()) |part| try parts.append(alloc, part);
+    const from_end: usize = @intCast(-field_index);
+    if (from_end == 0 or from_end > parts.items.len) return try alloc.dupe(u8, "");
+    return try alloc.dupe(u8, parts.items[parts.items.len - from_end]);
+}
+
+fn trimTextAlloc(alloc: Allocator, text: []const u8, trim_set: []const u8, trim_left: bool, trim_right: bool) ![]u8 {
+    try validateUtf8Text(trim_set);
+    var start: usize = 0;
+    var end: usize = text.len;
+    if (trim_left) {
+        while (start < end) {
+            const width = try utf8CodepointWidthAt(text, start);
+            if (!try utf8CodepointSetContains(trim_set, text[start .. start + width])) break;
+            start += width;
+        }
+    }
+    if (trim_right) {
+        while (end > start) {
+            const prev = try utf8PreviousCodepointStart(text, start, end);
+            if (!try utf8CodepointSetContains(trim_set, text[prev..end])) break;
+            end = prev;
+        }
+    }
+    return try alloc.dupe(u8, text[start..end]);
+}
+
+fn leftRightTextAlloc(alloc: Allocator, text: []const u8, count: i64, from_left: bool) ![]u8 {
+    const total_codepoints = std.unicode.utf8CountCodepoints(text) catch return error.InvalidColumnValue;
+    const abs_count: usize = if (count < 0) @intCast(-count) else @intCast(count);
+    const slice_start: usize, const slice_end: usize = if (from_left) blk: {
+        if (count >= 0) break :blk .{ 0, @min(abs_count, total_codepoints) };
+        break :blk .{ 0, total_codepoints - @min(abs_count, total_codepoints) };
+    } else blk: {
+        if (count >= 0) {
+            const kept = @min(abs_count, total_codepoints);
+            break :blk .{ total_codepoints - kept, total_codepoints };
+        }
+        break :blk .{ @min(abs_count, total_codepoints), total_codepoints };
+    };
+    const start_byte = try utf8ByteOffsetForCodepointIndex(text, slice_start);
+    const end_byte = try utf8ByteOffsetForCodepointIndex(text, slice_end);
+    return try alloc.dupe(u8, text[start_byte..end_byte]);
+}
+
+fn padTextAlloc(alloc: Allocator, text: []const u8, target_count: i64, fill: []const u8, pad_left: bool) ![]u8 {
+    try validateUtf8Text(text);
+    try validateUtf8Text(fill);
+    if (target_count <= 0) return try alloc.dupe(u8, "");
+    if (fill.len == 0) return error.InvalidColumnValue;
+    const target_codepoints: usize = @intCast(target_count);
+    const text_codepoints = std.unicode.utf8CountCodepoints(text) catch return error.InvalidColumnValue;
+    if (text_codepoints >= target_codepoints) {
+        const end_byte = try utf8ByteOffsetForCodepointIndex(text, target_codepoints);
+        return try alloc.dupe(u8, text[0..end_byte]);
+    }
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const padding_codepoints = target_codepoints - text_codepoints;
+    if (pad_left) {
+        try appendPadCodepoints(alloc, &out, fill, padding_codepoints);
+        try out.appendSlice(alloc, text);
+    } else {
+        try out.appendSlice(alloc, text);
+        try appendPadCodepoints(alloc, &out, fill, padding_codepoints);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendPadCodepoints(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), fill: []const u8, count: usize) !void {
+    var appended: usize = 0;
+    while (appended < count) {
+        var index: usize = 0;
+        while (index < fill.len and appended < count) : (appended += 1) {
+            const width = try utf8CodepointWidthAt(fill, index);
+            try out.appendSlice(alloc, fill[index .. index + width]);
+            index += width;
+        }
+    }
+}
+
+fn repeatTextAlloc(alloc: Allocator, text: []const u8, count: i64) ![]u8 {
+    try validateUtf8Text(text);
+    if (count < 0) return error.InvalidColumnValue;
+    const repeat_count: usize = @intCast(count);
+    const total_len = std.math.mul(usize, text.len, repeat_count) catch return error.InvalidColumnValue;
+    var out = try std.ArrayListUnmanaged(u8).initCapacity(alloc, total_len);
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < repeat_count) : (i += 1) try out.appendSlice(alloc, text);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn reverseTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
+    try validateUtf8Text(text);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var end = text.len;
+    while (end > 0) {
+        const start = try utf8PreviousCodepointStart(text, 0, end);
+        try out.appendSlice(alloc, text[start..end]);
+        end = start;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn initcapTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
+    try validateUtf8Text(text);
+    const out = try alloc.dupe(u8, text);
+    var at_word_start = true;
+    for (out) |*byte| {
+        if (std.ascii.isAlphanumeric(byte.*)) {
+            byte.* = if (at_word_start) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
+            at_word_start = false;
+        } else {
+            at_word_start = true;
+        }
+    }
+    return out;
+}
+
+fn translateTextAlloc(alloc: Allocator, text: []const u8, from_set: []const u8, to_set: []const u8) ![]u8 {
+    try validateUtf8Text(text);
+    try validateUtf8Text(from_set);
+    try validateUtf8Text(to_set);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < text.len) {
+        const width = try utf8CodepointWidthAt(text, index);
+        const codepoint = text[index .. index + width];
+        if (try translateReplacementCodepoint(from_set, to_set, codepoint)) |replacement| {
+            try out.appendSlice(alloc, replacement);
+        } else if (!try utf8CodepointSetContains(from_set, codepoint)) {
+            try out.appendSlice(alloc, codepoint);
+        }
+        index += width;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn translateReplacementCodepoint(from_set: []const u8, to_set: []const u8, needle: []const u8) !?[]const u8 {
+    var from_index: usize = 0;
+    var ordinal: usize = 0;
+    while (from_index < from_set.len) : (ordinal += 1) {
+        const from_width = try utf8CodepointWidthAt(from_set, from_index);
+        if (std.mem.eql(u8, from_set[from_index .. from_index + from_width], needle)) {
+            var to_index: usize = 0;
+            var to_ordinal: usize = 0;
+            while (to_index < to_set.len) : (to_ordinal += 1) {
+                const to_width = try utf8CodepointWidthAt(to_set, to_index);
+                if (to_ordinal == ordinal) return to_set[to_index .. to_index + to_width];
+                to_index += to_width;
+            }
+            return "";
+        }
+        from_index += from_width;
+    }
+    return null;
+}
+
+fn validateUtf8Text(text: []const u8) !void {
+    var index: usize = 0;
+    while (index < text.len) index += try utf8CodepointWidthAt(text, index);
+}
+
+fn firstUtf8Codepoint(text: []const u8) !u21 {
+    const width = try utf8CodepointWidthAt(text, 0);
+    return std.unicode.utf8Decode(text[0..width]) catch return error.InvalidColumnValue;
+}
+
+fn codepointTextAlloc(alloc: Allocator, codepoint: i64) ![]u8 {
+    if (codepoint <= 0 or codepoint > 0x10ffff) return error.InvalidColumnValue;
+    if (codepoint >= 0xd800 and codepoint <= 0xdfff) return error.InvalidColumnValue;
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(@intCast(codepoint), &buf) catch return error.InvalidColumnValue;
+    return try alloc.dupe(u8, buf[0..len]);
+}
+
+fn utf8CodepointWidthAt(text: []const u8, index: usize) !usize {
+    if (index >= text.len) return error.InvalidColumnValue;
+    const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return error.InvalidColumnValue;
+    if (index + width > text.len) return error.InvalidColumnValue;
+    return width;
+}
+
+fn utf8PreviousCodepointStart(text: []const u8, start: usize, end: usize) !usize {
+    if (end <= start or end > text.len) return error.InvalidColumnValue;
+    var index = end;
+    while (index > start) {
+        index -= 1;
+        if ((text[index] & 0b1100_0000) != 0b1000_0000) {
+            const width = try utf8CodepointWidthAt(text, index);
+            if (index + width != end) return error.InvalidColumnValue;
+            return index;
+        }
+    }
+    return error.InvalidColumnValue;
+}
+
+fn utf8CodepointSetContains(set: []const u8, needle: []const u8) !bool {
+    var index: usize = 0;
+    while (index < set.len) {
+        const width = try utf8CodepointWidthAt(set, index);
+        if (std.mem.eql(u8, set[index .. index + width], needle)) return true;
+        index += width;
+    }
+    return false;
+}
+
+fn strposTextCodepointPosition(text: []const u8, needle: []const u8) !usize {
+    if (needle.len == 0) return 1;
+    const byte_index = std.mem.indexOf(u8, text, needle) orelse return 0;
+    const codepoints_before = std.unicode.utf8CountCodepoints(text[0..byte_index]) catch return error.InvalidColumnValue;
+    return codepoints_before + 1;
+}
+
+fn utf8ByteOffsetForCodepointIndex(text: []const u8, codepoint_index: usize) !usize {
+    var byte_index: usize = 0;
+    var seen: usize = 0;
+    while (byte_index < text.len and seen < codepoint_index) : (seen += 1) {
+        const width = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch return error.InvalidColumnValue;
+        if (byte_index + width > text.len) return error.InvalidColumnValue;
+        byte_index += width;
+    }
+    return byte_index;
+}
+
+fn cellJsonValueAlloc(alloc: Allocator, cell: relational_row_codec.Cell) ![]u8 {
+    return switch (cell.value) {
+        .bytes_val => |bytes| if (cell.is_json)
+            try alloc.dupe(u8, bytes)
+        else
+            try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = bytes }, .{}),
+        .bool_val => |value| try alloc.dupe(u8, if (value) "true" else "false"),
+        .u64_val => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
+        .f64_val => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
+        .geo_point => return error.InvalidColumnValue,
+    };
+}
+
+fn md5HexTextAlloc(alloc: Allocator, text: []const u8) ![]u8 {
+    const digest = std.crypto.hash.Md5.hashResult(text);
+    const out = try alloc.alloc(u8, digest.len * 2);
+    for (digest, 0..) |byte, i| {
+        out[i * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        out[i * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return out;
 }
 
 fn cellEqualsJsonLiteral(alloc: Allocator, cell: relational_row_codec.Cell, value_json: []const u8) !bool {
@@ -1822,22 +4519,37 @@ fn uniqueConstraintColumnValueAlloc(alloc: Allocator, row_value: []const u8, col
 
 fn uniqueConstraintExpressionValueAlloc(alloc: Allocator, row_value: []const u8, expression: schema_mod.UniqueExpression) !?[]u8 {
     return switch (expression.op) {
-        .lower, .upper => blk: {
+        .lower, .upper, .md5 => blk: {
             const cell = (try relational_row_codec.findCellByPath(row_value, expression.field)) orelse return null;
             if (cell.is_json) return error.InvalidColumnValue;
             const bytes = switch (cell.value) {
                 .bytes_val => |value| value,
                 else => return error.InvalidColumnValue,
             };
-            const folded = try alloc.alloc(u8, bytes.len + 1);
-            folded[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
-            for (bytes, 0..) |ch, i| {
-                folded[i + 1] = switch (expression.op) {
-                    .lower => std.ascii.toLower(ch),
-                    .upper => std.ascii.toUpper(ch),
-                };
+            switch (expression.op) {
+                .lower, .upper => {
+                    const folded = try alloc.alloc(u8, bytes.len + 1);
+                    folded[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
+                    for (bytes, 0..) |ch, i| {
+                        folded[i + 1] = switch (expression.op) {
+                            .lower => std.ascii.toLower(ch),
+                            .upper => std.ascii.toUpper(ch),
+                            .md5 => unreachable,
+                        };
+                    }
+                    break :blk folded;
+                },
+                .md5 => {
+                    const digest = std.crypto.hash.Md5.hashResult(bytes);
+                    const hashed = try alloc.alloc(u8, 33);
+                    hashed[0] = @intFromEnum(typed_dv.ValueType.bytes_val);
+                    for (digest, 0..) |byte, i| {
+                        hashed[1 + i * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+                        hashed[1 + i * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+                    }
+                    break :blk hashed;
+                },
             }
-            break :blk folded;
         },
     };
 }
@@ -2598,6 +5310,51 @@ pub fn jsonValuesEqualExact(lhs: std.json.Value, rhs: std.json.Value) bool {
     };
 }
 
+const JsonScalarOrder = enum { lt, eq, gt };
+
+fn compareJsonScalars(lhs: std.json.Value, rhs: std.json.Value) ?JsonScalarOrder {
+    if (jsonValueAsFloat(lhs)) |left| {
+        if (jsonValueAsFloat(rhs)) |right| {
+            if (left < right) return .lt;
+            if (left > right) return .gt;
+            return .eq;
+        }
+    }
+    if (lhs == .string and rhs == .string) {
+        return switch (std.mem.order(u8, lhs.string, rhs.string)) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        };
+    }
+    return null;
+}
+
+fn jsonValueAsFloat(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        else => null,
+    };
+}
+
+fn jsonValueAsU64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn jsonValueAsI64(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
 pub fn jsonValueAtDotPath(root: std.json.Value, path: []const u8) ?*const std.json.Value {
     if (root != .object) return null;
     var current: *const std.json.Value = &root;
@@ -2687,6 +5444,208 @@ pub fn rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
     }
 
     if (writes.items.len > 0) try store.putBatch(writes.items, &.{});
+}
+
+pub fn rewriteRowsInRange(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    plan: RowRewritePlan,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+) !RowRewriteReport {
+    return try rewriteRowsInRangeWithColumnIndexPolicy(alloc, store, plan, lower_doc_key, upper_doc_key, ColumnIndexPolicy.all());
+}
+
+pub fn rewriteRowsInRangeWithColumnIndexPolicy(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    plan: RowRewritePlan,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    column_index_policy: ColumnIndexPolicy,
+) !RowRewriteReport {
+    try validateRowRewritePlan(plan);
+
+    const rows = try scanRowsAlloc(alloc, store, lower_doc_key, upper_doc_key);
+    defer freeRows(alloc, rows);
+
+    var report: RowRewriteReport = .{ .scanned_rows = @intCast(rows.len) };
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    for (rows) |row| {
+        const rewritten = try rewriteRowValueAlloc(alloc, row.row_value, plan, &report);
+        if (rewritten) |new_row| {
+            var new_row_owned = true;
+            errdefer if (new_row_owned) alloc.free(new_row);
+            try appendUpsertWithColumnIndexPolicy(alloc, store, &writes, &deletes, &owned_keys, &owned_values, row.doc_key, new_row, column_index_policy);
+            try owned_values.append(alloc, new_row);
+            new_row_owned = false;
+            report.rewritten_rows += 1;
+        } else {
+            report.unchanged_rows += 1;
+        }
+    }
+
+    if (writes.items.len > 0 or deletes.items.len > 0) try store.putBatch(writes.items, deletes.items);
+    return report;
+}
+
+pub fn rewriteRowValueWithPlanAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    plan: RowRewritePlan,
+) !?[]u8 {
+    try validateRowRewritePlan(plan);
+    var report: RowRewriteReport = .{};
+    return try rewriteRowValueAlloc(alloc, row_value, plan, &report);
+}
+
+fn validateRowRewritePlan(plan: RowRewritePlan) !void {
+    for (plan.renames, 0..) |rename, i| {
+        if (rename.old_path.len == 0 or rename.new_path.len == 0) return error.InvalidColumnValue;
+        if (std.mem.eql(u8, rename.old_path, rename.new_path)) return error.InvalidColumnValue;
+        for (plan.renames[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, rename.old_path, other.old_path)) return error.InvalidColumnValue;
+            if (std.mem.eql(u8, rename.new_path, other.new_path)) return error.InvalidColumnValue;
+        }
+        for (plan.drops) |drop| {
+            if (std.mem.eql(u8, rename.old_path, drop) or std.mem.eql(u8, rename.new_path, drop)) return error.InvalidColumnValue;
+        }
+    }
+    for (plan.drops, 0..) |drop, i| {
+        if (drop.len == 0) return error.InvalidColumnValue;
+        for (plan.drops[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, drop, other)) return error.InvalidColumnValue;
+        }
+    }
+    for (plan.sets, 0..) |set, i| {
+        if (set.cell.path.len == 0) return error.InvalidColumnValue;
+        if (!rowRewriteCellIsValid(set.cell)) return error.InvalidColumnValue;
+        for (plan.drops) |drop| {
+            if (std.mem.eql(u8, set.cell.path, drop)) return error.InvalidColumnValue;
+        }
+        for (plan.sets[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, set.cell.path, other.cell.path)) return error.InvalidColumnValue;
+        }
+    }
+}
+
+fn rewriteRowValueAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    plan: RowRewritePlan,
+    report: *RowRewriteReport,
+) !?[]u8 {
+    var row = try relational_row_codec.deserialize(alloc, row_value);
+    defer row.deinit(alloc);
+
+    var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
+    defer cells.deinit(alloc);
+    var changed = false;
+    var row_renamed: u64 = 0;
+    var row_dropped: u64 = 0;
+    var row_set: u64 = 0;
+
+    for (row.cells) |cell| {
+        if (rowRewriteDropsPath(plan, cell.path)) {
+            changed = true;
+            row_dropped += 1;
+            continue;
+        }
+
+        var rewritten = cell;
+        if (rowRewriteRenameTarget(plan, cell.path)) |new_path| {
+            rewritten.path = new_path;
+            changed = true;
+            row_renamed += 1;
+        }
+        if (rowRewriteCellsContainPath(cells.items, rewritten.path)) return error.InvalidColumnValue;
+        try cells.append(alloc, rewritten);
+    }
+
+    for (plan.sets) |set| {
+        if (rowRewriteCellsPathIndex(cells.items, set.cell.path)) |index| {
+            if (set.only_if_missing) continue;
+            cells.items[index] = set.cell;
+            changed = true;
+            row_set += 1;
+        } else {
+            try cells.append(alloc, set.cell);
+            changed = true;
+            row_set += 1;
+        }
+    }
+
+    if (!changed) return null;
+    const encoded = try relational_row_codec.serialize(alloc, cells.items);
+    report.renamed_cells += row_renamed;
+    report.dropped_cells += row_dropped;
+    report.set_cells += row_set;
+    return encoded;
+}
+
+fn rowRewriteCellIsValid(cell: relational_row_codec.Cell) bool {
+    if (cell.is_json and cell.value_type != .bytes_val) return false;
+    return switch (cell.value_type) {
+        .u64_val => switch (cell.value) {
+            .u64_val => true,
+            else => false,
+        },
+        .f64_val => switch (cell.value) {
+            .f64_val => true,
+            else => false,
+        },
+        .bool_val => switch (cell.value) {
+            .bool_val => true,
+            else => false,
+        },
+        .geo_point => switch (cell.value) {
+            .geo_point => true,
+            else => false,
+        },
+        .bytes_val => switch (cell.value) {
+            .bytes_val => true,
+            else => false,
+        },
+    };
+}
+
+fn rowRewriteDropsPath(plan: RowRewritePlan, path: []const u8) bool {
+    for (plan.drops) |drop| {
+        if (std.mem.eql(u8, drop, path)) return true;
+    }
+    return false;
+}
+
+fn rowRewriteRenameTarget(plan: RowRewritePlan, path: []const u8) ?[]const u8 {
+    for (plan.renames) |rename| {
+        if (std.mem.eql(u8, rename.old_path, path)) return rename.new_path;
+    }
+    return null;
+}
+
+fn rowRewriteCellsContainPath(cells: []const relational_row_codec.Cell, path: []const u8) bool {
+    return rowRewriteCellsPathIndex(cells, path) != null;
+}
+
+fn rowRewriteCellsPathIndex(cells: []const relational_row_codec.Cell, path: []const u8) ?usize {
+    for (cells, 0..) |cell, index| {
+        if (std.mem.eql(u8, cell.path, path)) return index;
+    }
+    return null;
 }
 
 pub fn rebuildColumnIndexFromRowsInSpanWithColumnIndexPolicy(
@@ -3253,6 +6212,8 @@ pub fn deleteColumnIndexesForRowRange(
 pub fn rebuildUniqueConstraintRowsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     unique_constraints: []const schema_mod.UniqueConstraint,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
@@ -3280,7 +6241,11 @@ pub fn rebuildUniqueConstraintRowsInRange(
             const encoded_value = (try uniqueConstraintTupleValueAlloc(alloc, row.row_value, constraint)) orelse continue;
             defer alloc.free(encoded_value);
 
-            const key = try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, encoded_value);
+            const key = if (constraint.without_overlaps_period) |period_name| blk: {
+                const span = try periodSpanForRowWithCatalog(alloc, columns, periods, row.row_value, period_name);
+                try requireTemporalUniqueAvailableInBatchAndStore(alloc, store, writes.items, &.{}, &.{}, constraint, encoded_value, span, row.doc_key);
+                break :blk try temporalUniqueConstraintKeyAlloc(alloc, constraint, encoded_value, span, row.doc_key);
+            } else try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, encoded_value);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
 
@@ -3314,6 +6279,8 @@ pub fn rebuildUniqueConstraintRowsInRange(
 pub fn reconcileUniqueConstraintRowsInRange(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     unique_constraints: []const schema_mod.UniqueConstraint,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
@@ -3345,7 +6312,10 @@ pub fn reconcileUniqueConstraintRowsInRange(
         for (unique_constraints) |constraint| {
             const encoded_value = (try uniqueConstraintTupleValueAlloc(alloc, row.row_value, constraint)) orelse continue;
             defer alloc.free(encoded_value);
-            const key = try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, encoded_value);
+            const key = if (constraint.without_overlaps_period) |period_name| blk: {
+                const span = try periodSpanForRowWithCatalog(alloc, columns, periods, row.row_value, period_name);
+                break :blk try temporalUniqueConstraintKeyAlloc(alloc, constraint, encoded_value, span, row.doc_key);
+            } else try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, encoded_value);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
             if (batchWriteValue(expected.items, key)) |existing_owner| {
@@ -3415,6 +6385,27 @@ pub fn reconcileUniqueConstraintRowsInRange(
         }
     }
 
+    const temporal_lower = [_]u8{internal_keys.relational_temporal_unique_namespace};
+    const temporal_upper = [_]u8{internal_keys.relational_temporal_unique_namespace + 1};
+    const scanned_temporal = try store.scanRange(alloc, temporal_lower[0..], temporal_upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned_temporal);
+    for (scanned_temporal) |entry| {
+        const constraint_name = (try decodeRelationalTemporalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
+        defer alloc.free(constraint_name);
+        if (!uniqueConstraintNameInCatalog(unique_constraints, constraint_name)) continue;
+        report.scanned_unique_rows += 1;
+        if (batchWriteValue(expected.items, entry.key)) |expected_owner| {
+            if (std.mem.eql(u8, expected_owner, entry.value)) continue;
+            if (containsKey(duplicate_expected_keys.items, entry.key)) continue;
+            continue;
+        }
+        report.stale_unique_rows += 1;
+        if (mode == .repair or mode == .dry_run) {
+            report.deleted_stale_unique_rows += 1;
+            if (mode == .repair) try deletes.append(alloc, entry.key);
+        }
+    }
+
     if (mode == .repair and (writes.items.len > 0 or deletes.items.len > 0)) {
         try store.putBatch(writes.items, deletes.items);
     }
@@ -3436,6 +6427,16 @@ pub fn deleteUniqueConstraintRows(
     defer deletes.deinit(alloc);
     for (scanned) |entry| {
         const constraint_name = (try decodeRelationalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
+        defer alloc.free(constraint_name);
+        if (!uniqueConstraintNameInCatalog(unique_constraints, constraint_name)) continue;
+        try deletes.append(alloc, entry.key);
+    }
+    const temporal_lower = [_]u8{internal_keys.relational_temporal_unique_namespace};
+    const temporal_upper = [_]u8{internal_keys.relational_temporal_unique_namespace + 1};
+    const scanned_temporal = try store.scanRange(alloc, temporal_lower[0..], temporal_upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, scanned_temporal);
+    for (scanned_temporal) |entry| {
+        const constraint_name = (try decodeRelationalTemporalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
         defer alloc.free(constraint_name);
         if (!uniqueConstraintNameInCatalog(unique_constraints, constraint_name)) continue;
         try deletes.append(alloc, entry.key);
@@ -3657,13 +6658,15 @@ pub fn explainForeignKeyDelete(
     unique_constraints: []const schema_mod.UniqueConstraint,
     doc_key: []const u8,
 ) !ForeignKeyDeletePlan {
-    return try explainForeignKeyDeleteWithPrimaryKey(alloc, store, table_name, foreign_keys, null, unique_constraints, doc_key);
+    return try explainForeignKeyDeleteWithPrimaryKey(alloc, store, table_name, &.{}, &.{}, foreign_keys, null, unique_constraints, doc_key);
 }
 
 pub fn explainForeignKeyDeleteWithPrimaryKey(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     table_name: []const u8,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     foreign_keys: []const schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
     unique_constraints: []const schema_mod.UniqueConstraint,
@@ -3688,6 +6691,7 @@ pub fn explainForeignKeyDeleteWithPrimaryKey(
     defer owned_values.deinit(alloc);
 
     var participant = WriteParticipant.init(alloc, store, &writes, &deletes, &owned_keys, &owned_values);
+    participant.configurePeriods(periods, columns);
     participant.configureForeignKeys(table_name, foreign_keys, &.{doc_key});
     participant.configurePrimaryKey(primary_key);
     participant.configureUniqueConstraints(unique_constraints);
@@ -3723,13 +6727,15 @@ pub fn listForeignKeyViolationsInRange(
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
 ) ![]ForeignKeyIntegrityViolation {
-    return try listForeignKeyViolationsInRangeWithPrimaryKey(alloc, store, table_name, foreign_keys, null, unique_constraints, lower_doc_key, upper_doc_key);
+    return try listForeignKeyViolationsInRangeWithPrimaryKey(alloc, store, table_name, &.{}, &.{}, foreign_keys, null, unique_constraints, lower_doc_key, upper_doc_key);
 }
 
 pub fn listForeignKeyViolationsInRangeWithPrimaryKey(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     table_name: []const u8,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     foreign_keys: []const schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
     unique_constraints: []const schema_mod.UniqueConstraint,
@@ -3745,6 +6751,8 @@ pub fn listForeignKeyViolationsInRangeWithPrimaryKey(
         alloc,
         store,
         table_name,
+        columns,
+        periods,
         foreign_keys,
         primary_key,
         unique_constraints,
@@ -3766,13 +6774,15 @@ pub fn reconcileForeignKeyRefsInRange(
     upper_doc_key: []const u8,
     mode: ForeignKeyIntegrityMode,
 ) !ForeignKeyIntegrityReport {
-    return try reconcileForeignKeyRefsInRangeWithPrimaryKey(alloc, store, table_name, foreign_keys, null, unique_constraints, lower_doc_key, upper_doc_key, mode);
+    return try reconcileForeignKeyRefsInRangeWithPrimaryKey(alloc, store, table_name, &.{}, &.{}, foreign_keys, null, unique_constraints, lower_doc_key, upper_doc_key, mode);
 }
 
 pub fn reconcileForeignKeyRefsInRangeWithPrimaryKey(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     table_name: []const u8,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     foreign_keys: []const schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
     unique_constraints: []const schema_mod.UniqueConstraint,
@@ -3780,13 +6790,15 @@ pub fn reconcileForeignKeyRefsInRangeWithPrimaryKey(
     upper_doc_key: []const u8,
     mode: ForeignKeyIntegrityMode,
 ) !ForeignKeyIntegrityReport {
-    return try reconcileForeignKeyRefsInRangeWithViolations(alloc, store, table_name, foreign_keys, primary_key, unique_constraints, lower_doc_key, upper_doc_key, mode, null);
+    return try reconcileForeignKeyRefsInRangeWithViolations(alloc, store, table_name, columns, periods, foreign_keys, primary_key, unique_constraints, lower_doc_key, upper_doc_key, mode, null);
 }
 
 fn reconcileForeignKeyRefsInRangeWithViolations(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     table_name: []const u8,
+    columns: []const schema_mod.RelationalColumn,
+    periods: []const schema_mod.RelationalPeriod,
     foreign_keys: []const schema_mod.ForeignKey,
     primary_key: ?schema_mod.PrimaryKey,
     unique_constraints: []const schema_mod.UniqueConstraint,
@@ -3818,7 +6830,7 @@ fn reconcileForeignKeyRefsInRangeWithViolations(
             defer alloc.free(parent_key);
             report.referenced_child_rows += 1;
 
-            if (!(try foreignKeyParentExists(alloc, store, foreign_key, primary_key, unique_constraints, parent_key))) {
+            if (!(try foreignKeyParentExistsForChildRow(alloc, store, columns, periods, row.row_value, foreign_key, primary_key, unique_constraints, parent_key))) {
                 report.missing_parent_rows += 1;
                 if (violations) |out| {
                     try appendForeignKeyIntegrityViolation(
@@ -4028,6 +7040,12 @@ fn findForeignKeyByName(foreign_keys: []const schema_mod.ForeignKey, name: []con
 
 fn decodeRelationalUniqueConstraintNameAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!internal_keys.isRelationalUniqueKey(key)) return null;
+    const constraint_term = internal_keys.findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    return try internal_keys.decodeBodyAlloc(alloc, key[1..constraint_term]);
+}
+
+fn decodeRelationalTemporalUniqueConstraintNameAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!internal_keys.isRelationalTemporalUniqueKey(key)) return null;
     const constraint_term = internal_keys.findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
     return try internal_keys.decodeBodyAlloc(alloc, key[1..constraint_term]);
 }
@@ -6065,6 +9083,215 @@ test "relational column scan indexes rebuild and delete from packed rows" {
     const remaining_a = try store.get(alloc, doc_a_index);
     defer alloc.free(remaining_a);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_index));
+}
+
+test "relational row rewrite renames and drops packed cells with fresh side indexes" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "open" },
+        },
+        .{
+            .path = "count",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 3.0 },
+        },
+        .{
+            .path = "amount",
+            .value_type = .f64_val,
+            .value = .{ .f64_val = 10.0 },
+        },
+        .{
+            .path = "metadata",
+            .value_type = .bytes_val,
+            .is_json = true,
+            .value = .{ .bytes_val = "{\"tier\":\"gold\"}" },
+        },
+    });
+    defer alloc.free(row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row);
+    try store.putBatch(writes.items, deletes.items);
+
+    const old_status_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "status");
+    defer alloc.free(old_status_column);
+    const old_status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
+    defer alloc.free(old_status_index);
+    const old_amount_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "amount");
+    defer alloc.free(old_amount_column);
+    const new_state_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "state");
+    defer alloc.free(new_state_column);
+    const new_state_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "state", "doc:a");
+    defer alloc.free(new_state_index);
+
+    const old_status_column_value = try store.get(alloc, old_status_column);
+    defer alloc.free(old_status_column_value);
+    const old_status_index_value = try store.get(alloc, old_status_index);
+    defer alloc.free(old_status_index_value);
+
+    const report = try rewriteRowsInRange(
+        alloc,
+        &store,
+        .{
+            .renames = &.{.{ .old_path = "status", .new_path = "state" }},
+            .drops = &.{"amount"},
+            .sets = &.{.{
+                .cell = .{
+                    .path = "source",
+                    .value_type = .bytes_val,
+                    .value = .{ .bytes_val = "rewrite" },
+                },
+            }},
+        },
+        "doc:a",
+        "doc:z",
+    );
+    try std.testing.expectEqual(@as(u64, 1), report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.renamed_cells);
+    try std.testing.expectEqual(@as(u64, 1), report.dropped_cells);
+    try std.testing.expectEqual(@as(u64, 1), report.set_cells);
+
+    const materialized = (try getMaterializedAlloc(alloc, &store, "doc:a")).?;
+    defer alloc.free(materialized);
+    try std.testing.expectEqualStrings("{\"state\":\"open\",\"count\":3,\"metadata\":{\"tier\":\"gold\"},\"source\":\"rewrite\"}", materialized);
+
+    try std.testing.expectError(error.NotFound, store.get(alloc, old_status_column));
+    try std.testing.expectError(error.NotFound, store.get(alloc, old_status_index));
+    try std.testing.expectError(error.NotFound, store.get(alloc, old_amount_column));
+
+    const new_state_column_value = try store.get(alloc, new_state_column);
+    defer alloc.free(new_state_column_value);
+    const new_state_index_value = try store.get(alloc, new_state_index);
+    defer alloc.free(new_state_index_value);
+}
+
+test "relational row rewrite sets cells and honors column index policy" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "status",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "open" },
+        },
+    });
+    defer alloc.free(row);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true },
+        .{ .name = "backfilled", .path = "backfilled", .field_type = .keyword, .indexed = false },
+        .{ .name = "count", .path = "count", .field_type = .numeric, .indexed = true },
+    };
+
+    try appendUpsertWithColumnIndexPolicy(
+        alloc,
+        &store,
+        &writes,
+        &deletes,
+        &owned_keys,
+        &owned_values,
+        "doc:a",
+        row,
+        ColumnIndexPolicy.fromColumns(columns[0..]),
+    );
+    try store.putBatch(writes.items, deletes.items);
+
+    const report = try rewriteRowsInRangeWithColumnIndexPolicy(
+        alloc,
+        &store,
+        .{ .sets = &.{
+            .{
+                .cell = .{
+                    .path = "status",
+                    .value_type = .bytes_val,
+                    .value = .{ .bytes_val = "closed" },
+                },
+            },
+            .{
+                .cell = .{
+                    .path = "backfilled",
+                    .value_type = .bytes_val,
+                    .value = .{ .bytes_val = "defaulted" },
+                },
+            },
+            .{
+                .cell = .{
+                    .path = "count",
+                    .value_type = .f64_val,
+                    .value = .{ .f64_val = 7.0 },
+                },
+                .only_if_missing = true,
+            },
+        } },
+        "doc:a",
+        "doc:z",
+        ColumnIndexPolicy.fromColumns(columns[0..]),
+    );
+    try std.testing.expectEqual(@as(u64, 1), report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 3), report.set_cells);
+
+    const materialized = (try getMaterializedAlloc(alloc, &store, "doc:a")).?;
+    defer alloc.free(materialized);
+    try std.testing.expectEqualStrings("{\"status\":\"closed\",\"count\":3,\"backfilled\":\"defaulted\"}", materialized);
+
+    const backfilled_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "backfilled");
+    defer alloc.free(backfilled_column);
+    const backfilled_value = try store.get(alloc, backfilled_column);
+    defer alloc.free(backfilled_value);
+
+    const backfilled_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "backfilled", "doc:a");
+    defer alloc.free(backfilled_index);
+    try std.testing.expectError(error.NotFound, store.get(alloc, backfilled_index));
+
+    const count_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "count", "doc:a");
+    defer alloc.free(count_index);
+    const count_index_value = try store.get(alloc, count_index);
+    defer alloc.free(count_index_value);
 }
 
 test "relational secondary index range rebuild repairs only target building index generation" {

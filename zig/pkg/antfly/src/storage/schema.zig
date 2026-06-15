@@ -134,6 +134,7 @@ pub const RelationalColumn = struct {
     field_type: AntflyType = .text,
     array_item_type: ?AntflyType = null,
     nullable: bool = true,
+    collation: ?[]const u8 = null,
     indexed: bool = true,
     index_lifecycle: RelationalIndexLifecycle = .ready,
     index_generation: u64 = 0,
@@ -142,6 +143,7 @@ pub const RelationalColumn = struct {
     on_update_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
     index_where: []const UniquePredicate = &.{},
+    index_where_expressions: []const RelationalRowsExpressionCondition = &.{},
 };
 
 pub const RelationalIndexLifecycle = enum(u8) {
@@ -155,6 +157,7 @@ pub const RelationalDefaultKind = enum(u8) {
     literal = 0,
     now_ns = 1,
     uuid_v4 = 2,
+    current_date_ns = 3,
 };
 
 pub const RelationalDefaultValue = struct {
@@ -166,6 +169,8 @@ pub const RelationalGeneratedOp = enum(u8) {
     lower = 0,
     concat = 1,
     upper = 2,
+    md5 = 3,
+    concat_ws = 4,
 };
 
 pub const RelationalGeneratedValue = struct {
@@ -190,10 +195,11 @@ pub const RelationalCheckOp = enum(u8) {
 
 pub const RelationalCheck = struct {
     name: []const u8,
-    field: []const u8,
-    op: RelationalCheckOp,
+    field: []const u8 = "",
+    op: RelationalCheckOp = .eq,
     value_json: ?[]const u8 = null,
     validation_state: RelationalCheckValidationState = .enforced,
+    expression: ?RelationalRowsExpressionCondition = null,
 };
 
 pub const RelationalCheckValidationState = enum(u8) {
@@ -201,6 +207,144 @@ pub const RelationalCheckValidationState = enum(u8) {
     unvalidated = 1,
     validating = 2,
     invalid = 3,
+};
+
+pub const RelationalRowsExpressionKind = enum {
+    field,
+    value,
+    coalesce,
+    now,
+    lower,
+    upper,
+    initcap,
+    trim,
+    ltrim,
+    rtrim,
+    replace,
+    translate,
+    substring,
+    overlay,
+    split_part,
+    strpos,
+    left,
+    right,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    starts_with,
+    ends_with,
+    ascii,
+    chr,
+    md5,
+    like,
+    ilike,
+    bool_and,
+    bool_or,
+    bool_not,
+    concat,
+    concat_ws,
+    length,
+    octet_length,
+    nullif,
+    greatest,
+    least,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    power,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    interval_ns,
+    interval_months,
+    date_trunc,
+    date_bin,
+    date_part,
+    case,
+    cast,
+    json_extract,
+    json_typeof,
+    json_array_length,
+    array_length,
+    array_position,
+    array_positions,
+    array_append,
+    array_prepend,
+    array_cat,
+    array_remove,
+    array_replace,
+    array_to_string,
+    string_to_array,
+    uuid_v4,
+    json_build_object,
+    to_jsonb,
+    json_path_exists,
+    regexp_replace,
+    regexp_match,
+};
+
+pub const RelationalRowsExpressionFieldSource = enum {
+    row,
+    existing,
+    proposed,
+    source,
+};
+
+pub const RelationalRowsExpressionCastType = enum {
+    text,
+    numeric,
+    bool,
+    datetime,
+};
+
+pub const RelationalRowsExpressionCondition = struct {
+    lhs: RelationalRowsExpression,
+    op: RelationalCheckOp,
+    rhs: []const RelationalRowsExpression = &.{},
+};
+
+pub const RelationalRowsExpressionPredicateGroup = struct {
+    conditions: []const RelationalRowsExpressionCondition = &.{},
+};
+
+pub const RelationalRowsExpressionArrayContainsPredicate = struct {
+    expression: RelationalRowsExpression,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsExpressionCaseBranch = struct {
+    when: RelationalRowsExpressionCondition,
+    then: RelationalRowsExpression,
+};
+
+pub const RelationalRowsExpression = struct {
+    kind: RelationalRowsExpressionKind,
+    field: []const u8 = "",
+    field_source: RelationalRowsExpressionFieldSource = .row,
+    value_json: []const u8 = "",
+    json_path: []const u8 = "",
+    json_as_text: bool = false,
+    operands: []const RelationalRowsExpression = &.{},
+    cast_type: ?RelationalRowsExpressionCastType = null,
+    case_branches: []const RelationalRowsExpressionCaseBranch = &.{},
+    case_else: []const RelationalRowsExpression = &.{},
+};
+
+pub const RelationalRowsExpressionProjection = struct {
+    output: []const u8,
+    expression: RelationalRowsExpression,
+};
+
+pub const RelationalRowsExpressionAssignment = struct {
+    field: []const u8,
+    expression: RelationalRowsExpression,
 };
 
 pub const ForeignKeyAction = enum(u8) {
@@ -231,8 +375,10 @@ pub const ForeignKeyValidationState = enum(u8) {
 pub const ForeignKey = struct {
     name: []const u8,
     child_columns: []const []const u8 = &.{},
+    child_period: ?[]const u8 = null,
     parent_table: []const u8,
     parent_columns: []const []const u8 = &.{},
+    parent_period: ?[]const u8 = null,
     on_delete: ForeignKeyAction = .restrict,
     on_update: ForeignKeyAction = .restrict,
     timing: ForeignKeyTiming = .immediate,
@@ -245,7 +391,9 @@ pub const UniqueConstraint = struct {
     name: []const u8,
     columns: []const []const u8 = &.{},
     expressions: []const UniqueExpression = &.{},
+    without_overlaps_period: ?[]const u8 = null,
     where: []const UniquePredicate = &.{},
+    where_expressions: []const RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
 };
 
@@ -259,6 +407,7 @@ pub const UniqueConstraintValidationState = enum(u8) {
 pub const UniqueExpressionOp = enum(u8) {
     lower = 0,
     upper = 1,
+    md5 = 2,
 };
 
 pub const UniqueExpression = struct {
@@ -279,8 +428,24 @@ pub const UniquePredicate = struct {
     value_json: ?[]const u8 = null,
 };
 
+pub const RelationalPeriod = struct {
+    name: []const u8,
+    start_column: []const u8,
+    end_column: []const u8,
+    range_type: ?RelationalPeriodRangeType = null,
+};
+
+pub const RelationalPeriodRangeType = enum(u8) {
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+};
+
 pub const PrimaryKey = struct {
+    name: ?[]const u8 = null,
     columns: []const []const u8 = &.{},
+    without_overlaps_period: ?[]const u8 = null,
 };
 
 pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []const RelationalColumn) bool {
@@ -291,6 +456,7 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.field_type != b.field_type) return false;
         if (a.array_item_type != b.array_item_type) return false;
         if (a.nullable != b.nullable) return false;
+        if (!optionalBytesEqual(a.collation, b.collation)) return false;
         if (a.indexed != b.indexed) return false;
         if (a.index_lifecycle != b.index_lifecycle) return false;
         if (a.index_generation != b.index_generation) return false;
@@ -299,6 +465,18 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
         if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
         if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
+        if (!relationalRowsExpressionConditionSlicesEqual(a.index_where_expressions, b.index_where_expressions)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionSlicesEqual(
+    a: []const RelationalRowsExpressionCondition,
+    b: []const RelationalRowsExpressionCondition,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left, right)) return false;
     }
     return true;
 }
@@ -327,11 +505,64 @@ fn relationalGeneratedValuesEqual(a: ?RelationalGeneratedValue, b: ?RelationalGe
 pub fn relationalCheckCatalogsEqual(current: []const RelationalCheck, next: []const RelationalCheck) bool {
     if (current.len != next.len) return false;
     for (current, next) |a, b| {
-        if (!std.mem.eql(u8, a.name, b.name)) return false;
-        if (!std.mem.eql(u8, a.field, b.field)) return false;
-        if (a.op != b.op) return false;
-        if (!optionalStringsEqual(a.value_json, b.value_json)) return false;
+        if (!relationalChecksEqual(a, b)) return false;
         if (a.validation_state != b.validation_state) return false;
+    }
+    return true;
+}
+
+pub fn relationalChecksEqual(a: RelationalCheck, b: RelationalCheck) bool {
+    return std.mem.eql(u8, a.name, b.name) and
+        std.mem.eql(u8, a.field, b.field) and
+        a.op == b.op and
+        optionalStringsEqual(a.value_json, b.value_json) and
+        optionalRelationalRowsExpressionConditionsEqual(a.expression, b.expression);
+}
+
+fn optionalRelationalRowsExpressionConditionsEqual(
+    a: ?RelationalRowsExpressionCondition,
+    b: ?RelationalRowsExpressionCondition,
+) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return relationalRowsExpressionConditionsEqual(a.?, b.?);
+}
+
+fn relationalRowsExpressionConditionsEqual(
+    a: RelationalRowsExpressionCondition,
+    b: RelationalRowsExpressionCondition,
+) bool {
+    if (a.op != b.op or a.rhs.len != b.rhs.len) return false;
+    if (!relationalRowsExpressionsEqual(a.lhs, b.lhs)) return false;
+    for (a.rhs, b.rhs) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionsEqual(a: RelationalRowsExpression, b: RelationalRowsExpression) bool {
+    if (a.kind != b.kind or
+        !std.mem.eql(u8, a.field, b.field) or
+        a.field_source != b.field_source or
+        !std.mem.eql(u8, a.value_json, b.value_json) or
+        !std.mem.eql(u8, a.json_path, b.json_path) or
+        a.json_as_text != b.json_as_text or
+        a.cast_type != b.cast_type or
+        a.operands.len != b.operands.len or
+        a.case_branches.len != b.case_branches.len or
+        a.case_else.len != b.case_else.len)
+    {
+        return false;
+    }
+    for (a.operands, b.operands) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    for (a.case_branches, b.case_branches) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left.when, right.when)) return false;
+        if (!relationalRowsExpressionsEqual(left.then, right.then)) return false;
+    }
+    for (a.case_else, b.case_else) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
     }
     return true;
 }
@@ -339,7 +570,20 @@ pub fn relationalCheckCatalogsEqual(current: []const RelationalCheck, next: []co
 pub fn primaryKeyCatalogsEqual(current: ?PrimaryKey, next: ?PrimaryKey) bool {
     if (current == null and next == null) return true;
     if (current == null or next == null) return false;
-    return stringSlicesEqual(current.?.columns, next.?.columns);
+    return optionalStringsEqual(current.?.name, next.?.name) and
+        stringSlicesEqual(current.?.columns, next.?.columns) and
+        optionalStringsEqual(current.?.without_overlaps_period, next.?.without_overlaps_period);
+}
+
+pub fn relationalPeriodCatalogsEqual(current: []const RelationalPeriod, next: []const RelationalPeriod) bool {
+    if (current.len != next.len) return false;
+    for (current, next) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!std.mem.eql(u8, a.start_column, b.start_column)) return false;
+        if (!std.mem.eql(u8, a.end_column, b.end_column)) return false;
+        if (a.range_type != b.range_type) return false;
+    }
+    return true;
 }
 
 pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const ForeignKey) bool {
@@ -347,8 +591,10 @@ pub fn foreignKeyCatalogsEqual(current: []const ForeignKey, next: []const Foreig
     for (current, next) |a, b| {
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!stringSlicesEqual(a.child_columns, b.child_columns)) return false;
+        if (!optionalStringsEqual(a.child_period, b.child_period)) return false;
         if (!std.mem.eql(u8, a.parent_table, b.parent_table)) return false;
         if (!stringSlicesEqual(a.parent_columns, b.parent_columns)) return false;
+        if (!optionalStringsEqual(a.parent_period, b.parent_period)) return false;
         if (a.on_delete != b.on_delete) return false;
         if (a.on_update != b.on_update) return false;
         if (a.timing != b.timing) return false;
@@ -365,7 +611,9 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!stringSlicesEqual(a.columns, b.columns)) return false;
         if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+        if (!optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period)) return false;
         if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
+        if (!relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions)) return false;
         if (a.validation_state != b.validation_state) return false;
     }
     return true;
@@ -415,6 +663,7 @@ pub const TableSchema = struct {
     full_text_documents: []const FullTextDocument = &.{},
     relational_columns: []const RelationalColumn = &.{},
     primary_key: ?PrimaryKey = null,
+    periods: []const RelationalPeriod = &.{},
     foreign_keys: []const ForeignKey = &.{},
     unique_constraints: []const UniqueConstraint = &.{},
     checks: []const RelationalCheck = &.{},
@@ -438,7 +687,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 28); // format version
+    try appendU32(&buf, alloc, 34); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -504,6 +753,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try buf.append(alloc, 0);
         }
         try buf.append(alloc, if (column.nullable) 1 else 0);
+        try appendOptStr(&buf, alloc, column.collation);
         try buf.append(alloc, if (column.indexed) 1 else 0);
         try buf.append(alloc, @intFromEnum(column.index_lifecycle));
         try appendU64(&buf, alloc, column.index_generation);
@@ -538,6 +788,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try appendStr(&buf, alloc, predicate.field);
             try appendOptStr(&buf, alloc, predicate.value_json);
         }
+        try appendRelationalRowsExpressionConditionSlice(&buf, alloc, column.index_where_expressions);
     }
 
     // Foreign-key catalog (format version 11+).
@@ -546,9 +797,11 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try appendStr(&buf, alloc, foreign_key.name);
         try appendU32(&buf, alloc, @intCast(foreign_key.child_columns.len));
         for (foreign_key.child_columns) |column| try appendStr(&buf, alloc, column);
+        try appendOptStr(&buf, alloc, foreign_key.child_period);
         try appendStr(&buf, alloc, foreign_key.parent_table);
         try appendU32(&buf, alloc, @intCast(foreign_key.parent_columns.len));
         for (foreign_key.parent_columns) |column| try appendStr(&buf, alloc, column);
+        try appendOptStr(&buf, alloc, foreign_key.parent_period);
         try buf.append(alloc, @intFromEnum(foreign_key.on_delete));
         try buf.append(alloc, @intFromEnum(foreign_key.on_update));
         try buf.append(alloc, @intFromEnum(foreign_key.timing));
@@ -568,12 +821,14 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try buf.append(alloc, @intFromEnum(expression.op));
             try appendStr(&buf, alloc, expression.field);
         }
+        try appendOptStr(&buf, alloc, constraint.without_overlaps_period);
         try appendU32(&buf, alloc, @intCast(constraint.where.len));
         for (constraint.where) |predicate| {
             try buf.append(alloc, @intFromEnum(predicate.op));
             try appendStr(&buf, alloc, predicate.field);
             try appendOptStr(&buf, alloc, predicate.value_json);
         }
+        try appendRelationalRowsExpressionConditionSlice(&buf, alloc, constraint.where_expressions);
         try buf.append(alloc, @intFromEnum(constraint.validation_state));
     }
 
@@ -582,6 +837,8 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, 1);
         try appendU32(&buf, alloc, @intCast(primary_key.columns.len));
         for (primary_key.columns) |column| try appendStr(&buf, alloc, column);
+        try appendOptStr(&buf, alloc, primary_key.without_overlaps_period);
+        try appendOptStr(&buf, alloc, primary_key.name);
     } else {
         try buf.append(alloc, 0);
     }
@@ -594,6 +851,26 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, @intFromEnum(check.op));
         try appendOptStr(&buf, alloc, check.value_json);
         try buf.append(alloc, @intFromEnum(check.validation_state));
+        if (check.expression) |expression| {
+            try buf.append(alloc, 1);
+            try appendRelationalRowsExpressionCondition(&buf, alloc, expression);
+        } else {
+            try buf.append(alloc, 0);
+        }
+    }
+
+    // Application-time period catalog (format version 30+).
+    try appendU32(&buf, alloc, @intCast(schema.periods.len));
+    for (schema.periods) |period| {
+        try appendStr(&buf, alloc, period.name);
+        try appendStr(&buf, alloc, period.start_column);
+        try appendStr(&buf, alloc, period.end_column);
+        if (period.range_type) |range_type| {
+            try buf.append(alloc, 1);
+            try buf.append(alloc, @intFromEnum(range_type));
+        } else {
+            try buf.append(alloc, 0);
+        }
     }
 
     const result = try alloc.dupe(u8, buf.items);
@@ -609,7 +886,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 28) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 34) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -870,10 +1147,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             for (columns[0..columns_initialized]) |column| {
                 alloc.free(column.name);
                 alloc.free(column.path);
+                if (column.collation) |collation| alloc.free(collation);
                 if (column.default_value) |value| alloc.free(value.value_json);
                 if (column.on_update_value) |value| alloc.free(value.value_json);
                 if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
                 freeUniquePredicateSlice(alloc, column.index_where);
+                freeRelationalRowsExpressionConditionSlice(alloc, column.index_where_expressions);
             }
             alloc.free(columns);
         }
@@ -895,6 +1174,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             };
             const nullable = data[pos] == 1;
             pos += 1;
+            const collation: ?[]const u8 = if (fmt_version >= 34) try readOptStrAlloc(alloc, data, &pos) else null;
+            errdefer if (collation) |value| alloc.free(value);
             const indexed = if (fmt_version >= 10) indexed_blk: {
                 const value = data[pos] == 1;
                 pos += 1;
@@ -948,7 +1229,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer if (generated) |value| freeRelationalGeneratedValue(alloc, value);
             const index_where = if (fmt_version >= 22) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, index_where);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where };
+            const index_where_expressions = if (fmt_version >= 31) try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeRelationalRowsExpressionConditionSlice(alloc, index_where_expressions);
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .collation = collation, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where, .index_where_expressions = index_where_expressions };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -968,10 +1251,14 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(name);
             const child_columns = try readStringSliceAlloc(alloc, data, &pos);
             errdefer freeStringSlice(alloc, child_columns);
+            const child_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
+            errdefer if (child_period) |period| alloc.free(period);
             const parent_table = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(parent_table);
             const parent_columns = try readStringSliceAlloc(alloc, data, &pos);
             errdefer freeStringSlice(alloc, parent_columns);
+            const parent_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
+            errdefer if (parent_period) |period| alloc.free(period);
             const on_delete: ForeignKeyAction = @enumFromInt(data[pos]);
             pos += 1;
             const on_update: ForeignKeyAction = if (fmt_version >= 14) update_blk: {
@@ -1002,8 +1289,10 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             foreign_key.* = .{
                 .name = name,
                 .child_columns = child_columns,
+                .child_period = child_period,
                 .parent_table = parent_table,
                 .parent_columns = parent_columns,
+                .parent_period = parent_period,
                 .on_delete = on_delete,
                 .on_update = on_update,
                 .timing = timing,
@@ -1032,8 +1321,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeStringSlice(alloc, columns);
             const expressions = if (fmt_version >= 19) try readUniqueExpressionSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniqueExpressionSlice(alloc, expressions);
+            const without_overlaps_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
+            errdefer if (without_overlaps_period) |period| alloc.free(period);
             const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, where);
+            const where_expressions = if (fmt_version >= 31) try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeRelationalRowsExpressionConditionSlice(alloc, where_expressions);
             const validation_state: UniqueConstraintValidationState = if (fmt_version >= 24) state_blk: {
                 const value: UniqueConstraintValidationState = @enumFromInt(data[pos]);
                 pos += 1;
@@ -1043,7 +1336,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .name = name,
                 .columns = columns,
                 .expressions = expressions,
+                .without_overlaps_period = without_overlaps_period,
                 .where = where,
+                .where_expressions = where_expressions,
                 .validation_state = validation_state,
             };
             constraints_initialized += 1;
@@ -1055,7 +1350,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
     const primary_key: ?PrimaryKey = if (fmt_version >= 17 and data[pos] == 1) key_blk: {
         pos += 1;
         const columns = try readStringSliceAlloc(alloc, data, &pos);
-        break :key_blk .{ .columns = columns };
+        errdefer freeStringSlice(alloc, columns);
+        const without_overlaps_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
+        errdefer if (without_overlaps_period) |period| alloc.free(period);
+        const name = if (fmt_version >= 32) try readOptStrAlloc(alloc, data, &pos) else null;
+        errdefer if (name) |value| alloc.free(value);
+        break :key_blk .{ .name = name, .columns = columns, .without_overlaps_period = without_overlaps_period };
     } else key_blk: {
         if (fmt_version >= 17) pos += 1;
         break :key_blk null;
@@ -1081,12 +1381,57 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer if (value_json) |value| alloc.free(value);
             const validation_state: RelationalCheckValidationState = if (fmt_version >= 27) @enumFromInt(data[pos]) else .enforced;
             if (fmt_version >= 27) pos += 1;
-            check.* = .{ .name = name, .field = field, .op = op, .value_json = value_json, .validation_state = validation_state };
+            const expression: ?RelationalRowsExpressionCondition = if (fmt_version >= 29 and data[pos] == 1) expression_blk: {
+                pos += 1;
+                break :expression_blk try readRelationalRowsExpressionConditionAlloc(alloc, data, &pos);
+            } else expression_blk: {
+                if (fmt_version >= 29) pos += 1;
+                break :expression_blk null;
+            };
+            errdefer if (expression) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            check.* = .{ .name = name, .field = field, .op = op, .value_json = value_json, .validation_state = validation_state, .expression = expression };
             checks_initialized += 1;
         }
         break :blk checks;
     } else &.{};
     errdefer freeRelationalChecksSlice(alloc, checks);
+
+    const periods: []RelationalPeriod = if (fmt_version >= 30) blk: {
+        const period_count = readU32(data, &pos);
+        const periods = try alloc.alloc(RelationalPeriod, period_count);
+        var periods_initialized: usize = 0;
+        errdefer {
+            for (periods[0..periods_initialized]) |period| freeRelationalPeriod(alloc, period);
+            alloc.free(periods);
+        }
+        for (periods) |*period| {
+            const name = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(name);
+            const start_column = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(start_column);
+            const end_column = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer alloc.free(end_column);
+            const range_type: ?RelationalPeriodRangeType = if (fmt_version >= 33 and data[pos] == 1) range_blk: {
+                pos += 1;
+                const raw = data[pos];
+                pos += 1;
+                break :range_blk switch (raw) {
+                    @intFromEnum(RelationalPeriodRangeType.numrange) => .numrange,
+                    @intFromEnum(RelationalPeriodRangeType.daterange) => .daterange,
+                    @intFromEnum(RelationalPeriodRangeType.tsrange) => .tsrange,
+                    @intFromEnum(RelationalPeriodRangeType.tstzrange) => .tstzrange,
+                    else => return error.InvalidFormat,
+                };
+            } else range_blk: {
+                if (fmt_version >= 33) pos += 1;
+                break :range_blk null;
+            };
+            period.* = .{ .name = name, .start_column = start_column, .end_column = end_column, .range_type = range_type };
+            periods_initialized += 1;
+        }
+        break :blk periods;
+    } else &.{};
+    errdefer freeRelationalPeriodsSlice(alloc, periods);
 
     return .{
         .version = version,
@@ -1099,6 +1444,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
         .primary_key = primary_key,
+        .periods = periods,
         .foreign_keys = foreign_keys,
         .unique_constraints = unique_constraints,
         .checks = checks,
@@ -1122,6 +1468,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     freeFullTextDocumentsSlice(alloc, s.full_text_documents);
     freeRelationalColumnsSlice(alloc, s.relational_columns);
     if (s.primary_key) |primary_key| freePrimaryKey(alloc, primary_key);
+    freeRelationalPeriodsSlice(alloc, s.periods);
     freeForeignKeysSlice(alloc, s.foreign_keys);
     freeUniqueConstraintsSlice(alloc, s.unique_constraints);
     freeRelationalChecksSlice(alloc, s.checks);
@@ -1131,11 +1478,13 @@ fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColum
     for (columns) |column| {
         alloc.free(column.name);
         alloc.free(column.path);
+        if (column.collation) |collation| alloc.free(collation);
         if (column.index_name) |index_name| alloc.free(index_name);
         if (column.default_value) |value| alloc.free(value.value_json);
         if (column.on_update_value) |value| alloc.free(value.value_json);
         if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
         freeUniquePredicateSlice(alloc, column.index_where);
+        freeRelationalRowsExpressionConditionSlice(alloc, column.index_where_expressions);
     }
     if (columns.len > 0) alloc.free(columns);
 }
@@ -1154,8 +1503,21 @@ fn freeForeignKeysSlice(alloc: Allocator, foreign_keys: []const ForeignKey) void
 fn freeForeignKey(alloc: Allocator, foreign_key: ForeignKey) void {
     alloc.free(foreign_key.name);
     freeStringSlice(alloc, foreign_key.child_columns);
+    if (foreign_key.child_period) |period| alloc.free(period);
     alloc.free(foreign_key.parent_table);
     freeStringSlice(alloc, foreign_key.parent_columns);
+    if (foreign_key.parent_period) |period| alloc.free(period);
+}
+
+fn freeRelationalPeriodsSlice(alloc: Allocator, periods: []const RelationalPeriod) void {
+    for (periods) |period| freeRelationalPeriod(alloc, period);
+    if (periods.len > 0) alloc.free(periods);
+}
+
+fn freeRelationalPeriod(alloc: Allocator, period: RelationalPeriod) void {
+    alloc.free(period.name);
+    alloc.free(period.start_column);
+    alloc.free(period.end_column);
 }
 
 fn freeUniqueConstraintsSlice(alloc: Allocator, constraints: []const UniqueConstraint) void {
@@ -1167,7 +1529,9 @@ fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
     freeUniqueExpressionSlice(alloc, constraint.expressions);
+    if (constraint.without_overlaps_period) |period| alloc.free(period);
     freeUniquePredicateSlice(alloc, constraint.where);
+    freeRelationalRowsExpressionConditionSlice(alloc, constraint.where_expressions);
 }
 
 fn freeUniqueExpressionSlice(alloc: Allocator, expressions: []const UniqueExpression) void {
@@ -1183,19 +1547,163 @@ fn freeUniquePredicateSlice(alloc: Allocator, predicates: []const UniquePredicat
     if (predicates.len > 0) alloc.free(predicates);
 }
 
+fn freeRelationalRowsExpressionConditionSlice(
+    alloc: Allocator,
+    conditions: []const RelationalRowsExpressionCondition,
+) void {
+    for (conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    if (conditions.len > 0) alloc.free(conditions);
+}
+
 fn freeRelationalChecksSlice(alloc: Allocator, checks: []const RelationalCheck) void {
     for (checks) |check| freeRelationalCheck(alloc, check);
     if (checks.len > 0) alloc.free(checks);
 }
 
-fn freeRelationalCheck(alloc: Allocator, check: RelationalCheck) void {
+pub fn freeRelationalCheck(alloc: Allocator, check: RelationalCheck) void {
     alloc.free(check.name);
     alloc.free(check.field);
     if (check.value_json) |value| alloc.free(value);
+    if (check.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
+}
+
+pub fn cloneRelationalCheckAlloc(alloc: Allocator, check: RelationalCheck) !RelationalCheck {
+    const name = try alloc.dupe(u8, check.name);
+    errdefer alloc.free(name);
+    const field = try alloc.dupe(u8, check.field);
+    errdefer alloc.free(field);
+    const value_json = if (check.value_json) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (value_json) |value| alloc.free(value);
+    const expression = if (check.expression) |condition| try cloneRelationalRowsExpressionConditionAlloc(alloc, condition) else null;
+    errdefer if (expression) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    return .{
+        .name = name,
+        .field = field,
+        .op = check.op,
+        .value_json = value_json,
+        .validation_state = check.validation_state,
+        .expression = expression,
+    };
+}
+
+pub fn cloneRelationalRowsExpressionConditionAlloc(
+    alloc: Allocator,
+    condition: RelationalRowsExpressionCondition,
+) anyerror!RelationalRowsExpressionCondition {
+    const lhs = try cloneRelationalRowsExpressionAlloc(alloc, condition.lhs);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeRelationalRowsExpression(alloc, lhs);
+    const rhs = try alloc.alloc(RelationalRowsExpression, condition.rhs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (rhs[0..initialized]) |expression| freeRelationalRowsExpression(alloc, expression);
+        if (rhs.len > 0) alloc.free(rhs);
+    }
+    for (condition.rhs) |expression| {
+        rhs[initialized] = try cloneRelationalRowsExpressionAlloc(alloc, expression);
+        initialized += 1;
+    }
+    lhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = condition.op,
+        .rhs = rhs,
+    };
+}
+
+pub fn cloneRelationalRowsExpressionAlloc(
+    alloc: Allocator,
+    expression: RelationalRowsExpression,
+) anyerror!RelationalRowsExpression {
+    const field = try alloc.dupe(u8, expression.field);
+    errdefer alloc.free(field);
+    const value_json = try alloc.dupe(u8, expression.value_json);
+    errdefer alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, expression.json_path);
+    errdefer alloc.free(json_path);
+
+    const operands = try alloc.alloc(RelationalRowsExpression, expression.operands.len);
+    var operands_initialized: usize = 0;
+    errdefer {
+        for (operands[0..operands_initialized]) |operand| freeRelationalRowsExpression(alloc, operand);
+        if (operands.len > 0) alloc.free(operands);
+    }
+    for (expression.operands) |operand| {
+        operands[operands_initialized] = try cloneRelationalRowsExpressionAlloc(alloc, operand);
+        operands_initialized += 1;
+    }
+
+    const case_branches = try alloc.alloc(RelationalRowsExpressionCaseBranch, expression.case_branches.len);
+    var branches_initialized: usize = 0;
+    errdefer {
+        for (case_branches[0..branches_initialized]) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+        if (case_branches.len > 0) alloc.free(case_branches);
+    }
+    for (expression.case_branches) |branch| {
+        const when = try cloneRelationalRowsExpressionConditionAlloc(alloc, branch.when);
+        var when_transferred = false;
+        errdefer if (!when_transferred) freeRelationalRowsExpressionCondition(alloc, when);
+        const then = try cloneRelationalRowsExpressionAlloc(alloc, branch.then);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeRelationalRowsExpression(alloc, then);
+        case_branches[branches_initialized] = .{ .when = when, .then = then };
+        when_transferred = true;
+        then_transferred = true;
+        branches_initialized += 1;
+    }
+
+    const case_else = try alloc.alloc(RelationalRowsExpression, expression.case_else.len);
+    var else_initialized: usize = 0;
+    errdefer {
+        for (case_else[0..else_initialized]) |fallback| freeRelationalRowsExpression(alloc, fallback);
+        if (case_else.len > 0) alloc.free(case_else);
+    }
+    for (expression.case_else) |fallback| {
+        case_else[else_initialized] = try cloneRelationalRowsExpressionAlloc(alloc, fallback);
+        else_initialized += 1;
+    }
+
+    return .{
+        .kind = expression.kind,
+        .field = field,
+        .field_source = expression.field_source,
+        .value_json = value_json,
+        .json_path = json_path,
+        .json_as_text = expression.json_as_text,
+        .operands = operands,
+        .cast_type = expression.cast_type,
+        .case_branches = case_branches,
+        .case_else = case_else,
+    };
+}
+
+pub fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: RelationalRowsExpressionCondition) void {
+    freeRelationalRowsExpression(alloc, condition.lhs);
+    for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+    if (condition.rhs.len > 0) alloc.free(condition.rhs);
+}
+
+fn freeRelationalRowsExpressionCaseBranch(alloc: Allocator, branch: RelationalRowsExpressionCaseBranch) void {
+    freeRelationalRowsExpressionCondition(alloc, branch.when);
+    freeRelationalRowsExpression(alloc, branch.then);
+}
+
+pub fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRowsExpression) void {
+    alloc.free(expression.field);
+    alloc.free(expression.value_json);
+    alloc.free(expression.json_path);
+    for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
+    if (expression.operands.len > 0) alloc.free(expression.operands);
+    for (expression.case_branches) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+    if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
+    for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
+    if (expression.case_else.len > 0) alloc.free(expression.case_else);
 }
 
 fn freePrimaryKey(alloc: Allocator, primary_key: PrimaryKey) void {
+    if (primary_key.name) |name| alloc.free(name);
     freeStringSlice(alloc, primary_key.columns);
+    if (primary_key.without_overlaps_period) |period| alloc.free(period);
 }
 
 fn freeStringSlice(alloc: Allocator, values: []const []const u8) void {
@@ -1565,11 +2073,190 @@ fn appendOptStr(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, s: ?[]const 
     }
 }
 
+fn appendRelationalRowsExpressionCondition(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    condition: RelationalRowsExpressionCondition,
+) anyerror!void {
+    try appendRelationalRowsExpression(buf, alloc, condition.lhs);
+    try buf.append(alloc, @intFromEnum(condition.op));
+    try appendU32(buf, alloc, @intCast(condition.rhs.len));
+    for (condition.rhs) |rhs| try appendRelationalRowsExpression(buf, alloc, rhs);
+}
+
+fn appendRelationalRowsExpressionConditionSlice(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    conditions: []const RelationalRowsExpressionCondition,
+) anyerror!void {
+    try appendU32(buf, alloc, @intCast(conditions.len));
+    for (conditions) |condition| try appendRelationalRowsExpressionCondition(buf, alloc, condition);
+}
+
+fn appendRelationalRowsExpression(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    expression: RelationalRowsExpression,
+) anyerror!void {
+    try buf.append(alloc, @intFromEnum(expression.kind));
+    try appendStr(buf, alloc, expression.field);
+    try buf.append(alloc, @intFromEnum(expression.field_source));
+    try appendStr(buf, alloc, expression.value_json);
+    try appendStr(buf, alloc, expression.json_path);
+    try buf.append(alloc, if (expression.json_as_text) 1 else 0);
+    try appendU32(buf, alloc, @intCast(expression.operands.len));
+    for (expression.operands) |operand| try appendRelationalRowsExpression(buf, alloc, operand);
+    if (expression.cast_type) |cast_type| {
+        try buf.append(alloc, 1);
+        try buf.append(alloc, @intFromEnum(cast_type));
+    } else {
+        try buf.append(alloc, 0);
+    }
+    try appendU32(buf, alloc, @intCast(expression.case_branches.len));
+    for (expression.case_branches) |branch| {
+        try appendRelationalRowsExpressionCondition(buf, alloc, branch.when);
+        try appendRelationalRowsExpression(buf, alloc, branch.then);
+    }
+    try appendU32(buf, alloc, @intCast(expression.case_else.len));
+    for (expression.case_else) |fallback| try appendRelationalRowsExpression(buf, alloc, fallback);
+}
+
 fn readOptStrAlloc(alloc: Allocator, data: []const u8, pos: *usize) !?[]const u8 {
     const present = data[pos.*] == 1;
     pos.* += 1;
     if (!present) return null;
     return try alloc.dupe(u8, readStr(data, pos));
+}
+
+fn readRelationalRowsExpressionConditionAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos: *usize,
+) anyerror!RelationalRowsExpressionCondition {
+    const lhs = try readRelationalRowsExpressionAlloc(alloc, data, pos);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeRelationalRowsExpression(alloc, lhs);
+    const op: RelationalCheckOp = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+    const rhs_count = readU32(data, pos);
+    const rhs = try alloc.alloc(RelationalRowsExpression, rhs_count);
+    var rhs_initialized: usize = 0;
+    errdefer {
+        for (rhs[0..rhs_initialized]) |expression| freeRelationalRowsExpression(alloc, expression);
+        if (rhs.len > 0) alloc.free(rhs);
+    }
+    for (rhs) |*expression| {
+        expression.* = try readRelationalRowsExpressionAlloc(alloc, data, pos);
+        rhs_initialized += 1;
+    }
+    lhs_transferred = true;
+    return .{ .lhs = lhs, .op = op, .rhs = rhs };
+}
+
+fn readRelationalRowsExpressionConditionSliceAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos: *usize,
+) anyerror![]const RelationalRowsExpressionCondition {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const conditions = try alloc.alloc(RelationalRowsExpressionCondition, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (conditions[0..initialized]) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        alloc.free(conditions);
+    }
+    for (conditions) |*condition| {
+        condition.* = try readRelationalRowsExpressionConditionAlloc(alloc, data, pos);
+        initialized += 1;
+    }
+    return conditions;
+}
+
+fn readRelationalRowsExpressionAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos: *usize,
+) anyerror!RelationalRowsExpression {
+    const kind: RelationalRowsExpressionKind = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+    const field = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(field);
+    const field_source: RelationalRowsExpressionFieldSource = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+    const value_json = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, readStr(data, pos));
+    errdefer alloc.free(json_path);
+    const json_as_text = data[pos.*] == 1;
+    pos.* += 1;
+
+    const operand_count = readU32(data, pos);
+    const operands = try alloc.alloc(RelationalRowsExpression, operand_count);
+    var operands_initialized: usize = 0;
+    errdefer {
+        for (operands[0..operands_initialized]) |operand| freeRelationalRowsExpression(alloc, operand);
+        if (operands.len > 0) alloc.free(operands);
+    }
+    for (operands) |*operand| {
+        operand.* = try readRelationalRowsExpressionAlloc(alloc, data, pos);
+        operands_initialized += 1;
+    }
+
+    const cast_type: ?RelationalRowsExpressionCastType = if (data[pos.*] == 1) blk: {
+        pos.* += 1;
+        const value: RelationalRowsExpressionCastType = @enumFromInt(data[pos.*]);
+        pos.* += 1;
+        break :blk value;
+    } else blk: {
+        pos.* += 1;
+        break :blk null;
+    };
+
+    const branch_count = readU32(data, pos);
+    const case_branches = try alloc.alloc(RelationalRowsExpressionCaseBranch, branch_count);
+    var branches_initialized: usize = 0;
+    errdefer {
+        for (case_branches[0..branches_initialized]) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+        if (case_branches.len > 0) alloc.free(case_branches);
+    }
+    for (case_branches) |*branch| {
+        const when = try readRelationalRowsExpressionConditionAlloc(alloc, data, pos);
+        var when_transferred = false;
+        errdefer if (!when_transferred) freeRelationalRowsExpressionCondition(alloc, when);
+        const then = try readRelationalRowsExpressionAlloc(alloc, data, pos);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeRelationalRowsExpression(alloc, then);
+        branch.* = .{ .when = when, .then = then };
+        when_transferred = true;
+        then_transferred = true;
+        branches_initialized += 1;
+    }
+
+    const else_count = readU32(data, pos);
+    const case_else = try alloc.alloc(RelationalRowsExpression, else_count);
+    var else_initialized: usize = 0;
+    errdefer {
+        for (case_else[0..else_initialized]) |fallback| freeRelationalRowsExpression(alloc, fallback);
+        if (case_else.len > 0) alloc.free(case_else);
+    }
+    for (case_else) |*fallback| {
+        fallback.* = try readRelationalRowsExpressionAlloc(alloc, data, pos);
+        else_initialized += 1;
+    }
+
+    return .{
+        .kind = kind,
+        .field = field,
+        .field_source = field_source,
+        .value_json = value_json,
+        .json_path = json_path,
+        .json_as_text = json_as_text,
+        .operands = operands,
+        .cast_type = cast_type,
+        .case_branches = case_branches,
+        .case_else = case_else,
+    };
 }
 
 fn readU32(data: []const u8, pos: *usize) u32 {
@@ -1620,6 +2307,7 @@ fn readUniqueExpressionSliceAlloc(alloc: Allocator, data: []const u8, pos: *usiz
         const op: UniqueExpressionOp = switch (data[pos.*]) {
             0 => .lower,
             1 => .upper,
+            2 => .md5,
             else => return error.InvalidSchema,
         };
         pos.* += 1;
@@ -1812,17 +2500,33 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .enforce_types = true,
         .storage_mode = .relational,
         .relational_columns = &.{
-            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "id", .path = "id", .field_type = .keyword, .collation = "C", .nullable = false },
             .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
-            .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false, .index_lifecycle = .building, .index_generation = 12345, .default_value = .{ .value_json = "1" }, .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }} },
+            .{
+                .name = "amount",
+                .path = "amount",
+                .field_type = .numeric,
+                .nullable = false,
+                .index_lifecycle = .building,
+                .index_generation = 12345,
+                .default_value = .{ .value_json = "1" },
+                .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }},
+                .index_where_expressions = &.{.{
+                    .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "tenant_id" }} },
+                    .op = .eq,
+                    .rhs = &.{.{ .kind = .value, .value_json = "\"t1\"" }},
+                }},
+            },
             .{ .name = "created_at", .path = "created_at", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .now_ns, .value_json = "" }, .on_update_value = .{ .kind = .now_ns, .value_json = "" } },
             .{ .name = "request_id", .path = "request_id", .field_type = .keyword, .nullable = true, .default_value = .{ .kind = .uuid_v4, .value_json = "" } },
+            .{ .name = "created_day", .path = "created_day", .field_type = .datetime, .nullable = true, .default_value = .{ .kind = .current_date_ns, .value_json = "" } },
             .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true, .indexed = false },
             .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
             .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
             .{ .name = "tenant_upper_key", .path = "tenant_upper_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .upper, .field = "tenant_id" } },
         },
-        .primary_key = .{ .columns = &.{ "tenant_id", "id" } },
+        .primary_key = .{ .name = "orders_pkey", .columns = &.{ "tenant_id", "id" }, .without_overlaps_period = "valid_time" },
+        .periods = &.{.{ .name = "valid_time", .start_column = "created_at", .end_column = "created_day", .range_type = .daterange }},
         .foreign_keys = &.{
             .{
                 .name = "orders_customer_id_fkey",
@@ -1840,8 +2544,10 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{
                 .name = "orders_account_id_fkey",
                 .child_columns = &.{"account_id"},
+                .child_period = "valid_time",
                 .parent_table = "accounts",
                 .parent_columns = &.{"_id"},
+                .parent_period = "valid_time",
                 .on_delete = .cascade,
                 .on_update = .no_action,
                 .timing = .immediate,
@@ -1857,6 +2563,10 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .where = &.{
                     .{ .field = "email", .op = .is_not_null },
                 },
+                .where_expressions = &.{.{
+                    .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "email" }} },
+                    .op = .is_not_null,
+                }},
             },
             .{
                 .name = "users_lower_email_key",
@@ -1873,9 +2583,31 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                     .{ .op = .upper, .field = "email" },
                 },
             },
+            .{
+                .name = "users_md5_email_key",
+                .columns = &.{"tenant_id"},
+                .without_overlaps_period = "valid_time",
+                .expressions = &.{
+                    .{ .op = .md5, .field = "email" },
+                },
+            },
         },
         .checks = &.{
             .{ .name = "amount_nonnegative", .field = "amount", .op = .gte, .value_json = "0" },
+            .{
+                .name = "amount_plus_fee_positive",
+                .expression = .{
+                    .lhs = .{
+                        .kind = .add,
+                        .operands = &.{
+                            .{ .kind = .field, .field = "amount" },
+                            .{ .kind = .field, .field = "fee" },
+                        },
+                    },
+                    .op = .gt,
+                    .rhs = &.{.{ .kind = .value, .value_json = "0" }},
+                },
+            },
         },
     };
 
@@ -1886,17 +2618,25 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     defer freeSchema(alloc, loaded);
 
     try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
-    try std.testing.expectEqual(@as(usize, 9), loaded.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 10), loaded.relational_columns.len);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].name);
     try std.testing.expectEqualStrings("id", loaded.relational_columns[0].path);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[0].field_type);
+    try std.testing.expectEqualStrings("C", loaded.relational_columns[0].collation.?);
     try std.testing.expect(!loaded.relational_columns[0].nullable);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[1].field_type);
     try std.testing.expect(!loaded.relational_columns[1].nullable);
     try std.testing.expect(loaded.primary_key != null);
+    try std.testing.expectEqualStrings("orders_pkey", loaded.primary_key.?.name.?);
     try std.testing.expectEqual(@as(usize, 2), loaded.primary_key.?.columns.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("id", loaded.primary_key.?.columns[1]);
+    try std.testing.expectEqualStrings("valid_time", loaded.primary_key.?.without_overlaps_period.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.periods.len);
+    try std.testing.expectEqualStrings("valid_time", loaded.periods[0].name);
+    try std.testing.expectEqualStrings("created_at", loaded.periods[0].start_column);
+    try std.testing.expectEqualStrings("created_day", loaded.periods[0].end_column);
+    try std.testing.expectEqual(RelationalPeriodRangeType.daterange, loaded.periods[0].range_type.?);
     try std.testing.expectEqual(AntflyType.numeric, loaded.relational_columns[2].field_type);
     try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[3].field_type);
     try std.testing.expect(loaded.relational_columns[3].nullable);
@@ -1907,10 +2647,13 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[4].field_type);
     try std.testing.expect(loaded.relational_columns[4].default_value != null);
     try std.testing.expectEqual(RelationalDefaultKind.uuid_v4, loaded.relational_columns[4].default_value.?.kind);
-    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[5].field_type);
-    try std.testing.expect(!loaded.relational_columns[5].indexed);
-    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[6].field_type);
-    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[6].array_item_type.?);
+    try std.testing.expectEqual(AntflyType.datetime, loaded.relational_columns[5].field_type);
+    try std.testing.expect(loaded.relational_columns[5].default_value != null);
+    try std.testing.expectEqual(RelationalDefaultKind.current_date_ns, loaded.relational_columns[5].default_value.?.kind);
+    try std.testing.expectEqual(AntflyType.json, loaded.relational_columns[6].field_type);
+    try std.testing.expect(!loaded.relational_columns[6].indexed);
+    try std.testing.expectEqual(AntflyType.array, loaded.relational_columns[7].field_type);
+    try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[7].array_item_type.?);
     try std.testing.expect(loaded.relational_columns[2].default_value != null);
     try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_columns[2].index_lifecycle);
     try std.testing.expectEqual(@as(u64, 12345), loaded.relational_columns[2].index_generation);
@@ -1918,12 +2661,15 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.relational_columns[2].index_where.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.relational_columns[2].index_where[0].op);
-    try std.testing.expect(loaded.relational_columns[7].generated != null);
-    try std.testing.expectEqual(RelationalGeneratedOp.lower, loaded.relational_columns[7].generated.?.op);
-    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[7].generated.?.field.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.relational_columns[2].index_where_expressions.len);
+    try std.testing.expectEqual(RelationalRowsExpressionKind.lower, loaded.relational_columns[2].index_where_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_where_expressions[0].lhs.operands[0].field);
     try std.testing.expect(loaded.relational_columns[8].generated != null);
-    try std.testing.expectEqual(RelationalGeneratedOp.upper, loaded.relational_columns[8].generated.?.op);
+    try std.testing.expectEqual(RelationalGeneratedOp.lower, loaded.relational_columns[8].generated.?.op);
     try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[8].generated.?.field.?);
+    try std.testing.expect(loaded.relational_columns[9].generated != null);
+    try std.testing.expectEqual(RelationalGeneratedOp.upper, loaded.relational_columns[9].generated.?.op);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[9].generated.?.field.?);
     try std.testing.expectEqual(@as(usize, 3), loaded.foreign_keys.len);
     try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.foreign_keys[0].name);
     try std.testing.expectEqualStrings("customer_id", loaded.foreign_keys[0].child_columns[0]);
@@ -1933,13 +2679,15 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqualStrings("orders_referrer_id_fkey", loaded.foreign_keys[1].name);
     try std.testing.expectEqual(ForeignKeyAction.set_null, loaded.foreign_keys[1].on_delete);
     try std.testing.expectEqualStrings("orders_account_id_fkey", loaded.foreign_keys[2].name);
+    try std.testing.expectEqualStrings("valid_time", loaded.foreign_keys[2].child_period.?);
+    try std.testing.expectEqualStrings("valid_time", loaded.foreign_keys[2].parent_period.?);
     try std.testing.expectEqual(ForeignKeyAction.cascade, loaded.foreign_keys[2].on_delete);
     try std.testing.expectEqual(ForeignKeyAction.no_action, loaded.foreign_keys[2].on_update);
     try std.testing.expectEqual(ForeignKeyTiming.immediate, loaded.foreign_keys[2].timing);
     try std.testing.expect(loaded.foreign_keys[2].deferrable);
     try std.testing.expectEqual(ForeignKeyMatch.simple, loaded.foreign_keys[2].match);
     try std.testing.expectEqual(ForeignKeyValidationState.enforced, loaded.foreign_keys[2].validation_state);
-    try std.testing.expectEqual(@as(usize, 3), loaded.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 4), loaded.unique_constraints.len);
     try std.testing.expectEqualStrings("users_tenant_email_key", loaded.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].columns.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.unique_constraints[0].columns[0]);
@@ -1947,6 +2695,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);
+    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where_expressions.len);
+    try std.testing.expectEqual(RelationalRowsExpressionKind.lower, loaded.unique_constraints[0].where_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where_expressions[0].lhs.operands[0].field);
     try std.testing.expectEqual(UniqueConstraintValidationState.enforced, loaded.unique_constraints[0].validation_state);
     try std.testing.expectEqualStrings("users_lower_email_key", loaded.unique_constraints[1].name);
     try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, loaded.unique_constraints[1].validation_state);
@@ -1957,10 +2708,52 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[2].expressions.len);
     try std.testing.expectEqual(UniqueExpressionOp.upper, loaded.unique_constraints[2].expressions[0].op);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[2].expressions[0].field);
-    try std.testing.expectEqual(@as(usize, 1), loaded.checks.len);
+    try std.testing.expectEqualStrings("users_md5_email_key", loaded.unique_constraints[3].name);
+    try std.testing.expectEqualStrings("valid_time", loaded.unique_constraints[3].without_overlaps_period.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[3].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.md5, loaded.unique_constraints[3].expressions[0].op);
+    try std.testing.expectEqualStrings("email", loaded.unique_constraints[3].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 2), loaded.checks.len);
     try std.testing.expectEqualStrings("amount_nonnegative", loaded.checks[0].name);
     try std.testing.expectEqual(RelationalCheckOp.gte, loaded.checks[0].op);
     try std.testing.expectEqualStrings("0", loaded.checks[0].value_json.?);
+    try std.testing.expectEqualStrings("amount_plus_fee_positive", loaded.checks[1].name);
+    try std.testing.expect(loaded.checks[1].expression != null);
+    try std.testing.expectEqual(RelationalRowsExpressionKind.add, loaded.checks[1].expression.?.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), loaded.checks[1].expression.?.lhs.operands.len);
+    try std.testing.expectEqualStrings("amount", loaded.checks[1].expression.?.lhs.operands[0].field);
+    try std.testing.expectEqual(RelationalCheckOp.gt, loaded.checks[1].expression.?.op);
+    try std.testing.expectEqualStrings("0", loaded.checks[1].expression.?.rhs[0].value_json);
+}
+
+test "schema relational check clone preserves expression AST" {
+    const alloc = std.testing.allocator;
+
+    const operands = [_]RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount" },
+        .{ .kind = .field, .field = "fee" },
+    };
+    const rhs = [_]RelationalRowsExpression{.{ .kind = .value, .value_json = "0" }};
+    const check = RelationalCheck{
+        .name = "amount_plus_fee_positive",
+        .expression = .{
+            .lhs = .{ .kind = .add, .operands = operands[0..] },
+            .op = .gt,
+            .rhs = rhs[0..],
+        },
+    };
+
+    const cloned = try cloneRelationalCheckAlloc(alloc, check);
+    defer freeRelationalCheck(alloc, cloned);
+
+    try std.testing.expect(relationalChecksEqual(check, cloned));
+    try std.testing.expect(cloned.expression != null);
+    try std.testing.expectEqual(RelationalRowsExpressionKind.add, cloned.expression.?.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), cloned.expression.?.lhs.operands.len);
+    try std.testing.expectEqualStrings("amount", cloned.expression.?.lhs.operands[0].field);
+    try std.testing.expect(cloned.expression.?.lhs.operands[0].field.ptr != operands[0].field.ptr);
+    try std.testing.expectEqualStrings("0", cloned.expression.?.rhs[0].value_json);
+    try std.testing.expect(cloned.expression.?.rhs[0].value_json.ptr != rhs[0].value_json.ptr);
 }
 
 test "schema save/load via DocStore" {

@@ -742,6 +742,16 @@ pub const RowsUniquePredicate = struct {
     value: ?std.json.Value = null,
 };
 
+/// Application-time temporal slice for update/delete mutation-source plans.
+pub const RowsTemporalPortion = struct {
+    /// Period name declared on the relational table schema.
+    period: []const u8,
+    /// Inclusive lower bound encoded as the period start column's JSON type.
+    from: std.json.Value,
+    /// Exclusive upper bound encoded as the period end column's JSON type.
+    to: std.json.Value,
+};
+
 /// Source-side assignment for joined mutation-source updates.
 pub const RowsJoinedMutationSourceAssignment = struct {
     /// Declared target-side relational field to assign.
@@ -771,6 +781,7 @@ pub const RowsQueryOrderField = struct {
 /// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
     mode: ?[]const u8 = null,
+    wait_policy: ?[]const u8 = null,
     skip_locked: ?bool = null,
     lease_ms: ?i64 = null,
     owner_id: ?[]const u8 = null,
@@ -900,19 +911,20 @@ pub const RowsLateralCorrelation = struct {
     right_field: []const u8,
 };
 
-pub const RowsQueryResultSet = struct {
-    total: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
-};
-
-pub const RowsAggregateResultSet = struct {
-    total_groups: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
-};
-
-pub const RowsStreamResultSet = struct {
-    total_rows: ?i64 = null,
-    rows: ?[]const std.json.Value = null,
+/// Typed column metadata emitted by a native relational read plan.
+pub const RowsResultColumn = struct {
+    /// Public result-object field name.
+    name: []const u8,
+    /// Source path represented by this result field.
+    path: []const u8,
+    /// Antfly scalar/container type for the result field.
+    type: []const u8,
+    /// Item type when `type` is `array`.
+    array_item_type: ?[]const u8 = null,
+    /// Optional source collation metadata for source-backed text or keyword result fields.
+    collation: ?[]const u8 = null,
+    /// Whether the result field may be null.
+    nullable: bool,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -2108,6 +2120,24 @@ pub const RowsAggregateHaving = struct {
     all: []const RowsAggregateHavingPredicate,
 };
 
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -2434,13 +2464,6 @@ pub const RowsGetResult = struct {
     physical_key: ?[]const u8 = null,
 };
 
-/// Declared unique constraint target for `ON CONFLICT`.
-pub const RowsConflictUniqueTarget = struct {
-    /// Unique constraint name.
-    name: []const u8,
-    where: ?RowsUniquePredicateGroup = null,
-};
-
 /// Compact COALESCE projection.
 pub const RowsCoalesceProjection = struct {
     /// Output field name.
@@ -2630,13 +2653,6 @@ pub const BatchRequest = struct {
 
 pub const RowsGetResultSet = struct {
     rows: ?[]const RowsGetResult = null,
-};
-
-/// Primary-key or named unique constraint conflict target.
-pub const RowsConflictTarget = struct {
-    /// Set to `true` to target the declared primary key.
-    primary: ?bool = null,
-    unique: ?RowsConflictUniqueTarget = null,
 };
 
 /// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
@@ -3106,6 +3122,22 @@ pub const RowsJsonSetTransform = struct {
     expr: ?RowsExpression = null,
 };
 
+/// Declared unique constraint target for `ON CONFLICT`.
+pub const RowsConflictUniqueTarget = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    where: ?RowsUniquePredicateGroup = null,
+    /// Expression predicates for expression-partial unique conflict targets. When present, the list must exactly match the named unique constraint's stored expression predicate metadata.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+/// Primary-key or named unique constraint conflict target.
+pub const RowsConflictTarget = struct {
+    /// Set to `true` to target the declared primary key.
+    primary: ?bool = null,
+    unique: ?RowsConflictUniqueTarget = null,
+};
+
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
 pub const RowsOnConflict = struct {
     target: RowsConflictTarget,
@@ -3162,6 +3194,8 @@ pub const RowsMutationSourceRequest = struct {
     json_set: ?[]const RowsJsonSetTransform = null,
     /// Array transforms for update operations.
     array_update: ?[]const RowsArrayUpdateTransform = null,
+    /// Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans.
+    temporal_portion: ?RowsTemporalPortion = null,
     /// Fields to return from the final update image or deleted row image. `*` returns the full row.
     returning: ?[]const []const u8 = null,
     /// Typed row-expression projections over the final update image or deleted row image.
@@ -3278,7 +3312,7 @@ pub const RowsQueryOrderExpression = struct {
     direction: ?[]const u8 = null,
 };
 
-/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators include `now`, `coalesce`, `lower`, `upper`, `trim`, `replace`, `concat`, `length`, `nullif`, `greatest`, `least`, numeric `abs`/`round`/`floor`/`ceil`/`add`/`sub`/`mul`/`div`, `interval_ns`, `cast`, `json_extract`, `array_length`, `string_to_array`, and searched `case` with `cases` and `else`. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
 pub const RowsExpression = union(enum) {
     rows_expression_operator: *RowsExpressionOperator,
     rows_expression_field: *RowsExpressionField,
@@ -3343,7 +3377,7 @@ pub const RowsExpressionOperator = struct {
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
     to: ?[]const u8 = null,
-    /// Structured JSON path for `json_extract`.
+    /// Structured JSON path for `json_extract` and `json_path_exists`.
     path: ?std.json.Value = null,
     /// Return JSON path extraction as text.
     as_text: ?bool = null,
@@ -3400,8 +3434,10 @@ pub const RowsQueryRequest = struct {
     field_aliases: ?[]const RowsFieldAliasProjection = null,
     /// Typed row-expression projections.
     expressions: ?[]const RowsExpressionProjection = null,
-    /// Ordered row identity fields used to keep the first row per key after order_by and before pagination. The leading order_by fields must match.
+    /// Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
     distinct_on: ?[]const []const u8 = null,
+    /// Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match.
+    distinct_on_expressions: ?[]const RowsExpression = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
@@ -3560,6 +3596,8 @@ pub const RowsPlanRequest = union(enum) {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
             "ctes",
+            "left_table",
+            "right_table",
             "left_ranges",
             "right_ranges",
             "join",
@@ -3568,6 +3606,8 @@ pub const RowsPlanRequest = union(enum) {
         }
         if (objectHasAnyKey(source.object, &.{
             "ctes",
+            "left_table",
+            "right_table",
             "left_ranges",
             "right_ranges",
             "lateral",
@@ -3630,17 +3670,25 @@ pub const RowsWindowPlanRequest = struct {
     window: RowsWindowRequest,
 };
 
-/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
 pub const RowsJoinPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
     left_ranges: ?[]const RowsDocKeyRange = null,
     right_ranges: ?[]const RowsDocKeyRange = null,
     join: RowsJoinRequest,
 };
 
-/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
 pub const RowsLateralPlanRequest = struct {
     ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
     left_ranges: ?[]const RowsDocKeyRange = null,
     right_ranges: ?[]const RowsDocKeyRange = null,
     lateral: RowsLateralRequest,

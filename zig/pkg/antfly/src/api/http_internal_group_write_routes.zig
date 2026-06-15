@@ -354,6 +354,25 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         defer result.deinit(ctx.alloc);
         return try http_route_helpers.jsonResponse(ctx.alloc, result);
     }
+    if (routes.Routes.matchGroupGraphMetricMaintenance(path)) |graph_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        const body = (writes.graphMetricMaintenanceGroupLocal(
+            ctx.alloc,
+            graph_route.group_id,
+            graph_route.table_name,
+            req.body,
+        ) catch |err| switch (err) {
+            error.InvalidGraphMetricRuntimeConfig => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid graph metric runtime config"),
+            error.UnsupportedOperation, error.ReadOnly => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return .{
+            .status = 200,
+            .content_type = try ctx.alloc.dupe(u8, "application/json"),
+            .body = body,
+        };
+    }
     if (routes.Routes.matchGroupSecondaryIndexRebuild(path)) |rebuild_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var parsed = std.json.parseFromSlice(table_writes.SecondaryIndexRebuildGroupRequest, ctx.alloc, req.body, .{

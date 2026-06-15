@@ -27,6 +27,7 @@ pub const relational_array_element_index_namespace: u8 = 0x09;
 pub const relational_json_value_index_namespace: u8 = 0x0a;
 pub const relational_array_value_index_namespace: u8 = 0x0b;
 pub const relational_json_path_index_namespace: u8 = 0x0c;
+pub const relational_temporal_unique_namespace: u8 = 0x0d;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
@@ -75,6 +76,7 @@ pub fn isInternalPhysicalTableDataKey(key: []const u8) bool {
         isRelationalColumnIndexByDocKey(key) or
         isRelationalForeignKeyRefKey(key) or
         isRelationalUniqueKey(key) or
+        isRelationalTemporalUniqueKey(key) or
         isRelationalForeignKeyConflictKey(key);
 }
 
@@ -424,6 +426,57 @@ pub fn relationalUniqueKeyAlloc(
     try appendEncodedComponent(&list, alloc, constraint_name);
     try appendEncodedComponent(&list, alloc, encoded_value);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniqueKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    doc_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalTemporalUniquePrefix(&list, alloc, constraint_name, encoded_value);
+    try appendEncodedComponent(&list, alloc, encoded_start);
+    try appendEncodedComponent(&list, alloc, encoded_end);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniquePrefixAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalTemporalUniquePrefix(&list, alloc, constraint_name, encoded_value);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniquePrefixUpperAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !?[]u8 {
+    const lower = try relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+fn appendRelationalTemporalUniquePrefix(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !void {
+    try list.append(alloc, relational_temporal_unique_namespace);
+    try appendEncodedComponent(list, alloc, constraint_name);
+    try appendEncodedComponent(list, alloc, encoded_value);
 }
 
 pub fn relationalForeignKeyConflictKeyAlloc(
@@ -823,6 +876,20 @@ pub fn isRelationalUniqueKey(key: []const u8) bool {
     const value_start = constraint_term + 2;
     const value_term = findComponentTerminator(key, value_start) orelse return false;
     return value_term + 2 == key.len;
+}
+
+pub fn isRelationalTemporalUniqueKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_temporal_unique_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const value_start = constraint_term + 2;
+    const value_term = findComponentTerminator(key, value_start) orelse return false;
+    const start_start = value_term + 2;
+    const start_term = findComponentTerminator(key, start_start) orelse return false;
+    const end_start = start_term + 2;
+    const end_term = findComponentTerminator(key, end_start) orelse return false;
+    const doc_start = end_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
 }
 
 pub fn isRelationalForeignKeyConflictKey(key: []const u8) bool {

@@ -88,6 +88,7 @@ pub const Routes = struct {
     pub const graph_expand_suffix = "/graph-expand";
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
+    pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";
@@ -100,6 +101,8 @@ pub const Routes = struct {
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
     pub const lookup_suffix = "/lookup";
     pub const lookup_marker = "/lookup/";
+    pub const temporal_unique_owner_suffix = "/relational-temporal-unique-owner";
+    pub const temporal_unique_overlap_owner_suffix = "/relational-temporal-unique-overlap-owner";
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const artifacts_suffix = "/artifacts";
@@ -238,6 +241,11 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const GroupTemporalUniqueOwner = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
     pub const GroupQuery = struct {
         group_id: u64,
         table_name: []const u8,
@@ -338,6 +346,11 @@ pub const Routes = struct {
     };
 
     pub const GroupGraphEdges = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupGraphMetricMaintenance = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -735,6 +748,24 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupTemporalUniqueOwner(path: []const u8) ?GroupTemporalUniqueOwner {
+        return matchGroupTemporalUniqueOwnerWithSuffix(path, temporal_unique_owner_suffix);
+    }
+
+    pub fn matchGroupTemporalUniqueOverlapOwner(path: []const u8) ?GroupTemporalUniqueOwner {
+        return matchGroupTemporalUniqueOwnerWithSuffix(path, temporal_unique_overlap_owner_suffix);
+    }
+
+    fn matchGroupTemporalUniqueOwnerWithSuffix(path: []const u8, suffix: []const u8) ?GroupTemporalUniqueOwner {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupQuery(path: []const u8) ?GroupQuery {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1066,6 +1097,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_edges_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_edges_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupGraphMetricMaintenance(path: []const u8) ?GroupGraphMetricMaintenance {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, graph_metric_maintenance_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - graph_metric_maintenance_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }

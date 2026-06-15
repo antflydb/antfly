@@ -16,7 +16,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test sql-api-parity-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test graph-metric-process-test graph-metric-release-qualification graph-metric-release-qualification-build download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test sql-api-parity-test db-temporal-test graph-metric-lifecycle-test graph-metric-cleanup-test graph-metric-degree-canary-test graph-metric-default-gate-test graph-metric-fan-in-test graph-metric-operations-test public-api-graph-metric-e2e-test graph-metric-process-test graph-metric-distributed-release-gate graph-metric-distributed-promotion-gate graph-metric-release-qualification graph-metric-release-qualification-smoke graph-metric-release-qualification-smoke-budgeted graph-metric-release-qualification-promotion graph-metric-release-qualification-promotion-budgeted graph-metric-release-qualification-build download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -42,6 +42,9 @@ unit-test: ## Run hermetic Antfly unit tests.
 sql-api-parity-test: ## Run SQL/API typed-plan parity corpus tests.
 	$(ZIG) build sql-api-parity-test
 
+db-temporal-test: ## Run focused application-time temporal table storage tests.
+	$(ZIG) build db-temporal-test
+
 graph-metric-lifecycle-test: ## Run focused graph metric planned lifecycle tests.
 	$(ZIG) build graph-metric-lifecycle-test
 
@@ -66,8 +69,26 @@ public-api-graph-metric-e2e-test: ## Run focused public API graph metric e2e tes
 graph-metric-process-test: ## Run spawned-process graph metric maintenance tests.
 	$(ZIG) build graph-metric-process-test
 
+graph-metric-distributed-release-gate: ## Run local distributed graph metric process and release qualification gates.
+	$(ZIG) build graph-metric-distributed-release-gate $(ZIG_BUILD_FLAGS)
+
+graph-metric-distributed-promotion-gate: ## Run local distributed graph metric process gate followed by promotion release qualification.
+	$(ZIG) build graph-metric-distributed-promotion-gate $(ZIG_BUILD_FLAGS)
+
 graph-metric-release-qualification: ## Run graph metric release qualification JSONL harness.
 	$(ZIG) build graph-metric-release-qualification $(ZIG_BUILD_FLAGS)
+
+graph-metric-release-qualification-smoke: ## Run smoke graph metric release qualification profile.
+	$(ZIG) build graph-metric-release-qualification-smoke $(ZIG_BUILD_FLAGS)
+
+graph-metric-release-qualification-smoke-budgeted: ## Run smoke graph metric release qualification profile with storage and scheduler budgets.
+	$(ZIG) build graph-metric-release-qualification-smoke-budgeted $(ZIG_BUILD_FLAGS)
+
+graph-metric-release-qualification-promotion: ## Run promotion graph metric release qualification profile.
+	$(ZIG) build graph-metric-release-qualification-promotion $(ZIG_BUILD_FLAGS)
+
+graph-metric-release-qualification-promotion-budgeted: ## Run promotion graph metric release qualification profile with storage and scheduler budgets.
+	$(ZIG) build graph-metric-release-qualification-promotion-budgeted $(ZIG_BUILD_FLAGS)
 
 graph-metric-release-qualification-build: ## Build graph metric release qualification harness without running it.
 	$(ZIG) build graph-metric-release-qualification-build $(ZIG_BUILD_FLAGS)
@@ -85,11 +106,11 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check sql-api-parity-fixture-promote sql-api-parity-fixture-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate sql-api-parity-fixture-promote ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check ## Check all checked-in generated sources are current.
+generated-check: openapi-check snowball-check sql-api-parity-fixture-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
@@ -105,6 +126,12 @@ snowball-generate:
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+sql-api-parity-fixture-promote:
+	$(ZIG) build sql-api-parity-fixture-promote
+
+sql-api-parity-fixture-check:
+	$(ZIG) build sql-api-parity-fixture-check
 
 license-headers: ## Add license headers to first-party source files.
 	$(SCRIPTS_PY) ../scripts/license_headers.py

@@ -90,6 +90,7 @@ help:
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
 	@echo "  zig-build          Build the migrated Zig runtime"
 	@echo "  zig-test           Run the migrated Zig test aggregate"
+	@echo "  zig-db-temporal-test  Run focused application-time temporal table storage tests"
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
 	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
@@ -135,7 +136,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-go build-docs generate generated-check go-generated-check ts-generated-check py-generated-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-graph-metric-lifecycle-test zig-graph-metric-cleanup-test zig-graph-metric-degree-canary-test zig-graph-metric-default-gate-test zig-graph-metric-fan-in-test zig-graph-metric-operations-test zig-public-api-graph-metric-e2e-test zig-graph-metric-process-test zig-graph-metric-release-qualification zig-graph-metric-release-qualification-build zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-graph-metric-lifecycle-test zig-graph-metric-cleanup-test zig-graph-metric-degree-canary-test zig-graph-metric-default-gate-test zig-graph-metric-fan-in-test zig-graph-metric-operations-test zig-public-api-graph-metric-e2e-test zig-graph-metric-process-test zig-graph-metric-distributed-release-gate zig-graph-metric-distributed-promotion-gate zig-graph-metric-release-qualification zig-graph-metric-release-qualification-smoke zig-graph-metric-release-qualification-smoke-budgeted zig-graph-metric-release-qualification-promotion zig-graph-metric-release-qualification-promotion-budgeted zig-graph-metric-release-qualification-build zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -217,6 +218,9 @@ zig-unit-test:
 zig-sql-api-parity-test:
 	$(ZIG_MAKE) sql-api-parity-test
 
+zig-db-temporal-test:
+	$(ZIG_MAKE) db-temporal-test
+
 zig-graph-metric-lifecycle-test:
 	$(ZIG_MAKE) graph-metric-lifecycle-test
 
@@ -241,8 +245,26 @@ zig-public-api-graph-metric-e2e-test:
 zig-graph-metric-process-test:
 	$(ZIG_MAKE) graph-metric-process-test
 
+zig-graph-metric-distributed-release-gate:
+	$(ZIG_MAKE) graph-metric-distributed-release-gate
+
+zig-graph-metric-distributed-promotion-gate:
+	$(ZIG_MAKE) graph-metric-distributed-promotion-gate
+
 zig-graph-metric-release-qualification:
 	$(ZIG_MAKE) graph-metric-release-qualification
+
+zig-graph-metric-release-qualification-smoke:
+	$(ZIG_MAKE) graph-metric-release-qualification-smoke
+
+zig-graph-metric-release-qualification-smoke-budgeted:
+	$(ZIG_MAKE) graph-metric-release-qualification-smoke-budgeted
+
+zig-graph-metric-release-qualification-promotion:
+	$(ZIG_MAKE) graph-metric-release-qualification-promotion
+
+zig-graph-metric-release-qualification-promotion-budgeted:
+	$(ZIG_MAKE) graph-metric-release-qualification-promotion-budgeted
 
 zig-graph-metric-release-qualification-build:
 	$(ZIG_MAKE) graph-metric-release-qualification-build

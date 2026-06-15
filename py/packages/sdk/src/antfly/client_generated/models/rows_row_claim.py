@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.rows_row_claim_mode import RowsRowClaimMode
+from ..models.rows_row_claim_wait_policy import RowsRowClaimWaitPolicy
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="RowsRowClaim")
@@ -20,6 +21,7 @@ class RowsRowClaim:
 
         Attributes:
             mode (RowsRowClaimMode | Unset):  Default: RowsRowClaimMode.FOR_UPDATE.
+            wait_policy (RowsRowClaimWaitPolicy | Unset):  Default: RowsRowClaimWaitPolicy.WAIT.
             skip_locked (bool | Unset):  Default: False.
             lease_ms (int | Unset):  Default: 30000.
             owner_id (str | Unset):
@@ -27,6 +29,7 @@ class RowsRowClaim:
     """
 
     mode: RowsRowClaimMode | Unset = RowsRowClaimMode.FOR_UPDATE
+    wait_policy: RowsRowClaimWaitPolicy | Unset = RowsRowClaimWaitPolicy.WAIT
     skip_locked: bool | Unset = False
     lease_ms: int | Unset = 30000
     owner_id: str | Unset = UNSET
@@ -36,6 +39,10 @@ class RowsRowClaim:
         mode: str | Unset = UNSET
         if not isinstance(self.mode, Unset):
             mode = self.mode.value
+
+        wait_policy: str | Unset = UNSET
+        if not isinstance(self.wait_policy, Unset):
+            wait_policy = self.wait_policy.value
 
         skip_locked = self.skip_locked
 
@@ -50,6 +57,8 @@ class RowsRowClaim:
         field_dict.update({})
         if mode is not UNSET:
             field_dict["mode"] = mode
+        if wait_policy is not UNSET:
+            field_dict["wait_policy"] = wait_policy
         if skip_locked is not UNSET:
             field_dict["skip_locked"] = skip_locked
         if lease_ms is not UNSET:
@@ -71,6 +80,13 @@ class RowsRowClaim:
         else:
             mode = RowsRowClaimMode(_mode)
 
+        _wait_policy = d.pop("wait_policy", UNSET)
+        wait_policy: RowsRowClaimWaitPolicy | Unset
+        if isinstance(_wait_policy, Unset):
+            wait_policy = UNSET
+        else:
+            wait_policy = RowsRowClaimWaitPolicy(_wait_policy)
+
         skip_locked = d.pop("skip_locked", UNSET)
 
         lease_ms = d.pop("lease_ms", UNSET)
@@ -81,6 +97,7 @@ class RowsRowClaim:
 
         rows_row_claim = cls(
             mode=mode,
+            wait_policy=wait_policy,
             skip_locked=skip_locked,
             lease_ms=lease_ms,
             owner_id=owner_id,

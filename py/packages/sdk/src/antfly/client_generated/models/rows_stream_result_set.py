@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.rows_result_column import RowsResultColumn
     from ..models.rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
 
 
@@ -20,15 +21,24 @@ class RowsStreamResultSet:
     """
     Attributes:
         total_rows (int | Unset):
+        result_schema (list[RowsResultColumn] | Unset):
         rows (list[RowsStreamResultSetRowsItem] | Unset):
     """
 
     total_rows: int | Unset = UNSET
+    result_schema: list[RowsResultColumn] | Unset = UNSET
     rows: list[RowsStreamResultSetRowsItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         total_rows = self.total_rows
+
+        result_schema: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.result_schema, Unset):
+            result_schema = []
+            for result_schema_item_data in self.result_schema:
+                result_schema_item = result_schema_item_data.to_dict()
+                result_schema.append(result_schema_item)
 
         rows: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.rows, Unset):
@@ -42,6 +52,8 @@ class RowsStreamResultSet:
         field_dict.update({})
         if total_rows is not UNSET:
             field_dict["total_rows"] = total_rows
+        if result_schema is not UNSET:
+            field_dict["result_schema"] = result_schema
         if rows is not UNSET:
             field_dict["rows"] = rows
 
@@ -49,10 +61,20 @@ class RowsStreamResultSet:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.rows_result_column import RowsResultColumn
         from ..models.rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
 
         d = dict(src_dict)
         total_rows = d.pop("total_rows", UNSET)
+
+        _result_schema = d.pop("result_schema", UNSET)
+        result_schema: list[RowsResultColumn] | Unset = UNSET
+        if _result_schema is not UNSET:
+            result_schema = []
+            for result_schema_item_data in _result_schema:
+                result_schema_item = RowsResultColumn.from_dict(result_schema_item_data)
+
+                result_schema.append(result_schema_item)
 
         _rows = d.pop("rows", UNSET)
         rows: list[RowsStreamResultSetRowsItem] | Unset = UNSET
@@ -65,6 +87,7 @@ class RowsStreamResultSet:
 
         rows_stream_result_set = cls(
             total_rows=total_rows,
+            result_schema=result_schema,
             rows=rows,
         )
 

@@ -284,13 +284,22 @@ For v1:
   `restrict` to a statement-time check, while the raw DB transaction API
   prepares row intents at commit.
 - Primary-key identity rewrites are intentionally separate from referenced
-  unique-tuple updates. Changing a row's physical primary key must be a native
-  typed identity-rewrite job that claims the old row, materializes the new row,
-  stages old-key delete plus new-key insert in one 2PC, moves unique-owner rows,
-  moves or rewrites FK reverse-reference rows, executes any parent `on_update`
-  action pages, and replays secondary plus embedded-JSON index maintenance from
-  the new committed row image. Until that operation exists, SQL adapters reject
-  primary-key assignments instead of lowering them into ordinary transforms.
+  unique-tuple updates. Point row-batch rewrites, claimed mutation-source
+  rewrites, and joined mutation-source rewrites use a native typed
+  `rewrite_identity` operation that claims the old row with OCC predicates,
+  materializes the new row from typed assignments or source-derived joined
+  assignments, emits an internal `relational_identity_rewrites`
+  request, moves primary/unique owner rows to the new physical owner, moves or
+  rewrites FK reverse-reference rows, runs parent `on_update`
+  restrict/no-action/set-null/cascade semantics, and replays secondary plus
+  embedded-JSON index maintenance from the new committed row image. Bound tables
+  execute the operation locally; provisioned and hosted table-write sources route
+  same-owner rewrites to the owner group and fail closed when old and new keys
+  would cross owner ranges. Claimed and joined mutation-source rewrites persist
+  durable transaction markers so commit cannot confuse a logical identity update
+  with an ordinary delete plus insert. Cross-owner point, claimed-source, and
+  joined-source primary-key rewrites remain fail-closed until routing can carry
+  one durable staged rewrite per affected target/source row pair.
 - `on_delete` supports `restrict`, `no_action`, `set_null`, and `cascade`;
   `no_action` is preserved as a first-class catalog value. `restrict` is never
   relaxed by `timing: "deferred"`; deferred `no_action` validates the final
@@ -792,7 +801,10 @@ and missing/stale reverse-reference rows, returns owned violation rows for
 operator diagnostics, recreates missing reverse-reference rows, and prunes stale
 reverse-reference rows whose child row is missing or now points elsewhere. The
 DB layer exposes the same local primitive for validation, repair, and violation
-listing. The public admin endpoint
+listing with runtime schema metadata. Temporal foreign keys use that metadata to
+validate parent coverage through temporal unique-owner ranges, so repair rebuilds
+period-aware reverse-reference rows only when the parent coverage that accepted
+the write still exists. The public admin endpoint
 `POST /tables/{table}/foreign-key-integrity` exposes the same operation for
 local/bound, provisioned, and hosted tables with `validate`, `dry_run`,
 `repair`, `list`, `plan`, and `progress` actions plus optional `constraint_name`,
@@ -1490,6 +1502,14 @@ Implemented:
 - durable local progress rows for validation, dry-run, and repair operations,
   keyed by `(mode, constraint, lower_doc_key, upper_doc_key)` so distinct range
   checkpoints do not overwrite each other;
+- temporal-FK validation and repair use period catalog metadata plus temporal
+  unique-owner coverage, not scalar parent lookup, when deciding whether a
+  missing reverse-reference row can be rebuilt;
+- temporal-FK parent actions use that same coverage proof before mutating a
+  child: `restrict` / `no_action` reject only when final coverage is broken,
+  while `set_null` and bounded `cascade` leave still-covered children untouched
+  and only update or delete children whose final spans are no longer covered by
+  remaining parent intervals;
 - public/hosted integrity responses that return the latest per-group progress
   rows alongside aggregate report counters and violations;
 - worker-facing `work_statuses` that join planned units to durable progress rows
@@ -2055,7 +2075,11 @@ Minimum coverage:
 - parent-delete explain reports restrict blocks, set-null updates, and cascade
   deletes without mutating committed rows;
 - crash/reopen preserves FK catalog and reverse-reference rows;
-- repair rebuilds reverse-reference rows from relational child rows;
+- repair rebuilds reverse-reference rows from relational child rows, including
+  temporal FK refs whose parent coverage is proven through temporal owner rows;
+- temporal parent deletes with `set_null` or bounded `cascade` skip children
+  that remain fully covered by other parent intervals and apply the action once
+  final coverage is broken;
 - cross-shard 2PC failure/recovery does not leave dangling references.
 - routed FK-ref ownership resolves only the owner range for a deleted parent key;
 - child writes register FK-ref owner participants for old/new parent keys;

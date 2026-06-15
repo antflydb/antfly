@@ -1051,7 +1051,10 @@ const AutomaticMergePublicTrafficScenario = struct {
 
 fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
     for (needles) |needle| {
-        try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
+        if (std.mem.indexOf(u8, body, needle) == null) {
+            std.debug.print("response body missing needle={s} body={s}\n", .{ needle, body });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 
@@ -1101,6 +1104,47 @@ fn fetchPublicRowsGet(
     body: []const u8,
 ) !api_http_client.QueryResponse {
     return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_get_suffix, body, 200);
+}
+
+fn waitForPublicRowsGetContains(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+    rounds: usize,
+) !api_http_client.QueryResponse {
+    var last_body: ?[]u8 = null;
+    defer if (last_body) |body_copy| client.alloc.free(body_copy);
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var resp = try fetchPublicRowsGet(client, base_uri, table_name, body);
+        var matched = true;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, resp.body, needle) == null) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            if (last_body) |body_copy| {
+                client.alloc.free(body_copy);
+                last_body = null;
+            }
+            return resp;
+        }
+        if (last_body) |body_copy| client.alloc.free(body_copy);
+        last_body = try client.alloc.dupe(u8, resp.body);
+        resp.deinit(std.heap.page_allocator);
+        try cluster.stepAll();
+    }
+
+    if (last_body) |body_copy| {
+        try expectBodyContainsAll(body_copy, needles);
+    }
+    return error.TestUnexpectedResult;
 }
 
 fn fetchPublicRowsBatchExpectStatus(
@@ -9745,8 +9789,14 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     const users_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"user_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","user_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","user_id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}]}
     ;
+    const prices_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"},"delta":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"}}]}
+    ;
     const ada_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:ada\",\"email\":\"ada@example.test\",\"status\":\"new\"}";
     const grace_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:grace\",\"email\":\"grace@example.test\",\"status\":\"new\"}";
+    const price_v1_row = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}";
+    const price_v2_row = "{\"sku\":\"sku:a\",\"valid_from\":10,\"valid_to\":20,\"price\":12}";
+    const price_adjustment_row = "{\"sku\":\"adj:rebate\",\"parent_sku\":\"sku:a\",\"valid_from\":12,\"valid_to\":18,\"delta\":-2}";
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9819,22 +9869,59 @@ test "metadata http cluster simulation resolves relational unique selectors acro
         .min_ranges = 1,
     }, initial_ranges[0..]);
     try std.testing.expect(create_summary.table_upserts > 0);
+    const price_ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 4871,
+        .table_id = 487,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const price_create_summary = try workflow.createTableWithRanges(&cluster.node(leader_index), .{
+        .table_id = 487,
+        .name = "prices",
+        .description = "temporal relational selector cluster prices",
+        .schema_json = prices_schema,
+        .desired_replica_count = 1,
+        .min_ranges = 1,
+    }, price_ranges[0..]);
+    try std.testing.expect(price_create_summary.table_upserts > 0);
     try std.testing.expect(try cluster.waitForGroupStatusCount(4861, .active, 1, 48));
     try std.testing.expect(try cluster.waitForGroupStatusCount(4862, .active, 1, 48));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4871, .active, 1, 48));
     try std.testing.expect(try waitForProjectedTablePresenceOnAllNodes(&cluster, "users", 48));
+    try std.testing.expect(try waitForProjectedTablePresenceOnAllNodes(&cluster, "prices", 48));
     const primary_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, db_mod.relational_store.primary_key_constraint_name, 48);
     const email_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, "users_tenant_email_key", 48);
+    const temporal_primary_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 487, db_mod.relational_store.primary_key_constraint_name, 48);
     try std.testing.expect(primary_owner_group != 0);
     try std.testing.expect(email_owner_group != 0);
+    try std.testing.expect(temporal_primary_owner_group != 0);
 
     var rig: PublicApiTestRig(3) = undefined;
     try rig.initLeaderBackedInPlace(alloc, &cluster, .{ root_a, root_b, root_c });
     defer rig.deinit();
 
-    const row_host = try waitForSingleActiveGroupHost(&cluster, 4861, 48);
+    const ada_key = try relationalPhysicalKeyForRowAlloc(alloc, users_schema, ada_row);
+    defer alloc.free(ada_key);
+    const price_v2_key = try relationalPhysicalKeyForRowAlloc(alloc, prices_schema, price_v2_row);
+    defer alloc.free(price_v2_key);
+    const price_adjustment_key = try relationalPhysicalKeyForRowAlloc(alloc, prices_schema, price_adjustment_row);
+    defer alloc.free(price_adjustment_key);
+    const row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "users", ada_key)) orelse return error.TestExpectedEqual;
+    const temporal_row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_v2_key)) orelse return error.TestExpectedEqual;
+    const adjustment_row_group = (try api_table_catalog.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_adjustment_key)) orelse return error.TestExpectedEqual;
+
+    const row_host = try waitForSingleActiveGroupHost(&cluster, row_group, 48);
+    const temporal_row_host = try waitForSingleActiveGroupHost(&cluster, temporal_row_group, 48);
+    const adjustment_row_host = try waitForSingleActiveGroupHost(&cluster, adjustment_row_group, 48);
     const client_index = (row_host + 1) % 3;
+    const temporal_client_index = (temporal_row_host + 1) % 3;
+    const adjustment_client_index = (adjustment_row_host + 1) % 3;
     const client_base = rig.api_base_uris[client_index];
-    try std.testing.expect(cluster.node(client_index).status(4861) != .active);
+    const temporal_client_base = rig.api_base_uris[temporal_client_index];
+    const adjustment_client_base = rig.api_base_uris[adjustment_client_index];
+    try std.testing.expect(cluster.node(client_index).status(row_group) != .active);
+    try std.testing.expect(cluster.node(temporal_client_index).status(temporal_row_group) != .active);
+    try std.testing.expect(cluster.node(adjustment_client_index).status(adjustment_row_group) != .active);
 
     const insert_body = try std.fmt.allocPrint(
         alloc,
@@ -9846,17 +9933,72 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     defer inserted.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"inserted\":2") != null);
 
-    var initial_get = try fetchPublicRowsGet(
+    const price_insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}},{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{ price_v1_row, price_v2_row },
+    );
+    defer alloc.free(price_insert_body);
+    var prices_inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, temporal_client_base, "prices", price_insert_body, 201);
+    defer prices_inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, prices_inserted.body, "\"inserted\":2") != null);
+
+    const adjustment_insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{price_adjustment_row},
+    );
+    defer alloc.free(adjustment_insert_body);
+    var adjustment_inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, adjustment_client_base, "prices", adjustment_insert_body, 201);
+    defer adjustment_inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, adjustment_inserted.body, "\"inserted\":1") != null);
+
+    var initial_get = try waitForPublicRowsGetContains(
+        &cluster,
         &rig.client,
         client_base,
         "users",
         "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"user_id\":\"user:ada\"", "\"physical_key\"" },
+        32,
     );
     defer initial_get.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(initial_get.body, &.{ "\"found\":true", "\"user_id\":\"user:ada\"", "\"physical_key\"" });
 
+    var initial_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"price\":12", "\"physical_key\"" },
+        32,
+    );
+    defer initial_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_temporal_get.body, &.{ "\"found\":true", "\"price\":12", "\"physical_key\"" });
+
+    var initial_adjustment_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        adjustment_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"adj:rebate\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"delta\":-2", "\"physical_key\"" },
+        32,
+    );
+    defer initial_adjustment_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_adjustment_get.body, &.{ "\"found\":true", "\"delta\":-2", "\"physical_key\"" });
+
     try cluster.restartNode(row_host);
-    _ = try waitForSingleActiveGroupHost(&cluster, 4861, 96);
+    _ = try waitForSingleActiveGroupHost(&cluster, row_group, 96);
+    if (temporal_row_host != row_host) {
+        try cluster.restartNode(temporal_row_host);
+    }
+    _ = try waitForSingleActiveGroupHost(&cluster, temporal_row_group, 96);
+    if (adjustment_row_host != row_host and adjustment_row_host != temporal_row_host) {
+        try cluster.restartNode(adjustment_row_host);
+    }
+    _ = try waitForSingleActiveGroupHost(&cluster, adjustment_row_group, 96);
     try cluster.stepAll();
 
     var update = try fetchPublicRowsBatchExpectStatus(
@@ -9869,14 +10011,51 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     defer update.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, update.body, "\"transformed\":1") != null);
 
-    var updated_get = try fetchPublicRowsGet(
+    var temporal_update = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}},\"patch\":{\"price\":13}}]}",
+        201,
+    );
+    defer temporal_update.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, temporal_update.body, "\"transformed\":1") != null);
+
+    var updated_get = try waitForPublicRowsGetContains(
+        &cluster,
         &rig.client,
         client_base,
         "users",
         "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}]}",
+        &.{ "\"found\":true", "\"status\":\"active\"" },
+        32,
     );
     defer updated_get.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(updated_get.body, &.{ "\"found\":true", "\"status\":\"active\"" });
+
+    var updated_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}]}",
+        &.{ "\"found\":true", "\"price\":13" },
+        32,
+    );
+    defer updated_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_temporal_get.body, &.{ "\"found\":true", "\"price\":13" });
+
+    var updated_adjustment_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        adjustment_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"adj:rebate\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}]}",
+        &.{ "\"found\":true", "\"delta\":-2" },
+        32,
+    );
+    defer updated_adjustment_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_adjustment_get.body, &.{ "\"found\":true", "\"delta\":-2" });
 
     var deleted = try fetchPublicRowsBatchExpectStatus(
         &rig.client,

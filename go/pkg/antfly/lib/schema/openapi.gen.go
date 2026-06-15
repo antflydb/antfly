@@ -71,10 +71,167 @@ const (
 	ForeignKeyValidationStateUnvalidated ForeignKeyValidationState = "unvalidated"
 )
 
+// Defines values for RelationalPeriodRangeType.
+const (
+	RelationalPeriodRangeTypeDaterange RelationalPeriodRangeType = "daterange"
+	RelationalPeriodRangeTypeNumrange  RelationalPeriodRangeType = "numrange"
+	RelationalPeriodRangeTypeTsrange   RelationalPeriodRangeType = "tsrange"
+	RelationalPeriodRangeTypeTstzrange RelationalPeriodRangeType = "tstzrange"
+)
+
+// Defines values for RowsExpressionConditionOp.
+const (
+	RowsExpressionConditionOpEq            RowsExpressionConditionOp = "eq"
+	RowsExpressionConditionOpGt            RowsExpressionConditionOp = "gt"
+	RowsExpressionConditionOpGte           RowsExpressionConditionOp = "gte"
+	RowsExpressionConditionOpIsDistinct    RowsExpressionConditionOp = "is_distinct"
+	RowsExpressionConditionOpIsNotDistinct RowsExpressionConditionOp = "is_not_distinct"
+	RowsExpressionConditionOpIsNotNull     RowsExpressionConditionOp = "is_not_null"
+	RowsExpressionConditionOpIsNull        RowsExpressionConditionOp = "is_null"
+	RowsExpressionConditionOpLt            RowsExpressionConditionOp = "lt"
+	RowsExpressionConditionOpLte           RowsExpressionConditionOp = "lte"
+	RowsExpressionConditionOpNe            RowsExpressionConditionOp = "ne"
+)
+
+// Defines values for RowsExpressionFieldSource.
+const (
+	RowsExpressionFieldSourceExisting RowsExpressionFieldSource = "existing"
+	RowsExpressionFieldSourceProposed RowsExpressionFieldSource = "proposed"
+	RowsExpressionFieldSourceRow      RowsExpressionFieldSource = "row"
+	RowsExpressionFieldSourceSource   RowsExpressionFieldSource = "source"
+)
+
+// Defines values for RowsExpressionOperatorOp.
+const (
+	RowsExpressionOperatorOpAbs                  RowsExpressionOperatorOp = "abs"
+	RowsExpressionOperatorOpAdd                  RowsExpressionOperatorOp = "add"
+	RowsExpressionOperatorOpAnd                  RowsExpressionOperatorOp = "and"
+	RowsExpressionOperatorOpArrayAppend          RowsExpressionOperatorOp = "array_append"
+	RowsExpressionOperatorOpArrayCat             RowsExpressionOperatorOp = "array_cat"
+	RowsExpressionOperatorOpArrayLength          RowsExpressionOperatorOp = "array_length"
+	RowsExpressionOperatorOpArrayPosition        RowsExpressionOperatorOp = "array_position"
+	RowsExpressionOperatorOpArrayPositions       RowsExpressionOperatorOp = "array_positions"
+	RowsExpressionOperatorOpArrayPrepend         RowsExpressionOperatorOp = "array_prepend"
+	RowsExpressionOperatorOpArrayRemove          RowsExpressionOperatorOp = "array_remove"
+	RowsExpressionOperatorOpArrayReplace         RowsExpressionOperatorOp = "array_replace"
+	RowsExpressionOperatorOpArrayToString        RowsExpressionOperatorOp = "array_to_string"
+	RowsExpressionOperatorOpAscii                RowsExpressionOperatorOp = "ascii"
+	RowsExpressionOperatorOpBoolAnd              RowsExpressionOperatorOp = "bool_and"
+	RowsExpressionOperatorOpBoolNot              RowsExpressionOperatorOp = "bool_not"
+	RowsExpressionOperatorOpBoolOr               RowsExpressionOperatorOp = "bool_or"
+	RowsExpressionOperatorOpBtrim                RowsExpressionOperatorOp = "btrim"
+	RowsExpressionOperatorOpCardinality          RowsExpressionOperatorOp = "cardinality"
+	RowsExpressionOperatorOpCase                 RowsExpressionOperatorOp = "case"
+	RowsExpressionOperatorOpCast                 RowsExpressionOperatorOp = "cast"
+	RowsExpressionOperatorOpCeil                 RowsExpressionOperatorOp = "ceil"
+	RowsExpressionOperatorOpCharLength           RowsExpressionOperatorOp = "char_length"
+	RowsExpressionOperatorOpCharacterLength      RowsExpressionOperatorOp = "character_length"
+	RowsExpressionOperatorOpChr                  RowsExpressionOperatorOp = "chr"
+	RowsExpressionOperatorOpCoalesce             RowsExpressionOperatorOp = "coalesce"
+	RowsExpressionOperatorOpConcat               RowsExpressionOperatorOp = "concat"
+	RowsExpressionOperatorOpConcatWs             RowsExpressionOperatorOp = "concat_ws"
+	RowsExpressionOperatorOpDateBin              RowsExpressionOperatorOp = "date_bin"
+	RowsExpressionOperatorOpDatePart             RowsExpressionOperatorOp = "date_part"
+	RowsExpressionOperatorOpDateTrunc            RowsExpressionOperatorOp = "date_trunc"
+	RowsExpressionOperatorOpDiv                  RowsExpressionOperatorOp = "div"
+	RowsExpressionOperatorOpEndsWith             RowsExpressionOperatorOp = "ends_with"
+	RowsExpressionOperatorOpExtract              RowsExpressionOperatorOp = "extract"
+	RowsExpressionOperatorOpFloor                RowsExpressionOperatorOp = "floor"
+	RowsExpressionOperatorOpGenRandomUuid        RowsExpressionOperatorOp = "gen_random_uuid"
+	RowsExpressionOperatorOpGreatest             RowsExpressionOperatorOp = "greatest"
+	RowsExpressionOperatorOpIlike                RowsExpressionOperatorOp = "ilike"
+	RowsExpressionOperatorOpInitcap              RowsExpressionOperatorOp = "initcap"
+	RowsExpressionOperatorOpIntervalMonths       RowsExpressionOperatorOp = "interval_months"
+	RowsExpressionOperatorOpIntervalNs           RowsExpressionOperatorOp = "interval_ns"
+	RowsExpressionOperatorOpJsonArrayLength      RowsExpressionOperatorOp = "json_array_length"
+	RowsExpressionOperatorOpJsonBuildObject      RowsExpressionOperatorOp = "json_build_object"
+	RowsExpressionOperatorOpJsonExtract          RowsExpressionOperatorOp = "json_extract"
+	RowsExpressionOperatorOpJsonExtractPath      RowsExpressionOperatorOp = "json_extract_path"
+	RowsExpressionOperatorOpJsonExtractPathText  RowsExpressionOperatorOp = "json_extract_path_text"
+	RowsExpressionOperatorOpJsonPathExists       RowsExpressionOperatorOp = "json_path_exists"
+	RowsExpressionOperatorOpJsonTypeof           RowsExpressionOperatorOp = "json_typeof"
+	RowsExpressionOperatorOpJsonbArrayLength     RowsExpressionOperatorOp = "jsonb_array_length"
+	RowsExpressionOperatorOpJsonbBuildObject     RowsExpressionOperatorOp = "jsonb_build_object"
+	RowsExpressionOperatorOpJsonbExtractPath     RowsExpressionOperatorOp = "jsonb_extract_path"
+	RowsExpressionOperatorOpJsonbExtractPathText RowsExpressionOperatorOp = "jsonb_extract_path_text"
+	RowsExpressionOperatorOpJsonbTypeof          RowsExpressionOperatorOp = "jsonb_typeof"
+	RowsExpressionOperatorOpLeast                RowsExpressionOperatorOp = "least"
+	RowsExpressionOperatorOpLeft                 RowsExpressionOperatorOp = "left"
+	RowsExpressionOperatorOpLength               RowsExpressionOperatorOp = "length"
+	RowsExpressionOperatorOpLike                 RowsExpressionOperatorOp = "like"
+	RowsExpressionOperatorOpLower                RowsExpressionOperatorOp = "lower"
+	RowsExpressionOperatorOpLpad                 RowsExpressionOperatorOp = "lpad"
+	RowsExpressionOperatorOpLtrim                RowsExpressionOperatorOp = "ltrim"
+	RowsExpressionOperatorOpMd5                  RowsExpressionOperatorOp = "md5"
+	RowsExpressionOperatorOpMod                  RowsExpressionOperatorOp = "mod"
+	RowsExpressionOperatorOpMul                  RowsExpressionOperatorOp = "mul"
+	RowsExpressionOperatorOpNot                  RowsExpressionOperatorOp = "not"
+	RowsExpressionOperatorOpNow                  RowsExpressionOperatorOp = "now"
+	RowsExpressionOperatorOpNullif               RowsExpressionOperatorOp = "nullif"
+	RowsExpressionOperatorOpOctetLength          RowsExpressionOperatorOp = "octet_length"
+	RowsExpressionOperatorOpOr                   RowsExpressionOperatorOp = "or"
+	RowsExpressionOperatorOpOverlay              RowsExpressionOperatorOp = "overlay"
+	RowsExpressionOperatorOpPower                RowsExpressionOperatorOp = "power"
+	RowsExpressionOperatorOpRegexpReplace        RowsExpressionOperatorOp = "regexp_replace"
+	RowsExpressionOperatorOpRepeat               RowsExpressionOperatorOp = "repeat"
+	RowsExpressionOperatorOpReplace              RowsExpressionOperatorOp = "replace"
+	RowsExpressionOperatorOpReverse              RowsExpressionOperatorOp = "reverse"
+	RowsExpressionOperatorOpRight                RowsExpressionOperatorOp = "right"
+	RowsExpressionOperatorOpRound                RowsExpressionOperatorOp = "round"
+	RowsExpressionOperatorOpRpad                 RowsExpressionOperatorOp = "rpad"
+	RowsExpressionOperatorOpRtrim                RowsExpressionOperatorOp = "rtrim"
+	RowsExpressionOperatorOpSign                 RowsExpressionOperatorOp = "sign"
+	RowsExpressionOperatorOpSplitPart            RowsExpressionOperatorOp = "split_part"
+	RowsExpressionOperatorOpSqrt                 RowsExpressionOperatorOp = "sqrt"
+	RowsExpressionOperatorOpStartsWith           RowsExpressionOperatorOp = "starts_with"
+	RowsExpressionOperatorOpStringToArray        RowsExpressionOperatorOp = "string_to_array"
+	RowsExpressionOperatorOpStrpos               RowsExpressionOperatorOp = "strpos"
+	RowsExpressionOperatorOpSub                  RowsExpressionOperatorOp = "sub"
+	RowsExpressionOperatorOpSubstr               RowsExpressionOperatorOp = "substr"
+	RowsExpressionOperatorOpSubstring            RowsExpressionOperatorOp = "substring"
+	RowsExpressionOperatorOpToJsonb              RowsExpressionOperatorOp = "to_jsonb"
+	RowsExpressionOperatorOpTranslate            RowsExpressionOperatorOp = "translate"
+	RowsExpressionOperatorOpTrim                 RowsExpressionOperatorOp = "trim"
+	RowsExpressionOperatorOpTrunc                RowsExpressionOperatorOp = "trunc"
+	RowsExpressionOperatorOpUpper                RowsExpressionOperatorOp = "upper"
+	RowsExpressionOperatorOpUuidGenerateV4       RowsExpressionOperatorOp = "uuid_generate_v4"
+	RowsExpressionOperatorOpUuidV4               RowsExpressionOperatorOp = "uuid_v4"
+)
+
+// Defines values for RowsExpressionOperatorTo.
+const (
+	RowsExpressionOperatorToBool     RowsExpressionOperatorTo = "bool"
+	RowsExpressionOperatorToBoolean  RowsExpressionOperatorTo = "boolean"
+	RowsExpressionOperatorToDatetime RowsExpressionOperatorTo = "datetime"
+	RowsExpressionOperatorToNumeric  RowsExpressionOperatorTo = "numeric"
+	RowsExpressionOperatorToText     RowsExpressionOperatorTo = "text"
+)
+
+// Defines values for RowsUniquePredicateOp.
+const (
+	RowsUniquePredicateOpEq        RowsUniquePredicateOp = "eq"
+	RowsUniquePredicateOpIsNotNull RowsUniquePredicateOp = "is_not_null"
+	RowsUniquePredicateOpIsNull    RowsUniquePredicateOp = "is_null"
+	RowsUniquePredicateOpNe        RowsUniquePredicateOp = "ne"
+)
+
 // Defines values for TableSchemaStorageMode.
 const (
 	TableSchemaStorageModeDocument   TableSchemaStorageMode = "document"
 	TableSchemaStorageModeRelational TableSchemaStorageMode = "relational"
+)
+
+// Defines values for UniqueConstraintExpressionsOp.
+const (
+	UniqueConstraintExpressionsOpLower UniqueConstraintExpressionsOp = "lower"
+	UniqueConstraintExpressionsOpMd5   UniqueConstraintExpressionsOp = "md5"
+	UniqueConstraintExpressionsOpUpper UniqueConstraintExpressionsOp = "upper"
+)
+
+// Defines values for UniqueConstraintValidationState.
+const (
+	UniqueConstraintValidationStateEnforced    UniqueConstraintValidationState = "enforced"
+	UniqueConstraintValidationStateUnvalidated UniqueConstraintValidationState = "unvalidated"
 )
 
 // AntflyType Field type annotations for schema fields
@@ -87,6 +244,10 @@ type DocumentSchema struct {
 
 	// Schema A valid JSON Schema defining the document's structure.
 	// This is used to infer indexing rules and field types.
+	// Relational-mode scalar properties may include optional
+	// `collation` metadata. The metadata is preserved in the
+	// durable relational column catalog and reported on result
+	// schemas for source-backed text/keyword fields.
 	Schema map[string]interface{} `json:"schema,omitempty,omitzero"`
 }
 
@@ -141,6 +302,9 @@ type ForeignKey struct {
 	// OnUpdate Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
 	OnUpdate ForeignKeyOnUpdate `json:"on_update,omitempty,omitzero"`
 
+	// Period Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+	Period string `json:"period,omitempty,omitzero"`
+
 	// References Parent side of a relational foreign-key constraint.
 	References ForeignKeyReference `json:"references,omitempty,omitzero"`
 
@@ -179,6 +343,9 @@ type ForeignKeyReference struct {
 	// Columns Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
 	Columns []string `json:"columns,omitempty,omitzero"`
 
+	// Period Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+	Period string `json:"period,omitempty,omitzero"`
+
 	// Table Referenced relational table name.
 	Table string `json:"table,omitempty,omitzero"`
 }
@@ -187,6 +354,137 @@ type ForeignKeyReference struct {
 type PrimaryKey struct {
 	// Columns Primary-key columns. One or more ordered required non-json relational columns are supported.
 	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Name Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+	Name string `json:"name,omitempty,omitzero"`
+
+	// WithoutOverlapsPeriod Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+	WithoutOverlapsPeriod string `json:"without_overlaps_period,omitempty,omitzero"`
+}
+
+// RelationalPeriod Application-time period over a start and end column.
+type RelationalPeriod struct {
+	// EndColumn Exclusive period end column.
+	EndColumn string `json:"end_column"`
+
+	// Name Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+	Name string `json:"name"`
+
+	// RangeType Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+	RangeType RelationalPeriodRangeType `json:"range_type,omitempty,omitzero"`
+
+	// StartColumn Inclusive period start column.
+	StartColumn string `json:"start_column"`
+}
+
+// RelationalPeriodRangeType Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+type RelationalPeriodRangeType string
+
+// RowsExpression Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+// `{ "value": ... }`, or an operator node such as
+// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+// operators are the shared row-local expression surface used by schema
+// predicates, mutation expressions, query projections, filters, grouping,
+// ordering, and SQL lowering.
+type RowsExpression struct {
+	union json.RawMessage
+}
+
+// RowsExpressionCaseBranch defines model for RowsExpressionCaseBranch.
+type RowsExpressionCaseBranch struct {
+	// Then Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Then RowsExpression `json:"then"`
+
+	// When Computed expression predicate over the shared row-expression AST.
+	When RowsExpressionCondition `json:"when"`
+}
+
+// RowsExpressionCondition Computed expression predicate over the shared row-expression AST.
+type RowsExpressionCondition struct {
+	// Lhs Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Lhs RowsExpression            `json:"lhs"`
+	Op  RowsExpressionConditionOp `json:"op"`
+
+	// Rhs Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Rhs RowsExpression `json:"rhs,omitempty,omitzero"`
+}
+
+// RowsExpressionConditionOp defines model for RowsExpressionCondition.Op.
+type RowsExpressionConditionOp string
+
+// RowsExpressionField defines model for RowsExpressionField.
+type RowsExpressionField struct {
+	Field  string                    `json:"field"`
+	Source RowsExpressionFieldSource `json:"source,omitempty,omitzero"`
+}
+
+// RowsExpressionFieldSource defines model for RowsExpressionField.Source.
+type RowsExpressionFieldSource string
+
+// RowsExpressionOperator defines model for RowsExpressionOperator.
+type RowsExpressionOperator struct {
+	// Args Operand expressions for operator nodes.
+	Args []RowsExpression `json:"args,omitempty,omitzero"`
+
+	// AsText Return JSON path extraction as text.
+	AsText bool `json:"as_text,omitempty,omitzero"`
+
+	// Cases Searched case branches, each with `when` and `then`.
+	Cases []RowsExpressionCaseBranch `json:"cases,omitempty,omitzero"`
+
+	// Else Fallback expression for searched `case`.
+	Else *RowsExpression          `json:"else,omitempty"`
+	Op   RowsExpressionOperatorOp `json:"op"`
+
+	// Path Structured JSON path for `json_extract` and `json_path_exists`.
+	Path interface{} `json:"path,omitempty,omitzero"`
+
+	// To Cast target for `cast`.
+	To RowsExpressionOperatorTo `json:"to,omitempty,omitzero"`
+}
+
+// RowsExpressionOperatorOp defines model for RowsExpressionOperator.Op.
+type RowsExpressionOperatorOp string
+
+// RowsExpressionOperatorTo Cast target for `cast`.
+type RowsExpressionOperatorTo string
+
+// RowsExpressionValue defines model for RowsExpressionValue.
+type RowsExpressionValue struct {
+	// Value Literal JSON value for a value node.
+	Value interface{} `json:"value"`
+}
+
+// RowsUniquePredicate Predicate atom that must match a partial unique constraint definition.
+type RowsUniquePredicate struct {
+	Field string                `json:"field"`
+	Op    RowsUniquePredicateOp `json:"op"`
+
+	// Value Predicate comparison value. Omit for null-test operators.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RowsUniquePredicateOp defines model for RowsUniquePredicate.Op.
+type RowsUniquePredicateOp string
+
+// RowsUniquePredicateGroup Conjunction of partial-unique predicate atoms.
+type RowsUniquePredicateGroup struct {
+	All []RowsUniquePredicate `json:"all"`
 }
 
 // TableSchema Schema definition for a table with multiple document types
@@ -214,12 +512,21 @@ type TableSchema struct {
 	// `on_update: "restrict"` and `on_update: "no_action"` are accepted
 	// as parent-key update checks, and mutating `set_null`/`cascade`
 	// update actions are supported where owner topology is configured.
+	// Temporal foreign keys with `period` on both child and parent
+	// references are restrictive-only: `restrict` / `no_action` are
+	// accepted, while mutating `set_null` / `cascade` actions are rejected
+	// because period coverage is validated as range ownership.
 	// `match: "simple"` is the default; `full` is accepted for composite
 	// nullable references, and `partial` is rejected until row-subset
 	// parent matching is implemented.
 	// Cross-table unique targets require routed parent-table unique participants.
 	// Unsupported shapes are rejected during schema validation.
 	ForeignKeys []ForeignKey `json:"foreign_keys,omitempty,omitzero"`
+
+	// Periods Application-time period declarations over two numeric or datetime
+	// relational columns. SQL `PERIOD FOR name (start, end)` and range
+	// column temporal DDL lower into this metadata.
+	Periods []RelationalPeriod `json:"periods,omitempty,omitzero"`
 
 	// PrimaryKey Relational primary-key constraint.
 	PrimaryKey PrimaryKey `json:"primary_key,omitempty,omitzero"`
@@ -289,9 +596,33 @@ type UniqueConstraint struct {
 	// Columns Unique columns. One or more ordered non-json relational columns are supported.
 	Columns []string `json:"columns,omitempty,omitzero"`
 
+	// Expressions Stable expression keys supported by unique-owner maintenance.
+	Expressions []struct {
+		Field string                        `json:"field"`
+		Op    UniqueConstraintExpressionsOp `json:"op"`
+	} `json:"expressions,omitempty,omitzero"`
+
 	// Name Constraint name, unique within the table schema.
 	Name string `json:"name,omitempty,omitzero"`
+
+	// ValidationState Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+	ValidationState UniqueConstraintValidationState `json:"validation_state,omitempty,omitzero"`
+
+	// Where Conjunction of partial-unique predicate atoms.
+	Where RowsUniquePredicateGroup `json:"where,omitempty,omitzero"`
+
+	// WhereExpressions Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+	WhereExpressions []RowsExpressionCondition `json:"where_expressions,omitempty,omitzero"`
+
+	// WithoutOverlapsPeriod Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+	WithoutOverlapsPeriod string `json:"without_overlaps_period,omitempty,omitzero"`
 }
+
+// UniqueConstraintExpressionsOp defines model for UniqueConstraint.Expressions.Op.
+type UniqueConstraintExpressionsOp string
+
+// UniqueConstraintValidationState Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+type UniqueConstraintValidationState string
 
 // AsForeignKeyDeferrable0 returns the union data inside the ForeignKey_Deferrable as a ForeignKeyDeferrable0
 func (t ForeignKey_Deferrable) AsForeignKeyDeferrable0() (ForeignKeyDeferrable0, error) {
@@ -355,62 +686,182 @@ func (t *ForeignKey_Deferrable) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsRowsExpressionField returns the union data inside the RowsExpression as a RowsExpressionField
+func (t RowsExpression) AsRowsExpressionField() (RowsExpressionField, error) {
+	var body RowsExpressionField
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionField overwrites any union data inside the RowsExpression as the provided RowsExpressionField
+func (t *RowsExpression) FromRowsExpressionField(v RowsExpressionField) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionField performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionField
+func (t *RowsExpression) MergeRowsExpressionField(v RowsExpressionField) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsRowsExpressionValue returns the union data inside the RowsExpression as a RowsExpressionValue
+func (t RowsExpression) AsRowsExpressionValue() (RowsExpressionValue, error) {
+	var body RowsExpressionValue
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionValue overwrites any union data inside the RowsExpression as the provided RowsExpressionValue
+func (t *RowsExpression) FromRowsExpressionValue(v RowsExpressionValue) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionValue performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionValue
+func (t *RowsExpression) MergeRowsExpressionValue(v RowsExpressionValue) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsRowsExpressionOperator returns the union data inside the RowsExpression as a RowsExpressionOperator
+func (t RowsExpression) AsRowsExpressionOperator() (RowsExpressionOperator, error) {
+	var body RowsExpressionOperator
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionOperator overwrites any union data inside the RowsExpression as the provided RowsExpressionOperator
+func (t *RowsExpression) FromRowsExpressionOperator(v RowsExpressionOperator) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionOperator performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionOperator
+func (t *RowsExpression) MergeRowsExpressionOperator(v RowsExpressionOperator) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t RowsExpression) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *RowsExpression) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"sfqaxXf9jp1QCbr7XwAAAP//4t7eF9olAAA=",
+	"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",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

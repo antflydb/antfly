@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.rows_aggregate_result_set_rows_item import RowsAggregateResultSetRowsItem
+    from ..models.rows_result_column import RowsResultColumn
 
 
 T = TypeVar("T", bound="RowsAggregateResultSet")
@@ -20,15 +21,24 @@ class RowsAggregateResultSet:
     """
     Attributes:
         total_groups (int | Unset):
+        result_schema (list[RowsResultColumn] | Unset):
         rows (list[RowsAggregateResultSetRowsItem] | Unset):
     """
 
     total_groups: int | Unset = UNSET
+    result_schema: list[RowsResultColumn] | Unset = UNSET
     rows: list[RowsAggregateResultSetRowsItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         total_groups = self.total_groups
+
+        result_schema: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.result_schema, Unset):
+            result_schema = []
+            for result_schema_item_data in self.result_schema:
+                result_schema_item = result_schema_item_data.to_dict()
+                result_schema.append(result_schema_item)
 
         rows: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.rows, Unset):
@@ -42,6 +52,8 @@ class RowsAggregateResultSet:
         field_dict.update({})
         if total_groups is not UNSET:
             field_dict["total_groups"] = total_groups
+        if result_schema is not UNSET:
+            field_dict["result_schema"] = result_schema
         if rows is not UNSET:
             field_dict["rows"] = rows
 
@@ -50,9 +62,19 @@ class RowsAggregateResultSet:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.rows_aggregate_result_set_rows_item import RowsAggregateResultSetRowsItem
+        from ..models.rows_result_column import RowsResultColumn
 
         d = dict(src_dict)
         total_groups = d.pop("total_groups", UNSET)
+
+        _result_schema = d.pop("result_schema", UNSET)
+        result_schema: list[RowsResultColumn] | Unset = UNSET
+        if _result_schema is not UNSET:
+            result_schema = []
+            for result_schema_item_data in _result_schema:
+                result_schema_item = RowsResultColumn.from_dict(result_schema_item_data)
+
+                result_schema.append(result_schema_item)
 
         _rows = d.pop("rows", UNSET)
         rows: list[RowsAggregateResultSetRowsItem] | Unset = UNSET
@@ -65,6 +87,7 @@ class RowsAggregateResultSet:
 
         rows_aggregate_result_set = cls(
             total_groups=total_groups,
+            result_schema=result_schema,
             rows=rows,
         )
 

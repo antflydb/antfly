@@ -33,6 +33,19 @@ const QueryPreflightRequestWire = struct {
     max_work: u32 = 0,
 };
 
+const TemporalUniqueOwnerLookupWire = struct {
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_point: []const u8,
+};
+
+const TemporalUniqueOverlapOwnerLookupWire = struct {
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+};
+
 fn parseQueryPreflightRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
@@ -406,6 +419,49 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
     }
 
     if (req.method == .POST) {
+        if (routes.Routes.matchGroupTemporalUniqueOwner(path)) |lookup| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            var parsed = std.json.parseFromSlice(TemporalUniqueOwnerLookupWire, alloc, req.body, .{ .allocate = .alloc_always }) catch return try http_route_helpers.textResponse(alloc, 400, "invalid temporal unique owner lookup");
+            defer parsed.deinit();
+            const owner = (reads.relationalTemporalUniqueOwnerLookupGroupLocal(
+                alloc,
+                lookup.group_id,
+                lookup.table_name,
+                parsed.value.constraint_name,
+                parsed.value.encoded_value,
+                parsed.value.encoded_point,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer alloc.free(owner);
+            return try http_route_helpers.jsonResponse(alloc, .{ .owner_key = owner });
+        }
+        if (routes.Routes.matchGroupTemporalUniqueOverlapOwner(path)) |lookup| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            var parsed = std.json.parseFromSlice(TemporalUniqueOverlapOwnerLookupWire, alloc, req.body, .{ .allocate = .alloc_always }) catch return try http_route_helpers.textResponse(alloc, 400, "invalid temporal unique owner lookup");
+            defer parsed.deinit();
+            const owner = (reads.relationalTemporalUniqueOverlapOwnerLookupGroupLocal(
+                alloc,
+                lookup.group_id,
+                lookup.table_name,
+                parsed.value.constraint_name,
+                parsed.value.encoded_value,
+                parsed.value.encoded_start,
+                parsed.value.encoded_end,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
+            defer alloc.free(owner);
+            return try http_route_helpers.jsonResponse(alloc, .{ .owner_key = owner });
+        }
         if (routes.Routes.matchGroupScan(path)) |scan| {
             const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             var scan_req = try http_route_helpers.parseScanKeysRequest(alloc, req.body);

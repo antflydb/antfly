@@ -474,7 +474,7 @@ const graph_metric_local_build_lease_ms: u64 = 300_000;
 const graph_metric_build_max_page_attempts: u64 = 3;
 const graph_metric_build_target_scan_page_units: usize = 64;
 const graph_metric_build_target_reduce_page_units: usize = 64;
-const graph_metric_build_cleanup_delete_page_units: usize = 64;
+const graph_metric_build_cleanup_delete_page_units: usize = 512;
 
 pub const ReverseBackend = enum {
     lmdb,
@@ -906,6 +906,84 @@ pub const GraphIndex = struct {
         const attempt_text = try std.fmt.allocPrint(self.alloc, "{d}", .{attempt});
         defer self.alloc.free(attempt_text);
         return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "attempt", @tagName(phase), iteration_text, page_id_text, attempt_text, "pagerank_contribution", target_node });
+    }
+
+    fn graphMetricBuildAttemptPageRankOutDegreePartialPrefixAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+        page_id: u64,
+        attempt: u64,
+    ) ![]u8 {
+        const attempt_prefix = try self.graphMetricBuildAttemptPrefixAlloc(metric_name, job_id, phase, iteration, page_id, attempt);
+        defer self.alloc.free(attempt_prefix);
+        var list = std.ArrayListUnmanaged(u8).empty;
+        defer list.deinit(self.alloc);
+        try list.appendSlice(self.alloc, attempt_prefix);
+        try internal_keys.appendEncodedComponent(&list, self.alloc, "pagerank_out_degree");
+        return try list.toOwnedSlice(self.alloc);
+    }
+
+    fn graphMetricBuildAttemptPageRankOutDegreePartialKeyAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+        page_id: u64,
+        attempt: u64,
+        node: []const u8,
+    ) ![]u8 {
+        const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
+        defer self.alloc.free(job_id_text);
+        const iteration_text = try std.fmt.allocPrint(self.alloc, "{d}", .{iteration});
+        defer self.alloc.free(iteration_text);
+        const page_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{page_id});
+        defer self.alloc.free(page_id_text);
+        const attempt_text = try std.fmt.allocPrint(self.alloc, "{d}", .{attempt});
+        defer self.alloc.free(attempt_text);
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "attempt", @tagName(phase), iteration_text, page_id_text, attempt_text, "pagerank_out_degree", node });
+    }
+
+    fn graphMetricBuildAttemptPageRankNodePartialPrefixAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+        page_id: u64,
+        attempt: u64,
+    ) ![]u8 {
+        const attempt_prefix = try self.graphMetricBuildAttemptPrefixAlloc(metric_name, job_id, phase, iteration, page_id, attempt);
+        defer self.alloc.free(attempt_prefix);
+        var list = std.ArrayListUnmanaged(u8).empty;
+        defer list.deinit(self.alloc);
+        try list.appendSlice(self.alloc, attempt_prefix);
+        try internal_keys.appendEncodedComponent(&list, self.alloc, "pagerank_node");
+        return try list.toOwnedSlice(self.alloc);
+    }
+
+    fn graphMetricBuildAttemptPageRankNodePartialKeyAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        job_id: u64,
+        phase: GraphMetricBuildPhase,
+        iteration: u32,
+        page_id: u64,
+        attempt: u64,
+        node: []const u8,
+    ) ![]u8 {
+        const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
+        defer self.alloc.free(job_id_text);
+        const iteration_text = try std.fmt.allocPrint(self.alloc, "{d}", .{iteration});
+        defer self.alloc.free(iteration_text);
+        const page_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{page_id});
+        defer self.alloc.free(page_id_text);
+        const attempt_text = try std.fmt.allocPrint(self.alloc, "{d}", .{attempt});
+        defer self.alloc.free(attempt_text);
+        return try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", job_id_text, "attempt", @tagName(phase), iteration_text, page_id_text, attempt_text, "pagerank_node", node });
     }
 
     fn graphMetricBuildAttemptHitsHubRawPrefixAlloc(
@@ -3444,6 +3522,7 @@ pub const GraphIndex = struct {
         metric_records: usize = 0,
         control_records: usize = 0,
         job_namespace_records: usize = 0,
+        attempt_records: usize = 0,
         failure_records: usize = 0,
         event_records: usize = 0,
     };
@@ -3520,6 +3599,7 @@ pub const GraphIndex = struct {
             .metric_records = try countKeysWithPrefix(&txn, metric_prefix),
             .control_records = try countKeysWithPrefix(&txn, control_prefix),
             .job_namespace_records = try countKeysWithPrefix(&txn, job_prefix),
+            .attempt_records = try countGraphMetricAttemptRecordsWithJobPrefix(&txn, job_prefix),
             .failure_records = try countKeysWithPrefix(&txn, failure_prefix),
             .event_records = try countKeysWithPrefix(&txn, event_prefix),
         };
@@ -3533,6 +3613,22 @@ pub const GraphIndex = struct {
         while (entry_opt) |entry| : (entry_opt = try cur.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             count += 1;
+        }
+        return count;
+    }
+
+    fn countGraphMetricAttemptRecordsWithJobPrefix(txn: anytype, job_prefix: []const u8) !usize {
+        var cur = try txn.openCursor();
+        defer cur.close();
+        var count: usize = 0;
+        var entry_opt = try cur.seekAtOrAfter(job_prefix);
+        while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            if (!std.mem.startsWith(u8, entry.key, job_prefix)) break;
+            const job_id_start = job_prefix.len;
+            const job_id_term = internal_keys.findComponentTerminator(entry.key, job_id_start) orelse continue;
+            const attempt_start = job_id_term + 2;
+            if (attempt_start >= entry.key.len) continue;
+            if (internal_keys.componentEquals(entry.key, attempt_start, "attempt")) count += 1;
         }
         return count;
     }
@@ -5739,7 +5835,7 @@ pub const GraphIndex = struct {
         const worker_id = if (page.worker_id.len != 0) page.worker_id else graph_metric_local_build_worker_id;
         var write_page = page;
         write_page.attempt = page_attempt;
-        const out_degree_total = try self.writePageRankScanPartialsForAttempt(metric_name, job, write_page, prior_completed_units, &out_degrees, &nodes);
+        const out_degree_total = try self.writePageRankScanPartialsForAttempt(metric_name, job, write_page, prior_completed_units, &out_degrees, &nodes, reached_page_end);
         const fingerprint = graphMetricPageRankScanFingerprint(page, completed_units, nodes.count(), out_degree_total);
         if (!reached_page_end) {
             _ = try self.updateGraphMetricBuildPageProgressForAttempt(metric_name, job.job_id, .scan_edges_and_out_degree, page.iteration, page.page_id, worker_id, page.attempt, last_scanned_key, completed_units, page.total_units);
@@ -5759,6 +5855,7 @@ pub const GraphIndex = struct {
         prior_completed_units: u64,
         out_degrees: *std.StringHashMapUnmanaged(u64),
         nodes: *std.StringHashMapUnmanaged(void),
+        adopt_on_complete: bool,
     ) !u64 {
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
@@ -5769,16 +5866,19 @@ pub const GraphIndex = struct {
         var out_it = out_degrees.iterator();
         while (out_it.next()) |entry| {
             out_degree_total += entry.value_ptr.*;
-            const key = try self.graphMetricBuildPageRankOutDegreePartialKeyAlloc(metric_name, job.job_id, entry.key_ptr.*, claimed_page.page_id);
+            const key = try self.graphMetricBuildAttemptPageRankOutDegreePartialKeyAlloc(metric_name, job.job_id, .scan_edges_and_out_degree, claimed_page.iteration, claimed_page.page_id, claimed_page.attempt, entry.key_ptr.*);
             defer self.alloc.free(key);
             const prior = if (prior_completed_units != 0) try readU64OrZero(&batch, key) else 0;
             try putU64(&batch, key, prior + entry.value_ptr.*);
         }
         var node_it = nodes.keyIterator();
         while (node_it.next()) |node_ptr| {
-            const key = try self.graphMetricBuildPageRankNodePartialKeyAlloc(metric_name, job.job_id, node_ptr.*, claimed_page.page_id);
+            const key = try self.graphMetricBuildAttemptPageRankNodePartialKeyAlloc(metric_name, job.job_id, .scan_edges_and_out_degree, claimed_page.iteration, claimed_page.page_id, claimed_page.attempt, node_ptr.*);
             defer self.alloc.free(key);
             try putU64(&batch, key, 1);
+        }
+        if (adopt_on_complete) {
+            _ = try self.adoptPageRankScanAttemptOutputInBatch(&batch, metric_name, job.job_id, claimed_page);
         }
         try batch.commit();
         return out_degree_total;
@@ -8420,6 +8520,72 @@ pub const GraphIndex = struct {
         return entries.items.len;
     }
 
+    fn adoptPageRankScanAttemptOutputInBatch(
+        self: *GraphIndex,
+        batch: anytype,
+        metric_name: []const u8,
+        job_id: u64,
+        page: GraphMetricBuildPage,
+    ) !usize {
+        const current_page = try self.metricBuildPage(batch, metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
+        try self.validateGraphMetricBuildPageExecutionLease(page, current_page);
+        const out_degree_prefix = try self.graphMetricBuildAttemptPageRankOutDegreePartialPrefixAlloc(metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id, page.attempt);
+        defer self.alloc.free(out_degree_prefix);
+        const node_prefix = try self.graphMetricBuildAttemptPageRankNodePartialPrefixAlloc(metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id, page.attempt);
+        defer self.alloc.free(node_prefix);
+
+        var out_degrees = std.ArrayListUnmanaged(struct {
+            node: []u8,
+            value: u64,
+        }).empty;
+        defer {
+            for (out_degrees.items) |entry| self.alloc.free(entry.node);
+            out_degrees.deinit(self.alloc);
+        }
+        var nodes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (nodes.items) |node| self.alloc.free(node);
+            nodes.deinit(self.alloc);
+        }
+
+        {
+            var cur = try batch.openCursor();
+            defer cur.close();
+            var entry_opt = try cur.seekAtOrAfter(out_degree_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+                if (!std.mem.startsWith(u8, entry.key, out_degree_prefix)) break;
+                const value = if (entry.value.len >= 8) std.mem.readInt(u64, entry.value[0..8], .little) else continue;
+                const node = (try graphMetricFirstComponentAfterPrefixAlloc(self.alloc, entry.key, out_degree_prefix)) orelse continue;
+                errdefer self.alloc.free(node);
+                try out_degrees.append(self.alloc, .{ .node = node, .value = value });
+            }
+        }
+        {
+            var cur = try batch.openCursor();
+            defer cur.close();
+            var entry_opt = try cur.seekAtOrAfter(node_prefix);
+            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+                if (!std.mem.startsWith(u8, entry.key, node_prefix)) break;
+                if ((if (entry.value.len >= 8) std.mem.readInt(u64, entry.value[0..8], .little) else 0) == 0) continue;
+                const node = (try graphMetricFirstComponentAfterPrefixAlloc(self.alloc, entry.key, node_prefix)) orelse continue;
+                errdefer self.alloc.free(node);
+                try nodes.append(self.alloc, node);
+            }
+        }
+
+        for (out_degrees.items) |entry| {
+            const partial_key = try self.graphMetricBuildPageRankOutDegreePartialKeyAlloc(metric_name, job_id, entry.node, page.page_id);
+            defer self.alloc.free(partial_key);
+            try putU64(batch, partial_key, entry.value);
+        }
+        for (nodes.items) |node| {
+            const partial_key = try self.graphMetricBuildPageRankNodePartialKeyAlloc(metric_name, job_id, node, page.page_id);
+            defer self.alloc.free(partial_key);
+            try putU64(batch, partial_key, 1);
+        }
+        return out_degrees.items.len + nodes.items.len;
+    }
+
     fn adoptPageRankContributionAttemptOutputInBatch(
         self: *GraphIndex,
         batch: anytype,
@@ -11045,10 +11211,16 @@ test "graph pagerank reclaimed scan page overwrites stale partial output" {
         try std.testing.expect(page.cursor.len > 0);
 
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "pagerank", active_job.job_id, "doc-a");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
+        const attempt_out_degree_key = try graph.graphMetricBuildAttemptPageRankOutDegreePartialKeyAlloc("pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-a");
+        defer alloc.free(attempt_out_degree_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_out_degree_key));
         const node_b_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("pagerank", active_job.job_id, "doc-b", 1);
         defer alloc.free(node_b_key);
-        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, node_b_key));
+        try std.testing.expectError(error.NotFound, txn.get(node_b_key));
+        const attempt_node_b_key = try graph.graphMetricBuildAttemptPageRankNodePartialKeyAlloc("pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-b");
+        defer alloc.free(attempt_node_b_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_node_b_key));
     }
 
     const scan_expires_at = blk: {
@@ -11077,7 +11249,7 @@ test "graph pagerank reclaimed scan page overwrites stale partial output" {
         }
         try stale_out_degrees.put(alloc, try alloc.dupe(u8, "doc-a"), 99);
         try stale_nodes.put(alloc, try alloc.dupe(u8, "doc-stale"), {});
-        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("pagerank", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes));
+        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("pagerank", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes, false));
     }
     {
         var txn = try graph.beginReadReverseTxn();
@@ -11086,7 +11258,7 @@ test "graph pagerank reclaimed scan page overwrites stale partial output" {
         defer alloc.free(stale_node_key);
         try std.testing.expectError(error.NotFound, txn.get(stale_node_key));
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "pagerank", active_job.job_id, "doc-a");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
     }
 
     _ = try graph.executePageRankScanBuildPageWithLimit("pagerank", metrics[0], active_job, reclaimed_scan, null);
@@ -14214,6 +14386,12 @@ test "graph metric status summarizes multiple active build pages with cap" {
     defer status.deinit(alloc);
     try std.testing.expectEqual(GraphIndex.GraphMetricState.building, status.state);
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, status.phase);
+    try std.testing.expect(status.build_job_id != 0);
+    try std.testing.expect(status.build_started_at_ms != 0);
+    try std.testing.expect(status.build_lease_expires_at_ms > 0);
+    try std.testing.expect(std.math.isFinite(status.progress));
+    try std.testing.expect(status.progress >= 0.0);
+    try std.testing.expect(status.progress <= 1.0);
     try std.testing.expect(status.build_pages_truncated);
     try std.testing.expectEqual(@as(usize, graph_metric_status_page_limit), status.build_pages.len);
     for (status.build_pages) |page_status| {
@@ -14223,7 +14401,11 @@ test "graph metric status summarizes multiple active build pages with cap" {
         try std.testing.expect(page_status.worker_id.len > 0);
         try std.testing.expect(page_status.lease_expires_at_ms > 0);
         try std.testing.expectEqual(@as(u64, 1), page_status.attempt);
+        try std.testing.expect(page_status.cursor.len > 0);
+        try std.testing.expectEqualStrings("", page_status.last_error);
+        try std.testing.expect(page_status.completed_units > 0);
         try std.testing.expect(page_status.total_units > 0);
+        try std.testing.expect(page_status.completed_units <= page_status.total_units);
     }
 }
 
@@ -18494,10 +18676,16 @@ test "graph eigenvector reclaimed scan page overwrites stale partial output" {
         try std.testing.expect(page.cursor.len > 0);
 
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "eigenvector", active_job.job_id, "doc-a");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
+        const attempt_out_degree_key = try graph.graphMetricBuildAttemptPageRankOutDegreePartialKeyAlloc("eigenvector", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-a");
+        defer alloc.free(attempt_out_degree_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_out_degree_key));
         const node_b_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("eigenvector", active_job.job_id, "doc-b", 1);
         defer alloc.free(node_b_key);
-        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, node_b_key));
+        try std.testing.expectError(error.NotFound, txn.get(node_b_key));
+        const attempt_node_b_key = try graph.graphMetricBuildAttemptPageRankNodePartialKeyAlloc("eigenvector", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-b");
+        defer alloc.free(attempt_node_b_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_node_b_key));
     }
 
     const scan_expires_at = blk: {
@@ -18526,7 +18714,7 @@ test "graph eigenvector reclaimed scan page overwrites stale partial output" {
         }
         try stale_out_degrees.put(alloc, try alloc.dupe(u8, "doc-a"), 99);
         try stale_nodes.put(alloc, try alloc.dupe(u8, "doc-stale"), {});
-        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("eigenvector", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes));
+        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("eigenvector", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes, false));
     }
     {
         var txn = try graph.beginReadReverseTxn();
@@ -18535,7 +18723,7 @@ test "graph eigenvector reclaimed scan page overwrites stale partial output" {
         defer alloc.free(stale_node_key);
         try std.testing.expectError(error.NotFound, txn.get(stale_node_key));
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "eigenvector", active_job.job_id, "doc-a");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
     }
 
     _ = try graph.executePageRankScanBuildPageWithLimit("eigenvector", metrics[0], active_job, reclaimed_scan, null);
@@ -20022,10 +20210,16 @@ test "graph hits reclaimed scan page overwrites stale partial output" {
         try std.testing.expect(page.cursor.len > 0);
 
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "hits_authority", active_job.job_id, "doc-hub");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
+        const attempt_out_degree_key = try graph.graphMetricBuildAttemptPageRankOutDegreePartialKeyAlloc("hits_authority", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-hub");
+        defer alloc.free(attempt_out_degree_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_out_degree_key));
         const node_authority_a_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("hits_authority", active_job.job_id, "doc-authority-a", 1);
         defer alloc.free(node_authority_a_key);
-        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, node_authority_a_key));
+        try std.testing.expectError(error.NotFound, txn.get(node_authority_a_key));
+        const attempt_node_authority_a_key = try graph.graphMetricBuildAttemptPageRankNodePartialKeyAlloc("hits_authority", active_job.job_id, .scan_edges_and_out_degree, 0, partial_scan_claim.page_id, partial_scan_claim.attempt, "doc-authority-a");
+        defer alloc.free(attempt_node_authority_a_key);
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, attempt_node_authority_a_key));
     }
 
     const scan_expires_at = blk: {
@@ -20054,7 +20248,7 @@ test "graph hits reclaimed scan page overwrites stale partial output" {
         }
         try stale_out_degrees.put(alloc, try alloc.dupe(u8, "doc-hub"), 99);
         try stale_nodes.put(alloc, try alloc.dupe(u8, "doc-stale"), {});
-        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("hits_authority", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes));
+        try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.writePageRankScanPartialsForAttempt("hits_authority", active_job, partial_scan_claim, 0, &stale_out_degrees, &stale_nodes, false));
     }
     {
         var txn = try graph.beginReadReverseTxn();
@@ -20063,7 +20257,7 @@ test "graph hits reclaimed scan page overwrites stale partial output" {
         defer alloc.free(stale_node_key);
         try std.testing.expectError(error.NotFound, txn.get(stale_node_key));
         const partial_out_degree = try graph.aggregatePageRankOutDegreeForNode(&txn, "hits_authority", active_job.job_id, "doc-hub");
-        try std.testing.expectEqual(@as(u64, 1), partial_out_degree);
+        try std.testing.expectEqual(@as(u64, 0), partial_out_degree);
     }
 
     _ = try graph.executePageRankScanBuildPageWithLimit("hits_authority", metrics[0], active_job, reclaimed_scan, null);
@@ -20824,6 +21018,258 @@ test "graph hits planned build drains partitioned paired pages across workers" {
     try std.testing.expectEqual(local_hub_status.converged, planned_hub_status.converged);
     try std.testing.expectApproxEqAbs(local_status.delta, planned_status.delta, 0.0000001);
     try std.testing.expectApproxEqAbs(local_hub_status.delta, planned_hub_status.delta, 0.0000001);
+
+    {
+        var txn = try planned_graph.beginReadReverseTxn();
+        defer txn.abort();
+        const completed_job = try planned_graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
+        try std.testing.expectEqual(active_job.job_id, completed_job.job_id);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.complete, completed_job.phase);
+        try std.testing.expect((try planned_graph.metricBuildLease(&txn, "hits_authority")) == null);
+        try std.testing.expect((try planned_graph.metricBuildManifest(&txn, "hits_authority", active_job.job_id)) == null);
+    }
+
+    const top_limit: usize = @intCast(planned_graph.node_count);
+    const local_authorities = try local_graph.graphMetricTopK("hits_authority", top_limit);
+    defer {
+        for (local_authorities) |*score| score.deinit(alloc);
+        alloc.free(local_authorities);
+    }
+    const planned_authorities = try planned_graph.graphMetricTopK("hits_authority", top_limit);
+    defer {
+        for (planned_authorities) |*score| score.deinit(alloc);
+        alloc.free(planned_authorities);
+    }
+    try std.testing.expectEqual(local_authorities.len, planned_authorities.len);
+    for (local_authorities, planned_authorities) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+
+    const local_hubs = try local_graph.graphMetricTopK("hits_hub", top_limit);
+    defer {
+        for (local_hubs) |*score| score.deinit(alloc);
+        alloc.free(local_hubs);
+    }
+    const planned_hubs = try planned_graph.graphMetricTopK("hits_hub", top_limit);
+    defer {
+        for (planned_hubs) |*score| score.deinit(alloc);
+        alloc.free(planned_hubs);
+    }
+    try std.testing.expectEqual(local_hubs.len, planned_hubs.len);
+    for (local_hubs, planned_hubs) |local, planned| {
+        try std.testing.expectEqualStrings(local.node, planned.node);
+        try std.testing.expectApproxEqAbs(local.score, planned.score, 0.0000001);
+    }
+}
+
+fn expectGraphMetricBuildPhasePageCountAtLeastForTest(
+    graph: *GraphIndex,
+    txn: anytype,
+    metric_name: []const u8,
+    job_id: u64,
+    phase: GraphIndex.GraphMetricBuildPhase,
+    iteration: u32,
+    min_pages: usize,
+) !void {
+    const prefix = try graph.graphMetricBuildPagePrefixAlloc(metric_name, job_id, phase, iteration);
+    defer graph.alloc.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var count: usize = 0;
+    var entry_opt = try cursor.first();
+    while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+        if (std.mem.startsWith(u8, entry.key, prefix)) count += 1;
+    }
+    try std.testing.expect(count >= min_pages);
+}
+
+test "graph hits larger manifest resumes across reopen boundaries" {
+    const alloc = std.testing.allocator;
+    const metrics = [_]GraphMetricConfig{
+        .{
+            .name = "hits_authority",
+            .kind = .hits_authority,
+            .refresh = .manual,
+            .max_iterations = 2,
+            .tolerance = 0.0,
+        },
+        .{
+            .name = "hits_hub",
+            .kind = .hits_hub,
+            .refresh = .manual,
+            .max_iterations = 2,
+            .tolerance = 0.0,
+        },
+    };
+
+    var local_store_buf: [256]u8 = undefined;
+    const local_store_path = tmpPath(&local_store_buf, "store-hits-local-large-manifest-reopen");
+    defer cleanupTmp(local_store_path);
+    var local_rev_buf: [256]u8 = undefined;
+    const local_rev_path = tmpPath(&local_rev_buf, "rev-hits-local-large-manifest-reopen");
+    defer cleanupTmp(local_rev_path);
+    var local_store = try docstore.DocStore.open(alloc, local_store_path, .{});
+    defer local_store.close();
+    var local_graph = try GraphIndex.open(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
+    defer local_graph.close();
+
+    for (0..graph_metric_build_target_scan_page_units + 9) |i| {
+        var source_buf: [64]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_buf, "doc-hub-{d:0>3}", .{i});
+        try local_graph.addEdge(source, "doc-authority", "cites", 1.0, 0, 0, "");
+    }
+    try local_graph.addEdge("doc-authority", "doc-authority", "cites", 1.0, 0, 0, "");
+
+    var local_status = try local_graph.runGraphMetric("hits_authority");
+    defer local_status.deinit(alloc);
+    var local_hub_status = try local_graph.graphMetricStatus("hits_hub");
+    defer local_hub_status.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, local_status.state);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, local_hub_status.state);
+    try std.testing.expectEqual(local_status.published_generation, local_hub_status.published_generation);
+    try std.testing.expectEqual(@as(u32, 2), local_status.iterations_completed);
+    try std.testing.expectEqual(local_status.iterations_completed, local_hub_status.iterations_completed);
+
+    var planned_store_buf: [256]u8 = undefined;
+    const planned_store_path = tmpPath(&planned_store_buf, "store-hits-planned-large-manifest-reopen");
+    defer cleanupTmp(planned_store_path);
+    var planned_rev_buf: [256]u8 = undefined;
+    const planned_rev_path = tmpPath(&planned_rev_buf, "rev-hits-planned-large-manifest-reopen");
+    defer cleanupTmp(planned_rev_path);
+    var planned_store = try docstore.DocStore.open(alloc, planned_store_path, .{});
+    defer planned_store.close();
+    var planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+    defer planned_graph.close();
+
+    for (0..graph_metric_build_target_scan_page_units + 9) |i| {
+        var source_buf: [64]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_buf, "doc-hub-{d:0>3}", .{i});
+        try planned_graph.addEdge(source, "doc-authority", "cites", 1.0, 0, 0, "");
+    }
+    try planned_graph.addEdge("doc-authority", "doc-authority", "cites", 1.0, 0, 0, "");
+    const target_generation = planned_graph.edge_generation;
+
+    try planned_graph.acquireGraphMetricBuildLease("hits_authority", target_generation);
+    var initial_manifest_page_count: usize = 0;
+    var active_job = blk: {
+        var txn = try planned_graph.beginReadReverseTxn();
+        defer txn.abort();
+        const job = try planned_graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
+        const manifest = try planned_graph.metricBuildManifest(&txn, "hits_authority", job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
+        initial_manifest_page_count = manifest.page_count;
+        try std.testing.expect(manifest.page_count >= GraphIndex.graph_metric_hits_build_phases.len + 10);
+        _ = try planned_graph.metricBuildPage(&txn, "hits_authority", job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try planned_graph.metricBuildPage(&txn, "hits_authority", job.job_id, .scan_edges_and_out_degree, 0, 2) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try planned_graph.metricBuildPage(&txn, "hits_authority", job.job_id, .initialize_ranks, 0, 2) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try planned_graph.metricBuildPage(&txn, "hits_authority", job.job_id, .reduce_ranks, 0, 4) orelse return error.TestExpectedGraphMetricBuildPage;
+        break :blk job;
+    };
+
+    var worker_a_completed: usize = 0;
+    var worker_b_completed: usize = 0;
+    var worker_c_completed: usize = 0;
+    var reopen_count: usize = 0;
+    var observed_second_iteration = false;
+    var observed_dynamic_manifest_growth = false;
+    var observed_hub_contribution_pages = false;
+    var observed_hub_reduce_pages = false;
+    var completed = false;
+    var steps: usize = 0;
+    while (steps < 512) : (steps += 1) {
+        const worker_id = switch (steps % 3) {
+            0 => "worker-a",
+            1 => "worker-b",
+            else => "worker-c",
+        };
+        const step = try planned_graph.runGraphMetricPlannedWorkerStep("hits_authority", metrics[0], worker_id);
+        if (step.completed_page) {
+            if (std.mem.eql(u8, worker_id, "worker-a")) {
+                worker_a_completed += 1;
+            } else if (std.mem.eql(u8, worker_id, "worker-b")) {
+                worker_b_completed += 1;
+            } else {
+                worker_c_completed += 1;
+            }
+        }
+        if (step.completed_build and step.phase == .cleanup_old_generations) {
+            completed = true;
+            break;
+        }
+        if (!step.claimed_page and !step.advanced_phase and step.phase != .cleanup_old_generations) {
+            return error.TestExpectedGraphMetricBuildProgress;
+        }
+        {
+            var txn = try planned_graph.beginReadReverseTxn();
+            defer txn.abort();
+            if (try planned_graph.metricBuildJob(&txn, "hits_authority")) |job| {
+                if (job.job_id == active_job.job_id) {
+                    observed_second_iteration = observed_second_iteration or job.iteration == 1;
+                    switch (job.phase) {
+                        .hits_hub_contributions => {
+                            try expectGraphMetricBuildPhasePageCountAtLeastForTest(&planned_graph, &txn, "hits_authority", active_job.job_id, .hits_hub_contributions, job.iteration, 2);
+                            observed_hub_contribution_pages = true;
+                        },
+                        .hits_hub_reduce_ranks => {
+                            try expectGraphMetricBuildPhasePageCountAtLeastForTest(&planned_graph, &txn, "hits_authority", active_job.job_id, .hits_hub_reduce_ranks, job.iteration, 2);
+                            observed_hub_reduce_pages = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        if (steps % 5 == 4) {
+            planned_graph.close();
+            planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+            reopen_count += 1;
+            var status = try planned_graph.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            var hub_status = try planned_graph.graphMetricStatus("hits_hub");
+            defer hub_status.deinit(alloc);
+            try std.testing.expectEqual(status.published_generation, hub_status.published_generation);
+            if (status.state == .building) {
+                try std.testing.expectEqual(active_job.job_id, status.build_job_id);
+                try std.testing.expect(status.build_pages.len <= graph_metric_status_page_limit);
+            }
+            var txn = try planned_graph.beginReadReverseTxn();
+            defer txn.abort();
+            const maybe_job = try planned_graph.metricBuildJob(&txn, "hits_authority");
+            if (maybe_job) |job| {
+                if (job.job_id == active_job.job_id) active_job = job;
+                if (try planned_graph.metricBuildManifest(&txn, "hits_authority", active_job.job_id)) |manifest| {
+                    observed_dynamic_manifest_growth = observed_dynamic_manifest_growth or manifest.page_count > initial_manifest_page_count;
+                }
+            }
+        }
+    }
+    try std.testing.expect(completed);
+    try std.testing.expect(reopen_count >= 3);
+    try std.testing.expect(observed_second_iteration);
+    try std.testing.expect(observed_dynamic_manifest_growth);
+    try std.testing.expect(observed_hub_contribution_pages);
+    try std.testing.expect(observed_hub_reduce_pages);
+    try std.testing.expect(worker_a_completed > 0);
+    try std.testing.expect(worker_b_completed > 0);
+    try std.testing.expect(worker_c_completed > 0);
+
+    var planned_status = try planned_graph.graphMetricStatus("hits_authority");
+    defer planned_status.deinit(alloc);
+    var planned_hub_status = try planned_graph.graphMetricStatus("hits_hub");
+    defer planned_hub_status.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, planned_status.state);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, planned_hub_status.state);
+    try std.testing.expectEqual(target_generation, planned_status.published_generation);
+    try std.testing.expectEqual(planned_status.published_generation, planned_hub_status.published_generation);
+    try std.testing.expectEqual(local_status.iterations_completed, planned_status.iterations_completed);
+    try std.testing.expectEqual(local_hub_status.iterations_completed, planned_hub_status.iterations_completed);
+    try std.testing.expectEqual(local_status.converged, planned_status.converged);
+    try std.testing.expectEqual(local_hub_status.converged, planned_hub_status.converged);
+    try std.testing.expectApproxEqAbs(local_status.delta, planned_status.delta, 0.0000001);
+    try std.testing.expectApproxEqAbs(local_hub_status.delta, planned_hub_status.delta, 0.0000001);
+    try std.testing.expectEqual(@as(usize, 0), planned_status.build_pages.len);
+    try std.testing.expectEqual(@as(usize, 0), planned_hub_status.build_pages.len);
 
     {
         var txn = try planned_graph.beginReadReverseTxn();

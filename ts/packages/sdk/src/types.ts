@@ -146,6 +146,7 @@ export type RowsLateralRequest = components["schemas"]["RowsLateralRequest"];
 export type RowsLateralCorrelation = components["schemas"]["RowsLateralCorrelation"];
 export type RowsMutationSourceRequest = components["schemas"]["RowsMutationSourceRequest"];
 export type RowsMutationSourceResultSet = components["schemas"]["RowsMutationSourceResultSet"];
+export type RowsResultColumn = components["schemas"]["RowsResultColumn"];
 export type RowsQueryResultSet = components["schemas"]["RowsQueryResultSet"];
 export type RowsAggregateResultSet = components["schemas"]["RowsAggregateResultSet"];
 export type RowsStreamResultSet = components["schemas"]["RowsStreamResultSet"];

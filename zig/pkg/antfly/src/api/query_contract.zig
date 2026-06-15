@@ -5988,8 +5988,16 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_row_claim and !options.strip_json_filter and !options.strip_graph_metric and !options.strip_graph_metric_rerank) return null;
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls) return null;
+    if (!options.strip_internal_shard_fields and
+        !options.strip_public_doc_filter_bindings and
+        !options.strip_row_claim and
+        !options.strip_json_filter and
+        !options.strip_graph_metric and
+        !options.strip_graph_metric_rerank and
+        !options.strip_public_hierarchy_controls)
+    {
+        return null;
+    }
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();

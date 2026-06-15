@@ -21,6 +21,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
+const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
 const cluster = @import("cluster.zig");
@@ -232,6 +233,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
+    artifact_reprocess_job_store_path: ?[]const u8 = null,
+    artifact_reprocess_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -247,6 +250,8 @@ const RowsUniqueSelectorResolverContext = struct {
         return .{
             .ptr = self,
             .resolve = resolve,
+            .resolve_temporal = resolveTemporal,
+            .resolve_temporal_overlap = resolveTemporalOverlap,
             .resolve_primary = resolvePrimary,
             .lookup_primary = lookupPrimary,
         };
@@ -262,6 +267,39 @@ const RowsUniqueSelectorResolverContext = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const source = self.source orelse return error.UnsupportedOperation;
         return source.relationalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, .read_index) catch |err| switch (err) {
+            error.NotFound => null,
+            else => err,
+        };
+    }
+
+    fn resolveTemporal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_point: []const u8,
+    ) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const source = self.source orelse return error.UnsupportedOperation;
+        return source.relationalTemporalUniqueOwnerLookup(alloc, table_name, constraint_name, encoded_value, encoded_point, .read_index) catch |err| switch (err) {
+            error.NotFound => null,
+            else => err,
+        };
+    }
+
+    fn resolveTemporalOverlap(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        constraint_name: []const u8,
+        encoded_value: []const u8,
+        encoded_start: []const u8,
+        encoded_end: []const u8,
+    ) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const source = self.source orelse return error.UnsupportedOperation;
+        return source.relationalTemporalUniqueOverlapOwnerLookup(alloc, table_name, constraint_name, encoded_value, encoded_start, encoded_end, .read_index) catch |err| switch (err) {
             error.NotFound => null,
             else => err,
         };
@@ -959,6 +997,7 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
+    artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
 
@@ -996,6 +1035,10 @@ pub const ApiHttpServer = struct {
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
+            }),
+            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(alloc, .{
+                .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
+                .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -1050,6 +1093,13 @@ pub const ApiHttpServer = struct {
             opened.* = try distributed_join.OpenedJoinJobStore.open(alloc, join_job_path);
             server.join_job_store.opened_join_job_store = opened;
         }
+        if (cfg.artifact_reprocess_job_store_path) |path| {
+            const opened = try alloc.create(artifact_reprocess_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, path);
+            errdefer opened.deinit();
+            try server.artifact_reprocess_job_store.attachOpenedStore(opened);
+        }
         return server;
     }
 
@@ -1079,6 +1129,7 @@ pub const ApiHttpServer = struct {
             opened.deinit();
             self.alloc.destroy(opened);
         }
+        self.artifact_reprocess_job_store.deinit();
         self.join_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
@@ -3796,6 +3847,36 @@ pub const ApiHttpServer = struct {
         return try search_pattern_filter.storedDocMatchesPatternFilter(self.alloc, key, json, row_filter_json);
     }
 
+    pub fn sourceDocumentVisibleToIdentity(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        key: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !bool {
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        if (row_filter_json == null) return true;
+        const source = self.table_reads orelse return false;
+        return try self.docMatchesRowFilter(source, table_name, key, row_filter_json.?);
+    }
+
+    pub fn documentArtifactManifestOptionsForRequest(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) error{ InvalidDetail, Forbidden }!public_table_http.DocumentArtifactManifestOptions {
+        _ = self;
+        _ = table_name;
+        const opts = public_table_http.parseDocumentArtifactManifestOptions(query) catch return error.InvalidDetail;
+        if (opts.detail == .raw) {
+            if (authenticated_identity) |identity| {
+                if (identity.row_filter.len > 0) return error.Forbidden;
+            }
+        }
+        return opts;
+    }
+
     pub fn filterScanResultByRowFilter(
         self: *ApiHttpServer,
         source: table_reads.TableReadSource,
@@ -5839,6 +5920,22 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
+    pub fn handlePublicTableRowsPlan(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const operation = relational_rows_api.detectRowsPlanOperationWithoutSchema(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid rows request");
+        return switch (operation) {
+            .query => try self.handlePublicTableRowsQuery(table_name, body, authenticated_identity),
+            .aggregate => try self.handlePublicTableRowsAggregate(table_name, body, authenticated_identity),
+            .window => try self.handlePublicTableRowsWindow(table_name, body, authenticated_identity),
+            .join => try self.handlePublicTableRowsJoin(table_name, body, authenticated_identity),
+            .lateral => try self.handlePublicTableRowsLateral(table_name, body, authenticated_identity),
+        };
+    }
+
     pub fn handlePublicTableRowsQuery(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -5859,6 +5956,8 @@ pub const ApiHttpServer = struct {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
             else => return err,
         };
+        const result_schema = relational_rows_api.rowsReadPlanOutputColumnsAlloc(self.alloc, schema, .{ .query = plan }) catch return try textResponse(self.alloc, 400, "invalid rows query request");
+        defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
@@ -5871,7 +5970,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
-        const response_body = try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, result);
+        const response_body = try relational_rows_api.encodeRowsQueryResponseWithSchemaAlloc(self.alloc, result, result_schema);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
@@ -5896,6 +5995,8 @@ pub const ApiHttpServer = struct {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
             else => return err,
         };
+        const result_schema = relational_rows_api.rowsReadPlanOutputColumnsAlloc(self.alloc, schema, .{ .aggregate = plan }) catch return try textResponse(self.alloc, 400, "invalid rows aggregate request");
+        defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
@@ -5908,7 +6009,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
-        const response_body = try relational_rows_api.encodeRowsAggregateResponseAlloc(self.alloc, result);
+        const response_body = try relational_rows_api.encodeRowsAggregateResponseWithSchemaAlloc(self.alloc, result, result_schema);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
@@ -5933,6 +6034,8 @@ pub const ApiHttpServer = struct {
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
             else => return err,
         };
+        const result_schema = relational_rows_api.rowsReadPlanOutputColumnsAlloc(self.alloc, schema, .{ .window = plan }) catch return try textResponse(self.alloc, 400, "invalid rows window request");
+        defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var result = (source.rowsWindowPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows window request"),
@@ -5945,7 +6048,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
-        const response_body = try relational_rows_api.encodeRowsWindowResponseAlloc(self.alloc, result);
+        const response_body = try relational_rows_api.encodeRowsWindowResponseWithSchemaAlloc(self.alloc, result, result_schema);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
@@ -5957,21 +6060,45 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+        const cte_schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
             else => return err,
         };
-        defer runtime_schema_mod.freeSchema(self.alloc, schema);
-
-        var plan = relational_rows_api.parseRowsJoinPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows join request");
-        defer plan.deinit(self.alloc);
-        self.applyRowsJoinPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
-            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+        defer runtime_schema_mod.freeSchema(self.alloc, cte_schema);
+        var side_tables = relational_rows_api.parseRowsPlanSideTablesAlloc(self.alloc, body, .join) catch return try textResponse(self.alloc, 400, "invalid rows join request");
+        defer side_tables.deinit(self.alloc);
+        const left_table_name = rowsPlanEffectiveSideTable(table_name, side_tables.left_table);
+        const right_table_name = rowsPlanEffectiveSideTable(table_name, side_tables.right_table);
+        const left_schema = self.runtimeSchemaForPublicRows(left_table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
             else => return err,
         };
+        defer runtime_schema_mod.freeSchema(self.alloc, left_schema);
+        const right_schema = self.runtimeSchemaForPublicRows(right_table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, right_schema);
 
-        var result = (source.rowsJoinPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+        var plan = relational_rows_api.parseRowsJoinPlanRequestWithSchemas(self.alloc, body, cte_schema, left_schema, right_schema) catch return try textResponse(self.alloc, 400, "invalid rows join request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsJoinPlanRowFilterWithSchemas(table_name, left_table_name, right_table_name, authenticated_identity, cte_schema, left_schema, right_schema, &plan) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "forbidden"),
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            else => return err,
+        };
+        const result_schema = relational_rows_api.rowsReadPlanOutputColumnsWithSchemasAlloc(self.alloc, cte_schema, left_schema, right_schema, .{ .join = plan }) catch return try textResponse(self.alloc, 400, "invalid rows join request");
+        defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
+
+        const same_table = std.mem.eql(u8, left_table_name, table_name) and std.mem.eql(u8, right_table_name, table_name);
+        var result = ((if (same_table)
+            source.rowsJoinPlan(self.alloc, table_name, cte_schema, plan, .read_index)
+        else
+            table_reads.rowsJoinPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows join plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -5982,7 +6109,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
-        const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+        const response_body = try relational_rows_api.encodeRowsJoinResponseWithSchemaAlloc(self.alloc, result, result_schema);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
@@ -5994,21 +6121,45 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
         const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+        const cte_schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
             else => return err,
         };
-        defer runtime_schema_mod.freeSchema(self.alloc, schema);
-
-        var plan = relational_rows_api.parseRowsLateralPlanRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows lateral request");
-        defer plan.deinit(self.alloc);
-        self.applyRowsLateralPlanRowFilter(table_name, authenticated_identity, schema, &plan) catch |err| switch (err) {
-            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+        defer runtime_schema_mod.freeSchema(self.alloc, cte_schema);
+        var side_tables = relational_rows_api.parseRowsPlanSideTablesAlloc(self.alloc, body, .lateral) catch return try textResponse(self.alloc, 400, "invalid rows lateral request");
+        defer side_tables.deinit(self.alloc);
+        const left_table_name = rowsPlanEffectiveSideTable(table_name, side_tables.left_table);
+        const right_table_name = rowsPlanEffectiveSideTable(table_name, side_tables.right_table);
+        const left_schema = self.runtimeSchemaForPublicRows(left_table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
             else => return err,
         };
+        defer runtime_schema_mod.freeSchema(self.alloc, left_schema);
+        const right_schema = self.runtimeSchemaForPublicRows(right_table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, right_schema);
 
-        var result = (source.rowsLateralPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
+        var plan = relational_rows_api.parseRowsLateralPlanRequestWithSchemas(self.alloc, body, cte_schema, left_schema, right_schema) catch return try textResponse(self.alloc, 400, "invalid rows lateral request");
+        defer plan.deinit(self.alloc);
+        self.applyRowsLateralPlanRowFilterWithSchemas(table_name, left_table_name, right_table_name, authenticated_identity, cte_schema, left_schema, right_schema, &plan) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "forbidden"),
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            else => return err,
+        };
+        const result_schema = relational_rows_api.rowsReadPlanOutputColumnsWithSchemasAlloc(self.alloc, cte_schema, left_schema, right_schema, .{ .lateral = plan }) catch return try textResponse(self.alloc, 400, "invalid rows lateral request");
+        defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
+
+        const same_table = std.mem.eql(u8, left_table_name, table_name) and std.mem.eql(u8, right_table_name, table_name);
+        var result = ((if (same_table)
+            source.rowsLateralPlan(self.alloc, table_name, cte_schema, plan, .read_index)
+        else
+            table_reads.rowsLateralPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows lateral plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -6019,7 +6170,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
-        const response_body = try relational_rows_api.encodeRowsJoinResponseAlloc(self.alloc, result);
+        const response_body = try relational_rows_api.encodeRowsJoinResponseWithSchemaAlloc(self.alloc, result, result_schema);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
@@ -6105,12 +6256,40 @@ pub const ApiHttpServer = struct {
         schema: runtime_schema_mod.TableSchema,
         plan: *relational_rows_api.OwnedRowsJoinPlan,
     ) !void {
-        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
-        defer if (filter) |*value| value.deinit(self.alloc);
-        const active = filter orelse return;
-        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
-        try self.applyRowsAuthFilterToQuery(schema, active, &plan.join.left);
-        try self.applyRowsAuthFilterToQuery(schema, active, &plan.join.right);
+        return try self.applyRowsJoinPlanRowFilterWithSchemas(table_name, table_name, table_name, authenticated_identity, schema, schema, schema, plan);
+    }
+
+    fn applyRowsJoinPlanRowFilterWithSchemas(
+        self: *ApiHttpServer,
+        cte_table_name: []const u8,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cte_schema: runtime_schema_mod.TableSchema,
+        left_schema: runtime_schema_mod.TableSchema,
+        right_schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsJoinPlan,
+    ) !void {
+        try ensureRowsPlanTableReadable(authenticated_identity, left_table_name);
+        try ensureRowsPlanTableReadable(authenticated_identity, right_table_name);
+        try validateRowsPlanCteSideTable(cte_table_name, left_table_name, plan.join.left);
+        try validateRowsPlanCteSideTable(cte_table_name, right_table_name, plan.join.right);
+
+        var cte_filter = try self.rowsAuthFilterPlanForIdentity(cte_table_name, authenticated_identity, cte_schema);
+        defer if (cte_filter) |*value| value.deinit(self.alloc);
+        if (cte_filter) |active| {
+            for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(cte_schema, active, &cte.query);
+        }
+        if (plan.join.left.source_cte.len == 0) {
+            var left_filter = try self.rowsAuthFilterPlanForIdentity(left_table_name, authenticated_identity, left_schema);
+            defer if (left_filter) |*value| value.deinit(self.alloc);
+            if (left_filter) |active| try self.applyRowsAuthFilterToQuery(left_schema, active, &plan.join.left);
+        }
+        if (plan.join.right.source_cte.len == 0) {
+            var right_filter = try self.rowsAuthFilterPlanForIdentity(right_table_name, authenticated_identity, right_schema);
+            defer if (right_filter) |*value| value.deinit(self.alloc);
+            if (right_filter) |active| try self.applyRowsAuthFilterToQuery(right_schema, active, &plan.join.right);
+        }
     }
 
     fn applyRowsLateralPlanRowFilter(
@@ -6120,12 +6299,40 @@ pub const ApiHttpServer = struct {
         schema: runtime_schema_mod.TableSchema,
         plan: *relational_rows_api.OwnedRowsLateralPlan,
     ) !void {
-        var filter = try self.rowsAuthFilterPlanForIdentity(table_name, authenticated_identity, schema);
-        defer if (filter) |*value| value.deinit(self.alloc);
-        const active = filter orelse return;
-        for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(schema, active, &cte.query);
-        try self.applyRowsAuthFilterToQuery(schema, active, &plan.lateral.left);
-        try self.applyRowsAuthFilterToQuery(schema, active, &plan.lateral.right);
+        return try self.applyRowsLateralPlanRowFilterWithSchemas(table_name, table_name, table_name, authenticated_identity, schema, schema, schema, plan);
+    }
+
+    fn applyRowsLateralPlanRowFilterWithSchemas(
+        self: *ApiHttpServer,
+        cte_table_name: []const u8,
+        left_table_name: []const u8,
+        right_table_name: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cte_schema: runtime_schema_mod.TableSchema,
+        left_schema: runtime_schema_mod.TableSchema,
+        right_schema: runtime_schema_mod.TableSchema,
+        plan: *relational_rows_api.OwnedRowsLateralPlan,
+    ) !void {
+        try ensureRowsPlanTableReadable(authenticated_identity, left_table_name);
+        try ensureRowsPlanTableReadable(authenticated_identity, right_table_name);
+        try validateRowsPlanCteSideTable(cte_table_name, left_table_name, plan.lateral.left);
+        try validateRowsPlanCteSideTable(cte_table_name, right_table_name, plan.lateral.right);
+
+        var cte_filter = try self.rowsAuthFilterPlanForIdentity(cte_table_name, authenticated_identity, cte_schema);
+        defer if (cte_filter) |*value| value.deinit(self.alloc);
+        if (cte_filter) |active| {
+            for (@constCast(plan.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(cte_schema, active, &cte.query);
+        }
+        if (plan.lateral.left.source_cte.len == 0) {
+            var left_filter = try self.rowsAuthFilterPlanForIdentity(left_table_name, authenticated_identity, left_schema);
+            defer if (left_filter) |*value| value.deinit(self.alloc);
+            if (left_filter) |active| try self.applyRowsAuthFilterToQuery(left_schema, active, &plan.lateral.left);
+        }
+        if (plan.lateral.right.source_cte.len == 0) {
+            var right_filter = try self.rowsAuthFilterPlanForIdentity(right_table_name, authenticated_identity, right_schema);
+            defer if (right_filter) |*value| value.deinit(self.alloc);
+            if (right_filter) |active| try self.applyRowsAuthFilterToQuery(right_schema, active, &plan.lateral.right);
+        }
     }
 
     fn rowsAuthFilterPlanForIdentity(
@@ -6472,6 +6679,24 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn rowsPlanEffectiveSideTable(default_table_name: []const u8, maybe_table_name: []const u8) []const u8 {
+        return if (maybe_table_name.len == 0) default_table_name else maybe_table_name;
+    }
+
+    fn ensureRowsPlanTableReadable(authenticated_identity: ?AuthenticatedIdentity, table_name: []const u8) !void {
+        const identity = authenticated_identity orelse return;
+        if (identity.permissions.len == 0) return;
+        if (!permissionsAllow(identity.permissions, .table, table_name, .read)) return error.PermissionDenied;
+    }
+
+    fn validateRowsPlanCteSideTable(
+        cte_table_name: []const u8,
+        side_table_name: []const u8,
+        query: relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (query.source_cte.len != 0 and !std.mem.eql(u8, side_table_name, cte_table_name)) return error.InvalidRowsRequest;
+    }
+
     fn rowsAuthRelationalColumn(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.RelationalColumn {
         for (schema.relational_columns) |column| {
             if (std.mem.eql(u8, column.path, field) or std.mem.eql(u8, column.name, field)) return column;
@@ -6676,6 +6901,78 @@ pub const ApiHttpServer = struct {
         return try jsonResponse(self.alloc, parsed);
     }
 
+    pub fn handlePublicTableQueryWithContentType(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        if (!isNdjsonContentType(content_type)) {
+            return try self.handlePublicTableQuery(table_name, body, authenticated_identity);
+        }
+        return try self.handlePublicTableMultiQuery(table_name, body, authenticated_identity);
+    }
+
+    pub fn handlePublicGlobalMultiQuery(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            const table_name = try queryTableNameAlloc(self.alloc, line);
+            defer self.alloc.free(table_name);
+            var resp = try self.handlePublicTableQuery(table_name, line, authenticated_identity);
+            defer resp.deinit(self.alloc);
+            if (resp.status != 200) {
+                return try textResponse(self.alloc, resp.status, resp.body);
+            }
+            try out.appendSlice(self.alloc, resp.body);
+            try out.append(self.alloc, '\n');
+        }
+
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/x-ndjson"),
+            .body = try out.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn handlePublicTableMultiQuery(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            var resp = try self.handlePublicTableQuery(table_name, line, authenticated_identity);
+            defer resp.deinit(self.alloc);
+            if (resp.status != 200) {
+                return try textResponse(self.alloc, resp.status, resp.body);
+            }
+            try out.appendSlice(self.alloc, resp.body);
+            try out.append(self.alloc, '\n');
+        }
+
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/x-ndjson"),
+            .body = try out.toOwnedSlice(self.alloc),
+        };
+    }
+
     pub fn handlePublicTableListIndexes(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi());
         defer resp.deinit(self.alloc);
@@ -6734,6 +7031,130 @@ pub const ApiHttpServer = struct {
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicStartDocumentArtifactReprocessJob(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try textResponse(self.alloc, 400, "invalid request");
+        };
+        defer parsed.deinit();
+
+        const encoded = try self.artifact_reprocess_job_store.startJob(self.alloc, table_name, artifact_name, parsed.value);
+        if (parsed.value.advance) {
+            var encoded_to_free: ?[]u8 = encoded;
+            errdefer if (encoded_to_free) |value| self.alloc.free(value);
+            var parsed_job = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded_to_free.?, .{ .ignore_unknown_fields = true });
+            defer parsed_job.deinit();
+            const job_id = try std.fmt.allocPrint(self.alloc, "{d}", .{parsed_job.value.job_id});
+            defer self.alloc.free(job_id);
+            self.alloc.free(encoded_to_free.?);
+            encoded_to_free = null;
+            return try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+        }
+        return .{
+            .status = 202,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = encoded,
+        };
+    }
+
+    pub fn handlePublicDocumentArtifactReprocessJob(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id_raw: []const u8,
+    ) !http_common.HttpResponse {
+        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        errdefer self.alloc.free(encoded);
+        var parsed_job = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_job.deinit();
+        if (!std.mem.eql(u8, parsed_job.value.table_name, table_name) or !std.mem.eql(u8, parsed_job.value.artifact_name, artifact_name)) {
+            self.alloc.free(encoded);
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = encoded,
+        };
+    }
+
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id_raw: []const u8,
+    ) !http_common.HttpResponse {
+        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const current_encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(current_encoded);
+        var parsed_current = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        if (!std.mem.eql(u8, parsed_current.value.table_name, table_name) or !std.mem.eql(u8, parsed_current.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+
+        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, parsed_current.value);
+        defer self.alloc.free(begin.encoded);
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, 200, begin.encoded);
+        }
+
+        var parsed_running = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_running.deinit();
+        var pass = self.tableApi().executeReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, .{
+            .from_key = parsed_running.value.next_key orelse parsed_running.value.from_key,
+            .to_key = parsed_running.value.to_key,
+            .limit = parsed_running.value.limit,
+        }) catch |err| switch (err) {
+            error.NotFound => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed_running.value, .failed, "not found");
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            error.MethodNotAllowed => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.InvalidRequest => return try textResponse(self.alloc, 400, "invalid request"),
+            error.DocIdentityUnavailable => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            error.InternalFailure => return try textResponse(self.alloc, 500, "artifact reprocess failed"),
+        };
+        defer pass.deinit(self.alloc);
+
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, parsed_running.value, pass);
+        errdefer self.alloc.free(updated);
+        return .{
+            .status = 202,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = updated,
+        };
+    }
+
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id_raw: []const u8,
+    ) !http_common.HttpResponse {
+        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const current_encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(current_encoded);
+        var parsed_current = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
+        defer parsed_current.deinit();
+        if (!std.mem.eql(u8, parsed_current.value.table_name, table_name) or !std.mem.eql(u8, parsed_current.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        const updated = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed_current.value, .cancelled, null);
+        errdefer self.alloc.free(updated);
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = updated,
         };
     }
 
@@ -7691,6 +8112,24 @@ fn parseJsonResponseBody(
     return try std.json.parseFromSliceLeaky(T, alloc, body, .{
         .allocate = .alloc_always,
     });
+}
+
+fn isNdjsonContentType(content_type: ?[]const u8) bool {
+    const value = content_type orelse return false;
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+fn queryTableNameAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    return try alloc.dupe(u8, parsed.value.table orelse "");
+}
+
+fn documentArtifactJobMatches(encoded: []const u8, table_name: []const u8, artifact_name: []const u8) bool {
+    var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, std.heap.page_allocator, encoded, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.table_name, table_name) and std.mem.eql(u8, parsed.value.artifact_name, artifact_name);
 }
 
 fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8) !http_common.HttpResponse {
@@ -12831,10 +13270,161 @@ test "api http server resolves relational rows by unique selector" {
     try std.testing.expect(missing.get("physical_key").? == .null);
 }
 
+test "api http server resolves temporal relational rows by period-qualified primary selector" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-temporal-primary-selector", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:a:v1", .value = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}" },
+            .{ .key = "price:a:v2", .value = "{\"sku\":\"sku:a\",\"valid_from\":10,\"valid_to\":20,\"price\":12}" },
+            .{ .key = "price:a:current", .value = "{\"sku\":\"sku:a\",\"valid_from\":20,\"price\":14}" },
+        },
+    });
+
+    var read_source = table_reads.BoundTableReadSource.init("prices", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("prices", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "prices",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+
+    var get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/prices/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":25}}}],\"include_physical_key\":true}",
+    });
+    defer get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), get_resp.status);
+    var parsed_get = try std.json.parseFromSlice(std.json.Value, alloc, get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_get.deinit();
+    const current = parsed_get.value.object.get("rows").?.array.items[0].object;
+    try std.testing.expect(current.get("found").?.bool);
+    try std.testing.expectEqualStrings("price:a:current", current.get("physical_key").?.string);
+    try std.testing.expectEqual(@as(i64, 14), current.get("row").?.object.get("price").?.integer);
+
+    var missing_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/prices/rows:get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:missing\"},\"period\":{\"name\":\"valid_time\",\"at\":25}}}]}",
+    });
+    defer missing_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing_get_resp.status);
+    var parsed_missing_temporal = try std.json.parseFromSlice(std.json.Value, alloc, missing_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_missing_temporal.deinit();
+    try std.testing.expect(!parsed_missing_temporal.value.object.get("rows").?.array.items[0].object.get("found").?.bool);
+}
+
+fn expectRowsResultSchemaColumn(
+    result: std.json.Value,
+    name: []const u8,
+    field_type: []const u8,
+    nullable: bool,
+    array_item_type: ?[]const u8,
+) !void {
+    const schema = result.object.get("result_schema") orelse return error.TestUnexpectedResult;
+    if (schema != .array) return error.TestUnexpectedResult;
+    for (schema.array.items) |item| {
+        if (item != .object) return error.TestUnexpectedResult;
+        const column_name = item.object.get("name") orelse return error.TestUnexpectedResult;
+        if (column_name != .string or !std.mem.eql(u8, column_name.string, name)) continue;
+        const column_path = item.object.get("path") orelse return error.TestUnexpectedResult;
+        if (column_path != .string) return error.TestUnexpectedResult;
+        const column_type = item.object.get("type") orelse return error.TestUnexpectedResult;
+        if (column_type != .string) return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(field_type, column_type.string);
+        const column_nullable = item.object.get("nullable") orelse return error.TestUnexpectedResult;
+        if (column_nullable != .bool) return error.TestUnexpectedResult;
+        try std.testing.expectEqual(nullable, column_nullable.bool);
+        if (array_item_type) |expected| {
+            const actual = item.object.get("array_item_type") orelse return error.TestUnexpectedResult;
+            if (actual != .string) return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(expected, actual.string);
+        } else {
+            try std.testing.expect(item.object.get("array_item_type") == null);
+        }
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn expectRowsResultSchemaColumnCollation(
+    result: std.json.Value,
+    name: []const u8,
+    expected: ?[]const u8,
+) !void {
+    const schema = result.object.get("result_schema") orelse return error.TestUnexpectedResult;
+    if (schema != .array) return error.TestUnexpectedResult;
+    for (schema.array.items) |item| {
+        if (item != .object) return error.TestUnexpectedResult;
+        const column_name = item.object.get("name") orelse return error.TestUnexpectedResult;
+        if (column_name != .string or !std.mem.eql(u8, column_name.string, name)) continue;
+        if (expected) |value| {
+            const actual = item.object.get("collation") orelse return error.TestUnexpectedResult;
+            if (actual != .string) return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(value, actual.string);
+        } else {
+            try std.testing.expect(item.object.get("collation") == null);
+        }
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "api http server executes public relational row plan endpoints" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword","collation":"C"},"customer_id":{"type":"keyword"},"name":{"type":"keyword","collation":"name_collation"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12912,6 +13502,10 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_query.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_query.value.object.get("total").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_query.value.object.get("rows").?.array.items[0].object.get("id").?.string);
+    try expectRowsResultSchemaColumn(parsed_query.value, "id", "keyword", false, null);
+    try expectRowsResultSchemaColumnCollation(parsed_query.value, "id", "C");
+    try expectRowsResultSchemaColumn(parsed_query.value, "amount", "numeric", true, null);
+    try expectRowsResultSchemaColumnCollation(parsed_query.value, "amount", null);
 
     var public_claim_query_resp = try server.handle(.{
         .method = .POST,
@@ -12943,6 +13537,8 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_aggregate.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_aggregate.value.object.get("total_groups").?.integer);
     try std.testing.expectEqual(@as(i64, 30), parsed_aggregate.value.object.get("rows").?.array.items[0].object.get("amount_sum").?.integer);
+    try expectRowsResultSchemaColumn(parsed_aggregate.value, "customer_id", "keyword", true, null);
+    try expectRowsResultSchemaColumn(parsed_aggregate.value, "amount_sum", "numeric", false, null);
 
     var window_resp = try server.handle(.{
         .method = .POST,
@@ -12956,6 +13552,8 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_window.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_window.value.object.get("total_rows").?.integer);
     try std.testing.expectEqual(@as(i64, 1), parsed_window.value.object.get("rows").?.array.items[0].object.get("row_num").?.integer);
+    try expectRowsResultSchemaColumn(parsed_window.value, "id", "keyword", false, null);
+    try expectRowsResultSchemaColumn(parsed_window.value, "row_num", "numeric", false, null);
 
     var join_resp = try server.handle(.{
         .method = .POST,
@@ -12969,6 +13567,10 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_join.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_join.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("Alice", parsed_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
+    try expectRowsResultSchemaColumn(parsed_join.value, "order_id", "keyword", false, null);
+    try expectRowsResultSchemaColumn(parsed_join.value, "customer_name", "keyword", true, null);
+    try expectRowsResultSchemaColumnCollation(parsed_join.value, "customer_name", "name_collation");
+    try expectRowsResultSchemaColumn(parsed_join.value, "amount", "numeric", true, null);
 
     var lateral_resp = try server.handle(.{
         .method = .POST,
@@ -12982,6 +13584,9 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_lateral.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
     try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("latest_order_id").?.string);
+    try expectRowsResultSchemaColumn(parsed_lateral.value, "customer_id", "keyword", false, null);
+    try expectRowsResultSchemaColumn(parsed_lateral.value, "latest_order_id", "keyword", true, null);
+    try expectRowsResultSchemaColumn(parsed_lateral.value, "latest_amount", "numeric", true, null);
 
     const mutation_txn_hex = "00112233445566778899aabbccddeeff";
     const mutation_txn_id = try distributed_txn.parseTxnIdHex(mutation_txn_hex);

@@ -17,19 +17,23 @@ T = TypeVar("T", bound="RowsJoinPlanRequest")
 
 @_attrs_define
 class RowsJoinPlanRequest:
-    """Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes` and paired `left_ranges` and
-    `right_ranges`.
+    """Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names,
+    and paired `left_ranges` and `right_ranges`.
 
         Attributes:
             join (RowsJoinRequest): Typed equality join plan. Each side is a full row-query request and can read an ordered
                 CTE through `source_cte`.
             ctes (list[RowsCte] | Unset):
+            left_table (str | Unset): Optional source table for the left side. Omitted or empty uses the endpoint table.
+            right_table (str | Unset): Optional source table for the right side. Omitted or empty uses the endpoint table.
             left_ranges (list[Any] | Unset):
             right_ranges (list[Any] | Unset):
     """
 
     join: RowsJoinRequest
     ctes: list[RowsCte] | Unset = UNSET
+    left_table: str | Unset = UNSET
+    right_table: str | Unset = UNSET
     left_ranges: list[Any] | Unset = UNSET
     right_ranges: list[Any] | Unset = UNSET
 
@@ -42,6 +46,10 @@ class RowsJoinPlanRequest:
             for ctes_item_data in self.ctes:
                 ctes_item = ctes_item_data.to_dict()
                 ctes.append(ctes_item)
+
+        left_table = self.left_table
+
+        right_table = self.right_table
 
         left_ranges: list[Any] | Unset = UNSET
         if not isinstance(self.left_ranges, Unset):
@@ -68,6 +76,10 @@ class RowsJoinPlanRequest:
         )
         if ctes is not UNSET:
             field_dict["ctes"] = ctes
+        if left_table is not UNSET:
+            field_dict["left_table"] = left_table
+        if right_table is not UNSET:
+            field_dict["right_table"] = right_table
         if left_ranges is not UNSET:
             field_dict["left_ranges"] = left_ranges
         if right_ranges is not UNSET:
@@ -91,6 +103,10 @@ class RowsJoinPlanRequest:
                 ctes_item = RowsCte.from_dict(ctes_item_data)
 
                 ctes.append(ctes_item)
+
+        left_table = d.pop("left_table", UNSET)
+
+        right_table = d.pop("right_table", UNSET)
 
         _left_ranges = d.pop("left_ranges", UNSET)
         left_ranges: list[Any] | Unset = UNSET
@@ -121,6 +137,8 @@ class RowsJoinPlanRequest:
         rows_join_plan_request = cls(
             join=join,
             ctes=ctes,
+            left_table=left_table,
+            right_table=right_table,
             left_ranges=left_ranges,
             right_ranges=right_ranges,
         )

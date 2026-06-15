@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.rows_json_set_transform import RowsJsonSetTransform
     from ..models.rows_numeric_increment import RowsNumericIncrement
     from ..models.rows_query_request import RowsQueryRequest
+    from ..models.rows_temporal_portion import RowsTemporalPortion
 
 
 T = TypeVar("T", bound="RowsMutationSourceRequest")
@@ -45,6 +46,8 @@ class RowsMutationSourceRequest:
                 expression AST.
             json_set (list[RowsJsonSetTransform] | Unset): JSON path transforms for update operations.
             array_update (list[RowsArrayUpdateTransform] | Unset): Array transforms for update operations.
+            temporal_portion (RowsTemporalPortion | Unset): Application-time temporal slice for update/delete mutation-
+                source plans.
             returning (list[str] | Unset): Fields to return from the final update image or deleted row image. `*` returns
                 the full row.
             returning_expressions (list[RowsExpressionProjection] | Unset): Typed row-expression projections over the final
@@ -59,6 +62,7 @@ class RowsMutationSourceRequest:
     increment_expr: RowsExpressionAssignmentMap | Unset = UNSET
     json_set: list[RowsJsonSetTransform] | Unset = UNSET
     array_update: list[RowsArrayUpdateTransform] | Unset = UNSET
+    temporal_portion: RowsTemporalPortion | Unset = UNSET
     returning: list[str] | Unset = UNSET
     returning_expressions: list[RowsExpressionProjection] | Unset = UNSET
 
@@ -97,6 +101,10 @@ class RowsMutationSourceRequest:
                 array_update_item = array_update_item_data.to_dict()
                 array_update.append(array_update_item)
 
+        temporal_portion: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.temporal_portion, Unset):
+            temporal_portion = self.temporal_portion.to_dict()
+
         returning: list[str] | Unset = UNSET
         if not isinstance(self.returning, Unset):
             returning = self.returning
@@ -128,6 +136,8 @@ class RowsMutationSourceRequest:
             field_dict["json_set"] = json_set
         if array_update is not UNSET:
             field_dict["array_update"] = array_update
+        if temporal_portion is not UNSET:
+            field_dict["temporal_portion"] = temporal_portion
         if returning is not UNSET:
             field_dict["returning"] = returning
         if returning_expressions is not UNSET:
@@ -144,6 +154,7 @@ class RowsMutationSourceRequest:
         from ..models.rows_json_set_transform import RowsJsonSetTransform
         from ..models.rows_numeric_increment import RowsNumericIncrement
         from ..models.rows_query_request import RowsQueryRequest
+        from ..models.rows_temporal_portion import RowsTemporalPortion
 
         d = dict(src_dict)
         op = RowsMutationSourceRequestOp(d.pop("op"))
@@ -196,6 +207,13 @@ class RowsMutationSourceRequest:
 
                 array_update.append(array_update_item)
 
+        _temporal_portion = d.pop("temporal_portion", UNSET)
+        temporal_portion: RowsTemporalPortion | Unset
+        if isinstance(_temporal_portion, Unset):
+            temporal_portion = UNSET
+        else:
+            temporal_portion = RowsTemporalPortion.from_dict(_temporal_portion)
+
         returning = cast(list[str], d.pop("returning", UNSET))
 
         _returning_expressions = d.pop("returning_expressions", UNSET)
@@ -216,6 +234,7 @@ class RowsMutationSourceRequest:
             increment_expr=increment_expr,
             json_set=json_set,
             array_update=array_update,
+            temporal_portion=temporal_portion,
             returning=returning,
             returning_expressions=returning_expressions,
         )

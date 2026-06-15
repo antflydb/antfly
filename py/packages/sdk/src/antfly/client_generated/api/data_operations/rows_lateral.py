@@ -90,7 +90,8 @@ def sync_detailed(
     Args:
         table_name (str):
         body (RowsLateralPlanRequest): Typed row-lateral plan envelope. Accepts exactly `lateral`
-            plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+            plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges`
+            and `right_ranges`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -123,7 +124,8 @@ def sync(
     Args:
         table_name (str):
         body (RowsLateralPlanRequest): Typed row-lateral plan envelope. Accepts exactly `lateral`
-            plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+            plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges`
+            and `right_ranges`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -151,7 +153,8 @@ async def asyncio_detailed(
     Args:
         table_name (str):
         body (RowsLateralPlanRequest): Typed row-lateral plan envelope. Accepts exactly `lateral`
-            plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+            plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges`
+            and `right_ranges`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -182,7 +185,8 @@ async def asyncio(
     Args:
         table_name (str):
         body (RowsLateralPlanRequest): Typed row-lateral plan envelope. Accepts exactly `lateral`
-            plus optional ordered `ctes` and paired `left_ranges` and `right_ranges`.
+            plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges`
+            and `right_ranges`.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
