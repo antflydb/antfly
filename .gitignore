@@ -90,6 +90,7 @@ scripts/__pycache__/
 .worktrees/
 
 /datasets/
+/.turbo/
 
 # TLA+ model checker state directories
 specs/tla/states/

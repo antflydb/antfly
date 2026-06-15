@@ -165,7 +165,7 @@ components:
             - lsm
             - segments
           default: lsm
-          description: "Dense vector index physical posting backend. lsm stores posting records in the LSM-backed index namespace. segments is reserved for the dedicated posting segment-file backend and is rejected until that runtime path is available. Ignored for sparse indexes."
+          description: "Dense vector index physical posting backend. lsm stores posting records in the LSM-backed index namespace. segments stores base_delta posting artifacts in dedicated posting segment files and is currently opt-in for dense indexes with format=base_delta and version=1. Ignored for sparse indexes."
         format:
           x-go-type-skip-optional-pointer: true
           type: string

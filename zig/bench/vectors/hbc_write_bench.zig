@@ -44,6 +44,7 @@ const Config = struct {
     use_random_ortho_trans: bool = false,
     centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
     posting_storage_mode: hbc.HBCConfig.PostingStorageMode = .packed_hbc,
+    posting_backend: hbc.HBCConfig.PostingBackend = .lsm,
     posting_base_member_block_size: usize = 32,
     flat_centroid_block_size: usize = 128,
     flat_centroid_probe_count: usize = 0,
@@ -583,13 +584,20 @@ const Scenario = struct {
         var storage_harness = try StorageHarness.init(allocator, storage_kind);
         errdefer storage_harness.deinit();
 
-        const root_dir = try allocPrintZ(allocator, "{s}/hbc-write-bench-{s}-{s}-{s}-{d}", .{
-            if (storage_kind == .native) "/tmp" else "",
-            @tagName(storage_kind),
-            @tagName(cfg.posting_storage_mode),
-            workload,
-            sample_index,
-        });
+        const root_dir = if (storage_kind == .native)
+            try allocPrintZ(allocator, "/tmp/hbc-write-bench-{s}-{s}-{s}-{d}", .{
+                @tagName(storage_kind),
+                @tagName(cfg.posting_storage_mode),
+                workload,
+                sample_index,
+            })
+        else
+            try allocPrintZ(allocator, "hbc-write-bench-{s}-{s}-{s}-{d}", .{
+                @tagName(storage_kind),
+                @tagName(cfg.posting_storage_mode),
+                workload,
+                sample_index,
+            });
         errdefer allocator.free(root_dir);
 
         var index = try hbc.HBCIndex.openWithLsmStorage(allocator, root_dir, hbcConfig(cfg), storage_harness.storage());
@@ -839,8 +847,8 @@ pub fn main(init: std.process.Init) !void {
     defer if (cfg.dataset_mode == .materialized) freeItems(allocator, items);
 
     try out.print(
-        "hbc write bench samples={d} vectors={d} dims={d} batch_size={d} leaf_size={d} branching_factor={d} search_width={d} storage={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} posting_storage={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} flat_centroid_block_probe_count={d} max_posting_overlay_cache_bytes={d} max_posting_overlay_cache_entry_bytes={d} dataset_mode={s} lazy_posting_maintenance={any}",
-        .{ cfg.samples, cfg.vectors, cfg.dims, cfg.batch_size, cfg.leaf_size, cfg.branching_factor, effectiveSearchWidth(cfg), @tagName(cfg.storage_mode), @tagName(cfg.kmeans_backend), @tagName(cfg.kmeans_update_strategy), @tagName(cfg.centroid_directory_mode), @tagName(cfg.posting_storage_mode), cfg.flat_centroid_block_size, cfg.flat_centroid_probe_count, cfg.flat_centroid_block_probe_count, cfg.max_posting_overlay_cache_bytes, cfg.max_posting_overlay_cache_entry_bytes, @tagName(cfg.dataset_mode), cfg.lazy_posting_maintenance },
+        "hbc write bench samples={d} vectors={d} dims={d} batch_size={d} leaf_size={d} branching_factor={d} search_width={d} storage={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} posting_storage={s} posting_backend={s} flat_centroid_block_size={d} flat_centroid_probe_count={d} flat_centroid_block_probe_count={d} max_posting_overlay_cache_bytes={d} max_posting_overlay_cache_entry_bytes={d} dataset_mode={s} lazy_posting_maintenance={any}",
+        .{ cfg.samples, cfg.vectors, cfg.dims, cfg.batch_size, cfg.leaf_size, cfg.branching_factor, effectiveSearchWidth(cfg), @tagName(cfg.storage_mode), @tagName(cfg.kmeans_backend), @tagName(cfg.kmeans_update_strategy), @tagName(cfg.centroid_directory_mode), @tagName(cfg.posting_storage_mode), @tagName(cfg.posting_backend), cfg.flat_centroid_block_size, cfg.flat_centroid_probe_count, cfg.flat_centroid_block_probe_count, cfg.max_posting_overlay_cache_bytes, cfg.max_posting_overlay_cache_entry_bytes, @tagName(cfg.dataset_mode), cfg.lazy_posting_maintenance },
     );
     try out.print(
         " auto_posting_maintenance_max_postings={d} auto_posting_maintenance_fold_delta_tails={any} auto_posting_maintenance_min_delta_records_to_fold={d} auto_posting_maintenance_min_tombstone_records_to_fold={d} auto_posting_maintenance_min_delta_to_base_ratio_bps={d} auto_posting_maintenance_max_delta_tail_postings={d} auto_posting_maintenance_min_dirty_postings={d} auto_posting_maintenance_max_dirty_version_age={d} auto_posting_maintenance_min_delta_records_to_run={d} auto_posting_maintenance_min_tombstone_records_to_run={d} auto_posting_maintenance_min_delta_to_base_ratio_bps_to_run={d} auto_posting_maintenance_min_centroid_version_lag={d} auto_posting_maintenance_min_payload_version_lag={d} auto_posting_maintenance_max_layout_changes={d} auto_posting_maintenance_split_full_postings={any} auto_posting_maintenance_min_overfull_postings_to_run={d} auto_posting_maintenance_min_postings_at_capacity_to_run={d} auto_posting_maintenance_max_boundary_reassignments={d} auto_posting_maintenance_allow_overfull_reassignment={any} auto_posting_maintenance_max_overfull_reassignment_postings={d} auto_posting_maintenance_max_over_capacity_reassignment_members={d} auto_posting_maintenance_boundary_reassignment_min_improvement={d:.4}",
@@ -2158,15 +2166,22 @@ fn printResult(
     const ns_per_vector = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(vectors, 1)));
     const vectors_per_second = if (ns == 0) 0 else (@as(f64, @floatFromInt(vectors)) * 1_000_000_000.0) / @as(f64, @floatFromInt(ns));
     try writer.print(
-        "{{\"scenario\":\"{s}_{s}_{s}_{s}\",\"storage\":\"{s}\",\"centroid_directory\":\"{s}\",\"posting_storage\":\"{s}\",\"branching_factor\":{d},\"search_width\":{d},\"max_posting_overlay_cache_bytes\":{d},\"max_posting_overlay_cache_entry_bytes\":{d},\"repair_before_bulk_finish\":{},\"repair_fold_delta_tails\":{},\"repair_min_delta_records_to_fold\":{d},\"repair_min_tombstone_records_to_fold\":{d},\"repair_min_delta_to_base_ratio_bps\":{d},\"repair_max_delta_tail_postings\":{d},\"repair_dirty_reassignments\":{d},\"repair_split_full_postings\":{},\"repair_max_layout_changes\":{d},\"repair_dirty_reassignment_allow_overfull\":{},\"repair_dirty_reassignment_max_overfull_postings\":{d},\"repair_dirty_reassignment_max_over_capacity_members\":{d},\"repair_dirty_reassignment_min_improvement\":{d:.4},\"defer_leaf_splits_to_posting_maintenance\":{},\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"ns\":{d},\"ns_per_vector\":{d:.2},\"vectors_per_second\":{d:.2}",
+        "{{\"scenario\":\"{s}_{s}_{s}_{s}_{s}\",\"storage\":\"{s}\",\"centroid_directory\":\"{s}\",\"posting_storage\":\"{s}\",\"posting_backend\":\"{s}\"",
         .{
             @tagName(scenario.storage_kind),
             @tagName(scenario.cfg.centroid_directory_mode),
             @tagName(scenario.cfg.posting_storage_mode),
+            @tagName(scenario.cfg.posting_backend),
             scenario.workload,
             @tagName(scenario.storage_kind),
             @tagName(scenario.cfg.centroid_directory_mode),
             @tagName(scenario.cfg.posting_storage_mode),
+            @tagName(scenario.cfg.posting_backend),
+        },
+    );
+    try writer.print(
+        ",\"branching_factor\":{d},\"search_width\":{d},\"max_posting_overlay_cache_bytes\":{d},\"max_posting_overlay_cache_entry_bytes\":{d},\"repair_before_bulk_finish\":{},\"repair_fold_delta_tails\":{},\"repair_min_delta_records_to_fold\":{d},\"repair_min_tombstone_records_to_fold\":{d},\"repair_min_delta_to_base_ratio_bps\":{d},\"repair_max_delta_tail_postings\":{d},\"repair_dirty_reassignments\":{d},\"repair_split_full_postings\":{},\"repair_max_layout_changes\":{d},\"repair_dirty_reassignment_allow_overfull\":{},\"repair_dirty_reassignment_max_overfull_postings\":{d},\"repair_dirty_reassignment_max_over_capacity_members\":{d},\"repair_dirty_reassignment_min_improvement\":{d:.4},\"defer_leaf_splits_to_posting_maintenance\":{},\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"ns\":{d},\"ns_per_vector\":{d:.2},\"vectors_per_second\":{d:.2}",
+        .{
             scenario.cfg.branching_factor,
             effectiveSearchWidth(scenario.cfg),
             scenario.cfg.max_posting_overlay_cache_bytes,
@@ -2721,12 +2736,17 @@ fn printResult(
         },
     );
     try writer.print(
-        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"posting_base_blocks\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d},\"posting_delta_fold_peak_scratch_bytes\":{d}",
+        ",\"posting_base_put_calls\":{d},\"posting_base_key_bytes\":{d},\"posting_base_value_bytes\":{d},\"posting_base_blocks\":{d},\"posting_base_member_probe_calls\":{d},\"posting_base_member_probe_blocks_seen\":{d},\"posting_base_member_probe_blocks_skipped_by_max\":{d},\"posting_base_member_probe_blocks_decoded\":{d},\"posting_base_member_probe_members_decoded\":{d},\"centroid_directory_put_calls\":{d},\"centroid_directory_key_bytes\":{d},\"centroid_directory_value_bytes\":{d},\"assignment_map_put_calls\":{d},\"assignment_map_delete_calls\":{d},\"assignment_map_key_bytes\":{d},\"assignment_map_value_bytes\":{d},\"posting_delta_append_calls\":{d},\"posting_delta_records\":{d},\"posting_delta_key_bytes\":{d},\"posting_delta_value_bytes\":{d},\"posting_delta_fold_calls\":{d},\"posting_delta_fold_records\":{d},\"posting_delta_fold_base_members\":{d},\"posting_delta_fold_materialized_members\":{d},\"posting_delta_fold_deleted_tail_keys\":{d},\"posting_delta_fold_deleted_tail_key_bytes\":{d},\"posting_delta_fold_deleted_tail_value_bytes\":{d},\"posting_delta_fold_written_base_key_bytes\":{d},\"posting_delta_fold_written_base_value_bytes\":{d},\"posting_delta_fold_peak_scratch_bytes\":{d}",
         .{
             profile.posting_base_put_calls,
             profile.posting_base_key_bytes,
             profile.posting_base_value_bytes,
             profile.posting_base_blocks,
+            profile.posting_base_member_probe_calls,
+            profile.posting_base_member_probe_blocks_seen,
+            profile.posting_base_member_probe_blocks_skipped_by_max,
+            profile.posting_base_member_probe_blocks_decoded,
+            profile.posting_base_member_probe_members_decoded,
             profile.centroid_directory_put_calls,
             profile.centroid_directory_key_bytes,
             profile.centroid_directory_value_bytes,
@@ -2949,7 +2969,10 @@ fn analyzeActiveTablesRoot(
         stats.active_run_bytes += run.size_bytes;
         const path = try resolveRunPathAlloc(allocator, root_dir, run.path);
         defer allocator.free(path);
-        var index = try lsm_repository.loadRunTableIndexAllocWithStorage(storage, allocator, path);
+        var index = lsm_repository.loadRunTableIndexAllocWithStorage(storage, allocator, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
         defer index.deinit(allocator);
         stats.active_bloom_filter_bytes += index.filter.bytes.len;
     }
@@ -2978,7 +3001,10 @@ fn analyzeActiveTablesRoot(
     for (manifest.runs) |run| {
         const path = try resolveRunPathAlloc(allocator, root_dir, run.path);
         defer allocator.free(path);
-        try analyzeRunTable(allocator, storage, path, &stats, &latest);
+        analyzeRunTable(allocator, storage, path, &stats, &latest) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
     }
 
     var value_it = latest.valueIterator();
@@ -3158,6 +3184,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .kmeans_update_strategy = cfg.kmeans_update_strategy,
         .centroid_directory_mode = cfg.centroid_directory_mode,
         .posting_storage_mode = cfg.posting_storage_mode,
+        .posting_backend = cfg.posting_backend,
         .posting_base_member_block_size = cfg.posting_base_member_block_size,
         .flat_centroid_block_size = cfg.flat_centroid_block_size,
         .flat_centroid_probe_count = cfg.flat_centroid_probe_count,
@@ -4177,6 +4204,9 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--posting-storage")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.posting_storage_mode = std.meta.stringToEnum(hbc.HBCConfig.PostingStorageMode, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--posting-backend")) {
+            const value = args.next() orelse return error.InvalidArgument;
+            cfg.posting_backend = std.meta.stringToEnum(hbc.HBCConfig.PostingBackend, value) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--posting-base-member-block-size")) {
             cfg.posting_base_member_block_size = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--flat-centroid-block-size")) {
@@ -4307,6 +4337,7 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
             return error.InvalidArgument;
         }
     }
+    if (cfg.posting_backend == .segments and cfg.posting_storage_mode != .base_delta) return error.InvalidArgument;
     if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.batch_size == 0 or cfg.post_write_query_rounds == 0) return error.InvalidArgument;
     if (cfg.post_write_truth_cache_only and
         (cfg.dataset_mode != .procedural or

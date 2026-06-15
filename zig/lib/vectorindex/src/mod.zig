@@ -255,8 +255,20 @@ test "posting segment directory batch writer flushes bounded segments" {
     try posting_segment.testDirectoryBatchWriterFlushesBoundedSegments();
 }
 
+test "posting segment directory batch writer coalesces pending point records" {
+    try posting_segment.testDirectoryBatchWriterCoalescesPendingPointRecords();
+}
+
+test "posting segment runtime directory store exposes pending read overlay" {
+    try posting_segment.testRuntimeDirectoryStoreExposesPendingReadOverlay();
+}
+
 test "posting segment runtime directory store refreshes snapshots" {
     try posting_segment.testRuntimeDirectoryStoreRefreshesSnapshots();
+}
+
+test "posting segment runtime directory store flush uses loaded manifest" {
+    try posting_segment.testRuntimeDirectoryStoreFlushUsesLoadedManifest();
 }
 
 test "posting segment directory compaction replaces manifest segments" {

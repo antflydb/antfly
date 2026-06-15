@@ -70,6 +70,10 @@ Current status:
 - Delta folds profile peak retained fold scratch bytes through
   `posting_delta_fold_peak_scratch_bytes`, so maintenance tuning can compare
   fold memory pressure against written base bytes and deleted tail bytes.
+  Retained fold scratch is also cleared and trimmed against
+  `max_retained_posting_fold_scratch_bytes` before it is cached, so a one-off
+  large fold no longer leaves oversized encoded-base, member, delta, or
+  overlay buffers resident.
 - The comparison summarizer derives posting-family LSM cost through
   `posting_lsm_keys_per_mutation` and `posting_lsm_bytes_per_mutation`, so
   backend overhead can be separated from logical base/delta format cost.
@@ -95,7 +99,13 @@ Current status:
   member list when the target is absent or found early. The primitive also
   checks each encoded block minimum before decoding member deltas, which gives
   large negative lookups a cheap early exit until richer block skip metadata
-  exists.
+  exists. A stats-returning probe helper reports blocks seen, blocks skipped by
+  max hint, blocks decoded, and members decoded, so tests and future profiles
+  can verify partial-decode behavior directly. Segment-backed write profiles
+  now record those probe counters from base/delta membership checks, and the
+  write comparison summary carries them through with
+  `posting_base_member_probe_skip_rate` so block-level pruning is visible in
+  benchmark output.
 - `SearchScratch` already groups fixed query arrays into `query_storage`; cold
   scratch retention now also releases query, distance, member-id, vector-batch,
   and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,
@@ -190,8 +200,15 @@ Current status:
   the existing atomic segment+manifest commit path, including coalescing
   individual and multi-record posting delta appends into one encoded delta-tail
   value per posting, which gives the future runtime backend an explicit
-  micro-batch append primitive. Segment folds can now materialize and re-encode
-  directly through retained fold scratch, avoiding separate owned
+  micro-batch append primitive. The runtime batcher also coalesces pending
+  posting-base and centroid-directory point records so a publish window keeps
+  only the latest point value while the immutable segment writer continues to
+  reject duplicate exact keys. Pending segment delta micro-batches now count
+  their exact encoded value bytes while still buffered as records, so
+  `max_pending_value_bytes` bounds delta batches as well as point values and
+  pending-tail stats expose the same encoded-byte total to fold policy.
+  Segment folds can now materialize and re-encode directly through retained
+  fold scratch, avoiding separate owned
   materialized-member and encoded-base allocations before publishing the folded
   base; when canonical base ordering is active, they use a sorted compact
   delta merge instead of linear remove/apply replay. A runtime-facing directory
@@ -211,6 +228,34 @@ Current status:
   posting hooks through it behind `posting_backend = segments`, materialize and
   fold from the segment manifest, and preserve those posting artifacts across
   reopen without writing posting-base records into the LSM namespace. Segment
+  base-header reads and fold decisions in a write transaction first consult
+  pending runtime batch point records and pending delta-tail stats, giving
+  segment-backed bulk-build parent updates and same-transaction folds the same
+  read-your-writes behavior that the LSM-backed path gets from pending LSM
+  transaction keys. Segment committed-plus-pending delta materialization now
+  merges both sources under the global delta sequence order before replay, so
+  write-transaction reads do not depend on whether a delta was already flushed
+  to a segment file or is still buffered in the runtime batch. Single-member
+  delta-op lookups use the same committed-plus-pending sequence comparison, so
+  membership checks do not prefer buffered operations over newer committed
+  operations, and the segment runtime exposes sequence-bearing latest-record
+  helpers so that path no longer has to allocate whole delta tails just to
+  compare one vector's latest op. Segment committed-plus-pending scratch replay
+  also now sorts the two delta sources inside retained replay scratch and
+  applies them in-place instead of allocating a separate materialized member
+  slice; canonical base/delta query replay uses merge-style sorted delta
+  application against sorted base members, preserving the sorted-base contract
+  across pending-overlay reads without the generic remove scan and final member
+  sort. Segment folds with a committed encoded base now stream sorted
+  committed-plus-pending deltas directly into base encoding from the existing
+  base bytes, avoiding a full decoded base member slice before writing the new
+  base. Committed and pending segment delta tails are appended directly into
+  retained query/fold/materialization scratch while collecting fold-policy
+  stats where needed, so replay no longer decodes the same delta values twice
+  or allocates separate owned delta slices on those paths. Pending in-memory
+  bases still use retained member scratch because they have no encoded base
+  value yet.
+  Segment
   file writes are now staged in the runtime batch and flushed at HBC commit
   boundaries, where the resulting segment manifest bytes are stored in the same
   LSM meta transaction as the namespace changes. Reopen prefers that committed
@@ -239,7 +284,9 @@ Current status:
   delete ignored temp/orphan physical segment files. The dense index config now
   separates `backend`, `format`, and `version`; `backend = segments,
   format = base_delta, version = 1` is an opt-in DB-facing mode while the
-  default remains `backend = lsm, format = packed_hbc, version = 1`. Generic DB
+  default remains `backend = lsm, format = packed_hbc, version = 1`. The
+  OpenAPI source and generated Zig config docs now describe that opt-in segment
+  backend instead of calling it reserved. Generic DB
   snapshots now include the self-contained bundle for segment-backed dense
   indexes and restore it before runtime repair begins, while non-segment dense
   indexes keep the existing logical-store rebuild behavior for generated/stored
@@ -892,7 +939,10 @@ implementations cleanly:
     bases, deltas, and centroid-directory records through an owned segment
     runtime store. Segment batch commits now publish the committed manifest via
     the same LSM meta transaction as HBC namespace commits, including bulk
-    publish windows and posting maintenance writes. Dense posting maintenance
+    publish windows, procedural external-vector bulk builds, and posting
+    maintenance writes. Runtime segment flushes use the loaded committed
+    manifest snapshot as authority instead of trusting any stale physical
+    manifest file left by an interrupted or uncommitted write. Dense posting maintenance
     can now run segment directory maintenance from the committed manifest,
     compact selected segment files, collect ignored temp/orphan files, publish
     the replacement manifest transactionally, and report segment run,
@@ -920,12 +970,47 @@ implementations cleanly:
     HBC private-namespace snapshot plus the referenced segment files, so DB
     snapshots and restores can preserve segment-backed dense indexes through
     the public snapshot API instead of relying on external orchestration to
-    stitch HBC metadata and segment files together. Segment query and explicit
-    base/delta materialization now decode segment bases into retained scratch,
-    replay globally sequence-sorted delta records from retained scratch, and
-    use compact sorted merge for small canonical tails instead of allocating
+    stitch HBC metadata and segment files together. Segment query, lazy snapshot
+    materialization, and explicit base/delta materialization now decode segment
+    bases into retained scratch, append committed and pending delta tails
+    directly into that scratch, replay globally sequence-sorted delta records,
+    and use compact sorted merge for small canonical tails instead of allocating
     owned intermediate base and delta slices before producing the final member
-    view. That may reduce LSM key overhead and improve sequential IO.
+    view. Segment folds also include pending runtime-batch bases and deltas in
+    their threshold decision and materialization before publishing the folded
+    base, so a fold in the same HBC transaction as a delta append cannot drop
+    that in-flight tail. Segment materialization likewise sorts committed and
+    pending delta sources into one replay stream when a write transaction has
+    buffered deltas, and segment single-member lookup compares the same global
+    sequence space through latest-record helpers instead of loading full tails
+    for the one-vector case. That preserves the format's sequence contract
+    across the file/runtime boundary. Query scratch replay applies that
+    combined stream directly into retained member scratch, using sorted merge
+    for canonical bases and avoiding a second owned materialized member buffer
+    on pending-overlay reads while preserving canonical sorted output. Fold
+    replay for committed segment bases can now stream the same sorted delta
+    summary straight from the encoded base bytes into the replacement base
+    encoder, so large committed bases do not need a decoded member slice during
+    fold. Query replay, lazy snapshot replay, explicit materialization, and fold
+    replay all append segment delta records directly into retained scratch;
+    folds collect tail stats in that same pass. This removes the duplicate
+    stats-then-replay scans, delta-location lists, and owned delta slices that
+    existed before. Fold scratch release now resets transient replay state and
+    trims retained buffers under the configured byte budget before caching the
+    scratch for reuse, so exact-size fold encoders do not still pin a previous
+    worst-case posting's memory. The HBC
+    read/write benches now expose
+    `posting_backend` in result JSON, and the comparison runner has an opt-in
+    `ENABLE_POSTING_SEGMENT_BACKEND_COMPARISON=1` mode that adds segment-backed
+    base/delta read and write arms without changing the default optimized
+    gate. The segment directory batch writer also accounts exact encoded bytes
+    for pending delta micro-batches before flush, so value-byte bounds apply
+    to buffered delta records rather than only already-encoded point values.
+    The comparison summarizer now also carries segment-relevant physical
+    IO columns, including manifest writes, renames, deletes, read-call
+    breakdowns, and bytes-per-read/write-call ratios, so segment-vs-LSM
+    comparisons can separate logical posting cost from backend file behavior.
+    That may reduce LSM key overhead and improve sequential IO.
 
     Expected win: lower LSM fanout, fewer small keys, better posting-local read
     locality, and format-specific compaction.
@@ -954,6 +1039,11 @@ tracking before making a segment-backend decision is:
 - overlay cache hit/miss/admission/eviction counts
 - query materialization ns/posting and ns/member
 - search scratch allocation count and retained bytes
+
+The write comparison summary now reports both the foreground delta density
+(`fg_delta_value_bytes_per_record`) and the total posting delta encoding density
+(`posting_delta_value_bytes_per_record`) so segment-vs-LSM rows can separate
+foreground grouping behavior from the full posting-format byte cost.
 
 Benchmarks should report these by workload shape:
 

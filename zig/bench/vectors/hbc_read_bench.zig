@@ -42,6 +42,7 @@ const Config = struct {
     use_random_ortho_trans: bool = false,
     centroid_directory_mode: hbc.HBCConfig.CentroidDirectoryMode = .hbc,
     posting_storage_mode: hbc.HBCConfig.PostingStorageMode = .packed_hbc,
+    posting_backend: hbc.HBCConfig.PostingBackend = .lsm,
     posting_base_member_block_size: usize = 32,
     dataset_mode: DatasetMode = .materialized,
     flat_centroid_block_size: usize = 128,
@@ -395,12 +396,18 @@ const Scenario = struct {
         var storage_harness = try StorageHarness.init(allocator, storage_kind);
         errdefer storage_harness.deinit();
 
-        const root_dir = try allocPrintZ(allocator, "{s}/hbc-read-bench-{s}-{s}-{d}", .{
-            if (storage_kind == .native) "/tmp" else "",
-            @tagName(storage_kind),
-            @tagName(build_kind),
-            sample_index,
-        });
+        const root_dir = if (storage_kind == .native)
+            try allocPrintZ(allocator, "/tmp/hbc-read-bench-{s}-{s}-{d}", .{
+                @tagName(storage_kind),
+                @tagName(build_kind),
+                sample_index,
+            })
+        else
+            try allocPrintZ(allocator, "hbc-read-bench-{s}-{s}-{d}", .{
+                @tagName(storage_kind),
+                @tagName(build_kind),
+                sample_index,
+            });
         errdefer allocator.free(root_dir);
 
         var index = try hbc.HBCIndex.openWithLsmStorage(allocator, root_dir, hbcConfig(cfg), storage_harness.storage());
@@ -925,7 +932,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} search_width={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} posting_storage={s} dataset_mode={s} exact_truth_cache_path={s} exact_truth_cache_hit={any} flat_centroid_block_size={d} flat_centroid_probe_count={d} flat_centroid_block_probe_count={d} max_posting_overlay_cache_bytes={d} max_posting_overlay_cache_entry_bytes={d} reopen_before_query={any} repair_postings_after_build={any} prewarm_warm_queries={any}\n",
+        "hbc read bench samples={d} vectors={d} dims={d} queries={d} k={d} batch_size={d} leaf_size={d} branching_factor={d} search_width={d} storage={s} build={s} kmeans_backend={s} kmeans_update_strategy={s} centroid_directory={s} posting_storage={s} posting_backend={s} dataset_mode={s} exact_truth_cache_path={s} exact_truth_cache_hit={any} flat_centroid_block_size={d} flat_centroid_probe_count={d} flat_centroid_block_probe_count={d} max_posting_overlay_cache_bytes={d} max_posting_overlay_cache_entry_bytes={d} reopen_before_query={any} repair_postings_after_build={any} prewarm_warm_queries={any}\n",
         .{
             cfg.samples,
             cfg.vectors,
@@ -942,6 +949,7 @@ pub fn main(init: std.process.Init) !void {
             @tagName(cfg.kmeans_update_strategy),
             @tagName(cfg.centroid_directory_mode),
             @tagName(cfg.posting_storage_mode),
+            @tagName(cfg.posting_backend),
             @tagName(cfg.dataset_mode),
             cfg.exact_truth_cache_path orelse "",
             exact_truth_result.cache_hit,
@@ -1150,16 +1158,23 @@ fn printResult(
     const recall_at_k = if (recall_total == 0) 0 else @as(f64, @floatFromInt(recall_hits)) / @as(f64, @floatFromInt(recall_total));
     const repair_ns_per_vector = @as(f64, @floatFromInt(scenario.posting_repair_after_build_ns)) / @as(f64, @floatFromInt(@max(scenario.cfg.vectors, 1)));
     try writer.print(
-        "{{\"scenario\":\"{s}_{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"centroid_directory\":\"{s}\",\"posting_storage\":\"{s}\",\"posting_base_member_block_size\":{d},\"dataset_mode\":\"{s}\",\"skip_vector_store\":{},\"branching_factor\":{d},\"search_width\":{d},\"max_posting_overlay_cache_bytes\":{d},\"max_posting_overlay_cache_entry_bytes\":{d},\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2},\"query_p50_ns\":{d},\"query_p95_ns\":{d},\"query_p99_ns\":{d},\"queries_per_second\":{d:.2},\"recall_hits\":{d},\"recall_total\":{d},\"recall_at_k\":{d:.4}",
+        "{{\"scenario\":\"{s}_{s}_{s}_{s}_{s}\",\"storage\":\"{s}\",\"build\":\"{s}\",\"centroid_directory\":\"{s}\",\"posting_storage\":\"{s}\",\"posting_backend\":\"{s}\"",
         .{
             @tagName(scenario.storage_kind),
             @tagName(scenario.build_kind),
             @tagName(scenario.cfg.posting_storage_mode),
+            @tagName(scenario.cfg.posting_backend),
             workload,
             @tagName(scenario.storage_kind),
             @tagName(scenario.build_kind),
             @tagName(scenario.cfg.centroid_directory_mode),
             @tagName(scenario.cfg.posting_storage_mode),
+            @tagName(scenario.cfg.posting_backend),
+        },
+    );
+    try writer.print(
+        ",\"posting_base_member_block_size\":{d},\"dataset_mode\":\"{s}\",\"skip_vector_store\":{},\"branching_factor\":{d},\"search_width\":{d},\"max_posting_overlay_cache_bytes\":{d},\"max_posting_overlay_cache_entry_bytes\":{d},\"sample\":{d},\"workload\":\"{s}\",\"vectors\":{d},\"dims\":{d},\"queries\":{d},\"k\":{d},\"ns\":{d},\"ns_per_query\":{d:.2},\"query_p50_ns\":{d},\"query_p95_ns\":{d},\"query_p99_ns\":{d},\"queries_per_second\":{d:.2},\"recall_hits\":{d},\"recall_total\":{d},\"recall_at_k\":{d:.4}",
+        .{
             scenario.cfg.posting_base_member_block_size,
             @tagName(scenario.cfg.dataset_mode),
             scenario.cfg.dataset_mode == .procedural,
@@ -1305,6 +1320,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
         .kmeans_update_strategy = cfg.kmeans_update_strategy,
         .centroid_directory_mode = cfg.centroid_directory_mode,
         .posting_storage_mode = cfg.posting_storage_mode,
+        .posting_backend = cfg.posting_backend,
         .posting_base_member_block_size = cfg.posting_base_member_block_size,
         .flat_centroid_block_size = cfg.flat_centroid_block_size,
         .flat_centroid_probe_count = cfg.flat_centroid_probe_count,
@@ -1483,6 +1499,9 @@ fn parseArgs(proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--posting-storage")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.posting_storage_mode = std.meta.stringToEnum(hbc.HBCConfig.PostingStorageMode, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--posting-backend")) {
+            const value = args.next() orelse return error.InvalidArgument;
+            cfg.posting_backend = std.meta.stringToEnum(hbc.HBCConfig.PostingBackend, value) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--posting-base-member-block-size")) {
             cfg.posting_base_member_block_size = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--dataset-mode")) {
@@ -1514,6 +1533,7 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             return error.InvalidArgument;
         }
     }
+    if (cfg.posting_backend == .segments and cfg.posting_storage_mode != .base_delta) return error.InvalidArgument;
     if (cfg.samples == 0 or cfg.vectors == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.k == 0 or cfg.batch_size == 0) return error.InvalidArgument;
     return cfg;
 }

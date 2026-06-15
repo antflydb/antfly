@@ -295,6 +295,13 @@ pub const PostingFormat = struct {
         encoded_len: usize = 0,
         member_count: usize,
     };
+    pub const BaseMemberProbeStats = struct {
+        found: bool = false,
+        blocks_seen: usize = 0,
+        blocks_skipped_by_max: usize = 0,
+        blocks_decoded: usize = 0,
+        members_decoded: usize = 0,
+    };
 
     pub fn encodedBaseSizeForMemberCount(member_count: usize) !usize {
         if (member_count > std.math.maxInt(u32)) return error.TooLarge;
@@ -776,6 +783,48 @@ pub const PostingFormat = struct {
         return out_count;
     }
 
+    pub fn applySortedDeltaRecordsToSortedScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        base_member_count: usize,
+        records: []PostingDeltaRecord,
+    ) !usize {
+        stableSortDeltaRecordsByVector(records);
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + records.len);
+        const base_members = scratch.member_ids[0..base_member_count];
+        const out = overlayAppendedIds(scratch);
+        var out_count: usize = 0;
+        var base_index: usize = 0;
+        var record_index: usize = 0;
+        while (base_index < base_members.len or record_index < records.len) {
+            if (record_index >= records.len) {
+                out[out_count] = base_members[base_index];
+                out_count += 1;
+                base_index += 1;
+                continue;
+            }
+            const vector_id = records[record_index].vector_id;
+            var last_op = records[record_index].op;
+            record_index += 1;
+            while (record_index < records.len and records[record_index].vector_id == vector_id) : (record_index += 1) {
+                last_op = records[record_index].op;
+            }
+            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
+                out[out_count] = base_members[base_index];
+                out_count += 1;
+            }
+            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
+            if (last_op != .tombstone) {
+                out[out_count] = vector_id;
+                out_count += 1;
+            }
+            if (present_in_base) base_index += 1;
+        }
+        try scratch.ensureMemberIdCapacity(alloc, out_count);
+        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
+        return out_count;
+    }
+
     pub fn stableSortCompactOpsByVector(ids: []VectorId, ops: []PostingDeltaOp) void {
         var i: usize = 1;
         while (i < ids.len) : (i += 1) {
@@ -788,6 +837,18 @@ pub const PostingFormat = struct {
             }
             ids[j] = id;
             ops[j] = op;
+        }
+    }
+
+    pub fn stableSortDeltaRecordsByVector(records: []PostingDeltaRecord) void {
+        var i: usize = 1;
+        while (i < records.len) : (i += 1) {
+            const record = records[i];
+            var j = i;
+            while (j > 0 and records[j - 1].vector_id > record.vector_id) : (j -= 1) {
+                records[j] = records[j - 1];
+            }
+            records[j] = record;
         }
     }
 
@@ -1017,11 +1078,19 @@ pub const PostingFormat = struct {
     }
 
     pub fn baseContainsSortedMember(data: []const u8, vector_id: VectorId) !bool {
-        return try baseContainsSortedMemberWithValidation(data, vector_id, false);
+        return (try baseContainsSortedMemberProbeWithValidation(data, vector_id, false)).found;
     }
 
     pub fn baseContainsSortedMemberStrict(data: []const u8, vector_id: VectorId) !bool {
-        return try baseContainsSortedMemberWithValidation(data, vector_id, true);
+        return (try baseContainsSortedMemberProbeWithValidation(data, vector_id, true)).found;
+    }
+
+    pub fn baseContainsSortedMemberProbe(data: []const u8, vector_id: VectorId) !BaseMemberProbeStats {
+        return try baseContainsSortedMemberProbeWithValidation(data, vector_id, false);
+    }
+
+    pub fn baseContainsSortedMemberProbeStrict(data: []const u8, vector_id: VectorId) !BaseMemberProbeStats {
+        return try baseContainsSortedMemberProbeWithValidation(data, vector_id, true);
     }
 
     pub fn baseContainsMemberStrict(data: []const u8, vector_id: VectorId) !bool {
@@ -1034,54 +1103,60 @@ pub const PostingFormat = struct {
         return found;
     }
 
-    fn baseContainsSortedMemberWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !bool {
+    fn baseContainsSortedMemberProbeWithValidation(data: []const u8, vector_id: VectorId, strict_validation: bool) !BaseMemberProbeStats {
         const header = try decodeBaseHeader(data);
         var pos: usize = base_header_size;
         var remaining_members = header.member_count;
-        var found = false;
+        var stats = BaseMemberProbeStats{};
         var resolved = false;
 
         while (remaining_members != 0) {
             const current_block_count = try readBaseBlockCount(data, &pos, remaining_members);
+            stats.blocks_seen += 1;
             const block_min = try readVarint(data, &pos);
             const block_max = try readVarint(data, &pos);
             if (block_max < block_min) return error.Corrupted;
             if (!resolved and block_min > vector_id) {
-                if (!strict_validation) return false;
+                if (!strict_validation) return stats;
                 resolved = true;
             }
             const block_payload_end = try readBaseBlockPayloadEnd(data, &pos);
             if (!resolved and block_max < vector_id) {
+                stats.blocks_skipped_by_max += 1;
                 if (!strict_validation) {
                     pos = block_payload_end;
                     remaining_members -= current_block_count;
                     continue;
                 }
+                stats.blocks_decoded += 1;
                 var skip_index: usize = 0;
                 while (skip_index < current_block_count) : (skip_index += 1) {
                     const delta = try readVarint(data, &pos);
                     if (pos > block_payload_end) return error.Corrupted;
                     const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
                     if (member > block_max) return error.Corrupted;
+                    stats.members_decoded += 1;
                 }
                 if (pos != block_payload_end) return error.Corrupted;
                 remaining_members -= current_block_count;
                 continue;
             }
 
+            stats.blocks_decoded += 1;
             var block_index: usize = 0;
             while (block_index < current_block_count) : (block_index += 1) {
                 const delta = try readVarint(data, &pos);
                 if (pos > block_payload_end) return error.Corrupted;
                 const member = std.math.add(VectorId, block_min, delta) catch return error.Corrupted;
                 if (member > block_max) return error.Corrupted;
+                stats.members_decoded += 1;
                 if (resolved) continue;
                 if (member == vector_id) {
-                    if (!strict_validation) return true;
-                    found = true;
+                    stats.found = true;
+                    if (!strict_validation) return stats;
                     resolved = true;
                 } else if (member > vector_id) {
-                    if (!strict_validation) return false;
+                    if (!strict_validation) return stats;
                     resolved = true;
                 }
             }
@@ -1089,7 +1164,7 @@ pub const PostingFormat = struct {
             remaining_members -= current_block_count;
         }
         if (pos != data.len) return error.Corrupted;
-        return found;
+        return stats;
     }
 
     pub fn decodeBaseIntoScratch(
@@ -1793,6 +1868,42 @@ pub const PostingStore = struct {
             self.resetFoldApply();
         }
 
+        pub fn prepareForRetention(self: *FoldScratch, alloc: std.mem.Allocator, max_retained_bytes: u64) void {
+            self.resetFoldApply();
+            if (max_retained_bytes == 0 or self.bytes() <= max_retained_bytes) return;
+
+            alloc.free(self.encoded_base);
+            self.encoded_base = &.{};
+            if (self.bytes() <= max_retained_bytes) return;
+
+            alloc.free(self.member_ids);
+            self.member_ids = &.{};
+            if (self.bytes() <= max_retained_bytes) return;
+
+            self.removed_members.deinit(alloc);
+            self.removed_members = .empty;
+            self.appended_positions.deinit(alloc);
+            self.appended_positions = .empty;
+            if (self.bytes() <= max_retained_bytes) return;
+
+            alloc.free(self.appended_ids);
+            self.appended_ids = &.{};
+            alloc.free(self.appended_live);
+            self.appended_live = &.{};
+            if (self.bytes() <= max_retained_bytes) return;
+
+            alloc.free(self.compact_delta_ids);
+            self.compact_delta_ids = &.{};
+            alloc.free(self.compact_delta_ops);
+            self.compact_delta_ops = &.{};
+            self.compact_delta_count = 0;
+            if (self.bytes() <= max_retained_bytes) return;
+
+            alloc.free(self.delta_records);
+            self.delta_records = &.{};
+            self.delta_record_count = 0;
+        }
+
         pub fn bytes(self: *const FoldScratch) u64 {
             return byteLen(self.delta_records) +
                 byteLen(self.compact_delta_ids) +
@@ -2257,10 +2368,11 @@ pub const PostingStore = struct {
             return err;
         };
         const base_header = try PostingFormat.decodeBaseHeader(base_data);
-        const present_in_base = if (shouldSortBaseMembers(index))
-            try PostingFormat.baseContainsSortedMemberStrict(base_data, vector_id)
-        else
-            try PostingFormat.baseContainsMemberStrict(base_data, vector_id);
+        const present_in_base = if (shouldSortBaseMembers(index)) present: {
+            const probe = try PostingFormat.baseContainsSortedMemberProbeStrict(base_data, vector_id);
+            notePostingBaseMemberProbe(index, probe);
+            break :present probe.found;
+        } else try PostingFormat.baseContainsMemberStrict(base_data, vector_id);
         const latest_delta_op = try latestDeltaOpAfterGenerationForMember(index, txn, posting_id, vector_id, base_header.generation);
         return if (latest_delta_op) |op| op != .tombstone else present_in_base;
     }
@@ -2849,7 +2961,7 @@ pub const PostingStore = struct {
         if (use_overlay_plan) {
             member_count.* = try compactMembersWithOverlayPlan(alloc, scratch, member_count.*);
         } else if (comptime can_use_delta_record_scratch) {
-            member_count.* = try applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
+            member_count.* = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
         } else {
             member_count.* = try applySortedCompactOpsToSortedScratch(alloc, scratch, member_count.*, compact_ids[0..compact_count], compact_ops[0..compact_count]);
         }
@@ -2937,7 +3049,7 @@ pub const PostingStore = struct {
                 try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + 1);
                 scratch.appendDeltaRecordAssumeCapacity(record);
             }
-            member_count.* = try applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
+            member_count.* = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
             return result;
         }
         var compact_ids: [compact_sorted_delta_max_records]VectorId = undefined;
@@ -2974,48 +3086,6 @@ pub const PostingStore = struct {
         for (records) |record| {
             try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
         }
-    }
-
-    fn applySortedDeltaRecordsToSortedScratch(
-        alloc: std.mem.Allocator,
-        scratch: anytype,
-        base_member_count: usize,
-        records: []PostingDeltaRecord,
-    ) !usize {
-        stableSortDeltaRecordsByVector(records);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + records.len);
-        const base_members = scratch.member_ids[0..base_member_count];
-        const out = PostingFormat.overlayAppendedIds(scratch);
-        var out_count: usize = 0;
-        var base_index: usize = 0;
-        var op_index: usize = 0;
-        while (base_index < base_members.len or op_index < records.len) {
-            if (op_index >= records.len) {
-                out[out_count] = base_members[base_index];
-                out_count += 1;
-                base_index += 1;
-                continue;
-            }
-            const vector_id = records[op_index].vector_id;
-            var last_op = records[op_index].op;
-            op_index += 1;
-            while (op_index < records.len and records[op_index].vector_id == vector_id) : (op_index += 1) {
-                last_op = records[op_index].op;
-            }
-            while (base_index < base_members.len and base_members[base_index] < vector_id) : (base_index += 1) {
-                out[out_count] = base_members[base_index];
-                out_count += 1;
-            }
-            const present_in_base = base_index < base_members.len and base_members[base_index] == vector_id;
-            if (last_op != .tombstone) {
-                out[out_count] = vector_id;
-                out_count += 1;
-            }
-            if (present_in_base) base_index += 1;
-        }
-        try scratch.ensureMemberIdCapacity(alloc, out_count);
-        @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
-        return out_count;
     }
 
     fn applySortedCompactOpsToSortedScratch(
@@ -3073,18 +3143,6 @@ pub const PostingStore = struct {
             }
             ids[j] = id;
             ops[j] = op;
-        }
-    }
-
-    fn stableSortDeltaRecordsByVector(records: []PostingDeltaRecord) void {
-        var i: usize = 1;
-        while (i < records.len) : (i += 1) {
-            const record = records[i];
-            var j = i;
-            while (j > 0 and records[j - 1].vector_id > record.vector_id) : (j -= 1) {
-                records[j] = records[j - 1];
-            }
-            records[j] = record;
         }
     }
 
@@ -3724,6 +3782,29 @@ fn notePostingBasePut(index: anytype, key_len: usize, encoded: []const u8) void 
     }
 }
 
+fn notePostingBaseMemberProbe(index: anytype, stats: PostingFormat.BaseMemberProbeStats) void {
+    const Index = switch (@typeInfo(@TypeOf(index))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(index),
+    };
+    if (comptime !@hasField(Index, "write_profile")) return;
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_member_probe_calls")) {
+        index.write_profile.posting_base_member_probe_calls += 1;
+    }
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_member_probe_blocks_seen")) {
+        index.write_profile.posting_base_member_probe_blocks_seen += @intCast(stats.blocks_seen);
+    }
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_member_probe_blocks_skipped_by_max")) {
+        index.write_profile.posting_base_member_probe_blocks_skipped_by_max += @intCast(stats.blocks_skipped_by_max);
+    }
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_member_probe_blocks_decoded")) {
+        index.write_profile.posting_base_member_probe_blocks_decoded += @intCast(stats.blocks_decoded);
+    }
+    if (comptime @hasField(@TypeOf(index.write_profile), "posting_base_member_probe_members_decoded")) {
+        index.write_profile.posting_base_member_probe_members_decoded += @intCast(stats.members_decoded);
+    }
+}
+
 fn noteCentroidDirectoryPut(index: anytype, key_len: usize, value_len: usize) void {
     const Index = switch (@typeInfo(@TypeOf(index))) {
         .pointer => |ptr| ptr.child,
@@ -4318,6 +4399,32 @@ test "posting state encoding round trips" {
     try std.testing.expectEqual(state.payload_dirty, decoded.payload_dirty);
 }
 
+test "posting fold scratch trims retained buffers to budget" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureDeltaRecordCapacity(alloc, 64);
+    try scratch.ensureCompactDeltaCapacity(alloc, 64);
+    try scratch.ensureEncodedBaseCapacity(alloc, 4096);
+    try scratch.ensureMemberIdCapacity(alloc, 512);
+    try scratch.ensureAppendCapacity(alloc, 512);
+    try scratch.removed_members.put(alloc, 7, {});
+    try scratch.appended_positions.put(alloc, 9, 0);
+    scratch.delta_record_count = 4;
+    scratch.compact_delta_count = 4;
+    scratch.appended_count = 4;
+
+    const before = scratch.bytes();
+    try std.testing.expect(before > 4096);
+
+    scratch.prepareForRetention(alloc, 256);
+    try std.testing.expect(scratch.bytes() <= 256);
+    try std.testing.expectEqual(@as(usize, 0), scratch.delta_record_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.compact_delta_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.appended_count);
+}
+
 test "posting base format round trips members" {
     const alloc = std.testing.allocator;
     const members = [_]VectorId{ 10, 20, 30 };
@@ -4386,6 +4493,23 @@ test "posting base sorted membership streams without full materialization" {
     try std.testing.expect(try PostingFormat.baseContainsSortedMember(encoded, 170));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 99));
     try std.testing.expect(!try PostingFormat.baseContainsSortedMember(encoded, 999));
+    const negative_probe = try PostingFormat.baseContainsSortedMemberProbe(encoded, 999);
+    try std.testing.expect(!negative_probe.found);
+    try std.testing.expectEqual(@as(usize, 3), negative_probe.blocks_seen);
+    try std.testing.expectEqual(@as(usize, 3), negative_probe.blocks_skipped_by_max);
+    try std.testing.expectEqual(@as(usize, 0), negative_probe.blocks_decoded);
+    try std.testing.expectEqual(@as(usize, 0), negative_probe.members_decoded);
+    const strict_negative_probe = try PostingFormat.baseContainsSortedMemberProbeStrict(encoded, 999);
+    try std.testing.expect(!strict_negative_probe.found);
+    try std.testing.expectEqual(@as(usize, 3), strict_negative_probe.blocks_seen);
+    try std.testing.expectEqual(@as(usize, 3), strict_negative_probe.blocks_skipped_by_max);
+    try std.testing.expectEqual(@as(usize, 3), strict_negative_probe.blocks_decoded);
+    try std.testing.expectEqual(@as(usize, members.len), strict_negative_probe.members_decoded);
+    const positive_probe = try PostingFormat.baseContainsSortedMemberProbe(encoded, 170);
+    try std.testing.expect(positive_probe.found);
+    try std.testing.expectEqual(@as(usize, 2), positive_probe.blocks_seen);
+    try std.testing.expectEqual(@as(usize, 1), positive_probe.blocks_skipped_by_max);
+    try std.testing.expectEqual(@as(usize, 1), positive_probe.blocks_decoded);
 
     const corrupt = try alloc.alloc(u8, encoded.len + 1);
     defer alloc.free(corrupt);
@@ -5831,6 +5955,11 @@ test "posting store segment backend hooks route posting persistence" {
     try std.testing.expect(try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 20, isNotFoundForPostingPersistenceTest));
     try std.testing.expect(try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 30, isNotFoundForPostingPersistenceTest));
     try std.testing.expect(!try PostingStore.containsBaseDeltaMember(&index, &txn, 9, 40, isNotFoundForPostingPersistenceTest));
+    try std.testing.expectEqual(@as(u64, 4), index.write_profile.posting_base_member_probe_calls);
+    try std.testing.expect(index.write_profile.posting_base_member_probe_blocks_seen >= 4);
+    try std.testing.expect(index.write_profile.posting_base_member_probe_blocks_skipped_by_max > 0);
+    try std.testing.expect(index.write_profile.posting_base_member_probe_blocks_decoded > 0);
+    try std.testing.expect(index.write_profile.posting_base_member_probe_members_decoded > 0);
 
     const members = try PostingStore.materializeBaseDeltaMembers(&index, &txn, 9, isNotFoundForPostingPersistenceTest);
     defer alloc.free(members);

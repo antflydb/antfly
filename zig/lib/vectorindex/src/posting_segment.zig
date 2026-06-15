@@ -455,6 +455,15 @@ pub const RuntimeDirectoryStoreOptions = struct {
     }
 };
 
+pub const DeltaTailWithStats = struct {
+    records: []posting.PostingDeltaRecord,
+    stats: posting.PostingDeltaTailStats,
+
+    pub fn deinit(self: DeltaTailWithStats, alloc: Allocator) void {
+        alloc.free(self.records);
+    }
+};
+
 pub const RuntimeDirectoryStore = struct {
     alloc: Allocator,
     io: std.Io,
@@ -516,6 +525,66 @@ pub const RuntimeDirectoryStore = struct {
         return self.batch.stats;
     }
 
+    pub fn pendingBaseHeader(self: *const RuntimeDirectoryStore, posting_id: PostingId) !?posting.PostingBaseHeader {
+        return try self.batch.pendingBaseHeader(posting_id);
+    }
+
+    pub fn pendingBaseStats(self: *const RuntimeDirectoryStore, posting_id: PostingId) !?posting.PostingBaseStats {
+        return try self.batch.pendingBaseStats(posting_id);
+    }
+
+    pub fn pendingBase(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
+        return try self.batch.pendingBase(alloc, posting_id);
+    }
+
+    pub fn pendingBaseDataAlloc(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId) !?[]u8 {
+        return try self.batch.pendingBaseDataAlloc(alloc, posting_id);
+    }
+
+    pub fn pendingCentroidDirectoryRecord(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
+        return try self.batch.pendingCentroidDirectoryRecord(alloc, posting_id);
+    }
+
+    pub fn pendingDeltaTailAlloc(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        return try self.batch.pendingDeltaTailAlloc(alloc, posting_id, min_generation);
+    }
+
+    pub fn pendingDeltaTailWithStatsAlloc(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId, base_generation: u64) !DeltaTailWithStats {
+        return try self.batch.pendingDeltaTailWithStatsAlloc(alloc, posting_id, base_generation);
+    }
+
+    pub fn appendPendingDeltaTailIntoScratchWithStats(
+        self: *const RuntimeDirectoryStore,
+        alloc: Allocator,
+        posting_id: PostingId,
+        base_generation: u64,
+        scratch: anytype,
+    ) !posting.PostingDeltaTailStats {
+        return try self.batch.appendPendingDeltaTailIntoScratchWithStats(alloc, posting_id, base_generation, scratch);
+    }
+
+    pub fn pendingDeltaTailStats(self: *const RuntimeDirectoryStore, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+        return try self.batch.pendingDeltaTailStats(posting_id, base_generation);
+    }
+
+    pub fn pendingLatestDeltaOpAfterGenerationForMember(
+        self: *const RuntimeDirectoryStore,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaOp {
+        return try self.batch.pendingLatestDeltaOpAfterGenerationForMember(posting_id, vector_id, base_generation);
+    }
+
+    pub fn pendingLatestDeltaRecordAfterGenerationForMember(
+        self: *const RuntimeDirectoryStore,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaRecord {
+        return try self.batch.pendingLatestDeltaRecordAfterGenerationForMember(posting_id, vector_id, base_generation);
+    }
+
     pub fn appendBase(self: *RuntimeDirectoryStore, posting_id: PostingId, value: []const u8) !void {
         try self.batch.appendBase(posting_id, value);
     }
@@ -545,7 +614,7 @@ pub const RuntimeDirectoryStore = struct {
     }
 
     pub fn flush(self: *RuntimeDirectoryStore) !?SegmentCommitStats {
-        const result = try self.batch.flush();
+        const result = try self.batch.flushWithManifest(self.lazy.manifest);
         if (result != null) try self.reloadManifest();
         return result;
     }
@@ -672,72 +741,31 @@ pub const LazyDirectorySnapshot = struct {
     options: OpenStoreOptions,
 
     pub fn loadBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
-        var i = self.manifest.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.manifest.segments[i];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-
-            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
-            defer alloc.free(base_data);
-            return try posting.PostingFormat.decodeBaseHeader(base_data);
-        }
-        return null;
+        const base_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .base)) orelse return null;
+        defer alloc.free(base_data);
+        return try posting.PostingFormat.decodeBaseHeader(base_data);
     }
 
     pub fn loadBaseStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseStats {
-        var i = self.manifest.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.manifest.segments[i];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-
-            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
-            defer alloc.free(base_data);
-            return try posting.PostingFormat.decodeBaseStats(base_data);
-        }
-        return null;
+        const base_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .base)) orelse return null;
+        defer alloc.free(base_data);
+        return try posting.PostingFormat.decodeBaseStats(base_data);
     }
 
     pub fn loadBase(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
-        var i = self.manifest.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.manifest.segments[i];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-
-            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
-            defer alloc.free(base_data);
-            return try posting.PostingFormat.decodeBase(alloc, base_data);
-        }
-        return null;
+        const base_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .base)) orelse return null;
+        defer alloc.free(base_data);
+        return try posting.PostingFormat.decodeBase(alloc, base_data);
     }
 
     pub fn loadBaseData(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?[]u8 {
-        var i = self.manifest.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.manifest.segments[i];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-
-            const base_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .base)) orelse continue;
-            return base_data;
-        }
-        return null;
+        return try self.readLatestPointValueAlloc(alloc, posting_id, .base);
     }
 
     pub fn loadCentroidDirectoryRecord(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
-        var i = self.manifest.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.manifest.segments[i];
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-
-            const centroid_data = (try self.readPointValueAlloc(alloc, entry, posting_id, .centroid_directory)) orelse continue;
-            defer alloc.free(centroid_data);
-            return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
-        }
-        return null;
+        const centroid_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .centroid_directory)) orelse return null;
+        defer alloc.free(centroid_data);
+        return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
     }
 
     pub fn loadDeltaTail(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
@@ -746,6 +774,26 @@ pub const LazyDirectorySnapshot = struct {
 
     pub fn loadDeltaTailAfterGeneration(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, generation: u64) ![]posting.PostingDeltaRecord {
         return try self.loadDeltaTailFilteredAlloc(alloc, posting_id, generation);
+    }
+
+    pub fn loadDeltaTailAfterGenerationWithStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, generation: u64) !DeltaTailWithStats {
+        return try self.loadDeltaTailFilteredWithStatsAlloc(alloc, posting_id, generation);
+    }
+
+    pub fn appendDeltaTailAfterGenerationIntoScratchWithStats(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        posting_id: PostingId,
+        generation: u64,
+        scratch: anytype,
+    ) !posting.PostingDeltaTailStats {
+        var stats = posting.PostingDeltaTailStats{};
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
+            try self.readDeltaRecordsIntoScratchWithStatsAlloc(alloc, entry, posting_id, generation, scratch, &stats);
+        }
+        return stats;
     }
 
     pub fn applyDeltaTailAfterGenerationIntoScratch(
@@ -856,8 +904,19 @@ pub const LazyDirectorySnapshot = struct {
         vector_id: posting.VectorId,
         base_generation: u64,
     ) !?posting.PostingDeltaOp {
+        const record = try self.latestDeltaRecordAfterGenerationForMember(alloc, posting_id, vector_id, base_generation);
+        return if (record) |found| found.op else null;
+    }
+
+    pub fn latestDeltaRecordAfterGenerationForMember(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaRecord {
         var best_sequence: u64 = 0;
-        var best_op: ?posting.PostingDeltaOp = null;
+        var best_record: ?posting.PostingDeltaRecord = null;
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
@@ -880,148 +939,33 @@ pub const LazyDirectorySnapshot = struct {
                 while (try iterator.next()) |record| {
                     if (record.vector_id != vector_id) continue;
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                    if (best_op == null or record.sequence >= best_sequence) {
+                    if (best_record == null or record.sequence >= best_sequence) {
                         best_sequence = record.sequence;
-                        best_op = record.op;
+                        best_record = record;
                     }
                 }
             }
         }
-        return best_op;
+        return best_record;
     }
 
     pub fn materializeMembers(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
-        var base_segment_id: u64 = 0;
-        var base: ?posting.OwnedPostingBase = null;
-        defer if (base) |*owned| owned.deinit(alloc);
+        var scratch = posting.PostingStore.FoldScratch{};
+        defer scratch.deinit(alloc);
 
-        var delta_locations = std.ArrayListUnmanaged(PendingDeltaLocation).empty;
-        defer delta_locations.deinit(alloc);
-
-        for (self.manifest.segments, 0..) |entry, segment_index| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
-            defer alloc.free(index_data);
-
-            const base_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .base, 0);
-            if (base_index < entry.meta.entry_count) {
-                const base_entry = try indexEntryFromBytes(index_data[base_index * index_entry_size ..][0..index_entry_size]);
-                if (base_entry.posting_id == posting_id and base_entry.kind == .base and base_entry.sequence == 0 and entry.meta.segment_id > base_segment_id) {
-                    const base_data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, base_entry);
-                    defer alloc.free(base_data);
-                    var decoded = try posting.PostingFormat.decodeBase(alloc, base_data);
-                    errdefer decoded.deinit(alloc);
-                    if (base) |*previous| previous.deinit(alloc);
-                    base = decoded;
-                    base_segment_id = entry.meta.segment_id;
-                }
-            }
-
-            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
-                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
-                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
-                try delta_locations.append(alloc, .{
-                    .segment_index = segment_index,
-                    .entry = delta_entry,
-                });
-            }
-        }
-
-        const found_base = if (base) |*owned| owned else return null;
-        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
-        errdefer records.deinit(alloc);
-        for (delta_locations.items) |location| {
-            const entry = self.manifest.segments[location.segment_index];
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= found_base.generation) continue;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, location.entry);
-            defer alloc.free(value);
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= found_base.generation) continue;
-                records.appendAssumeCapacity(record);
-            }
-        }
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
-        const owned_records = try records.toOwnedSlice(alloc);
-        defer alloc.free(owned_records);
-        return try posting.PostingFormat.materializeMembersAfterGeneration(alloc, found_base.members, owned_records, found_base.generation);
+        const member_count = (try self.materializeMembersIntoScratch(alloc, posting_id, &scratch)) orelse return null;
+        return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
     }
 
     pub fn materializeMembersIntoScratch(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, scratch: anytype) !?usize {
-        var base_segment_id: u64 = 0;
-        var base: ?posting.OwnedPostingBase = null;
-        defer if (base) |*owned| owned.deinit(alloc);
+        var found_base = (try self.loadBase(alloc, posting_id)) orelse return null;
+        defer found_base.deinit(alloc);
 
-        var delta_locations = std.ArrayListUnmanaged(PendingDeltaLocation).empty;
-        defer delta_locations.deinit(alloc);
-
-        for (self.manifest.segments, 0..) |entry, segment_index| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
-            defer alloc.free(index_data);
-
-            const base_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .base, 0);
-            if (base_index < entry.meta.entry_count) {
-                const base_entry = try indexEntryFromBytes(index_data[base_index * index_entry_size ..][0..index_entry_size]);
-                if (base_entry.posting_id == posting_id and base_entry.kind == .base and base_entry.sequence == 0 and entry.meta.segment_id > base_segment_id) {
-                    const base_data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, base_entry);
-                    defer alloc.free(base_data);
-                    var decoded = try posting.PostingFormat.decodeBase(alloc, base_data);
-                    errdefer decoded.deinit(alloc);
-                    if (base) |*previous| previous.deinit(alloc);
-                    base = decoded;
-                    base_segment_id = entry.meta.segment_id;
-                }
-            }
-
-            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
-                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
-                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
-                try delta_locations.append(alloc, .{
-                    .segment_index = segment_index,
-                    .entry = delta_entry,
-                });
-            }
-        }
-
-        const found_base = if (base) |*owned| owned else return null;
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        for (delta_locations.items) |location| {
-            const entry = self.manifest.segments[location.segment_index];
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= found_base.generation) continue;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, location.entry);
-            defer alloc.free(value);
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-            try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= found_base.generation) continue;
-                scratch.appendDeltaRecordAssumeCapacity(record);
-            }
-        }
-        const records = scratch.delta_records[0..scratch.delta_record_count];
+        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, found_base.generation, scratch);
+        const records = scratch.deltaRecordsMut();
         std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
 
         try scratch.ensureMemberIdCapacity(alloc, found_base.members.len + records.len);
@@ -1034,46 +978,8 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     pub fn materializeSortedMembersIntoScratch(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, scratch: anytype) !?usize {
-        var base_segment_id: u64 = 0;
-        var base_data: ?[]u8 = null;
-        defer if (base_data) |data| alloc.free(data);
-
-        var delta_locations = std.ArrayListUnmanaged(PendingDeltaLocation).empty;
-        defer delta_locations.deinit(alloc);
-
-        for (self.manifest.segments, 0..) |entry, segment_index| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
-            defer alloc.free(index_data);
-
-            const base_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .base, 0);
-            if (base_index < entry.meta.entry_count) {
-                const base_entry = try indexEntryFromBytes(index_data[base_index * index_entry_size ..][0..index_entry_size]);
-                if (base_entry.posting_id == posting_id and base_entry.kind == .base and base_entry.sequence == 0 and entry.meta.segment_id > base_segment_id) {
-                    const next_base_data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, base_entry);
-                    if (base_data) |previous| alloc.free(previous);
-                    base_data = next_base_data;
-                    base_segment_id = entry.meta.segment_id;
-                }
-            }
-
-            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
-                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
-                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
-                try delta_locations.append(alloc, .{
-                    .segment_index = segment_index,
-                    .entry = delta_entry,
-                });
-            }
-        }
-
-        const found_base_data = base_data orelse return null;
+        const found_base_data = (try self.loadBaseData(alloc, posting_id)) orelse return null;
+        defer alloc.free(found_base_data);
         const base_header = try posting.PostingFormat.decodeBaseHeader(found_base_data);
         scratch.resetDeltaRecords();
         scratch.resetCompactDeltaRecords();
@@ -1082,23 +988,8 @@ pub const LazyDirectorySnapshot = struct {
             scratch.resetCompactDeltaRecords();
         }
 
-        for (delta_locations.items) |location| {
-            const entry = self.manifest.segments[location.segment_index];
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_header.generation) continue;
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, location.entry);
-            defer alloc.free(value);
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-            try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_header.generation) continue;
-                scratch.appendDeltaRecordAssumeCapacity(record);
-            }
-        }
-        const records = scratch.delta_records[0..scratch.delta_record_count];
+        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_header.generation, scratch);
+        const records = scratch.deltaRecordsMut();
         std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
         try scratch.ensureCompactDeltaCapacity(alloc, records.len);
         for (records) |record| {
@@ -1108,8 +999,14 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn loadDeltaTailFilteredAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        const loaded = try self.loadDeltaTailFilteredWithStatsAlloc(alloc, posting_id, min_generation);
+        return loaded.records;
+    }
+
+    fn loadDeltaTailFilteredWithStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) !DeltaTailWithStats {
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
+        var stats = posting.PostingDeltaTailStats{};
 
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
@@ -1117,13 +1014,14 @@ pub const LazyDirectorySnapshot = struct {
                 if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
             }
 
-            const segment_records = try self.readDeltaRecordsAlloc(alloc, entry, posting_id, min_generation);
-            defer alloc.free(segment_records);
-            try records.appendSlice(alloc, segment_records);
+            try self.readDeltaRecordsWithStatsAlloc(alloc, entry, posting_id, min_generation, &records, &stats);
         }
 
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
-        return try records.toOwnedSlice(alloc);
+        return .{
+            .records = try records.toOwnedSlice(alloc),
+            .stats = stats,
+        };
     }
 
     fn readSegmentAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry) ![]u8 {
@@ -1142,12 +1040,61 @@ pub const LazyDirectorySnapshot = struct {
         }, posting_id, kind);
     }
 
+    fn readLatestPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?[]u8 {
+        var best_segment_id: u64 = 0;
+        var best_value: ?[]u8 = null;
+        errdefer if (best_value) |value| alloc.free(value);
+
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (entry.meta.segment_id <= best_segment_id) continue;
+
+            const value = (try self.readPointValueAlloc(alloc, entry, posting_id, kind)) orelse continue;
+            if (best_value) |previous| alloc.free(previous);
+            best_value = value;
+            best_segment_id = entry.meta.segment_id;
+        }
+        return best_value;
+    }
+
     fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
         if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
         return try readSegmentDeltaRecordsAlloc(alloc, self.io, self.dir, .{
             .meta = entry.meta,
             .path = entry.path,
         }, posting_id, min_generation);
+    }
+
+    fn readDeltaRecordsWithStatsAlloc(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        entry: OwnedManifestEntry,
+        posting_id: PostingId,
+        min_generation: ?u64,
+        records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+        stats: *posting.PostingDeltaTailStats,
+    ) !void {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        try readSegmentDeltaRecordsWithStatsAlloc(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id, min_generation, records, stats);
+    }
+
+    fn readDeltaRecordsIntoScratchWithStatsAlloc(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        entry: OwnedManifestEntry,
+        posting_id: PostingId,
+        base_generation: u64,
+        scratch: anytype,
+        stats: *posting.PostingDeltaTailStats,
+    ) !void {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        try readSegmentDeltaRecordsIntoScratchWithStatsAlloc(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id, base_generation, scratch, stats);
     }
 
     fn readDeltaTailStatsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
@@ -1931,6 +1878,75 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     return try records.toOwnedSlice(alloc);
 }
 
+pub fn readSegmentDeltaRecordsWithStatsAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    posting_id: PostingId,
+    min_generation: ?u64,
+    records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    const base_generation = min_generation orelse 0;
+    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+    while (index < entry.meta.entry_count) : (index += 1) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+
+        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+        defer alloc.free(value);
+        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        stats.records += iterator.recordCount();
+        stats.encoded_value_bytes += value.len;
+        try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+        while (try iterator.next()) |record| {
+            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            stats.records_after_generation += 1;
+            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+            records.appendAssumeCapacity(record);
+        }
+    }
+}
+
+pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    posting_id: PostingId,
+    base_generation: u64,
+    scratch: anytype,
+    stats: *posting.PostingDeltaTailStats,
+) !void {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+    while (index < entry.meta.entry_count) : (index += 1) {
+        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+
+        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+        defer alloc.free(value);
+        var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
+        stats.records += iterator.recordCount();
+        stats.encoded_value_bytes += value.len;
+        try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
+        while (try iterator.next()) |record| {
+            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            stats.records_after_generation += 1;
+            if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+            stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+            scratch.appendDeltaRecordAssumeCapacity(record);
+        }
+    }
+}
+
 pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
     const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
@@ -2183,12 +2199,36 @@ const PendingEntry = struct {
 
 const PendingDeltaBatch = struct {
     records: std.ArrayListUnmanaged(posting.PostingDeltaRecord) = .empty,
+    encoded_value_bytes: usize = 0,
 
     fn deinit(self: *PendingDeltaBatch, alloc: Allocator) void {
         self.records.deinit(alloc);
         self.* = .{};
     }
 };
+
+fn deltaRecordEncodedSizeFromBaseSequence(record: posting.PostingDeltaRecord, base_sequence: u64) !usize {
+    var total = posting.PostingFormat.varintSize(record.sequence - base_sequence);
+    total = try std.math.add(usize, total, 1);
+    total = try std.math.add(usize, total, posting.PostingFormat.varintSize(record.vector_id));
+    return total;
+}
+
+fn pendingDeltaBatchEncodedSizeWithRecord(batch: PendingDeltaBatch, record: posting.PostingDeltaRecord) !usize {
+    if (batch.records.items.len == 0) {
+        return try posting.PostingFormat.encodedDeltaTailSize(&.{record});
+    }
+
+    var base_sequence = record.sequence;
+    for (batch.records.items) |existing| base_sequence = @min(base_sequence, existing.sequence);
+
+    var total = posting.PostingFormat.delta_header_size;
+    for (batch.records.items) |existing| {
+        total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(existing, base_sequence));
+    }
+    total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(record, base_sequence));
+    return total;
+}
 
 const PointCandidate = struct {
     segment_id: u64,
@@ -2199,11 +2239,6 @@ const DeltaCandidate = struct {
     posting_id: PostingId,
     segment_id: u64,
     record: posting.PostingDeltaRecord,
-};
-
-const PendingDeltaLocation = struct {
-    segment_index: usize,
-    entry: IndexEntry,
 };
 
 const IndexEntry = struct {
@@ -2403,10 +2438,152 @@ pub const DirectoryBatchWriter = struct {
         return self.pending_delta_records;
     }
 
+    pub fn pendingBaseHeader(self: *const DirectoryBatchWriter, posting_id: PostingId) !?posting.PostingBaseHeader {
+        const value = self.pendingPointValue(posting_id, .base) orelse return null;
+        return try posting.PostingFormat.decodeBaseHeader(value);
+    }
+
+    pub fn pendingBaseStats(self: *const DirectoryBatchWriter, posting_id: PostingId) !?posting.PostingBaseStats {
+        const value = self.pendingPointValue(posting_id, .base) orelse return null;
+        return try posting.PostingFormat.decodeBaseStats(value);
+    }
+
+    pub fn pendingBase(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId) !?posting.OwnedPostingBase {
+        const value = self.pendingPointValue(posting_id, .base) orelse return null;
+        return try posting.PostingFormat.decodeBase(alloc, value);
+    }
+
+    pub fn pendingBaseDataAlloc(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId) !?[]u8 {
+        const value = self.pendingPointValue(posting_id, .base) orelse return null;
+        return try alloc.dupe(u8, value);
+    }
+
+    pub fn pendingCentroidDirectoryRecord(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
+        const value = self.pendingPointValue(posting_id, .centroid_directory) orelse return null;
+        return try posting.CentroidDirectoryFormat.decode(alloc, value);
+    }
+
+    pub fn pendingDeltaTailAlloc(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        errdefer records.deinit(alloc);
+
+        try self.appendPendingDeltaEntries(alloc, &records, posting_id, min_generation);
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            try records.ensureUnusedCapacity(alloc, batch.records.items.len);
+            for (batch.records.items) |record| {
+                if (min_generation) |generation| {
+                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                }
+                records.appendAssumeCapacity(record);
+            }
+        }
+
+        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        return try records.toOwnedSlice(alloc);
+    }
+
+    pub fn pendingDeltaTailWithStatsAlloc(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId, base_generation: u64) !DeltaTailWithStats {
+        var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+        errdefer records.deinit(alloc);
+        var stats = posting.PostingDeltaTailStats{};
+
+        try self.appendPendingDeltaEntriesWithStats(alloc, &records, &stats, posting_id, base_generation);
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            stats.encoded_value_bytes += batch.encoded_value_bytes;
+            try records.ensureUnusedCapacity(alloc, batch.records.items.len);
+            for (batch.records.items) |record| {
+                stats.records += 1;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                stats.records_after_generation += 1;
+                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+                records.appendAssumeCapacity(record);
+            }
+        }
+
+        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        return .{
+            .records = try records.toOwnedSlice(alloc),
+            .stats = stats,
+        };
+    }
+
+    pub fn appendPendingDeltaTailIntoScratchWithStats(
+        self: *const DirectoryBatchWriter,
+        alloc: Allocator,
+        posting_id: PostingId,
+        base_generation: u64,
+        scratch: anytype,
+    ) !posting.PostingDeltaTailStats {
+        var stats = posting.PostingDeltaTailStats{};
+
+        try self.appendPendingDeltaEntriesIntoScratchWithStats(alloc, scratch, &stats, posting_id, base_generation);
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            stats.encoded_value_bytes += batch.encoded_value_bytes;
+            try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + batch.records.items.len);
+            for (batch.records.items) |record| {
+                stats.records += 1;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                stats.records_after_generation += 1;
+                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+                scratch.appendDeltaRecordAssumeCapacity(record);
+            }
+        }
+
+        return stats;
+    }
+
+    pub fn pendingDeltaTailStats(self: *const DirectoryBatchWriter, posting_id: PostingId, base_generation: u64) !posting.PostingDeltaTailStats {
+        var out = posting.PostingDeltaTailStats{};
+        try self.accumulatePendingDeltaEntryStats(&out, posting_id, base_generation);
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            out.encoded_value_bytes += batch.encoded_value_bytes;
+            for (batch.records.items) |record| {
+                out.records += 1;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                out.records_after_generation += 1;
+                if (record.op == .tombstone) out.tombstones_after_generation += 1;
+                out.max_sequence_after_generation = @max(out.max_sequence_after_generation, record.sequence);
+            }
+        }
+        return out;
+    }
+
+    pub fn pendingLatestDeltaOpAfterGenerationForMember(
+        self: *const DirectoryBatchWriter,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaOp {
+        const record = try self.pendingLatestDeltaRecordAfterGenerationForMember(posting_id, vector_id, base_generation);
+        return if (record) |found| found.op else null;
+    }
+
+    pub fn pendingLatestDeltaRecordAfterGenerationForMember(
+        self: *const DirectoryBatchWriter,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+    ) !?posting.PostingDeltaRecord {
+        var best_sequence: u64 = 0;
+        var best_record: ?posting.PostingDeltaRecord = null;
+        try self.latestPendingDeltaEntryAfterGenerationForMember(posting_id, vector_id, base_generation, &best_sequence, &best_record);
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            for (batch.records.items) |record| {
+                if (record.vector_id != vector_id) continue;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (best_record == null or record.sequence >= best_sequence) {
+                    best_sequence = record.sequence;
+                    best_record = record;
+                }
+            }
+        }
+        return best_record;
+    }
+
     pub fn appendBase(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
-        try self.prepareForAppend(value.len);
-        try self.writer.appendBase(posting_id, value);
-        try self.notePendingAppend(value.len);
+        try self.appendLatestPoint(posting_id, .base, value);
     }
 
     pub fn appendPostingBase(self: *DirectoryBatchWriter, base: posting.PostingBase) !void {
@@ -2416,9 +2593,7 @@ pub const DirectoryBatchWriter = struct {
     }
 
     pub fn appendCentroidDirectory(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
-        try self.prepareForAppend(value.len);
-        try self.writer.appendCentroidDirectory(posting_id, value);
-        try self.notePendingAppend(value.len);
+        try self.appendLatestPoint(posting_id, .centroid_directory, value);
     }
 
     pub fn appendCentroidDirectoryRecord(self: *DirectoryBatchWriter, record: posting.CentroidDirectoryRecord) !void {
@@ -2444,10 +2619,28 @@ pub const DirectoryBatchWriter = struct {
         if (self.options.max_pending_delta_records != 0 and self.pending_delta_records + 1 > self.options.max_pending_delta_records) {
             _ = try self.flush();
         }
-        const existed = self.pending_delta_batches.contains(posting_id);
-        if (!existed and self.options.max_pending_entries != 0 and self.pendingEntries() + 1 > self.options.max_pending_entries) {
-            _ = try self.flush();
+
+        if (self.pending_delta_batches.get(posting_id)) |batch| {
+            const next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecord(batch, record);
+            if (self.options.max_pending_value_bytes != 0 and
+                self.pendingEntries() != 0 and
+                self.pending_value_bytes - batch.encoded_value_bytes + next_encoded_value_bytes > self.options.max_pending_value_bytes)
+            {
+                _ = try self.flush();
+            }
+        } else {
+            const next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecord(.{}, record);
+            if (!self.pending_delta_batches.contains(posting_id) and self.options.max_pending_entries != 0 and self.pendingEntries() + 1 > self.options.max_pending_entries) {
+                _ = try self.flush();
+            }
+            if (self.options.max_pending_value_bytes != 0 and
+                self.pendingEntries() != 0 and
+                self.pending_value_bytes + next_encoded_value_bytes > self.options.max_pending_value_bytes)
+            {
+                _ = try self.flush();
+            }
         }
+
         const gop = try self.pending_delta_batches.getOrPut(self.alloc, posting_id);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
@@ -2456,20 +2649,36 @@ pub const DirectoryBatchWriter = struct {
             gop.value_ptr.deinit(self.alloc);
             _ = self.pending_delta_batches.remove(posting_id);
         };
+        const previous_encoded_value_bytes = gop.value_ptr.encoded_value_bytes;
+        const next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecord(gop.value_ptr.*, record);
+        const pending_value_bytes_without_batch = self.pending_value_bytes - previous_encoded_value_bytes;
+        const next_pending_value_bytes = std.math.add(usize, pending_value_bytes_without_batch, next_encoded_value_bytes) catch return error.PostingSegmentTooLarge;
         try gop.value_ptr.records.append(self.alloc, record);
+        gop.value_ptr.encoded_value_bytes = next_encoded_value_bytes;
+        self.pending_value_bytes = next_pending_value_bytes;
         self.pending_delta_records += 1;
-        if (self.options.max_pending_delta_records != 0 and self.pending_delta_records >= self.options.max_pending_delta_records) {
+        if ((self.options.max_pending_delta_records != 0 and self.pending_delta_records >= self.options.max_pending_delta_records) or
+            (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes))
+        {
             _ = try self.flush();
         }
     }
 
     pub fn flush(self: *DirectoryBatchWriter) !?SegmentCommitStats {
+        var manifest = try readManifestForCommitAlloc(self.alloc, self.io, self.dir, self.options.commit);
+        defer manifest.deinit(self.alloc);
+        return try self.flushWithManifest(manifest);
+    }
+
+    pub fn flushWithManifest(self: *DirectoryBatchWriter, manifest: OwnedManifest) !?SegmentCommitStats {
         const pending_delta_records = self.pending_delta_records;
         try self.drainPendingDeltaBatches();
         if (self.writer.entries.items.len == 0) return null;
         const pending_entries = self.writer.entries.items.len;
         const pending_value_bytes = self.pending_value_bytes;
-        var result = try commitWriterToDirectoryAlloc(self.alloc, self.io, self.dir, &self.writer, self.options.commit);
+        var built = try self.writer.buildSegment(manifest.next_segment_id);
+        defer built.deinit(self.alloc);
+        var result = try commitBuiltSegmentToDirectoryWithManifestAlloc(self.alloc, self.io, self.dir, built, manifest, self.options.commit);
         defer result.deinit(self.alloc);
 
         self.stats.flushed_segments += 1;
@@ -2497,6 +2706,154 @@ pub const DirectoryBatchWriter = struct {
         }
     }
 
+    fn appendLatestPoint(self: *DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind, value: []const u8) !void {
+        std.debug.assert(kind != .delta);
+        if (try self.replacePendingPoint(posting_id, kind, value)) return;
+        try self.prepareForAppend(value.len);
+        switch (kind) {
+            .base => try self.writer.appendBase(posting_id, value),
+            .centroid_directory => try self.writer.appendCentroidDirectory(posting_id, value),
+            .delta => unreachable,
+        }
+        try self.notePendingAppend(value.len);
+    }
+
+    fn pendingPointValue(self: *const DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind) ?[]const u8 {
+        std.debug.assert(kind != .delta);
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id == posting_id and entry.kind == kind and entry.sequence == 0) return entry.value;
+        }
+        return null;
+    }
+
+    fn appendPendingDeltaEntries(
+        self: *const DirectoryBatchWriter,
+        alloc: Allocator,
+        records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+        posting_id: PostingId,
+        min_generation: ?u64,
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
+            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            while (try iterator.next()) |record| {
+                if (min_generation) |generation| {
+                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                }
+                records.appendAssumeCapacity(record);
+            }
+        }
+    }
+
+    fn appendPendingDeltaEntriesWithStats(
+        self: *const DirectoryBatchWriter,
+        alloc: Allocator,
+        records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+        stats: *posting.PostingDeltaTailStats,
+        posting_id: PostingId,
+        base_generation: u64,
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
+            stats.records += iterator.recordCount();
+            stats.encoded_value_bytes += entry.value.len;
+            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            while (try iterator.next()) |record| {
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                stats.records_after_generation += 1;
+                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+                records.appendAssumeCapacity(record);
+            }
+        }
+    }
+
+    fn appendPendingDeltaEntriesIntoScratchWithStats(
+        self: *const DirectoryBatchWriter,
+        alloc: Allocator,
+        scratch: anytype,
+        stats: *posting.PostingDeltaTailStats,
+        posting_id: PostingId,
+        base_generation: u64,
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
+            stats.records += iterator.recordCount();
+            stats.encoded_value_bytes += entry.value.len;
+            try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
+            while (try iterator.next()) |record| {
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                stats.records_after_generation += 1;
+                if (record.op == .tombstone) stats.tombstones_after_generation += 1;
+                stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
+                scratch.appendDeltaRecordAssumeCapacity(record);
+            }
+        }
+    }
+
+    fn accumulatePendingDeltaEntryStats(
+        self: *const DirectoryBatchWriter,
+        out: *posting.PostingDeltaTailStats,
+        posting_id: PostingId,
+        base_generation: u64,
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            out.encoded_value_bytes += entry.value.len;
+            const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            out.records += stats.records;
+            out.records_after_generation += stats.records_after_generation;
+            out.tombstones_after_generation += stats.tombstones_after_generation;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
+        }
+    }
+
+    fn latestPendingDeltaEntryAfterGenerationForMember(
+        self: *const DirectoryBatchWriter,
+        posting_id: PostingId,
+        vector_id: posting.VectorId,
+        base_generation: u64,
+        best_sequence: *u64,
+        best_record: *?posting.PostingDeltaRecord,
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
+            while (try iterator.next()) |record| {
+                if (record.vector_id != vector_id) continue;
+                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (best_record.* == null or record.sequence >= best_sequence.*) {
+                    best_sequence.* = record.sequence;
+                    best_record.* = record;
+                }
+            }
+        }
+    }
+
+    fn replacePendingPoint(self: *DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind, value: []const u8) !bool {
+        std.debug.assert(kind != .delta);
+        for (self.writer.entries.items) |*entry| {
+            if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != 0) continue;
+            const owned = try self.alloc.dupe(u8, value);
+            const old_len = entry.value.len;
+            self.alloc.free(entry.value);
+            entry.value = owned;
+            if (value.len >= old_len) {
+                self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, value.len - old_len) catch return error.PostingSegmentTooLarge;
+            } else {
+                self.pending_value_bytes -= old_len - value.len;
+            }
+            if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes) {
+                _ = try self.flush();
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn notePendingAppend(self: *DirectoryBatchWriter, value_len: usize) !void {
         self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, value_len) catch return error.PostingSegmentTooLarge;
         if (self.options.max_pending_entries != 0 and self.pendingEntries() >= self.options.max_pending_entries) {
@@ -2518,7 +2875,6 @@ pub const DirectoryBatchWriter = struct {
             const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, entry.value_ptr.records.items);
             defer self.alloc.free(encoded);
             try self.writer.appendDelta(entry.key_ptr.*, min_sequence, encoded);
-            self.pending_value_bytes = std.math.add(usize, self.pending_value_bytes, encoded.len) catch return error.PostingSegmentTooLarge;
         }
         self.clearPendingDeltaBatches();
     }
@@ -4165,6 +4521,200 @@ pub fn testDirectoryBatchWriterFlushesBoundedSegments() !void {
     defer loaded_centroid.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), loaded_centroid.mutation_version);
     try std.testing.expectEqual(@as(u64, 3), loaded_centroid.payload_version);
+
+    {
+        var value_tmp = std.testing.tmpDir(.{});
+        defer value_tmp.cleanup();
+
+        const record_1 = posting.PostingDeltaRecord{
+            .sequence = (@as(u64, 2) << 32) | 1,
+            .op = .insert,
+            .vector_id = 10,
+        };
+        const record_2 = posting.PostingDeltaRecord{
+            .sequence = (@as(u64, 2) << 32) | 2,
+            .op = .insert,
+            .vector_id = 20,
+        };
+        const single_delta_value_bytes = try posting.PostingFormat.encodedDeltaTailSize(&.{record_1});
+        var value_bounded = DirectoryBatchWriter.init(alloc, std.testing.io, value_tmp.dir, .{
+            .max_pending_entries = 64,
+            .max_pending_value_bytes = single_delta_value_bytes + 1,
+            .max_pending_delta_records = 64,
+        });
+        defer value_bounded.deinit();
+
+        try value_bounded.appendDeltaRecord(7, record_1);
+        try std.testing.expectEqual(@as(usize, 0), value_bounded.stats.flushed_segments);
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.pendingEntries());
+        try value_bounded.appendDeltaRecord(9, record_2);
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.stats.flushed_segments);
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.stats.committed_entries);
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.stats.committed_delta_records);
+        try std.testing.expectEqual(single_delta_value_bytes, value_bounded.stats.committed_value_bytes);
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.pendingEntries());
+        try std.testing.expectEqual(@as(usize, 1), value_bounded.pendingDeltaRecords());
+    }
+}
+
+pub fn testDirectoryBatchWriterCoalescesPendingPointRecords() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(old_base);
+    const new_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(new_base);
+    const old_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 2,
+        .payload_version = 3,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 1.25,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    defer alloc.free(old_centroid);
+    const new_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 5,
+        .payload_version = 8,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 3,
+        .bounds_radius = 2.5,
+        .centroid = &.{ 3.0, 4.0 },
+    });
+    defer alloc.free(new_centroid);
+
+    var batcher = DirectoryBatchWriter.init(alloc, std.testing.io, tmp.dir, .{
+        .max_pending_entries = 64,
+        .max_pending_value_bytes = 0,
+    });
+    defer batcher.deinit();
+
+    try batcher.appendBase(7, old_base);
+    try batcher.appendCentroidDirectory(7, old_centroid);
+    try batcher.appendBase(7, new_base);
+    try batcher.appendCentroidDirectory(7, new_centroid);
+    try std.testing.expectEqual(@as(usize, 2), batcher.pendingEntries());
+
+    _ = (try batcher.flush()).?;
+    try std.testing.expectEqual(@as(usize, 1), batcher.stats.flushed_segments);
+    try std.testing.expectEqual(@as(usize, 2), batcher.stats.committed_entries);
+
+    var store = try openStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer store.deinit(alloc);
+    const snapshot = store.snapshot();
+    const header = (try snapshot.loadBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 2), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+
+    var loaded_centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer loaded_centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), loaded_centroid.generation);
+    try std.testing.expectEqual(@as(u64, 5), loaded_centroid.mutation_version);
+    try std.testing.expectEqual(@as(usize, 3), loaded_centroid.member_count);
+}
+
+pub fn testRuntimeDirectoryStoreExposesPendingReadOverlay() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try RuntimeDirectoryStore.openAlloc(alloc, std.testing.io, tmp.dir, .{
+        .max_pending_entries = 64,
+        .max_pending_value_bytes = 64 * 1024,
+        .max_pending_delta_records = 64,
+    });
+    defer store.deinit();
+
+    try store.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 3,
+        .members = &.{ 10, 20 },
+    });
+    try store.appendCentroidDirectoryRecord(.{
+        .posting_id = 7,
+        .generation = 4,
+        .mutation_version = 5,
+        .payload_version = 6,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 1,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 1.25,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    try store.appendDeltaRecord(7, .{
+        .sequence = (@as(u64, 4) << 32) | 1,
+        .op = .insert,
+        .vector_id = 30,
+    });
+    try store.appendDeltaRecord(7, .{
+        .sequence = (@as(u64, 4) << 32) | 2,
+        .op = .tombstone,
+        .vector_id = 10,
+    });
+
+    try std.testing.expectEqual(@as(?posting.PostingBaseHeader, null), try store.snapshot().loadBaseHeader(alloc, 7));
+    const header = (try store.pendingBaseHeader(7)).?;
+    try std.testing.expectEqual(@as(u64, 3), header.generation);
+    try std.testing.expectEqual(@as(usize, 2), header.member_count);
+
+    var base = (try store.pendingBase(alloc, 7)).?;
+    defer base.deinit(alloc);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20 }, base.members);
+
+    var centroid = (try store.pendingCentroidDirectoryRecord(alloc, 7)).?;
+    defer centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 5), centroid.mutation_version);
+    try std.testing.expectEqual(@as(usize, 2), centroid.member_count);
+
+    const records = try store.pendingDeltaTailAlloc(alloc, 7, 3);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(@as(posting.VectorId, 30), records[0].vector_id);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, records[1].op);
+
+    const stats = try store.pendingDeltaTailStats(7, 3);
+    try std.testing.expectEqual(@as(usize, 2), stats.records);
+    try std.testing.expectEqual(@as(usize, 2), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), stats.tombstones_after_generation);
+    try std.testing.expectEqual(try posting.PostingFormat.encodedDeltaTailSize(records), stats.encoded_value_bytes);
+    const records_with_stats = try store.pendingDeltaTailWithStatsAlloc(alloc, 7, 3);
+    defer records_with_stats.deinit(alloc);
+    try std.testing.expectEqualSlices(posting.PostingDeltaRecord, records, records_with_stats.records);
+    try std.testing.expectEqual(stats.records, records_with_stats.stats.records);
+    try std.testing.expectEqual(stats.records_after_generation, records_with_stats.stats.records_after_generation);
+    try std.testing.expectEqual(stats.tombstones_after_generation, records_with_stats.stats.tombstones_after_generation);
+    try std.testing.expectEqual(stats.encoded_value_bytes, records_with_stats.stats.encoded_value_bytes);
+    var delta_scratch = posting.PostingStore.FoldScratch{};
+    defer delta_scratch.deinit(alloc);
+    const scratch_stats = try store.appendPendingDeltaTailIntoScratchWithStats(alloc, 7, 3, &delta_scratch);
+    try std.testing.expectEqualSlices(posting.PostingDeltaRecord, records, delta_scratch.deltaRecords());
+    try std.testing.expectEqual(stats.records, scratch_stats.records);
+    try std.testing.expectEqual(stats.records_after_generation, scratch_stats.records_after_generation);
+    try std.testing.expectEqual(stats.tombstones_after_generation, scratch_stats.tombstones_after_generation);
+    try std.testing.expectEqual(stats.encoded_value_bytes, scratch_stats.encoded_value_bytes);
+    const latest_record = (try store.pendingLatestDeltaRecordAfterGenerationForMember(7, 10, 3)).?;
+    try std.testing.expectEqual((@as(u64, 4) << 32) | 2, latest_record.sequence);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, latest_record.op);
+    try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, (try store.pendingLatestDeltaOpAfterGenerationForMember(7, 10, 3)).?);
 }
 
 pub fn testRuntimeDirectoryStoreRefreshesSnapshots() !void {
@@ -4239,6 +4789,59 @@ pub fn testRuntimeDirectoryStoreRefreshesSnapshots() !void {
     try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, members_after_maintenance);
     try std.testing.expectEqual(@as(usize, 0), store.pendingEntries());
     try std.testing.expectEqual(@as(usize, 0), store.pendingDeltaRecords());
+}
+
+pub fn testRuntimeDirectoryStoreFlushUsesLoadedManifest() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stale_entries = [_]ManifestEntry{.{
+        .meta = .{
+            .segment_id = 99,
+            .min_posting_id = 1,
+            .max_posting_id = 100,
+            .byte_len = 123,
+            .entry_count = 1,
+        },
+        .path = "postings/stale.afps",
+    }};
+    const stale_manifest_data = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 100,
+        .segments = stale_entries[0..],
+    });
+    defer alloc.free(stale_manifest_data);
+    try writeManifestFileAlloc(alloc, std.testing.io, tmp.dir, default_manifest_path, stale_manifest_data);
+
+    const committed_empty_manifest = try encodeManifestAlloc(alloc, .{
+        .next_segment_id = 1,
+        .segments = &.{},
+    });
+    defer alloc.free(committed_empty_manifest);
+
+    var store = try RuntimeDirectoryStore.openAllocWithManifestData(alloc, std.testing.io, tmp.dir, .{
+        .max_pending_entries = 64,
+        .max_pending_value_bytes = 64 * 1024,
+        .max_pending_delta_records = 64,
+    }, committed_empty_manifest);
+    defer store.deinit();
+
+    try store.appendPostingBase(.{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    const flushed = (try store.flush()).?;
+    try std.testing.expectEqual(@as(u64, 1), flushed.segment_id);
+    try std.testing.expectEqual(@as(usize, 1), store.snapshot().manifest.segments.len);
+    try std.testing.expectEqual(@as(u64, 2), store.snapshot().manifest.next_segment_id);
+
+    const manifest_data = try tmp.dir.readFileAlloc(std.testing.io, default_manifest_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(manifest_data);
+    var manifest = try decodeManifestAlloc(alloc, manifest_data);
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), manifest.segments.len);
+    try std.testing.expectEqual(@as(u64, 1), manifest.segments[0].meta.segment_id);
 }
 
 pub fn testDirectoryCompactionReplacesManifestSegments() !void {
@@ -4811,6 +5414,21 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqual(@as(usize, 1), current_stats.records_after_generation);
     try std.testing.expectEqual(delta.len, current_stats.encoded_value_bytes);
     try std.testing.expectEqual(live_sequence, current_stats.max_sequence_after_generation);
+    const current_with_stats = try snapshot.loadDeltaTailAfterGenerationWithStats(alloc, 7, 1);
+    defer current_with_stats.deinit(alloc);
+    try std.testing.expectEqualSlices(posting.PostingDeltaRecord, current_records, current_with_stats.records);
+    try std.testing.expectEqual(current_stats.records, current_with_stats.stats.records);
+    try std.testing.expectEqual(current_stats.records_after_generation, current_with_stats.stats.records_after_generation);
+    try std.testing.expectEqual(current_stats.encoded_value_bytes, current_with_stats.stats.encoded_value_bytes);
+    try std.testing.expectEqual(current_stats.max_sequence_after_generation, current_with_stats.stats.max_sequence_after_generation);
+    var delta_scratch = posting.PostingStore.FoldScratch{};
+    defer delta_scratch.deinit(alloc);
+    const scratch_stats = try snapshot.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, 7, 1, &delta_scratch);
+    try std.testing.expectEqualSlices(posting.PostingDeltaRecord, current_records, delta_scratch.deltaRecords());
+    try std.testing.expectEqual(current_stats.records, scratch_stats.records);
+    try std.testing.expectEqual(current_stats.records_after_generation, scratch_stats.records_after_generation);
+    try std.testing.expectEqual(current_stats.encoded_value_bytes, scratch_stats.encoded_value_bytes);
+    try std.testing.expectEqual(current_stats.max_sequence_after_generation, scratch_stats.max_sequence_after_generation);
 
     const materialized = (try snapshot.materializeMembers(alloc, 7)).?;
     defer alloc.free(materialized);
@@ -4820,6 +5438,100 @@ pub fn testLazyDirectoryStoreLoadsDeltaTail() !void {
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..scratch_count]);
     const sorted_scratch_count = (try snapshot.materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
     try std.testing.expectEqualSlices(posting.VectorId, materialized, scratch.member_ids[0..sorted_scratch_count]);
+}
+
+pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{10},
+    });
+    defer alloc.free(old_base);
+    const old_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .mutation_version = 1,
+        .payload_version = 1,
+        .flags = 0,
+        .parent = 1,
+        .level = 0,
+        .member_count = 1,
+        .bounds_radius = 1.0,
+        .centroid = &.{ 1.0, 2.0 },
+    });
+    defer alloc.free(old_centroid);
+    var writer_1 = Writer.init(alloc);
+    defer writer_1.deinit();
+    try writer_1.appendBase(7, old_base);
+    try writer_1.appendCentroidDirectory(7, old_centroid);
+    var committed_1 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_1, .{});
+    defer committed_1.deinit(alloc);
+
+    const new_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .members = &.{ 20, 30 },
+    });
+    defer alloc.free(new_base);
+    const new_centroid = try posting.CentroidDirectoryFormat.encode(alloc, .{
+        .posting_id = 7,
+        .generation = 2,
+        .mutation_version = 4,
+        .payload_version = 5,
+        .flags = posting.CentroidDirectoryFormat.dirty_flag,
+        .parent = 2,
+        .level = 0,
+        .member_count = 2,
+        .bounds_radius = 2.0,
+        .centroid = &.{ 3.0, 4.0 },
+    });
+    defer alloc.free(new_centroid);
+    var writer_2 = Writer.init(alloc);
+    defer writer_2.deinit();
+    try writer_2.appendBase(7, new_base);
+    try writer_2.appendCentroidDirectory(7, new_centroid);
+    var committed_2 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_2, .{});
+    defer committed_2.deinit(alloc);
+
+    const stale_sequence = (@as(u64, 2) << 32) | 1;
+    const live_sequence = (@as(u64, 3) << 32) | 1;
+    var writer_3 = Writer.init(alloc);
+    defer writer_3.deinit();
+    try writer_3.appendPostingDeltaRecords(7, &.{
+        .{ .sequence = stale_sequence, .op = .insert, .vector_id = 99 },
+        .{ .sequence = live_sequence, .op = .insert, .vector_id = 40 },
+    });
+    var committed_3 = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &writer_3, .{});
+    defer committed_3.deinit(alloc);
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), lazy.manifest.segments.len);
+    std.mem.swap(OwnedManifestEntry, &lazy.manifest.segments[0], &lazy.manifest.segments[1]);
+
+    const snapshot = lazy.snapshot();
+    const header = (try snapshot.loadBaseHeader(alloc, 7)).?;
+    try std.testing.expectEqual(@as(u64, 2), header.generation);
+    try std.testing.expectEqual(@as(usize, 2), header.member_count);
+
+    var centroid = (try snapshot.loadCentroidDirectoryRecord(alloc, 7)).?;
+    defer centroid.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), centroid.generation);
+    try std.testing.expectEqual(@as(u64, 4), centroid.mutation_version);
+    try std.testing.expectEqual(@as(usize, 2), centroid.member_count);
+
+    const materialized = (try snapshot.materializeMembers(alloc, 7)).?;
+    defer alloc.free(materialized);
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 20, 30, 40 }, materialized);
+
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+    const scratch_count = (try snapshot.materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 20, 30, 40 }, scratch.member_ids[0..scratch_count]);
 }
 
 pub fn testTypedBaseDeltaFacadeRoundTripsThroughDirectoryStore() !void {
@@ -5216,6 +5928,10 @@ test "posting segment lazy directory store reads only candidate segments" {
 
 test "posting segment lazy directory store loads delta tail" {
     try testLazyDirectoryStoreLoadsDeltaTail();
+}
+
+test "posting segment lazy directory store uses newest point records by segment id" {
+    try testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId();
 }
 
 test "posting segment typed base delta facade round trips through directory store" {

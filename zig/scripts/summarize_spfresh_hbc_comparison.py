@@ -30,6 +30,7 @@ WRITE_COLUMNS = [
     "label",
     "workload",
     "posting",
+    "backend",
     "directory",
     "dataset_mode",
     "recall_mode",
@@ -54,6 +55,8 @@ WRITE_COLUMNS = [
     "warm_quant_internal_misses",
     "warm_quant_leaf_misses",
     "warm_query_read_ranges",
+    "warm_query_read_bytes",
+    "warm_query_read_bytes_per_range",
     "ns_per_vector",
     "fg_node_bytes",
     "fg_node_bytes_vs_packed",
@@ -61,6 +64,16 @@ WRITE_COLUMNS = [
     "storage_write_bytes_vs_packed",
     "storage_write_files",
     "storage_write_files_vs_packed",
+    "storage_write_bytes_per_file",
+    "storage_manifest_write_bytes",
+    "storage_manifest_write_files",
+    "storage_manifest_write_bytes_per_file",
+    "storage_renames",
+    "storage_delete_files",
+    "storage_delete_trees",
+    "storage_read_bytes",
+    "storage_read_ranges",
+    "storage_read_bytes_per_range",
     "logical_write_puts",
     "logical_write_puts_vs_packed",
     "lsm_run_bytes",
@@ -86,6 +99,9 @@ WRITE_COLUMNS = [
     "fg_delta_legacy_value_bytes",
     "fg_delta_value_bytes_per_record",
     "fg_delta_value_bytes_vs_legacy",
+    "posting_delta_records",
+    "posting_delta_value_bytes",
+    "posting_delta_value_bytes_per_record",
     "posting_base_value_bytes",
     "posting_base_fixed_width_value_bytes",
     "posting_base_value_bytes_vs_fixed_width",
@@ -93,6 +109,12 @@ WRITE_COLUMNS = [
     "posting_base_blocks",
     "posting_base_members_per_block",
     "posting_base_value_bytes_per_block",
+    "posting_base_member_probe_calls",
+    "posting_base_member_probe_blocks_seen",
+    "posting_base_member_probe_blocks_skipped_by_max",
+    "posting_base_member_probe_skip_rate",
+    "posting_base_member_probe_blocks_decoded",
+    "posting_base_member_probe_members_decoded",
     "posting_base_decode_ns",
     "posting_base_decode_members",
     "posting_base_decode_ns_per_member",
@@ -213,6 +235,7 @@ READ_COLUMNS = [
     "label",
     "workload",
     "posting",
+    "backend",
     "directory",
     "dataset_mode",
     "skip_vector_store",
@@ -228,6 +251,12 @@ READ_COLUMNS = [
     "p95_vs_packed",
     "read_bytes",
     "read_bytes_vs_packed",
+    "read_files",
+    "read_ranges",
+    "read_trailers",
+    "file_size_calls",
+    "read_bytes_per_range",
+    "read_bytes_per_call",
     "cache_bytes",
     "workspace_bytes",
     "exact_truth_build_ns",
@@ -537,6 +566,7 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "label": first(group, "comparison_label"),
                 "workload": first(group, "workload"),
                 "posting": first(group, "posting_storage"),
+                "backend": first(group, "posting_backend"),
                 "directory": directory_name(group),
                 "dataset_mode": first(group, "dataset_mode"),
                 "recall_mode": first(group, "post_write_recall_mode"),
@@ -570,10 +600,22 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "post_write_warm_storage_read_range",
                     "post_write_storage_read_range",
                 ),
+                "warm_query_read_bytes": preferred_mean(
+                    group,
+                    "post_write_warm_storage_read_bytes",
+                    "post_write_storage_read_bytes",
+                ),
                 "ns_per_vector": mean(group, "ns_per_vector"),
                 "fg_node_bytes": preferred_mean(group, "foreground_ns_nodes_value_bytes", "ns_nodes_value_bytes"),
                 "storage_write_bytes": mean(group, "storage_write_bytes"),
                 "storage_write_files": mean(group, "storage_write_file"),
+                "storage_manifest_write_bytes": mean(group, "storage_manifest_write_bytes"),
+                "storage_manifest_write_files": mean(group, "storage_manifest_write_file"),
+                "storage_renames": mean(group, "storage_rename"),
+                "storage_delete_files": mean(group, "storage_delete_file"),
+                "storage_delete_trees": mean(group, "storage_delete_tree"),
+                "storage_read_bytes": mean(group, "storage_read_bytes"),
+                "storage_read_ranges": mean(group, "storage_read_range"),
                 "logical_write_puts": mean_numeric_sum(
                     group,
                     "ns_nodes_put_calls",
@@ -613,10 +655,17 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "foreground_posting_delta_value_bytes",
                     "posting_delta_value_bytes",
                 ),
+                "posting_delta_records": mean(group, "posting_delta_records"),
+                "posting_delta_value_bytes": mean(group, "posting_delta_value_bytes"),
                 "posting_base_value_bytes": mean(group, "posting_base_value_bytes"),
                 "posting_base_fixed_width_value_bytes": mean(group, "posting_base_fixed_width_value_bytes"),
                 "posting_base_members": mean(group, "posting_base_members"),
                 "posting_base_blocks": mean(group, "posting_base_blocks"),
+                "posting_base_member_probe_calls": mean(group, "posting_base_member_probe_calls"),
+                "posting_base_member_probe_blocks_seen": mean(group, "posting_base_member_probe_blocks_seen"),
+                "posting_base_member_probe_blocks_skipped_by_max": mean(group, "posting_base_member_probe_blocks_skipped_by_max"),
+                "posting_base_member_probe_blocks_decoded": mean(group, "posting_base_member_probe_blocks_decoded"),
+                "posting_base_member_probe_members_decoded": mean(group, "posting_base_member_probe_members_decoded"),
                 "posting_base_decode_ns": preferred_mean(
                     group,
                     "post_write_warm_profile_posting_base_decode_ns",
@@ -1005,6 +1054,22 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("storage_write_files"),
             baseline.get("storage_write_files") if baseline else None,
         )
+        summary["storage_write_bytes_per_file"] = safe_ratio(
+            summary.get("storage_write_bytes"),
+            summary.get("storage_write_files"),
+        )
+        summary["storage_manifest_write_bytes_per_file"] = safe_ratio(
+            summary.get("storage_manifest_write_bytes"),
+            summary.get("storage_manifest_write_files"),
+        )
+        summary["storage_read_bytes_per_range"] = safe_ratio(
+            summary.get("storage_read_bytes"),
+            summary.get("storage_read_ranges"),
+        )
+        summary["warm_query_read_bytes_per_range"] = safe_ratio(
+            summary.get("warm_query_read_bytes"),
+            summary.get("warm_query_read_ranges"),
+        )
         summary["logical_write_puts_vs_packed"] = ratio(
             summary.get("logical_write_puts"),
             baseline.get("logical_write_puts") if baseline else None,
@@ -1045,6 +1110,10 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             summary.get("fg_delta_value_bytes"),
             summary.get("fg_delta_legacy_value_bytes"),
         )
+        summary["posting_delta_value_bytes_per_record"] = safe_ratio(
+            summary.get("posting_delta_value_bytes"),
+            summary.get("posting_delta_records"),
+        )
         summary["posting_base_value_bytes_vs_fixed_width"] = ratio(
             summary.get("posting_base_value_bytes"),
             summary.get("posting_base_fixed_width_value_bytes"),
@@ -1060,6 +1129,10 @@ def summarize_write(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["posting_base_value_bytes_per_block"] = safe_ratio(
             summary.get("posting_base_value_bytes"),
             summary.get("posting_base_blocks"),
+        )
+        summary["posting_base_member_probe_skip_rate"] = safe_ratio(
+            summary.get("posting_base_member_probe_blocks_skipped_by_max"),
+            summary.get("posting_base_member_probe_blocks_seen"),
         )
         summary["posting_base_decode_ns_per_member"] = safe_ratio(
             summary.get("posting_base_decode_ns"),
@@ -1112,6 +1185,7 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "label": first(group, "comparison_label"),
                 "workload": first(group, "workload"),
                 "posting": first(group, "posting_storage"),
+                "backend": first(group, "posting_backend"),
                 "directory": directory_name(group),
                 "dataset_mode": first(group, "dataset_mode"),
                 "skip_vector_store": first(group, "skip_vector_store"),
@@ -1123,6 +1197,10 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ns_per_query": mean(group, "ns_per_query"),
                 "p95_ns": mean(group, "query_p95_ns"),
                 "read_bytes": mean(group, "storage_read_bytes"),
+                "read_files": mean(group, "storage_read_file"),
+                "read_ranges": mean(group, "storage_read_range"),
+                "read_trailers": mean(group, "storage_read_trailer"),
+                "file_size_calls": mean(group, "storage_file_size"),
                 "cache_bytes": mean(group, "hbc_cache_total_bytes"),
                 "workspace_bytes": mean(group, "search_workspace_bytes"),
                 "exact_truth_build_ns": mean(group, "exact_truth_build_ns"),
@@ -1178,6 +1256,14 @@ def summarize_read(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         summary["read_bytes_vs_packed"] = ratio(
             summary.get("read_bytes"),
             baseline.get("read_bytes") if baseline else None,
+        )
+        summary["read_bytes_per_range"] = safe_ratio(
+            summary.get("read_bytes"),
+            summary.get("read_ranges"),
+        )
+        summary["read_bytes_per_call"] = safe_ratio(
+            summary.get("read_bytes"),
+            numeric_sum(summary, "read_files", "read_ranges", "read_trailers"),
         )
         summary["overlay_cache_hit_rate"] = cache_hit_rate(
             summary.get("overlay_cache_hits"),
