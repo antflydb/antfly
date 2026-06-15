@@ -61642,11 +61642,13 @@ const AppParityCorpusCoverage = struct {
     insert: bool = false,
     insert_source: bool = false,
     insert_source_expression_assignment: bool = false,
+    insert_source_regexp_expression_assignment: bool = false,
     insert_source_computed_pattern_source: bool = false,
     insert_source_expression_or_source: bool = false,
     insert_source_expression_not_source: bool = false,
     insert_source_returning_all_expression: bool = false,
     insert_source_conflict_json_set_expression: bool = false,
+    insert_source_conflict_regexp_expression: bool = false,
     insert_source_conflict_boolean_is_not_guard: bool = false,
     update: bool = false,
     delete: bool = false,
@@ -63278,6 +63280,15 @@ const AppParityCorpusCoverage = struct {
         self.insert_source_expression_assignment = self.insert_source_expression_assignment or
             (entry.family == .insert_source and
                 std.mem.indexOf(u8, entry.plan, ":assignment_expr=") != null);
+        self.insert_source_regexp_expression_assignment = self.insert_source_regexp_expression_assignment or
+            (entry.family == .insert_source and
+                std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null and
+                std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
+                std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
+                std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") and
+                appParityPlanHasNonZeroToken(entry.plan, ":assignment_expr=") and
+                appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.insert_source_computed_pattern_source = self.insert_source_computed_pattern_source or
             (entry.family == .insert_source and
                 uses_computed_pattern and
@@ -63295,6 +63306,11 @@ const AppParityCorpusCoverage = struct {
         self.insert_source_conflict_json_set_expression = self.insert_source_conflict_json_set_expression or
             (entry.family == .insert_source and
                 appParityPlanHasNonZeroToken(entry.plan, ":conflict_json_set_expr="));
+        self.insert_source_conflict_regexp_expression = self.insert_source_conflict_regexp_expression or
+            (entry.family == .insert_source and
+                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
+                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
+                appParityPlanHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
         self.insert_source_conflict_boolean_is_not_guard = self.insert_source_conflict_boolean_is_not_guard or
             (entry.family == .insert_source and
                 appParityPlanHasNonZeroToken(entry.plan, ":conflict_where_any=") and
@@ -63345,10 +63361,12 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.insert);
         try std.testing.expect(self.insert_source);
         try std.testing.expect(self.insert_source_expression_assignment);
+        try std.testing.expect(self.insert_source_regexp_expression_assignment);
         try std.testing.expect(self.insert_source_computed_pattern_source);
         try std.testing.expect(self.insert_source_expression_or_source);
         try std.testing.expect(self.insert_source_expression_not_source);
         try std.testing.expect(self.insert_source_returning_all_expression);
+        try std.testing.expect(self.insert_source_conflict_regexp_expression);
         try std.testing.expect(self.insert_source_cross_table_source_schema);
         try std.testing.expect(self.joined_source_cross_table_source_schema);
         try std.testing.expect(self.read_join_cross_table_source_schema);
@@ -67186,6 +67204,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['ready%', 'queued%']) RETURNING id, status",
         },
         .{
+            .name = "same-table insert select regexp expression assignment",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .operations = 3, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=2:returning_expr=1:returning_all=0:assignment_expr=2",
+            .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, regexp_substr(status, '[a-z]+') AS status, regexp_count(status, '[0-9]+') AS amount FROM usage_records WHERE regexp_like(status, '^ready', true) RETURNING id, status, regexp_instr(status, '[0-9]+') AS first_digit",
+        },
+        .{
             .name = "same-table insert select computed expression or source plan",
             .family = .insert_source,
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .operations = 3, .returning = 2 },
@@ -67219,6 +67244,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 3, .patch_expressions = 1, .returning = 2 },
             .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=1:source_order=0:source_limit=-1:assignments=3:conflict=1:returning=2:returning_expr=0:returning_all=0:assignment_expr=1:conflict_action=update:conflict_patch_expr=1",
             .sql = "INSERT INTO usage_records (id, status, tags) SELECT id, status, string_to_array(status, ' ') AS tags FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET tags = array_append((tags), excluded.status) RETURNING id, tags",
+        },
+        .{
+            .name = "same-table insert select conflict regexp patch expression",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 3, .patch_expressions = 2, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=1:source_order=0:source_limit=-1:assignments=3:conflict=1:returning=2:returning_expr=0:returning_all=0:conflict_action=update:conflict_patch_expr=2",
+            .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = regexp_substr(excluded.status, '[a-z]+'), amount = regexp_count(excluded.status, '[0-9]+') RETURNING id, status",
         },
         .{
             .name = "same-table insert select conflict boolean guard conjunction",
