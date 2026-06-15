@@ -246,6 +246,10 @@ fn sqlKeywordIsRegexpCountFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "regexp_count");
 }
 
+fn sqlKeywordIsRegexpInstrFunction(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "regexp_instr");
+}
+
 fn rowExpressionBoundaryKeyword(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "as") or
         std.ascii.eqlIgnoreCase(text, "from") or
@@ -16616,6 +16620,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -16692,6 +16697,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -17270,6 +17276,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
@@ -18528,6 +18535,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -21036,6 +21044,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -21325,6 +21334,7 @@ const Parser = struct {
         if (self.peekKeyword("replace")) return try self.parseConflictReplaceExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekKeyword("regexp_replace")) return try self.parseConflictRegexpReplaceExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekRegexpCountFunctionCall()) return try self.parseConflictRegexpCountExpressionAlloc(column, insert_columns, expected_type);
+        if (self.peekRegexpInstrFunctionCall()) return try self.parseConflictRegexpInstrExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekTranslateFunctionCall()) return try self.parseConflictTranslateExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return try self.parseConflictConcatExpressionAlloc(column, insert_columns, expected_type);
         if (self.peekKeyword("coalesce")) return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, expected_type);
@@ -21467,6 +21477,7 @@ const Parser = struct {
             self.peekKeyword("replace") or
             self.peekKeyword("regexp_replace") or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -22402,6 +22413,35 @@ const Parser = struct {
         try self.expect(.rparen);
         return .{
             .kind = .regexp_count,
+            .operands = operands,
+        };
+    }
+
+    fn parseConflictRegexpInstrExpressionAlloc(
+        self: *@This(),
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) !db_mod.types.RelationalRowsExpression {
+        if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
+        if (!self.matchRegexpInstrFunctionKeyword()) return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (operands[0..initialized]) |operand| freeExpression(self.alloc, operand);
+            self.alloc.free(operands);
+        }
+        operands[0] = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
+        initialized += 1;
+        try self.validateTextRowExpression(operands[0]);
+        try self.expect(.comma);
+        operands[1] = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
+        initialized += 1;
+        try self.validateTextRowExpression(operands[1]);
+        try self.expect(.rparen);
+        return .{
+            .kind = .regexp_instr,
             .operands = operands,
         };
     }
@@ -24548,6 +24588,7 @@ const Parser = struct {
             .replace => "replace",
             .regexp_replace => "regexp_replace",
             .regexp_count => "regexp_count",
+            .regexp_instr => "regexp_instr",
             .translate => "translate",
             .substring => "substring",
             .overlay => "overlay",
@@ -24881,6 +24922,7 @@ const Parser = struct {
             self.peekKeyword("coalesce") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekKeyword("nullif") or
             self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
@@ -24918,6 +24960,7 @@ const Parser = struct {
         if (self.peekKeyword("regexp_replace")) return true;
         if (self.peekRegexpMatchFunctionCall()) return true;
         if (self.peekRegexpCountFunctionCall()) return true;
+        if (self.peekRegexpInstrFunctionCall()) return true;
         if (self.peekTranslateFunctionCall()) return true;
         if (self.peekKeyword("concat_ws")) return true;
         if (self.jsonExtractNullTestPredicateCanStartAt(self.pos)) return true;
@@ -29114,6 +29157,7 @@ const Parser = struct {
             self.peekJsonBuildObjectFunctionCall() or
             self.peekKeyword("to_jsonb") or
             self.peekArrayLengthFunctionCall() or self.peekArrayPositionFunctionCall() or self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace") or self.peekKeyword("array_to_string") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("coalesce") or self.peekTrimVariantFunctionCall() or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekRegexpMatchFunctionCall() or self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or self.peekKeyword("nullif") or self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
             self.peekChrFunctionCall() or
@@ -29314,6 +29358,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("concat") or
             self.peekKeyword("concat_ws") or
@@ -29938,6 +29983,7 @@ const Parser = struct {
             self.peekKeyword("regexp_replace") or
             self.peekRegexpMatchFunctionCall() or
             self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or
             self.peekKeyword("case") or
             self.peekKeyword("cast") or
@@ -31079,6 +31125,7 @@ const Parser = struct {
     fn peekSimpleReturningField(self: *@This()) bool {
         if (!self.peekKind(.identifier)) return false;
         if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekInitcapFunctionCall() or self.peekKeyword("trim") or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or self.peekRegexpMatchFunctionCall() or self.peekRegexpCountFunctionCall() or
+            self.peekRegexpInstrFunctionCall() or
             self.peekTranslateFunctionCall() or self.peekKeyword("concat") or self.peekKeyword("concat_ws") or self.peekKeyword("coalesce") or self.peekKeyword("nullif") or self.peekTextLengthFunctionKeyword() or
             self.peekAsciiFunctionCall() or
             self.peekChrFunctionCall() or
@@ -31363,6 +31410,7 @@ const Parser = struct {
         if (self.peekKeyword("regexp_replace")) return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() };
         if (self.peekRegexpMatchFunctionCall()) return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() };
         if (self.peekRegexpCountFunctionCall()) return .{ .expression = try self.parseRegexpCountExpressionProjectionAlloc() };
+        if (self.peekRegexpInstrFunctionCall()) return .{ .expression = try self.parseRegexpInstrExpressionProjectionAlloc() };
         if (self.peekTranslateFunctionCall()) return .{ .expression = try self.parseTranslateExpressionProjectionAlloc() };
         if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
         if (self.peekKeyword("nullif")) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
@@ -32006,7 +32054,7 @@ const Parser = struct {
                 if (expression.operands.len != 1) return error.UnsupportedSqlShape;
                 try self.validateJsonRowExpression(expression.operands[0]);
             },
-            .regexp_count => {
+            .regexp_count, .regexp_instr => {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
                 try self.validateTextRowExpression(expression.operands[0]);
                 try self.validateTextRowExpression(expression.operands[1]);
@@ -32188,7 +32236,7 @@ const Parser = struct {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
                 return try self.rowExpressionOutputType(expression.operands[0]);
             },
-            .length, .octet_length, .strpos, .ascii, .regexp_count, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
+            .length, .octet_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
             .add, .sub => {
                 if (expression.operands.len > 0 and @This().sqlExpressionContainsInterval(expression)) {
                     return try self.rowExpressionOutputType(expression.operands[0]);
@@ -32744,6 +32792,48 @@ const Parser = struct {
         try self.expect(.rparen);
         return .{
             .kind = .regexp_count,
+            .operands = operands,
+        };
+    }
+
+    fn parseRegexpInstrExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
+        const expression = try self.parseRegexpInstrRowExpressionAlloc();
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        const output = if (self.matchKeyword("as"))
+            try self.parseIdentifierOwned()
+        else
+            try self.alloc.dupe(u8, "regexp_instr");
+        var output_transferred = false;
+        errdefer if (!output_transferred) self.alloc.free(output);
+
+        expression_transferred = true;
+        output_transferred = true;
+        return .{
+            .output = output,
+            .expression = expression,
+        };
+    }
+
+    fn parseRegexpInstrRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
+        if (!self.matchRegexpInstrFunctionKeyword()) return error.UnsupportedSqlShape;
+        try self.expect(.lparen);
+        const operands = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (operands[0..initialized]) |operand| freeExpression(self.alloc, operand);
+            self.alloc.free(operands);
+        }
+        operands[0] = try self.parseRowExpressionAlloc();
+        initialized += 1;
+        try self.validateTextRowExpression(operands[0]);
+        try self.expect(.comma);
+        operands[1] = try self.parseRowExpressionAlloc();
+        initialized += 1;
+        try self.validateTextRowExpression(operands[1]);
+        try self.expect(.rparen);
+        return .{
+            .kind = .regexp_instr,
             .operands = operands,
         };
     }
@@ -33965,6 +34055,9 @@ const Parser = struct {
         }
         if (self.peekRegexpCountFunctionCall()) {
             return try self.parseRegexpCountRowExpressionAlloc();
+        }
+        if (self.peekRegexpInstrFunctionCall()) {
+            return try self.parseRegexpInstrRowExpressionAlloc();
         }
         if (self.peekTranslateFunctionCall()) {
             return try self.parseTranslateRowExpressionAlloc();
@@ -36487,6 +36580,14 @@ const Parser = struct {
             self.tokens[self.pos + 1].kind == .lparen;
     }
 
+    fn peekRegexpInstrFunctionCall(self: *@This()) bool {
+        if (self.pos + 1 >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        return token.kind == .identifier and
+            sqlKeywordIsRegexpInstrFunction(token.text) and
+            self.tokens[self.pos + 1].kind == .lparen;
+    }
+
     fn matchRegexpMatchFunctionKeyword(self: *@This()) bool {
         if (self.pos >= self.tokens.len) return false;
         const token = self.tokens[self.pos];
@@ -36499,6 +36600,14 @@ const Parser = struct {
         if (self.pos >= self.tokens.len) return false;
         const token = self.tokens[self.pos];
         if (token.kind != .identifier or !sqlKeywordIsRegexpCountFunction(token.text)) return false;
+        self.pos += 1;
+        return true;
+    }
+
+    fn matchRegexpInstrFunctionKeyword(self: *@This()) bool {
+        if (self.pos >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        if (token.kind != .identifier or !sqlKeywordIsRegexpInstrFunction(token.text)) return false;
         self.pos += 1;
         return true;
     }
@@ -41246,7 +41355,7 @@ fn checkExpressionTypeForColumns(
             }
             return .{ .type = .numeric };
         },
-        .regexp_count => {
+        .regexp_count, .regexp_instr => {
             if (expression.operands.len != 2) return error.InvalidSqlCatalog;
             for (expression.operands) |operand| {
                 if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
@@ -53800,6 +53909,23 @@ test "postgres sql adapter lowers length into expression AST" {
     try std.testing.expect(regexp_counted.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_counted.query.order_by[0].expression.?.kind);
 
+    var regexp_positioned = try lowerSelectAlloc(
+        alloc,
+        "SELECT regexp_instr(status, '[0-9]+') AS status_digit_pos FROM usage_records WHERE regexp_instr(status, $1) > 0 ORDER BY regexp_instr(status, '[A-Z]+') DESC LIMIT 5",
+        schema,
+        &.{.{ .string = "[0-9]+" }},
+    );
+    defer regexp_positioned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.query.expressions.len);
+    try std.testing.expectEqualStrings("status_digit_pos", regexp_positioned.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_positioned.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.query.order_by.len);
+    try std.testing.expect(regexp_positioned.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.query.order_by[0].expression.?.kind);
+
     var substring = try lowerSelectAlloc(
         alloc,
         "SELECT substring(status FROM 2 FOR 3) AS status_mid FROM usage_records WHERE substr(status, 1, 2) = $1 ORDER BY substring(status FROM 2) ASC LIMIT 5",
@@ -61575,6 +61701,7 @@ const AppParityCorpusCoverage = struct {
     query_regexp_replace_expression: bool = false,
     query_regexp_match_expression: bool = false,
     query_regexp_count_expression: bool = false,
+    query_regexp_instr_expression: bool = false,
     query_pad_expression: bool = false,
     query_repeat_expression: bool = false,
     query_reverse_expression: bool = false,
@@ -62680,6 +62807,11 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
             appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
+        self.query_regexp_instr_expression = self.query_regexp_instr_expression or (entry.family == .query and
+            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_pad_expression = self.query_pad_expression or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, "lpad(status") != null and
             std.mem.indexOf(u8, entry.sql, "rpad(status") != null and
@@ -63181,6 +63313,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.query_regexp_replace_expression);
         try std.testing.expect(self.query_regexp_match_expression);
         try std.testing.expect(self.query_regexp_count_expression);
+        try std.testing.expect(self.query_regexp_instr_expression);
         try std.testing.expect(self.query_pad_expression);
         try std.testing.expect(self.query_repeat_expression);
         try std.testing.expect(self.query_reverse_expression);
@@ -65012,6 +65145,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
             .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
             .sql = "SELECT id, regexp_count(status, '[0-9]+') AS status_digits FROM usage_records WHERE regexp_count(status, $1) > 0 ORDER BY regexp_count(status, '[A-Z]+') DESC LIMIT 5",
+            .params = &.{.{ .string = "[0-9]+" }},
+        },
+        .{
+            .name = "single table regexp instr predicate projection and order query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+            .sql = "SELECT id, regexp_instr(status, '[0-9]+') AS status_digit_pos FROM usage_records WHERE regexp_instr(status, $1) > 0 ORDER BY regexp_instr(status, '[A-Z]+') DESC LIMIT 5",
             .params = &.{.{ .string = "[0-9]+" }},
         },
         .{
@@ -74056,6 +74197,22 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     try std.testing.expectEqualStrings("3", regexp_count_patch.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), regexp_count_patch.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":3}", regexp_count_patch.batch.returning_rows[0]);
+
+    var regexp_instr_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'A1B22C333') ON CONFLICT (email) DO UPDATE SET amount = regexp_instr(excluded.next_status, '[0-9]+') RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_instr_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_instr_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_instr_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", regexp_instr_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("2", regexp_instr_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_instr_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":2}", regexp_instr_patch.batch.returning_rows[0]);
 
     var ascii_patch = try lowerInsertWithResolverAlloc(
         alloc,

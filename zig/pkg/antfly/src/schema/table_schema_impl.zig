@@ -2596,7 +2596,7 @@ fn relationalRowsExpressionType(
             }
             return .text;
         },
-        .regexp_count => {
+        .regexp_count, .regexp_instr => {
             if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
             for (expression.operands) |operand| {
                 if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
@@ -4691,6 +4691,7 @@ fn parseRelationalRowsExpressionKind(op: []const u8) !storage_schema.RelationalR
     if (std.mem.eql(u8, op, "ilike")) return .ilike;
     if (std.mem.eql(u8, op, "regexp_match")) return .regexp_match;
     if (std.mem.eql(u8, op, "regexp_count")) return .regexp_count;
+    if (std.mem.eql(u8, op, "regexp_instr")) return .regexp_instr;
     if (std.mem.eql(u8, op, "and") or std.mem.eql(u8, op, "bool_and")) return .bool_and;
     if (std.mem.eql(u8, op, "or") or std.mem.eql(u8, op, "bool_or")) return .bool_or;
     if (std.mem.eql(u8, op, "not") or std.mem.eql(u8, op, "bool_not")) return .bool_not;
@@ -4751,7 +4752,7 @@ fn validateRelationalRowsExpressionArity(kind: storage_schema.RelationalRowsExpr
         .substring => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
         .overlay => if (len != 3 and len != 4) return error.InvalidSchemaUpdateRequest,
         .json_build_object => if (len % 2 != 0) return error.InvalidSchemaUpdateRequest,
-        .strpos, .left, .right, .repeat, .starts_with, .ends_with, .like, .ilike, .regexp_count, .nullif, .sub, .div, .mod, .array_position, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .string_to_array => if (len != 2) return error.InvalidSchemaUpdateRequest,
+        .strpos, .left, .right, .repeat, .starts_with, .ends_with, .like, .ilike, .regexp_count, .regexp_instr, .nullif, .sub, .div, .mod, .array_position, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .string_to_array => if (len != 2) return error.InvalidSchemaUpdateRequest,
         .regexp_match => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
         .array_replace => if (len != 3) return error.InvalidSchemaUpdateRequest,
         .array_to_string => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
