@@ -110,7 +110,7 @@
         "name": "memoryaf_wasm",
         "mode": "wasm",
         "artifact": "target/wasm32-wasip2/release/memoryaf_extension.wasm",
-        "config_json": "{\"abi\":\"antfly-extension/v1\",\"entrypoint\":\"memoryaf_call_tool\",\"wit\":\"wit/antfly-extension.wit\"}"
+        "config_json": "{\"abi\":\"antfly-extension/v1\",\"entrypoint\":\"call-tool\",\"wit\":\"wit/antfly-extension.wit\"}"
       }
     ],
     "config_schema_json": "{\"type\":\"object\",\"properties\":{\"default_project\":{\"type\":\"string\"},\"default_visibility\":{\"type\":\"string\",\"enum\":[\"team\",\"private\"]},\"embedding_model\":{\"type\":\"string\"},\"ephemeral_ttl\":{\"type\":\"string\"}}}"

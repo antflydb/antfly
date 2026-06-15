@@ -16,6 +16,7 @@ const std = @import("std");
 const schema_mod = @import("../schema/mod.zig");
 
 pub const lifecycle = @import("lifecycle.zig");
+pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
 
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";

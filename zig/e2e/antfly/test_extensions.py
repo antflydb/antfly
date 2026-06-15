@@ -85,6 +85,7 @@ class _ExtensionProcess:
             raise
 
     def _start_swarm(self) -> None:
+        env = self._server_env()
         command = [
             self.binary,
             "swarm",
@@ -107,11 +108,12 @@ class _ExtensionProcess:
             "--extension-package-store",
             str(self.package_store),
         ]
-        self.swarm_proc = subprocess.Popen(command, stdout=self.swarm_log_file, stderr=subprocess.STDOUT, cwd=self.root)
+        self.swarm_proc = subprocess.Popen(command, stdout=self.swarm_log_file, stderr=subprocess.STDOUT, cwd=self.root, env=env)
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"swarm extension server failed to start\n{self.debug_logs()}")
 
     def _start_distributed(self) -> None:
+        env = self._server_env()
         metadata_command = _metadata_command(
             self.binary,
             host=self.host,
@@ -125,6 +127,7 @@ class _ExtensionProcess:
             stdout=self.metadata_log_file,
             stderr=subprocess.STDOUT,
             cwd=self.root,
+            env=env,
         )
         if not wait_for_server(self.metadata_admin_url, path="/metadata/v1/status"):
             raise RuntimeError(f"metadata extension server failed to start\n{self.debug_logs()}")
@@ -142,9 +145,15 @@ class _ExtensionProcess:
             stdout=self.data_log_file,
             stderr=subprocess.STDOUT,
             cwd=self.root,
+            env=env,
         )
         if not wait_for_server(self.api_url):
             raise RuntimeError(f"data extension server failed to start\n{self.debug_logs()}")
+
+    def _server_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["ANTFLY_EXTENSION_PACKAGE_STORE"] = str(self.package_store)
+        return env
 
     def debug_logs(self) -> str:
         for handle in (self.swarm_log_file, self.metadata_log_file, self.data_log_file):
@@ -200,6 +209,26 @@ def _check_response(response: requests.Response) -> Any:
 
 
 def test_extension_package_routes_match_swarm_and_distributed(extension_server: _ExtensionProcess) -> None:
+    _assert_extension_package_routes(extension_server)
+
+
+def test_extension_memoryaf_wasm_runtime_required() -> None:
+    if not os.environ.get("ANTFLY_WASMTIME_LIB"):
+        pytest.skip("set ANTFLY_WASMTIME_LIB to run the required Wasmtime extension runtime e2e")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).expanduser().resolve()
+    if binary.name != "antfly":
+        pytest.skip("extension e2e requires the unified antfly binary")
+    if not binary.exists():
+        pytest.skip(f"antfly binary not built: {binary}")
+
+    server = _ExtensionProcess(str(binary), "swarm")
+    try:
+        _assert_extension_package_routes(server)
+    finally:
+        server.stop()
+
+
+def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> None:
     session = requests.Session()
     base_url = extension_server.url
 
@@ -283,3 +312,66 @@ def test_extension_package_routes_match_swarm_and_distributed(extension_server: 
     tool_names = {tool["name"] for tool in tools["result"]["tools"]}
     assert {"store_memory", "search_memories", "list_memories"}.issubset(tool_names)
     assert "create_table" not in tool_names
+
+    if not os.environ.get("ANTFLY_WASMTIME_LIB"):
+        return
+
+    store = _check_response(
+        session.post(
+            mcp_endpoint,
+            headers={"Mcp-Session-Id": mcp_session_id},
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "store_memory",
+                    "arguments": {
+                        "content": "Extension runtimes should be executable",
+                        "project": "antfly",
+                        "visibility": "team",
+                    },
+                },
+            },
+            timeout=10,
+        )
+    )
+    assert store["result"]["isError"] is False
+    assert store["result"]["structuredContent"]["ok"] is True
+    assert store["result"]["structuredContent"]["tool"] == "store_memory"
+    assert "db.write(memory_record)" in store["result"]["structuredContent"]["host_calls"]
+    assert "ai.embed(content)" in store["result"]["structuredContent"]["host_calls"]
+
+    search = _check_response(
+        session.post(
+            mcp_endpoint,
+            headers={"Mcp-Session-Id": mcp_session_id},
+            json={
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "search_memories", "arguments": {"query": "extension runtime", "limit": 5}},
+            },
+            timeout=10,
+        )
+    )
+    assert search["result"]["isError"] is False
+    assert search["result"]["structuredContent"]["tool"] == "search_memories"
+    assert search["result"]["structuredContent"]["query"] == "extension runtime"
+    assert search["result"]["structuredContent"]["limit"] == 5
+
+    missing_query = _check_response(
+        session.post(
+            mcp_endpoint,
+            headers={"Mcp-Session-Id": mcp_session_id},
+            json={
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "search_memories", "arguments": {}},
+            },
+            timeout=10,
+        )
+    )
+    assert missing_query["result"]["isError"] is True
+    assert missing_query["result"]["structuredContent"]["error"]["code"] == "invalid_request"

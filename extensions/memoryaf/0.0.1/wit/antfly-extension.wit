@@ -6,19 +6,21 @@ interface db {
 }
 
 interface ai {
-  embed: func(model: string, text: string) -> result<list<float32>, string>;
+  embed: func(model: string, text: string) -> result<list<f32>, string>;
 }
 
 interface mcp {
-  tool-result: record {
+  record tool-result {
     content-json: string,
   }
 }
 
 world extension {
+  use mcp.{tool-result};
+
   import db;
   import ai;
 
   export init: func(config-json: string) -> result<_, string>;
-  export call-tool: func(name: string, request-json: string) -> result<mcp.tool-result, string>;
+  export call-tool: func(name: string, request-json: string) -> result<tool-result, string>;
 }

@@ -2,14 +2,12 @@
 
 This is a reference Antfly extension package for MemoryAF. It declares the MemoryAF data shape, MCP tools, and a WASM runtime artifact that Antfly can host behind `/mcp/v1/extensions/memoryaf`.
 
-The checked-in Rust crate is intentionally small and dependency-free. It exposes a C-style ABI today:
+The checked-in Rust crate is intentionally small. It uses `wit-bindgen` to export the generic `antfly-extension/v1` WIT world:
 
-- `memoryaf_alloc`
-- `memoryaf_dealloc`
-- `memoryaf_free_buffer`
-- `memoryaf_call_tool`
+- `init(config-json: string) -> result<_, string>`
+- `call-tool(name: string, request-json: string) -> result<tool-result, string>`
 
-The WIT file in `wit/antfly-extension.wit` describes the long-term component-model ABI Antfly should host once the extension runtime supports WASM components directly.
+The WIT file in `wit/antfly-extension.wit` is the runtime ABI Antfly hosts through Wasmtime's component model.
 
 ## Build
 
@@ -32,7 +30,7 @@ The package declares three MCP tools:
 - `search_memories`
 - `list_memories`
 
-The current Rust implementation returns planned host calls such as `db.write(memory_record)` and `ai.embed(content)`. Once Antfly has a WASM host runtime, those planned calls should become real imported host calls through the WIT ABI.
+The current Rust implementation returns planned host calls such as `db.write(memory_record)` and `ai.embed(content)`. Those planned calls should become real imported host calls through the WIT ABI as host capabilities are added.
 
 ## Package Layout
 

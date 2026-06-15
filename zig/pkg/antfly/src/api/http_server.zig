@@ -9929,9 +9929,9 @@ test "api http server lists extension-owned mcp tools" {
                     .extension_name = "memoryaf",
                     .scope = .{ .kind = .table, .table_name = "memories" },
                     .object_kind = .mcp_tool,
-                    .object_name = "recall",
+                    .object_name = "search_memories",
                     .table_name = "memories",
-                    .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}}}",
+                    .owner_metadata_json = "{\"description\":\"Search long-term memory\",\"input_schema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"}}},\"handler\":\"wasm:memoryaf_wasm/search_memories\"}",
                 }})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
@@ -9966,21 +9966,9 @@ test "api http server lists extension-owned mcp tools" {
     });
     defer tools_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"description\":\"Search long-term memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"required\":[\"query\"]") != null);
-
-    var call_resp = try server.handle(.{
-        .method = .POST,
-        .uri = routes.Routes.mcp_v1,
-        .headers = &mcp_session_headers,
-        .content_type = "application/json",
-        .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"recall\",\"arguments\":{\"query\":\"alpha\"}}}",
-    });
-    defer call_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 200), call_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "\"isError\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, call_resp.body, "no executable handler in v1") != null);
 }
 
 test "api http server scopes mcp endpoint to one extension" {

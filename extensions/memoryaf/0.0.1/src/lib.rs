@@ -1,83 +1,30 @@
-use std::alloc::{alloc, dealloc, Layout};
-use std::slice;
-use std::str;
+wit_bindgen::generate!({
+    path: "wit",
+    world: "extension",
+});
 
-#[repr(C)]
-pub struct WasmBuffer {
-    ptr: *mut u8,
-    len: usize,
-}
+struct MemoryAf;
 
-#[no_mangle]
-pub extern "C" fn memoryaf_alloc(len: usize) -> *mut u8 {
-    if len == 0 {
-        return std::ptr::null_mut();
+impl Guest for MemoryAf {
+    fn init(_config_json: String) -> Result<(), String> {
+        Ok(())
     }
-    let layout = match Layout::array::<u8>(len) {
-        Ok(layout) => layout,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    unsafe { alloc(layout) }
-}
 
-#[no_mangle]
-pub unsafe extern "C" fn memoryaf_dealloc(ptr: *mut u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    if let Ok(layout) = Layout::array::<u8>(len) {
-        dealloc(ptr, layout);
+    fn call_tool(
+        name: String,
+        request_json: String,
+    ) -> Result<antfly::extension::mcp::ToolResult, String> {
+        let content_json = match name.as_str() {
+            "store_memory" => store_memory(&request_json),
+            "search_memories" => search_memories(&request_json),
+            "list_memories" => list_memories(&request_json),
+            other => error_json("unknown_tool", &format!("unknown memoryaf tool: {other}")),
+        };
+        Ok(antfly::extension::mcp::ToolResult { content_json })
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn memoryaf_free_buffer(buffer: WasmBuffer) {
-    memoryaf_dealloc(buffer.ptr, buffer.len);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memoryaf_call_tool(
-    name_ptr: *const u8,
-    name_len: usize,
-    request_ptr: *const u8,
-    request_len: usize,
-) -> WasmBuffer {
-    let name = read_utf8(name_ptr, name_len);
-    let request = read_utf8(request_ptr, request_len);
-    let response = match (name, request) {
-        (Err(message), _) => error_json("invalid_tool_name", message),
-        (_, Err(message)) => error_json("invalid_request", message),
-        (Ok("store_memory"), Ok(request)) => store_memory(request),
-        (Ok("search_memories"), Ok(request)) => search_memories(request),
-        (Ok("list_memories"), Ok(request)) => list_memories(request),
-        (Ok(other), Ok(_)) => {
-            error_json("unknown_tool", &format!("unknown memoryaf tool: {other}"))
-        }
-    };
-    into_buffer(response)
-}
-
-unsafe fn read_utf8<'a>(ptr: *const u8, len: usize) -> Result<&'a str, &'static str> {
-    if ptr.is_null() && len != 0 {
-        return Err("non-empty buffer had null pointer");
-    }
-    let bytes = if len == 0 {
-        &[]
-    } else {
-        slice::from_raw_parts(ptr, len)
-    };
-    str::from_utf8(bytes).map_err(|_| "buffer was not valid utf-8")
-}
-
-fn into_buffer(value: String) -> WasmBuffer {
-    let mut bytes = value.into_bytes();
-    let buffer = WasmBuffer {
-        ptr: bytes.as_mut_ptr(),
-        len: bytes.len(),
-    };
-    std::mem::forget(bytes);
-    buffer
-}
+export!(MemoryAf);
 
 fn store_memory(request_json: &str) -> String {
     let content = json_string_field(request_json, "content").unwrap_or_default();
@@ -85,12 +32,26 @@ fn store_memory(request_json: &str) -> String {
     if content.is_empty() {
         return error_json("invalid_request", "store_memory requires non-empty content");
     }
+    let embedding = host_embed("default", content);
+    let write_result = host_db_write(
+        "memory_record",
+        &format!(
+            "{{\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{},\"embedding_dimensions\":{}}}",
+            json_quote(content),
+            json_quote(memory_type),
+            json_quote(json_string_field(request_json, "visibility").unwrap_or("team")),
+            json_quote(json_string_field(request_json, "project").unwrap_or("default")),
+            embedding.as_ref().map(|values| values.len()).unwrap_or(0)
+        ),
+    );
     format!(
-        "{{\"ok\":true,\"tool\":\"store_memory\",\"status\":\"planned\",\"memory\":{{\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{}}},\"host_calls\":[\"db.write(memory_record)\",\"ai.embed(content)\"]}}",
+        "{{\"ok\":true,\"tool\":\"store_memory\",\"status\":\"planned\",\"memory\":{{\"content\":{},\"memory_type\":{},\"visibility\":{},\"project\":{}}},\"host_calls\":[\"db.write(memory_record)\",\"ai.embed(content)\"],\"host_results\":{{\"embedding_dimensions\":{},\"write\":{}}}}}",
         json_quote(content),
         json_quote(memory_type),
         json_quote(json_string_field(request_json, "visibility").unwrap_or("team")),
-        json_quote(json_string_field(request_json, "project").unwrap_or("default"))
+        json_quote(json_string_field(request_json, "project").unwrap_or("default")),
+        embedding.as_ref().map(|values| values.len()).unwrap_or(0),
+        json_quote(&write_result.unwrap_or_else(|err| format!("error:{err}")))
     )
 }
 
@@ -102,20 +63,72 @@ fn search_memories(request_json: &str) -> String {
             "search_memories requires non-empty query",
         );
     }
+    let embedding = host_embed("default", query);
+    let db_result = host_db_query(
+        "memory_record",
+        &format!(
+            "{{\"query\":{},\"limit\":{},\"embedding_dimensions\":{}}}",
+            json_quote(query),
+            json_number_field(request_json, "limit").unwrap_or("10"),
+            embedding.as_ref().map(|values| values.len()).unwrap_or(0)
+        ),
+    );
     format!(
-        "{{\"ok\":true,\"tool\":\"search_memories\",\"status\":\"planned\",\"query\":{},\"limit\":{},\"host_calls\":[\"ai.embed(query)\",\"db.query(memory_record)\"]}}",
+        "{{\"ok\":true,\"tool\":\"search_memories\",\"status\":\"planned\",\"query\":{},\"limit\":{},\"host_calls\":[\"ai.embed(query)\",\"db.query(memory_record)\"],\"host_results\":{{\"embedding_dimensions\":{},\"rows\":{}}}}}",
         json_quote(query),
-        json_number_field(request_json, "limit").unwrap_or("10")
+        json_number_field(request_json, "limit").unwrap_or("10"),
+        embedding.as_ref().map(|values| values.len()).unwrap_or(0),
+        db_result.unwrap_or_else(|_| "[]".to_string())
     )
 }
 
 fn list_memories(request_json: &str) -> String {
+    let db_result = host_db_query(
+        "memory_record",
+        &format!(
+            "{{\"project\":{},\"limit\":{},\"offset\":{}}}",
+            json_quote(json_string_field(request_json, "project").unwrap_or("")),
+            json_number_field(request_json, "limit").unwrap_or("20"),
+            json_number_field(request_json, "offset").unwrap_or("0")
+        ),
+    );
     format!(
-        "{{\"ok\":true,\"tool\":\"list_memories\",\"status\":\"planned\",\"project\":{},\"limit\":{},\"offset\":{},\"host_calls\":[\"db.query(memory_record)\"]}}",
+        "{{\"ok\":true,\"tool\":\"list_memories\",\"status\":\"planned\",\"project\":{},\"limit\":{},\"offset\":{},\"host_calls\":[\"db.query(memory_record)\"],\"host_results\":{{\"rows\":{}}}}}",
         json_quote(json_string_field(request_json, "project").unwrap_or("")),
         json_number_field(request_json, "limit").unwrap_or("20"),
-        json_number_field(request_json, "offset").unwrap_or("0")
+        json_number_field(request_json, "offset").unwrap_or("0"),
+        db_result.unwrap_or_else(|_| "[]".to_string())
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn host_db_query(table: &str, query_json: &str) -> Result<String, String> {
+    antfly::extension::db::query(table, query_json)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_db_query(_table: &str, _query_json: &str) -> Result<String, String> {
+    Ok("[]".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn host_db_write(table: &str, writes_json: &str) -> Result<String, String> {
+    antfly::extension::db::write(table, writes_json)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_db_write(_table: &str, _writes_json: &str) -> Result<String, String> {
+    Ok("{\"ok\":true}".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn host_embed(model: &str, text: &str) -> Result<Vec<f32>, String> {
+    antfly::extension::ai::embed(model, text)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_embed(_model: &str, _text: &str) -> Result<Vec<f32>, String> {
+    Ok(Vec::new())
 }
 
 fn error_json(code: &str, message: &str) -> String {
