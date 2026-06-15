@@ -36313,6 +36313,34 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
         }
     }
 
+    if (lhs_batch.len == 0 and rhs_batch.len == 0 and lhs_contracting.len == 0 and rhs_contracting.len == 0) {
+        if (lhs_effective_shape.len == 1 and rhs_effective_shape.len == 1) {
+            const lhs_view = try denseWeightView(self, lhs);
+            defer if (lhs_view.owned) |owned| self.allocator.free(owned);
+            const rhs_view = try denseWeightView(self, rhs);
+            defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+
+            const m = positiveShapeDim(lhs_effective_shape, 0) catch lhs_view.data.len;
+            const n = positiveShapeDim(rhs_effective_shape, 0) catch rhs_view.data.len;
+            if (m != lhs_view.data.len or n != rhs_view.data.len) return error.ShapeMismatch;
+
+            const output = try self.allocator.alloc(f32, m * n);
+            var raw_output: ?[]f32 = output;
+            errdefer if (raw_output) |raw| self.allocator.free(raw);
+            for (0..m) |i| {
+                for (0..n) |j| {
+                    output[i * n + j] = lhs_view.data[i] * rhs_view.data[j];
+                }
+            }
+
+            const result = try self.makeBuf(output, true);
+            raw_output = null;
+            errdefer freeTensor(self, result);
+            const out_shape = [_]i64{ @intCast(m), @intCast(n) };
+            return self.withLogicalShape(result, &out_shape);
+        }
+    }
+
     // Handle common case: 2D matmul (no batch dims, one contracting dim each).
     if (lhs_batch.len == 0 and lhs_contracting.len == 1 and rhs_contracting.len == 1) {
         const lhs_rank = lhs_effective_shape.len;
@@ -46276,6 +46304,33 @@ test "dot_general flattens lhs suffix for shared rhs source tensor" {
     for (out, expected) |actual, want| {
         try std.testing.expectApproxEqAbs(want, actual, 1e-4);
     }
+}
+
+test "dot_general handles rank1 outer product without contracting axes" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    var lhs_data = [_]f32{ 1, 2, 3 };
+    var rhs_data = [_]f32{ 10, 20, 30, 40 };
+
+    const lhs_ct = try compute.makeBuf(lhs_data[0..], false);
+    defer freeTensor(&compute, lhs_ct);
+    const lhs_shaped = try compute.withLogicalShape(lhs_ct, &.{3});
+
+    const rhs_ct = try compute.makeBuf(rhs_data[0..], false);
+    defer freeTensor(&compute, rhs_ct);
+    const rhs_shaped = try compute.withLogicalShape(rhs_ct, &.{4});
+
+    const out_ct = try primDotGeneralOp(&compute, lhs_shaped, rhs_shaped, &.{3}, &.{4}, &.{}, &.{}, &.{}, &.{});
+    defer freeTensor(&compute, out_ct);
+
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, tensorStoredShape(out_ct).?);
+    try std.testing.expectEqualSlices(f32, &.{
+        10, 20, 30, 40,
+        20, 40, 60, 80,
+        30, 60, 90, 120,
+    }, getData(out_ct));
 }
 
 test "dot_general handles rank2 lhs transpose view without materializing input first" {
