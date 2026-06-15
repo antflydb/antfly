@@ -2604,6 +2604,10 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"common config"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
@@ -3850,6 +3854,10 @@ pub fn build(b: *std.Build) void {
             "hbc cache shrinks to resource budget under pressure",
             "provisioned group storage derives all resource budgets",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
@@ -4175,8 +4183,13 @@ pub fn build(b: *std.Build) void {
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
+    wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
 
@@ -4242,8 +4255,13 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
+    persistent_test_mod.addImport("structlog", structlog_mod);
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
 
@@ -4307,9 +4325,14 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
+    index_manager_test_mod.addImport("structlog", structlog_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
         .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
 
