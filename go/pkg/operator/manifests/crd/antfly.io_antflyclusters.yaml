@@ -1525,8 +1525,8 @@ spec:
                       operator execution.
                     properties:
                       envFrom:
-                        description: EnvFrom is applied to HA admin Job containers,
-                          commonly for backup object-store credentials.
+                        description: EnvFrom is applied to CLI-backed HA admin Job
+                          containers, commonly for backup object-store credentials.
                         items:
                           description: EnvFromSource represents the source of a set
                             of ConfigMaps or Secrets
@@ -1575,30 +1575,32 @@ spec:
                           type: object
                         type: array
                       executePlannedActions:
-                        description: ExecutePlannedActions lets the operator create
-                          Kubernetes Jobs for executable HA planned actions.
+                        description: |-
+                          ExecutePlannedActions lets the operator execute planned HA actions.
+                          The operator prefers typed /admin/v1/ha calls and uses CLI-backed Kubernetes Jobs for pod-local files, shared backup volumes, or break-glass workflows.
                         type: boolean
                       jobBackoffLimit:
-                        description: JobBackoffLimit is the HA admin Job retry count
-                          before Kubernetes marks it failed.
+                        description: JobBackoffLimit is the CLI-backed HA admin Job
+                          retry count before Kubernetes marks it failed.
                         format: int32
                         type: integer
                       jobTTLSecondsAfterFinished:
                         description: JobTTLSecondsAfterFinished controls how long
-                          completed HA admin Jobs are retained.
+                          completed CLI-backed HA admin Jobs are retained.
                         format: int32
                         type: integer
                       jobTimeoutSeconds:
-                        description: JobTimeoutSeconds is the HA admin Job active
-                          deadline.
+                        description: JobTimeoutSeconds is the CLI-backed HA admin
+                          Job active deadline.
                         format: int64
                         type: integer
                       primaryURL:
                         description: PrimaryURL is the primary HA admin endpoint used
-                          for slot, seed, and fence commands.
+                          for typed status, slot, seed, and fence actions.
                         type: string
                       volumeMounts:
-                        description: VolumeMounts are added to the HA admin Job container.
+                        description: VolumeMounts are added to the CLI-backed HA admin
+                          Job container.
                         items:
                           description: VolumeMount describes a mounting of a Volume
                             within a container.
@@ -1662,8 +1664,8 @@ spec:
                           type: object
                         type: array
                       volumes:
-                        description: Volumes are added to HA admin Job pods, commonly
-                          for shared base-backup manifests and contents.
+                        description: Volumes are added to CLI-backed HA admin Job
+                          pods, commonly for shared base-backup manifests and contents.
                         items:
                           description: Volume represents a named volume in a pod that
                             may be accessed by any container in the pod.
@@ -3666,7 +3668,7 @@ spec:
                       properties:
                         adminURL:
                           description: AdminURL is the standby HA admin endpoint used
-                            for promotion commands.
+                            for typed status and promotion actions.
                           type: string
                         desired:
                           default: true
@@ -3696,12 +3698,12 @@ spec:
                           type: object
                         seedContentRoot:
                           description: |-
-                            SeedContentRoot is the copied base-backup content root visible to the standby HA admin Job.
+                            SeedContentRoot is the copied base-backup content root visible to the standby CLI-backed HA admin Job.
                             Defaults to the manifest parent directory when omitted.
                           type: string
                         seedManifestPath:
                           description: |-
-                            SeedManifestPath is the base-backup manifest path visible to HA admin Jobs.
+                            SeedManifestPath is the base-backup manifest path visible to CLI-backed HA admin Jobs.
                             When set, the operator can run seed finish on the primary and seed bootstrap on this standby.
                           type: string
                         slotName:

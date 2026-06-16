@@ -556,16 +556,16 @@ type HAStandbySpec struct {
 	// +optional
 	InitialLSN *uint64 `json:"initialLSN,omitempty"`
 
-	// AdminURL is the standby HA admin endpoint used for promotion commands.
+	// AdminURL is the standby HA admin endpoint used for typed status and promotion actions.
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
-	// SeedManifestPath is the base-backup manifest path visible to HA admin Jobs.
+	// SeedManifestPath is the base-backup manifest path visible to CLI-backed HA admin Jobs.
 	// When set, the operator can run seed finish on the primary and seed bootstrap on this standby.
 	// +optional
 	SeedManifestPath string `json:"seedManifestPath,omitempty"`
 
-	// SeedContentRoot is the copied base-backup content root visible to the standby HA admin Job.
+	// SeedContentRoot is the copied base-backup content root visible to the standby CLI-backed HA admin Job.
 	// Defaults to the manifest parent directory when omitted.
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
@@ -577,35 +577,36 @@ type HAStandbySpec struct {
 
 // HAAdminSpec configures operator access to HA admin endpoints.
 type HAAdminSpec struct {
-	// PrimaryURL is the primary HA admin endpoint used for slot, seed, and fence commands.
+	// PrimaryURL is the primary HA admin endpoint used for typed status, slot, seed, and fence actions.
 	// +optional
 	PrimaryURL string `json:"primaryURL,omitempty"`
 
-	// ExecutePlannedActions lets the operator create Kubernetes Jobs for executable HA planned actions.
+	// ExecutePlannedActions lets the operator execute planned HA actions.
+	// The operator prefers typed /admin/v1/ha calls and uses CLI-backed Kubernetes Jobs for pod-local files, shared backup volumes, or break-glass workflows.
 	// +optional
 	ExecutePlannedActions bool `json:"executePlannedActions,omitempty"`
 
-	// JobBackoffLimit is the HA admin Job retry count before Kubernetes marks it failed.
+	// JobBackoffLimit is the CLI-backed HA admin Job retry count before Kubernetes marks it failed.
 	// +optional
 	JobBackoffLimit *int32 `json:"jobBackoffLimit,omitempty"`
 
-	// JobTimeoutSeconds is the HA admin Job active deadline.
+	// JobTimeoutSeconds is the CLI-backed HA admin Job active deadline.
 	// +optional
 	JobTimeoutSeconds *int64 `json:"jobTimeoutSeconds,omitempty"`
 
-	// JobTTLSecondsAfterFinished controls how long completed HA admin Jobs are retained.
+	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained.
 	// +optional
 	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
 
-	// EnvFrom is applied to HA admin Job containers, commonly for backup object-store credentials.
+	// EnvFrom is applied to CLI-backed HA admin Job containers, commonly for backup object-store credentials.
 	// +optional
 	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
 
-	// Volumes are added to HA admin Job pods, commonly for shared base-backup manifests and contents.
+	// Volumes are added to CLI-backed HA admin Job pods, commonly for shared base-backup manifests and contents.
 	// +optional
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
 
-	// VolumeMounts are added to the HA admin Job container.
+	// VolumeMounts are added to the CLI-backed HA admin Job container.
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
