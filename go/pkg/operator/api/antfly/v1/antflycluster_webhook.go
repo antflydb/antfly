@@ -1250,8 +1250,17 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if len(names) == 0 {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one declared standby")
 		}
-		if failover.fencingAuthorityOrDefault() == HAFencingAuthorityNone {
+		fencingAuthority := failover.fencingAuthorityOrDefault()
+		if fencingAuthority == HAFencingAuthorityNone {
 			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must not be None when automatic failover is enabled")
+		} else if fencingAuthority != HAFencingAuthorityKubernetesLease {
+			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must be KubernetesLease for operator-managed automatic failover")
+		}
+		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
+		}
+		if ha.Identity == nil {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
 		}
 		if failover.requireRemoteApplyOrDefault() && ha.SyncPolicy != nil && ha.SyncPolicy.modeOrDefault() == HADurabilityModeRemoteWrite {
 			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply requires syncPolicy.mode RemoteApply or Async")
