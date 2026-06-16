@@ -1649,6 +1649,12 @@ spec:
                             slot name.
                           minLength: 1
                           type: string
+                        routeSelector:
+                          additionalProperties:
+                            type: string
+                          description: RouteSelector is the public-api Service selector
+                            to use when this standby is promoted.
+                          type: object
                         slotName:
                           description: SlotName overrides the replication slot name.
                             Defaults to name.

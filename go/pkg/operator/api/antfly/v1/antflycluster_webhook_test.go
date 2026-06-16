@@ -1811,7 +1811,10 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 			ExecutePlannedActions: true,
 		},
 		Standbys: []HAStandbySpec{
-			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081", RouteSelector: map[string]string{
+				"app.kubernetes.io/name":      "antfly-database",
+				"app.kubernetes.io/component": "standby-a",
+			}},
 			{Name: "standby-b", AdminURL: "http://standby-b-ha.default.svc:8081"},
 		},
 		SyncPolicy: &HASyncPolicy{
@@ -1863,6 +1866,27 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
 		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
 		t.Fatalf("expected invalid and missing HA admin URL errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidRouteSelector(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name: "standby-a",
+			RouteSelector: map[string]string{
+				"bad key": "standby-a",
+			},
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA route selector to be rejected")
+	}
+	if !strings.Contains(err.Error(), "standbys[0].routeSelector") {
+		t.Fatalf("expected route selector validation error, got: %v", err)
 	}
 }
 

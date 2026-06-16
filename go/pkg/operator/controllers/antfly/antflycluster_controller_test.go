@@ -301,7 +301,17 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			HighAvailability: &antflyv1.HighAvailabilitySpec{Mode: antflyv1.HAModeHotStandby},
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name: "standby-a",
+					RouteSelector: map[string]string{
+						"app.kubernetes.io/name":      "antfly-database",
+						"app.kubernetes.io/component": "standby-a",
+						"app.kubernetes.io/instance":  "test-cluster",
+					},
+				}},
+			},
 		},
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
@@ -349,6 +359,8 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteSelectorAnnotation, "true"))
+	g.Expect(observed.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standby-a"))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Stale).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Action).To(Equal("None"))
@@ -2635,6 +2647,41 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 	err = client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-data", Namespace: "default"}, &corev1.Service{})
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
+}
+
+func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseSwarmControllerCluster()
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name: "standby-a",
+			RouteSelector: map[string]string{
+				"app.kubernetes.io/name":      "antfly-database",
+				"app.kubernetes.io/component": "standby-a",
+				"app.kubernetes.io/instance":  "test-swarm-standby-a",
+			},
+		}},
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		Mode: antflyv1.HAModeHotStandby,
+		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+			CurrentTarget: "standby-a",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
+
+	publicSvc := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
 }
 
 func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {

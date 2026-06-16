@@ -74,6 +74,7 @@ const (
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
+	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
 
 	haAdminJobPhasePending   = "Pending"
 	haAdminJobPhaseRunning   = "Running"
@@ -218,6 +219,33 @@ func serviceSelectorLabels(clusterName, component string) map[string]string {
 		"app.kubernetes.io/component": component,
 		"app.kubernetes.io/instance":  clusterName,
 	}
+}
+
+func haCurrentPrimaryRouteTarget(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Status.HAStatus != nil && cluster.Status.HAStatus.PrimaryRoute.CurrentTarget != "" {
+		return cluster.Status.HAStatus.PrimaryRoute.CurrentTarget
+	}
+	return "primary"
+}
+
+func haPublicAPISelector(cluster *antflyv1.AntflyCluster, swarmMode bool, target string) (map[string]string, bool) {
+	if target == "" || target == "primary" {
+		component := "metadata"
+		if swarmMode {
+			component = "swarm"
+		}
+		return serviceSelectorLabels(cluster.Name, component), true
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha == nil {
+		return nil, false
+	}
+	for _, standby := range ha.Standbys {
+		if standby.Name == target && len(standby.RouteSelector) > 0 {
+			return maps.Clone(standby.RouteSelector), true
+		}
+	}
+	return nil, false
 }
 
 // buildPVCRetentionPolicy maps CRD PVCRetentionPolicy to the Kubernetes StatefulSet retention policy.
@@ -1932,20 +1960,25 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 		servicePort.NodePort = *cluster.Spec.PublicAPI.NodePort
 	}
 
+	selector := serviceSelectorLabels(cluster.Name, func() string {
+		if swarmMode {
+			return "swarm"
+		}
+		return "metadata"
+	}())
+	if routeSelector, ok := haPublicAPISelector(cluster, swarmMode, haCurrentPrimaryRouteTarget(cluster)); ok {
+		selector = routeSelector
+	}
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cluster.Name + "-public-api",
 			Namespace: cluster.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Type: serviceType,
-			Selector: serviceSelectorLabels(cluster.Name, func() string {
-				if swarmMode {
-					return "swarm"
-				}
-				return "metadata"
-			}()),
-			Ports: []corev1.ServicePort{servicePort},
+			Type:     serviceType,
+			Selector: selector,
+			Ports:    []corev1.ServicePort{servicePort},
 		},
 	}
 }
@@ -3449,6 +3482,12 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 	service.Annotations[haPrimaryRouteTargetAnnotation] = action.RouteTo
 	if action.FenceGeneration > 0 {
 		service.Annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(action.FenceGeneration, 10)
+	}
+	if selector, ok := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo); ok {
+		service.Spec.Selector = selector
+		service.Annotations[haPrimaryRouteSelectorAnnotation] = "true"
+	} else {
+		service.Annotations[haPrimaryRouteSelectorAnnotation] = "false"
 	}
 	if err := r.Patch(ctx, service, patch); err != nil {
 		return err

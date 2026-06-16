@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 var (
@@ -1154,6 +1155,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			slotNames[slotName] = i
 		}
 		errors = append(errors, validateHAAdminURL(standby.AdminURL, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL", i))...)
+		errors = append(errors, validateHARouteSelector(standby.RouteSelector, fmt.Sprintf("spec.highAvailability.standbys[%d].routeSelector", i))...)
 	}
 
 	if admin := ha.Admin; admin != nil {
@@ -1264,6 +1266,22 @@ func validateHAAdminURL(raw string, fieldPath string) []string {
 		return []string{fmt.Sprintf("%s must use http or https", fieldPath)}
 	}
 	return nil
+}
+
+func validateHARouteSelector(selector map[string]string, fieldPath string) []string {
+	if len(selector) == 0 {
+		return nil
+	}
+	var errors []string
+	for key, value := range selector {
+		if keyErrs := utilvalidation.IsQualifiedName(key); len(keyErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s key %q is invalid: %s", fieldPath, key, strings.Join(keyErrs, "; ")))
+		}
+		if valueErrs := utilvalidation.IsValidLabelValue(value); len(valueErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s[%q] value %q is invalid: %s", fieldPath, key, value, strings.Join(valueErrs, "; ")))
+		}
+	}
+	return errors
 }
 
 func (s *HighAvailabilitySpec) modeOrDefault() HAMode {

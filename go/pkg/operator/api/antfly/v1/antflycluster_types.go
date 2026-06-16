@@ -536,6 +536,10 @@ type HAStandbySpec struct {
 	// AdminURL is the standby HA admin endpoint used for promotion commands.
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
+
+	// RouteSelector is the public-api Service selector to use when this standby is promoted.
+	// +optional
+	RouteSelector map[string]string `json:"routeSelector,omitempty"`
 }
 
 // HAAdminSpec configures operator access to HA admin endpoints.
