@@ -35,6 +35,7 @@ type haPlan struct {
 	HealthyStandbyCount       int32
 	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
+	FencingReady              bool
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -108,6 +109,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		}
 	}
 
+	plan.FencingReady = haFencingReady(ha, status)
 	plan.AutomaticPromotionAllowed = haAutomaticPromotionAllowed(ha, status, plan)
 	if plan.AutomaticPromotionAllowed {
 		plan.Actions = append(plan.Actions,
@@ -249,6 +251,9 @@ func haAutomaticPromotionAllowed(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return false
 	}
+	if !plan.FencingReady {
+		return false
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return false
 	}
@@ -289,6 +294,30 @@ func standbySafeReadLSN(standby antflyv1.HAStandbyStatus) uint64 {
 	return standby.AppliedLSN
 }
 
+func haFencingReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
+	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
+		return false
+	}
+	authority := ha.AutomaticFailover.FencingAuthority
+	if authority == "" || authority == antflyv1.HAFencingAuthorityNone {
+		return false
+	}
+	if status == nil {
+		return false
+	}
+	fencing := status.Fencing
+	if !fencing.Ready {
+		return false
+	}
+	if fencing.Authority != authority {
+		return false
+	}
+	if fencing.Holder == "" || fencing.Generation == 0 {
+		return false
+	}
+	return true
+}
+
 func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) string {
 	if plan.AutomaticPromotionAllowed {
 		return "HAFencedPromotionReady"
@@ -298,6 +327,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	}
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return antflyv1.ReasonHAFencingAuthorityMissing
+	}
+	if !plan.FencingReady {
+		return antflyv1.ReasonHAFencingNotReady
 	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return antflyv1.ReasonHASyncPolicyUnsatisfied

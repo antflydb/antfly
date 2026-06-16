@@ -6460,6 +6460,37 @@ spec:
                     description: DesiredStandbyCount is the count requested by spec.highAvailability.
                     format: int32
                     type: integer
+                  fencing:
+                    description: Fencing reports the observed fencing authority state
+                      used for automatic promotion.
+                    properties:
+                      authority:
+                        description: Authority is the observed fencing authority.
+                        enum:
+                        - None
+                        - KubernetesLease
+                        - StorageFence
+                        - MetadataRaft
+                        - External
+                        type: string
+                      generation:
+                        description: Generation is the observed fencing epoch used
+                          to order promotions.
+                        format: int64
+                        type: integer
+                      holder:
+                        description: Holder identifies the actor that currently holds
+                          or can acquire the fence.
+                        type: string
+                      ready:
+                        description: Ready reports whether the fencing authority has
+                          been observed and can fence a primary.
+                        type: boolean
+                      reason:
+                        description: Reason describes the latest fencing readiness
+                          decision.
+                        type: string
+                    type: object
                   healthyStandbyCount:
                     description: HealthyStandbyCount is the count of desired standbys
                       caught up to apply.

@@ -209,6 +209,9 @@ const (
 	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
 	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
 
+	// ReasonHAFencingNotReady indicates automatic failover lacks an observed ready fence.
+	ReasonHAFencingNotReady = "HAFencingNotReady"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 
@@ -1247,6 +1250,10 @@ type HAStatus struct {
 	// +optional
 	PlannedActions []HAPlannedActionStatus `json:"plannedActions,omitempty"`
 
+	// Fencing reports the observed fencing authority state used for automatic promotion.
+	// +optional
+	Fencing HAFencingStatus `json:"fencing,omitempty"`
+
 	// Retention summarizes primary WAL retention pressure.
 	// +optional
 	Retention HARetentionStatus `json:"retention,omitempty"`
@@ -1285,6 +1292,30 @@ type HAStandbyStatus struct {
 	Status string `json:"status,omitempty"`
 
 	LastError string `json:"lastError,omitempty"`
+}
+
+// HAFencingStatus reports the observed fencing state for automatic promotion.
+type HAFencingStatus struct {
+	// Authority is the observed fencing authority.
+	// +kubebuilder:validation:Enum=None;KubernetesLease;StorageFence;MetadataRaft;External
+	// +optional
+	Authority HAFencingAuthority `json:"authority,omitempty"`
+
+	// Ready reports whether the fencing authority has been observed and can fence a primary.
+	// +optional
+	Ready bool `json:"ready,omitempty"`
+
+	// Holder identifies the actor that currently holds or can acquire the fence.
+	// +optional
+	Holder string `json:"holder,omitempty"`
+
+	// Generation is the observed fencing epoch used to order promotions.
+	// +optional
+	Generation uint64 `json:"generation,omitempty"`
+
+	// Reason describes the latest fencing readiness decision.
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // HAPlannedActionStatus reports one planned HA operator action.

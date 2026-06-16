@@ -139,8 +139,36 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	cluster.Spec.HighAvailability.AutomaticFailover.FencingAuthority = antflyv1.HAFencingAuthorityKubernetesLease
 	reconciler.updateHAStatusAndConditions(cluster)
 
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked until fencing is observed ready")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAFencingNotReady {
+		t.Fatalf("expected fence-not-ready condition, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityStorageFence,
+		Ready:      true,
+		Holder:     "standby-a",
+		Generation: 1,
+		Reason:     "WrongAuthority",
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked with mismatched observed fencing authority")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAFencingNotReady {
+		t.Fatalf("expected fence-not-ready condition for mismatched authority, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	reconciler.updateHAStatusAndConditions(cluster)
+
 	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
-		t.Fatal("expected automatic promotion to be allowed with fencing and caught-up standby")
+		t.Fatal("expected automatic promotion to be allowed with ready fencing and caught-up standby")
 	}
 	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
 	if failover == nil || failover.Status != metav1.ConditionTrue || failover.Reason != "HAFencedPromotionReady" {
@@ -174,6 +202,7 @@ func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromot
 		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
 	}
 	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
 	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 10
 	cluster.Status.HAStatus.Standbys[0].SafeReadLagLSN = 2
 	reconciler := &AntflyClusterReconciler{}
@@ -237,5 +266,15 @@ func caughtUpHAStatus() *antflyv1.HAStatus {
 			ApplyLagLSN: 0,
 			Status:      "healthy",
 		}},
+	}
+}
+
+func readyFencingStatus() antflyv1.HAFencingStatus {
+	return antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      true,
+		Holder:     "standby-a",
+		Generation: 1,
+		Reason:     "LeaseHeld",
 	}
 }
