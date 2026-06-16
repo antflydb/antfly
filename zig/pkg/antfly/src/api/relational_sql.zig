@@ -32314,8 +32314,10 @@ const Parser = struct {
     fn rowExpressionOutputType(self: *@This(), expression: db_mod.types.RelationalRowsExpression) !runtime_schema.AntflyType {
         switch (expression.kind) {
             .field => {
-                if (self.defer_row_expression_field_validation) return .json;
-                const column = relationalColumnForField(self.schemaForRowExpressionField(expression), expression.field, null) orelse return error.InvalidSqlCatalog;
+                const column = relationalColumnForField(self.schemaForRowExpressionField(expression), expression.field, null) orelse {
+                    if (self.defer_row_expression_field_validation) return .json;
+                    return error.InvalidSqlCatalog;
+                };
                 return column.field_type;
             },
             .value => {
@@ -32368,8 +32370,10 @@ const Parser = struct {
         if (output_type != .array) return null;
         switch (expression.kind) {
             .field => {
-                if (self.defer_row_expression_field_validation) return .json;
-                const column = relationalColumnForField(self.schemaForRowExpressionField(expression), expression.field, .array) orelse return error.InvalidSqlCatalog;
+                const column = relationalColumnForField(self.schemaForRowExpressionField(expression), expression.field, .array) orelse {
+                    if (self.defer_row_expression_field_validation) return .json;
+                    return error.InvalidSqlCatalog;
+                };
                 return column.array_item_type orelse .json;
             },
             .array_positions => return .numeric,
@@ -61839,6 +61843,8 @@ const AppParityCorpusCoverage = struct {
     update_joined_source_modulo_expression: bool = false,
     update_joined_source_regexp_expression: bool = false,
     delete_joined_source_regexp_expression: bool = false,
+    update_joined_source_array_expression: bool = false,
+    delete_joined_source_array_expression: bool = false,
     update_joined_source_row_assignment: bool = false,
     update_source_patch_expression: bool = false,
     update_source_increment_expression: bool = false,
@@ -62337,6 +62343,18 @@ const AppParityCorpusCoverage = struct {
         self.delete_joined_source_regexp_expression = self.delete_joined_source_regexp_expression or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
             std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.update_joined_source_array_expression = self.update_joined_source_array_expression or (is_update_joined_source and
+            std.mem.indexOf(u8, entry.sql, "array_append(source.tags") != null and
+            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
+            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.delete_joined_source_array_expression = self.delete_joined_source_array_expression or (is_delete_joined_source and
+            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
+            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
             appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
@@ -63831,6 +63849,18 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.update_source_regexp_substr_expression);
         try std.testing.expect(self.update_joined_source_regexp_expression);
         try std.testing.expect(self.delete_joined_source_regexp_expression);
+    }
+
+    fn expectArrayCoverage(self: @This()) !void {
+        try std.testing.expect(self.query_cardinality_expression);
+        try std.testing.expect(self.query_array_position_expression);
+        try std.testing.expect(self.query_array_positions_expression);
+        try std.testing.expect(self.query_array_element_transform_expression);
+        try std.testing.expect(self.query_array_to_string_expression);
+        try std.testing.expect(self.query_string_to_array_expression);
+        try std.testing.expect(self.point_update_array);
+        try std.testing.expect(self.update_joined_source_array_expression);
+        try std.testing.expect(self.delete_joined_source_array_expression);
     }
 
     fn expectRowAssignmentCoverage(self: @This()) !void {
@@ -69604,6 +69634,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records SET status = regexp_substr(source.status, '[a-z]+'), amount = regexp_count(source.status, '[0-9]+') FROM source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^ready', true) FOR UPDATE RETURNING id, regexp_instr(source.status, '[0-9]+') AS source_digit",
         },
         .{
+            .name = "joined update source array expression assignment",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .patch_expressions = 1, .returning = 1 },
+            .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:patch_expr=1:right_expr_pred=1",
+            .sql = "UPDATE usage_records SET tags = array_append(source.tags, 'joined') FROM source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'hot') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags",
+        },
+        .{
             .name = "joined delete source returning field",
             .family = .delete_joined_source,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
@@ -69623,6 +69660,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
             .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
             .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^stale', true) FOR UPDATE RETURNING id, regexp_substr(source.status, '[a-z]+') AS source_token",
+        },
+        .{
+            .name = "joined delete source array returning expression",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
+            .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
+            .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'stale') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags",
         },
         .{
             .name = "distinct on ordered query",
@@ -69841,6 +69885,7 @@ test "postgres sql adapter classifies application parity corpus" {
     try coverage.expectComputedPatternCoverage();
     try coverage.expectModuloCoverage();
     try coverage.expectRegexpCoverage();
+    try coverage.expectArrayCoverage();
     try coverage.expectRowAssignmentCoverage();
     try coverage.expectSeededBooleanAssignmentCoverage();
     try coverage.expectJsonSetCoverage();

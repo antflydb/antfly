@@ -8433,6 +8433,19 @@
       "sql": "UPDATE usage_records SET status = regexp_substr(source.status, '[a-z]+'), amount = regexp_count(source.status, '[0-9]+') FROM source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^ready', true) FOR UPDATE RETURNING id, regexp_instr(source.status, '[0-9]+') AS source_digit"
     },
     {
+      "name": "joined update source array expression assignment",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "patch_expressions": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:patch_expr=1:right_expr_pred=1",
+      "sql": "UPDATE usage_records SET tags = array_append(source.tags, 'joined') FROM source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'hot') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags"
+    },
+    {
       "name": "joined delete source returning field",
       "family": "delete_joined_source",
       "summary": {
@@ -8465,6 +8478,18 @@
       },
       "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
       "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^stale', true) FOR UPDATE RETURNING id, regexp_substr(source.status, '[a-z]+') AS source_token"
+    },
+    {
+      "name": "joined delete source array returning expression",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
+      "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'stale') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags"
     },
     {
       "name": "distinct on ordered query",
