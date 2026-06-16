@@ -62255,6 +62255,16 @@ fn appParityFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) b
     };
 }
 
+fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .insert,
+        .update,
+        .delete,
+        => true,
+        else => false,
+    };
+}
+
 fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
     if (entry.family != .ddl) return false;
     return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -62394,6 +62404,20 @@ fn validateAppParityFixtureMetadata(
     if (entry.source_schema_json.len > 0 and !appParityFixtureFamilyAllowsSourceSchema(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_exists == false and
+        (entry.resolver_row_json.len > 0 or entry.resolver_version != 0))
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_exists == true and entry.resolver_row_json.len == 0) {
+        return error.TestUnexpectedResult;
+    }
     if (try appParityDdlFixtureRequiresAppliedPlan(entry)) {
         if (entry.applied_plan.len == 0) return error.TestUnexpectedResult;
     }
@@ -62496,6 +62520,35 @@ test "app parity fixture metadata requires typed summary anchors" {
         .source_schema_json = "{}",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ignored returning rows",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .returning_rows = &.{"{\"id\":\"u1\"}"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "resolver row without version",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+        .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "resolver miss with row",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT DO NOTHING RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+        .resolver_version = 17,
+        .resolver_exists = false,
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid unsupported reason",
         .sql = "TRUNCATE usage_records CASCADE",
@@ -62528,6 +62581,16 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
         .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=false",
         .applied_plan = "applied:drop_table:rebuild=true:validation=true:rewrite=true",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid resolver miss",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT DO NOTHING RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        .returning_rows = &.{"{\"id\":\"u1\"}"},
+        .resolver_exists = false,
     }, &seen, alloc);
 }
 
