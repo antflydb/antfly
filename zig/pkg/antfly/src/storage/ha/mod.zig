@@ -13,3 +13,9 @@
 // limitations.
 
 pub const replication_record = @import("replication_record.zig");
+pub const replication_log = @import("replication_log.zig");
+
+test {
+    _ = replication_record;
+    _ = replication_log;
+}
