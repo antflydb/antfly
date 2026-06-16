@@ -4683,7 +4683,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1:op_inc=1",
       "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = quantity + excluded.quantity RETURNING id, quantity, CAST(quantity AS text) AS quantity_text"
     },
     {
@@ -4694,7 +4694,7 @@
         "operations": 2,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=1:op_inc=1",
       "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = ROW(DEFAULT, quantity + excluded.quantity) RETURNING id, status, quantity"
     },
     {
@@ -4705,7 +4705,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, enabled) VALUES ('u1', true) ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled OR false RETURNING id, enabled"
     },
     {
@@ -4716,7 +4716,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = (quantity + excluded.quantity) RETURNING id, quantity"
     },
     {
@@ -4727,7 +4727,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity + 3 RETURNING id, quantity"
     },
     {
@@ -4738,7 +4738,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO public.usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = public.usage_records.quantity + excluded.quantity RETURNING id, quantity"
     },
     {
@@ -4749,7 +4749,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}",
       "resolver_version": 17,
@@ -4763,7 +4763,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text UNIQUE, status text);"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}",
       "resolver_version": 17,
@@ -4777,7 +4777,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}",
       "resolver_version": 23,
@@ -4791,7 +4791,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
       "resolver_version": 24,
@@ -4805,7 +4805,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
       "resolver_version": 25,
@@ -4819,7 +4819,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
       "resolver_version": 25,
@@ -4833,7 +4833,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
       "resolver_version": 25,
@@ -4847,7 +4847,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, next_status text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\",\"amount\":5}",
       "resolver_version": 26,
@@ -4861,7 +4861,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"Ready For Review\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old status\"}",
@@ -4876,7 +4876,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"updated_at_ns\":1}",
       "resolver_version": 27,
@@ -4890,7 +4890,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, metadata jsonb);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\",\"metadata\":{}}",
       "resolver_version": 28,
@@ -4904,7 +4904,7 @@
         "operations": 2,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=2",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, metadata jsonb);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "returning_rows": ["{\"metadata.source\":\"conflict\",\"metadata.flags\":[\"seen\"]}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"metadata\":{\"source\":\"old\"}}",
@@ -4919,7 +4919,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}",
       "resolver_version": 17,
@@ -5418,7 +5418,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, name text);", "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\",\"name\":\"old\"}",
       "resolver_version": 18,
@@ -5432,7 +5432,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, name text);", "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\",\"name\":\"old\"}",
       "resolver_version": 18,
@@ -5446,7 +5446,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));"],
       "resolver_row_json": "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
       "resolver_version": 45,
@@ -5460,7 +5460,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);", "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (lower(email));", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_lower_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"name\":\"old\"}",
       "resolver_version": 19,
@@ -5474,7 +5474,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);", "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (lower(email));", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_lower_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"name\":\"old\"}",
       "resolver_version": 19,
@@ -5488,7 +5488,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, name text);", "CREATE UNIQUE INDEX usage_records_tenant_lower_email_key ON usage_records (tenant_id, lower(email));", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_tenant_lower_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"name\":\"old\"}",
       "resolver_version": 22,
@@ -5502,7 +5502,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);", "CREATE UNIQUE INDEX usage_records_upper_email_key ON usage_records (upper(email));", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_upper_email_key;"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"A@EXAMPLE.TEST\",\"name\":\"old\"}",
       "resolver_version": 20,
@@ -5527,7 +5527,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u1', 'named') ON CONFLICT ON CONSTRAINT usage_records_pkey DO UPDATE SET status = excluded.status RETURNING id, status"
     },
     {
@@ -5538,7 +5538,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk;"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"existing\"}",
       "resolver_version": 31,
@@ -5552,7 +5552,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, status) VALUES ('u1', 'open') ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status"
     },
     {
@@ -5563,7 +5563,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1:op_set=1",
       "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = CASE WHEN excluded.amount > amount THEN CURRENT_TIMESTAMP(6) ELSE updated_at_ns END RETURNING id, updated_at_ns, CAST(updated_at_ns AS text) AS updated_at_text"
     },
     {
@@ -5574,7 +5574,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = CURRENT_DATE RETURNING id, updated_at_ns"
     },
     {
@@ -5585,7 +5585,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "returning_rows": ["{\"updated_at_ns\":3600000000000}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"updated_at_ns\":1}",
@@ -5600,7 +5600,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "returning_rows": ["{\"updated_at_ns\":1735689600000000000}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"updated_at_ns\":1}",
@@ -5615,7 +5615,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"tags\":[\"old\",\"new\"]}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
       "resolver_version": 33,
@@ -5629,7 +5629,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"ACTIVE_USER_#\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
       "resolver_version": 47,
@@ -5643,7 +5643,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"id\":\"u1\",\"enabled\":true}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\",\"enabled\":false}",
       "resolver_version": 48,
@@ -5657,7 +5657,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"id\":\"u1\",\"amount\":2}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
       "resolver_version": 49,
@@ -5671,7 +5671,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"id\":\"u1\",\"amount\":2}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
       "resolver_version": 50,
@@ -5685,7 +5685,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"A\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"old\"}",
       "resolver_version": 51,
@@ -5699,7 +5699,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, request_id text);"],
       "resolver_row_json": "{\"id\":\"u1\",\"request_id\":\"old\"}",
       "resolver_version": 43,
@@ -5713,7 +5713,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "sql": "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 month 1 day' RETURNING id, updated_at_ns"
     },
     {
@@ -5725,7 +5725,7 @@
         "returning": 1,
         "conflict_where": true
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:conflict_where=1",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1:conflict_where=1",
       "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 2) ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.quantity > quantity RETURNING id, status"
     },
     {
@@ -5751,7 +5751,7 @@
         "returning": 1,
         "conflict_where": true
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:conflict_where=1",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1:conflict_where=1",
       "sql": "INSERT INTO usage_records AS u (id, status, quantity) VALUES ('u1', 'ready', 2) ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.quantity > u.quantity RETURNING id, status"
     },
     {
@@ -5901,7 +5901,7 @@
         "operations": 2,
         "returning": 1
       },
-      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=2",
       "apply_setup_sql": ["CREATE TABLE usage_records (id text DEFAULT 'u_default' PRIMARY KEY, status text DEFAULT 'active', amount numeric DEFAULT 0);"],
       "returning_rows": ["{\"id\":\"u_default\",\"status\":\"active\",\"amount\":0}"],
       "resolver_row_json": "{\"id\":\"u_default\",\"status\":\"existing\",\"amount\":9}",
@@ -5928,7 +5928,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
       "params": [{"string": "processing"}, {"string": "u1"}],
       "sql": "UPDATE usage_records SET status = $1 WHERE id = $2 RETURNING id, status, LOWER(status) AS status_key"
     },
@@ -5940,7 +5940,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"status\":\"active\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"ACTIVE\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
       "resolver_version": 29,
@@ -5954,7 +5954,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{\"billing\":{}}}",
       "resolver_version": 30,
       "params": [{"json": "\"pro\""}, {"string": "u1"}],
@@ -5967,7 +5967,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2",
+      "plan": "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_set=2",
       "returning_rows": ["{\"source_text\":\"old\",\"flags_json\":[\"rated\"]}"],
       "resolver_row_json": "{\"id\":\"u1\",\"metadata\":{\"billing\":{\"plan\":\"free\"},\"source\":\"old\"}}",
       "resolver_version": 10,
@@ -5982,7 +5982,7 @@
         "operations": 2,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2",
+      "plan": "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_push=1:op_pull=1",
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
       "resolver_version": 31,
       "params": [{"string": "u1"}],
@@ -5996,7 +5996,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "returning_rows": ["{\"tags\":[\"active\",\"new\"]}"],
       "resolver_row_json": "{\"id\":\"u1\",\"status\":\"active\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
       "resolver_version": 32,
@@ -6011,7 +6011,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, request_id text);"],
       "resolver_row_json": "{\"id\":\"u1\",\"request_id\":\"old\"}",
       "resolver_version": 44,
@@ -6027,7 +6027,7 @@
         "returning": 1,
         "returning_all": true
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:returning_all=1",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1:returning_all=1",
       "sql": "UPDATE usage_records SET status = 'processing' WHERE id = 'u1' RETURNING *, LOWER(status) AS status_key"
     },
     {
@@ -6039,7 +6039,7 @@
         "returning": 1,
         "returning_all": true
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:returning_all=1",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1:returning_all=1",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.*"
     },
     {
@@ -6050,7 +6050,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE u.id = 'u1' RETURNING u.id, u.status AS returned_status"
     },
     {
@@ -6061,7 +6061,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.id, u.status AS returned_status"
     },
     {
@@ -6072,7 +6072,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=3",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=3:op_set=1",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.status || ':' || u.id AS status_key, lower(u.status) AS lower_status, u.metadata->>'source' AS metadata_source"
     },
     {
@@ -6083,7 +6083,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"processing\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"queued\"}",
@@ -6099,7 +6099,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;"],
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"disabled\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
@@ -6115,7 +6115,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, deleted_at text, status text);", "CREATE UNIQUE INDEX usage_records_live_email_key ON usage_records (email) WHERE deleted_at IS NULL;", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_live_email_key;"],
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"disabled\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
@@ -6131,7 +6131,7 @@
         "operations": 1,
         "returning": 1
       },
-      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+      "plan": "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, status text);", "CREATE UNIQUE INDEX usage_records_active_tenant_email_key ON usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_tenant_email_key;"],
       "returning_rows": ["{\"id\":\"u1\",\"status\":\"disabled\"}"],
       "resolver_row_json": "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"status\":\"active\"}",

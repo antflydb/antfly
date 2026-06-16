@@ -59889,6 +59889,73 @@ fn expressionAssignmentComputedCount(assignments: []const db_mod.types.Relationa
     return count;
 }
 
+const TransformOpFingerprintCounts = struct {
+    set: usize = 0,
+    set_on_insert: usize = 0,
+    unset: usize = 0,
+    inc: usize = 0,
+    push: usize = 0,
+    pull: usize = 0,
+    add_to_set: usize = 0,
+    pop: usize = 0,
+    mul: usize = 0,
+    min: usize = 0,
+    max: usize = 0,
+    current_date: usize = 0,
+    rename: usize = 0,
+};
+
+fn transformOperationCount(transforms: []const db_mod.types.DocumentTransform) usize {
+    var count: usize = 0;
+    for (transforms) |transform| count += transform.operations.len;
+    return count;
+}
+
+fn transformOpFingerprintCounts(transforms: []const db_mod.types.DocumentTransform) TransformOpFingerprintCounts {
+    var counts: TransformOpFingerprintCounts = .{};
+    for (transforms) |transform| {
+        for (transform.operations) |operation| switch (operation.op) {
+            .set => counts.set += 1,
+            .set_on_insert => counts.set_on_insert += 1,
+            .unset => counts.unset += 1,
+            .inc => counts.inc += 1,
+            .push => counts.push += 1,
+            .pull => counts.pull += 1,
+            .add_to_set => counts.add_to_set += 1,
+            .pop => counts.pop += 1,
+            .mul => counts.mul += 1,
+            .min => counts.min += 1,
+            .max => counts.max += 1,
+            .current_date => counts.current_date += 1,
+            .rename => counts.rename += 1,
+        };
+    }
+    return counts;
+}
+
+fn appendTransformOpFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    transforms: []const db_mod.types.DocumentTransform,
+) ![]u8 {
+    const counts = transformOpFingerprintCounts(transforms);
+    var fingerprint = owned_base;
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_set", counts.set);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_set_on_insert", counts.set_on_insert);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_unset", counts.unset);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_inc", counts.inc);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_push", counts.push);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_pull", counts.pull);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_add_to_set", counts.add_to_set);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_pop", counts.pop);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_mul", counts.mul);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_min", counts.min);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_max", counts.max);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_current_date", counts.current_date);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_rename", counts.rename);
+    return fingerprint;
+}
+
 fn insertSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredInsertSource) ![]u8 {
     const req = lowered.insert_source.req;
     const source = req.source;
@@ -60438,7 +60505,7 @@ fn mergeNotMatchedHasDoNothing(arms: []const MergeNotMatchedArm) bool {
 fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan) ![]u8 {
     return switch (lowered) {
         .insert => |insert| blk: {
-            const operations = if (insert.batch.transforms.len == 0) 0 else insert.batch.transforms[0].operations.len;
+            const operations = transformOperationCount(insert.batch.transforms);
             var fingerprint = try std.fmt.allocPrint(
                 alloc,
                 "insert:table={s}:writes={d}:transforms={d}:ops={d}:deletes={d}:returning_rows={d}:returning_expr={d}",
@@ -60452,6 +60519,7 @@ fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan
                     insert.returning_expression_count,
                 },
             );
+            fingerprint = try appendTransformOpFingerprintAlloc(alloc, fingerprint, insert.batch.transforms);
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", insert.returning_all);
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", insert.conflict_where);
             break :blk fingerprint;
@@ -60463,12 +60531,13 @@ fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan
             break :blk fingerprint;
         },
         .update => |update| blk: {
-            const operations = if (update.batch.transforms.len == 0) 0 else update.batch.transforms[0].operations.len;
+            const operations = transformOperationCount(update.batch.transforms);
             var fingerprint = try std.fmt.allocPrint(
                 alloc,
                 "update:table={s}:transforms={d}:ops={d}:returning_rows={d}:returning_expr={d}",
                 .{ update.table_name, update.batch.transforms.len, operations, update.batch.returning_rows.len, update.returning_expression_count },
             );
+            fingerprint = try appendTransformOpFingerprintAlloc(alloc, fingerprint, update.batch.transforms);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "writes", update.batch.writes.len);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "deletes", update.batch.deletes.len);
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "identity_rewrites", update.batch.relational_identity_rewrites.len);
@@ -60835,26 +60904,11 @@ fn expectAppParityWritePlanEntry(
         .insert => switch (lowered) {
             .insert => |insert| {
                 try expectOptionalTableName(entry.summary.table_name, insert.table_name);
-                try expectOptionalUsize(entry.summary.operations, if (insert.batch.transforms.len == 0) 0 else insert.batch.transforms[0].operations.len);
+                try expectOptionalUsize(entry.summary.operations, transformOperationCount(insert.batch.transforms));
                 try expectOptionalUsize(entry.summary.returning, insert.batch.returning_rows.len);
                 if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, insert.returning_all);
                 if (entry.summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert.conflict_where);
-                const operations = if (insert.batch.transforms.len == 0) 0 else insert.batch.transforms[0].operations.len;
-                var fingerprint = try std.fmt.allocPrint(
-                    alloc,
-                    "insert:table={s}:writes={d}:transforms={d}:ops={d}:deletes={d}:returning_rows={d}:returning_expr={d}",
-                    .{
-                        insert.table_name,
-                        insert.batch.writes.len,
-                        insert.batch.transforms.len,
-                        operations,
-                        insert.batch.deletes.len,
-                        insert.batch.returning_rows.len,
-                        insert.returning_expression_count,
-                    },
-                );
-                fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", insert.returning_all);
-                fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", insert.conflict_where);
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
                 try expectAppParityReturningRows(entry.returning_rows, insert.batch.returning_rows);
@@ -60887,19 +60941,10 @@ fn expectAppParityWritePlanEntry(
         .update => switch (lowered) {
             .update => |update| {
                 try expectOptionalTableName(entry.summary.table_name, update.table_name);
-                try expectOptionalUsize(entry.summary.operations, if (update.batch.transforms.len == 0) 0 else update.batch.transforms[0].operations.len);
+                try expectOptionalUsize(entry.summary.operations, transformOperationCount(update.batch.transforms));
                 try expectOptionalUsize(entry.summary.returning, update.batch.returning_rows.len);
                 if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, update.returning_all);
-                const operations = if (update.batch.transforms.len == 0) 0 else update.batch.transforms[0].operations.len;
-                var fingerprint = try std.fmt.allocPrint(
-                    alloc,
-                    "update:table={s}:transforms={d}:ops={d}:returning_rows={d}:returning_expr={d}",
-                    .{ update.table_name, update.batch.transforms.len, operations, update.batch.returning_rows.len, update.returning_expression_count },
-                );
-                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "writes", update.batch.writes.len);
-                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "deletes", update.batch.deletes.len);
-                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "identity_rewrites", update.batch.relational_identity_rewrites.len);
-                fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", update.returning_all);
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
                 try expectAppParityReturningRows(entry.returning_rows, update.batch.returning_rows);
@@ -61205,26 +61250,11 @@ fn expectAppParityCorpusEntry(
             var lowered = try lowerInsertWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
             defer lowered.deinit(alloc);
             try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.operations, if (lowered.batch.transforms.len == 0) 0 else lowered.batch.transforms[0].operations.len);
+            try expectOptionalUsize(entry.summary.operations, transformOperationCount(lowered.batch.transforms));
             try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
             if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.returning_all);
             if (entry.summary.conflict_where) |expected| try std.testing.expectEqual(expected, lowered.conflict_where);
-            const operations = if (lowered.batch.transforms.len == 0) 0 else lowered.batch.transforms[0].operations.len;
-            var fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "insert:table={s}:writes={d}:transforms={d}:ops={d}:deletes={d}:returning_rows={d}:returning_expr={d}",
-                .{
-                    lowered.table_name,
-                    lowered.batch.writes.len,
-                    lowered.batch.transforms.len,
-                    operations,
-                    lowered.batch.deletes.len,
-                    lowered.batch.returning_rows.len,
-                    lowered.returning_expression_count,
-                },
-            );
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", lowered.returning_all);
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", lowered.conflict_where);
+            const fingerprint = try writePlanFingerprintAlloc(alloc, .{ .insert = lowered });
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
             try expectAppParityReturningRows(entry.returning_rows, lowered.batch.returning_rows);
@@ -61255,18 +61285,10 @@ fn expectAppParityCorpusEntry(
             var lowered = try lowerUpdateAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
             defer lowered.deinit(alloc);
             try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.operations, if (lowered.batch.transforms.len == 0) 0 else lowered.batch.transforms[0].operations.len);
+            try expectOptionalUsize(entry.summary.operations, transformOperationCount(lowered.batch.transforms));
             try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
             if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.returning_all);
-            const operations = if (lowered.batch.transforms.len == 0) 0 else lowered.batch.transforms[0].operations.len;
-            var fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "update:table={s}:transforms={d}:ops={d}:returning_rows={d}:returning_expr={d}",
-                .{ lowered.table_name, lowered.batch.transforms.len, operations, lowered.batch.returning_rows.len, lowered.returning_expression_count },
-            );
-            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "writes", lowered.batch.writes.len);
-            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "deletes", lowered.batch.deletes.len);
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", lowered.returning_all);
+            const fingerprint = try writePlanFingerprintAlloc(alloc, .{ .update = lowered });
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
             try expectAppParityReturningRows(entry.returning_rows, lowered.batch.returning_rows);
@@ -68001,49 +68023,49 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1:op_inc=1",
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = quantity + excluded.quantity RETURNING id, quantity, CAST(quantity AS text) AS quantity_text",
         },
         .{
             .name = "conflict row assignment update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=1:op_inc=1",
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = ROW(DEFAULT, quantity + excluded.quantity) RETURNING id, status, quantity",
         },
         .{
             .name = "conflict boolean expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, enabled) VALUES ('u1', true) ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled OR false RETURNING id, enabled",
         },
         .{
             .name = "conflict parenthesized arithmetic update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = (quantity + excluded.quantity) RETURNING id, quantity",
         },
         .{
             .name = "conflict proposed arithmetic update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity + 3 RETURNING id, quantity",
         },
         .{
             .name = "schema-qualified conflict arithmetic update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO public.usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET quantity = public.usage_records.quantity + excluded.quantity RETURNING id, quantity",
         },
         .{
             .name = "schema-derived unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68057,7 +68079,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "inline unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text UNIQUE, status text);",
             },
@@ -68069,7 +68091,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict coalesce existing update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68083,7 +68105,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict numeric expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, amount numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68097,7 +68119,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict text expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68111,7 +68133,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict bit length update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68125,7 +68147,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict octet length update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68139,7 +68161,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict nested text expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, next_status text, amount numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68153,7 +68175,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict initcap text update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68168,7 +68190,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict fixed interval update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns numeric);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68182,7 +68204,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict jsonb update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, metadata jsonb);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68196,7 +68218,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived unique conflict jsonb concat update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=2",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, metadata jsonb);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68211,7 +68233,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "target-qualified unique conflict text update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68575,7 +68597,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived partial unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, name text);",
                 "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
@@ -68589,7 +68611,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived named partial unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text, name text);",
                 "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
@@ -68603,7 +68625,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived temporal unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "prices", .operations = 1, .returning = 1 },
-            .plan = "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
             },
@@ -68615,7 +68637,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived expression unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);",
                 "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (lower(email));",
@@ -68629,7 +68651,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived named expression unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);",
                 "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (lower(email));",
@@ -68643,7 +68665,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived mixed expression unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, name text);",
                 "CREATE UNIQUE INDEX usage_records_tenant_lower_email_key ON usage_records (tenant_id, lower(email));",
@@ -68657,7 +68679,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived upper expression unique conflict upsert",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, name text);",
                 "CREATE UNIQUE INDEX usage_records_upper_email_key ON usage_records (upper(email));",
@@ -68678,14 +68700,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "default named primary conflict update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'named') ON CONFLICT ON CONSTRAINT usage_records_pkey DO UPDATE SET status = excluded.status RETURNING id, status",
         },
         .{
             .name = "custom named primary conflict update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
                 "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk;",
@@ -68698,28 +68720,28 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict default update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'open') ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status",
         },
         .{
             .name = "conflict server-time expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=1:op_set=1",
             .sql = "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = CASE WHEN excluded.amount > amount THEN CURRENT_TIMESTAMP(6) ELSE updated_at_ns END RETURNING id, updated_at_ns, CAST(updated_at_ns AS text) AS updated_at_text",
         },
         .{
             .name = "conflict current date update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = CURRENT_DATE RETURNING id, updated_at_ns",
         },
         .{
             .name = "conflict date_bin expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68734,7 +68756,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict typed datetime literal update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, updated_at_ns timestamptz);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -68749,7 +68771,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict computed array patch expression",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
             .resolver_version = 33,
             .returning_rows = &.{"{\"tags\":[\"old\",\"new\"]}"},
@@ -68759,7 +68781,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict regexp replace expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
             .resolver_version = 47,
             .returning_rows = &.{"{\"id\":\"u1\",\"status\":\"ACTIVE_USER_#\"}"},
@@ -68769,7 +68791,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict regexp like expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"enabled\":false}",
             .resolver_version = 48,
             .returning_rows = &.{"{\"id\":\"u1\",\"enabled\":true}"},
@@ -68779,7 +68801,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict regexp count expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
             .resolver_version = 49,
             .returning_rows = &.{"{\"id\":\"u1\",\"amount\":2}"},
@@ -68789,7 +68811,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict regexp instr expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\",\"amount\":0}",
             .resolver_version = 50,
             .returning_rows = &.{"{\"id\":\"u1\",\"amount\":2}"},
@@ -68799,7 +68821,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict regexp substr expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
             .resolver_version = 51,
             .returning_rows = &.{"{\"id\":\"u1\",\"status\":\"A\"}"},
@@ -68809,7 +68831,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict uuid generation update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, request_id text);",
             },
@@ -68821,14 +68843,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "conflict mixed interval expression update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
             .sql = "INSERT INTO usage_records (id, amount) VALUES ('u1', 10) ON CONFLICT (id) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 month 1 day' RETURNING id, updated_at_ns",
         },
         .{
             .name = "conflict guarded update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1, .conflict_where = true },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:conflict_where=1",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1:conflict_where=1",
             .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'ready', 2) ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.quantity > quantity RETURNING id, status",
         },
         .{
@@ -68844,7 +68866,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "target-qualified conflict guarded update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1, .conflict_where = true },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:conflict_where=1",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1:conflict_where=1",
             .sql = "INSERT INTO usage_records AS u (id, status, quantity) VALUES ('u1', 'ready', 2) ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.quantity > u.quantity RETURNING id, status",
         },
         .{
@@ -68959,7 +68981,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-derived default values conflict update",
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
-            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0:op_set=2",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id text DEFAULT 'u_default' PRIMARY KEY, status text DEFAULT 'active', amount numeric DEFAULT 0);",
             },
@@ -68983,7 +69005,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
             .sql = "UPDATE usage_records SET status = $1 WHERE id = $2 RETURNING id, status, LOWER(status) AS status_key",
             .params = &.{ .{ .string = "processing" }, .{ .string = "u1" } },
         },
@@ -68991,7 +69013,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update expression assignment",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"ACTIVE\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{}}",
             .resolver_version = 29,
             .returning_rows = &.{"{\"status\":\"active\"}"},
@@ -69001,7 +69023,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update jsonb",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{\"billing\":{}}}",
             .resolver_version = 30,
             .sql = "UPDATE usage_records SET metadata = jsonb_set(metadata, '{billing,plan}', $1, true) WHERE id = $2 RETURNING metadata",
@@ -69011,7 +69033,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update jsonb concat",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 2 },
-            .plan = "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2",
+            .plan = "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_set=2",
             .resolver_row_json = "{\"id\":\"u1\",\"metadata\":{\"billing\":{\"plan\":\"free\"},\"source\":\"old\"}}",
             .resolver_version = 10,
             .returning_rows = &.{"{\"source_text\":\"old\",\"flags_json\":[\"rated\"]}"},
@@ -69022,7 +69044,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update array",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2",
+            .plan = "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_push=1:op_pull=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"queued\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
             .resolver_version = 31,
             .sql = "UPDATE usage_records SET tags = array_append(tags, 'new'), tags = array_remove(tags, 'old') WHERE id = $1 RETURNING tags, array_append(tags, 'tail') AS tags_preview, array_remove(tags, 'new') AS tags_without_new",
@@ -69032,7 +69054,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update computed array patch expression",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .resolver_row_json = "{\"id\":\"u1\",\"status\":\"active\",\"quantity\":1,\"amount\":5,\"priority\":1,\"updated_at_ns\":1,\"metadata\":{},\"tags\":[\"old\"]}",
             .resolver_version = 32,
             .returning_rows = &.{"{\"tags\":[\"active\",\"new\"]}"},
@@ -69043,7 +69065,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update uuid generation",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, request_id text);",
             },
@@ -69056,42 +69078,42 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update returning all",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1, .returning_all = true },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:returning_all=1",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1:returning_all=1",
             .sql = "UPDATE usage_records SET status = 'processing' WHERE id = 'u1' RETURNING *, LOWER(status) AS status_key",
         },
         .{
             .name = "point update alias returning all",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1, .returning_all = true },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:returning_all=1",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1:returning_all=1",
             .sql = "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.*",
         },
         .{
             .name = "point update alias qualified selector",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
             .sql = "UPDATE usage_records AS u SET status = 'processing' WHERE u.id = 'u1' RETURNING u.id, u.status AS returned_status",
         },
         .{
             .name = "point update alias qualified returning fields",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=1:op_set=1",
             .sql = "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.id, u.status AS returned_status",
         },
         .{
             .name = "point update alias qualified returning expressions",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=3",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=3:op_set=1",
             .sql = "UPDATE usage_records AS u SET status = 'processing' WHERE id = 'u1' RETURNING u.status || ':' || u.id AS status_key, lower(u.status) AS lower_status, u.metadata->>'source' AS metadata_source",
         },
         .{
             .name = "point update unique selector",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
@@ -69107,7 +69129,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update partial unique selector",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
@@ -69123,7 +69145,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update partial unique null selector",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, deleted_at text, status text);",
                 "CREATE UNIQUE INDEX usage_records_live_email_key ON usage_records (email) WHERE deleted_at IS NULL;",
@@ -69139,7 +69161,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "point update expression partial unique selector",
             .family = .update,
             .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
-            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0",
+            .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, status text);",
                 "CREATE UNIQUE INDEX usage_records_active_tenant_email_key ON usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';",
