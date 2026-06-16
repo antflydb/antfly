@@ -573,6 +573,9 @@ be validated against that operator package.
 - Bootstrap standby pods from base backup and attach them to replication slots.
 - Manage slot lifecycle and WAL retention pressure.
 - Prefer typed `/admin/v1/ha` calls for idempotent operator actions.
+- Publish each executable planned action with its typed admin HTTP method/path
+  and target admin URL, while keeping CLI argv as a compatibility and
+  break-glass execution hint.
 - Use CLI-backed Kubernetes Jobs only for workflows that need pod-local mounted
   files, shared backup volumes, or explicit break-glass execution.
 - Publish lag, degraded, unhealthy, and reseed-required conditions.

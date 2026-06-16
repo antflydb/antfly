@@ -1533,6 +1533,14 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
+	// AdminMethod is the HTTP method for the typed /admin/v1 operation that executes this action.
+	// +optional
+	AdminMethod string `json:"adminMethod,omitempty"`
+
+	// AdminPath is the typed /admin/v1 operation path that executes this action.
+	// +optional
+	AdminPath string `json:"adminPath,omitempty"`
+
 	// SeedManifestPath is the base-backup manifest path used by seed finish/bootstrap actions.
 	// +optional
 	SeedManifestPath string `json:"seedManifestPath,omitempty"`

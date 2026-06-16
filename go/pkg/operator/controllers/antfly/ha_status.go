@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -571,6 +572,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	}
 	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
 	for _, action := range actions {
+		adminMethod, adminPath := haAdminOperation(action)
 		out = append(out, antflyv1.HAPlannedActionStatus{
 			Kind:             string(action.Kind),
 			Phase:            string(haPlannedActionPhase(action.Kind)),
@@ -591,6 +593,8 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			SeedContentRoot:  action.SeedContentRoot,
 			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
 			AdminURL:         haAdminURL(action, ha),
+			AdminMethod:      adminMethod,
+			AdminPath:        adminPath,
 			Reason:           action.Reason,
 		})
 	}
@@ -648,6 +652,8 @@ func parseHAOperatorPlanAction(lines map[string]string, idx uint64) (antflyv1.HA
 		FenceHolder:      strings.TrimSpace(lines[prefix+"fence_holder"]),
 		FenceReason:      strings.TrimSpace(lines[prefix+"fence_reason"]),
 		AdminURL:         strings.TrimSpace(lines[prefix+"admin_url"]),
+		AdminMethod:      strings.TrimSpace(lines[prefix+"admin_method"]),
+		AdminPath:        strings.TrimSpace(lines[prefix+"admin_path"]),
 		SeedManifestPath: strings.TrimSpace(lines[prefix+"seed_manifest_path"]),
 		SeedContentRoot:  strings.TrimSpace(lines[prefix+"seed_content_root"]),
 		Reason:           strings.TrimSpace(lines[prefix+"reason"]),
@@ -662,6 +668,20 @@ func parseHAOperatorPlanAction(lines map[string]string, idx uint64) (antflyv1.HA
 	action.ObservedLSN, _ = parseHAResultUint(lines, prefix+"observed_lsn")
 	action.RetainedFromLSN, _ = parseHAResultUint(lines, prefix+"retained_from_lsn")
 	action.FenceGeneration, _ = parseHAResultUint(lines, prefix+"fence_generation")
+	if action.AdminMethod == "" || action.AdminPath == "" {
+		derivedMethod, derivedPath := haAdminOperation(haPlannedAction{
+			Kind:             kind,
+			StandbyName:      action.StandbyName,
+			SlotName:         action.SlotName,
+			SeedManifestPath: action.SeedManifestPath,
+		})
+		if action.AdminMethod == "" {
+			action.AdminMethod = derivedMethod
+		}
+		if action.AdminPath == "" {
+			action.AdminPath = derivedPath
+		}
+	}
 	return action, nil
 }
 
@@ -972,6 +992,45 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 	default:
 		return ""
 	}
+}
+
+func haAdminOperation(action haPlannedAction) (string, string) {
+	switch action.Kind {
+	case haActionCreateSlot:
+		return "POST", "/admin/v1/ha/replication-slots"
+	case haActionResumeSlot:
+		if slotName := haPlannedActionSlotName(action); slotName != "" {
+			return "PUT", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName) + "/resume"
+		}
+	case haActionPauseSlot:
+		if slotName := haPlannedActionSlotName(action); slotName != "" {
+			return "PUT", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName) + "/pause"
+		}
+	case haActionDropSlot:
+		if slotName := haPlannedActionSlotName(action); slotName != "" {
+			return "DELETE", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName)
+		}
+	case haActionSeedStandby, haActionMarkReseed:
+		return "POST", "/admin/v1/ha/base-backups"
+	case haActionFinishStandbySeed:
+		return "POST", "/admin/v1/ha/base-backups/finish"
+	case haActionBootstrapStandbySeed:
+		return "POST", "/admin/v1/ha/standby/bootstrap"
+	case haActionAcquireFence:
+		return "POST", "/admin/v1/ha/fence"
+	case haActionPromoteStandby:
+		return "POST", "/admin/v1/ha/promotion/current-fence"
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return "POST", "/admin/v1/ha/rejoin/assess"
+	}
+	return "", ""
+}
+
+func haPlannedActionSlotName(action haPlannedAction) string {
+	if action.SlotName != "" {
+		return action.SlotName
+	}
+	return action.StandbyName
 }
 
 func haStandbyAdminURL(ha *antflyv1.HighAvailabilitySpec, standbyName string) string {

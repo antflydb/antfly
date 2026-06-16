@@ -97,6 +97,12 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("expected slot and seed actions to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
+	if cluster.Status.HAStatus.PlannedActions[0].AdminMethod != "POST" ||
+		cluster.Status.HAStatus.PlannedActions[0].AdminPath != "/admin/v1/ha/replication-slots" ||
+		cluster.Status.HAStatus.PlannedActions[1].AdminMethod != "POST" ||
+		cluster.Status.HAStatus.PlannedActions[1].AdminPath != "/admin/v1/ha/base-backups" {
+		t.Fatalf("expected slot and seed actions to publish typed admin operations, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
 }
 
 func TestParseHAOperatorPlanTableActions(t *testing.T) {
@@ -120,6 +126,8 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		"actions.0.fence_generation=3",
 		"actions.0.fence_reason=LeaseHeld",
 		"actions.0.admin_url=http://standby-a-ha.default.svc:8081",
+		"actions.0.admin_method=POST",
+		"actions.0.admin_path=/admin/v1/ha/fence",
 		"actions.1.kind=promote_standby",
 		"actions.1.phase=promote",
 		"actions.1.executor=admin_command",
@@ -160,11 +168,15 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		plan.Actions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		plan.Actions[0].FenceHolder != "standby-a" ||
 		plan.Actions[0].FenceGeneration != 3 ||
-		plan.Actions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		plan.Actions[0].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		plan.Actions[0].AdminMethod != "POST" ||
+		plan.Actions[0].AdminPath != "/admin/v1/ha/fence" {
 		t.Fatalf("unexpected parsed acquire-fence action: %#v", plan.Actions[0])
 	}
 	if plan.Actions[1].Kind != string(haActionPromoteStandby) ||
-		plan.Actions[1].DependsOn != string(haActionAcquireFence) {
+		plan.Actions[1].DependsOn != string(haActionAcquireFence) ||
+		plan.Actions[1].AdminMethod != "POST" ||
+		plan.Actions[1].AdminPath != "/admin/v1/ha/promotion/current-fence" {
 		t.Fatalf("unexpected parsed promote action: %#v", plan.Actions[1])
 	}
 	if plan.Actions[2].Kind != string(haActionUpdatePrimaryRoute) ||
@@ -181,7 +193,9 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		plan.Actions[3].ObservedLSN != 13 ||
 		plan.Actions[3].RetainedFromLSN != 8 ||
 		plan.Actions[3].SeedManifestPath != "/backup/base.afha" ||
-		plan.Actions[3].SeedContentRoot != "/backup/base" {
+		plan.Actions[3].SeedContentRoot != "/backup/base" ||
+		plan.Actions[3].AdminMethod != "POST" ||
+		plan.Actions[3].AdminPath != "/admin/v1/ha/rejoin/assess" {
 		t.Fatalf("unexpected parsed former-primary action: %#v", plan.Actions[3])
 	}
 }
@@ -209,13 +223,17 @@ func TestPlanHAPlansSeedFinishAndBootstrapWhenManifestPathConfigured(t *testing.
 	if actions[2].Kind != string(haActionFinishStandbySeed) ||
 		actions[2].DependsOn != string(haActionSeedStandby) ||
 		!reflect.DeepEqual(actions[2].AdminCommand, []string{"seed", "finish", "--manifest", "/backup/base-standby-a-5.afha"}) ||
-		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
+		actions[2].AdminURL != "http://primary-ha.default.svc:8081" ||
+		actions[2].AdminMethod != "POST" ||
+		actions[2].AdminPath != "/admin/v1/ha/base-backups/finish" {
 		t.Fatalf("unexpected seed finish action: %#v", actions[2])
 	}
 	if actions[3].Kind != string(haActionBootstrapStandbySeed) ||
 		actions[3].DependsOn != string(haActionFinishStandbySeed) ||
 		!reflect.DeepEqual(actions[3].AdminCommand, []string{"seed", "bootstrap", "--manifest", "/backup/base-standby-a-5.afha", "--content-root", "/backup/base-standby-a-5"}) ||
-		actions[3].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		actions[3].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		actions[3].AdminMethod != "POST" ||
+		actions[3].AdminPath != "/admin/v1/ha/standby/bootstrap" {
 		t.Fatalf("unexpected seed bootstrap action: %#v", actions[3])
 	}
 }
@@ -254,18 +272,24 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	}
 	if actions[0].Kind != string(haActionPauseSlot) ||
 		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "pause", "--slot", "standby-a"}) ||
-		actions[0].AdminURL != "http://primary-ha.default.svc:8081" {
+		actions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		actions[0].AdminMethod != "PUT" ||
+		actions[0].AdminPath != "/admin/v1/ha/replication-slots/standby-a/pause" {
 		t.Fatalf("unexpected pause action: %#v", actions[0])
 	}
 	if actions[1].Kind != string(haActionDropSlot) ||
 		actions[1].DependsOn != string(haActionPauseSlot) ||
 		!reflect.DeepEqual(actions[1].AdminCommand, []string{"slot", "drop", "--slot", "standby-a"}) ||
-		actions[1].AdminURL != "http://primary-ha.default.svc:8081" {
+		actions[1].AdminURL != "http://primary-ha.default.svc:8081" ||
+		actions[1].AdminMethod != "DELETE" ||
+		actions[1].AdminPath != "/admin/v1/ha/replication-slots/standby-a" {
 		t.Fatalf("unexpected drop action: %#v", actions[1])
 	}
 	if actions[2].Kind != string(haActionResumeSlot) ||
 		!reflect.DeepEqual(actions[2].AdminCommand, []string{"slot", "resume", "--slot", "slot-b"}) ||
-		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
+		actions[2].AdminURL != "http://primary-ha.default.svc:8081" ||
+		actions[2].AdminMethod != "PUT" ||
+		actions[2].AdminPath != "/admin/v1/ha/replication-slots/slot-b/resume" {
 		t.Fatalf("unexpected resume action: %#v", actions[2])
 	}
 	if cluster.Status.HAStatus.DesiredStandbyCount != 1 {
