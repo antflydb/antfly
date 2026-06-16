@@ -113,6 +113,8 @@ type haFormerPrimaryEvaluation struct {
 	ObservedTimelineID uint64
 	SwitchLSN          uint64
 	ObservedLSN        uint64
+	FenceAuthority     antflyv1.HAFencingAuthority
+	FenceHolder        string
 	FenceGeneration    uint64
 	Action             string
 	Reason             string
@@ -921,6 +923,8 @@ func haFormerPrimaryStatus(evaluation haFormerPrimaryEvaluation) *antflyv1.HAFor
 		ObservedTimelineID: evaluation.ObservedTimelineID,
 		SwitchLSN:          evaluation.SwitchLSN,
 		ObservedLSN:        evaluation.ObservedLSN,
+		FenceAuthority:     evaluation.FenceAuthority,
+		FenceHolder:        evaluation.FenceHolder,
 		FenceGeneration:    evaluation.FenceGeneration,
 		Action:             evaluation.Action,
 		Reason:             evaluation.Reason,
@@ -947,6 +951,8 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *
 			TargetLSN:       evaluation.SwitchLSN,
 			ObservedLSN:     evaluation.ObservedLSN,
 			RetainedFromLSN: retainedFromLSN,
+			FenceAuthority:  evaluation.FenceAuthority,
+			FenceHolder:     evaluation.FenceHolder,
 			FenceGeneration: evaluation.FenceGeneration,
 			FenceReason:     fenceReason,
 			Reason:          evaluation.Reason,
@@ -1419,6 +1425,8 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 		ParentTimelineID: promotion.ParentTimelineID,
 		NewTimelineID:    promotion.NewTimelineID,
 		SwitchLSN:        promotion.SwitchLSN,
+		FenceAuthority:   promotion.FenceAuthority,
+		FenceHolder:      promotion.PromotedStandbyID,
 		FenceGeneration:  promotion.FenceGeneration,
 		Action:           string(haActionDemoteFormerPrimary),
 		Reason:           "FormerPrimaryFenceNotObserved",

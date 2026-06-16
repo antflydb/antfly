@@ -722,6 +722,8 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		!former.RejoinRequired ||
 		!former.RewindPossible ||
 		former.ReseedRequired ||
+		former.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		former.FenceHolder != "standby-a" ||
 		former.Action != string(haActionRewindFormerPrimary) ||
 		former.Reason != "FormerPrimaryNeedsRewind" {
 		t.Fatalf("unexpected rewind disposition: %#v", former)
@@ -730,7 +732,9 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionRewindFormerPrimary) ||
 		cluster.Status.HAStatus.PlannedActions[0].StandbyName != "old-primary" ||
 		cluster.Status.HAStatus.PlannedActions[0].TargetLSN != 10 ||
-		cluster.Status.HAStatus.PlannedActions[0].ObservedLSN != 10 {
+		cluster.Status.HAStatus.PlannedActions[0].ObservedLSN != 10 ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" {
 		t.Fatalf("expected rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
@@ -820,6 +824,7 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 			SwitchLSN:         10,
 			RequiredLSN:       10,
 			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 			FenceGeneration:   4,
 			FenceReason:       "operator-approved",
 		},
@@ -841,6 +846,10 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminCommand != nil {
 		t.Fatalf("rewind should not be executable without a fence token, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" {
+		t.Fatalf("expected former-primary planned action to carry fence identity, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
 
 	cluster.Status.HAStatus.LastPromotion.FenceToken = "token"

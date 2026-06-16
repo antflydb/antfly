@@ -8621,9 +8621,15 @@ spec:
                         type: boolean
                       diverged:
                         type: boolean
+                      fenceAuthority:
+                        description: HAFencingAuthority selects the authority used
+                          before automatic promotion.
+                        type: string
                       fenceGeneration:
                         format: int64
                         type: integer
+                      fenceHolder:
+                        type: string
                       fenced:
                         type: boolean
                       forkLSN:

@@ -1606,6 +1606,10 @@ type HAFormerPrimaryStatus struct {
 
 	ObservedLSN uint64 `json:"observedLSN,omitempty"`
 
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
+	FenceHolder string `json:"fenceHolder,omitempty"`
+
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
 
 	TargetTimelineID uint64 `json:"targetTimelineID,omitempty"`
