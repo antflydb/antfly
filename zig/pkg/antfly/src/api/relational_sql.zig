@@ -14115,6 +14115,18 @@ const Parser = struct {
         target_table: TableAlias,
         source_table: TableAlias,
     ) !db_mod.types.RelationalRowsExpression {
+        if (self.matchKeyword("default")) {
+            const default_value = column.default_value orelse return error.UnsupportedSqlShape;
+            const value_json = try relational_rows.relationalDefaultValueJsonAlloc(self.alloc, default_value);
+            var value_transferred = false;
+            errdefer if (!value_transferred) self.alloc.free(value_json);
+            value_transferred = true;
+            return .{
+                .kind = .value,
+                .value_json = value_json,
+            };
+        }
+
         const previous_joined_target_expression_qualifiers = self.joined_target_expression_qualifiers;
         const previous_joined_source_expression_qualifiers = self.joined_source_expression_qualifiers;
         const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
@@ -62285,6 +62297,7 @@ const AppParityCorpusCoverage = struct {
     unsupported_read_row_lock_key_share: bool = false,
     query_row_lock_no_key_update: bool = false,
     merge_mutation_typed_plan: bool = false,
+    merge_mutation_default_expressions: bool = false,
     unsupported_write_truncate_multi_table: bool = false,
     unsupported_write_truncate_cascade: bool = false,
     truncate_continue_identity: bool = false,
@@ -63279,6 +63292,10 @@ const AppParityCorpusCoverage = struct {
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
         } else if (entry.family == .merge_mutation) {
             self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.indexOf(u8, entry.plan, "merge_mutation:") != null;
+            self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
+                (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, ":matched_update_expr=") and
+                    appParityPlanHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
         } else if (entry.family == .unsupported_write) {
             self.unsupported_write_truncate_multi_table = self.unsupported_write_truncate_multi_table or
                 (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
@@ -64191,6 +64208,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_row_lock_key_share);
         try std.testing.expect(self.query_row_lock_no_key_update);
         try std.testing.expect(self.merge_mutation_typed_plan);
+        try std.testing.expect(self.merge_mutation_default_expressions);
         try std.testing.expect(self.unsupported_write_truncate_multi_table);
         try std.testing.expect(self.unsupported_write_truncate_cascade);
         try std.testing.expect(self.truncate_continue_identity);
@@ -70049,6 +70067,17 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, upper(source.status))",
         },
         .{
+            .name = "merge mutation plan with default expressions",
+            .family = .merge_mutation,
+            .summary = .{
+                .table_name = "usage_records",
+                .join_on = 1,
+                .select = 1,
+            },
+            .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+            .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, DEFAULT)",
+        },
+        .{
             .name = "merge mutation plan with expression arm predicates",
             .family = .merge_mutation,
             .summary = .{
@@ -74518,6 +74547,58 @@ test "postgres sql adapter merge mutation batch executes through relational stor
         .op = .is_not_distinct,
         .value_json = "null",
     }));
+}
+
+test "postgres sql adapter merge mutation batch applies default expressions" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const target_json = "{\"id\":\"t1\",\"status\":\"old\",\"organization_id\":\"org:1\"}";
+    const target_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, target_json);
+    defer alloc.free(target_key);
+    const target_rows = [_]MergeExecutionTargetRow{.{
+        .key = target_key,
+        .json = target_json,
+        .version = 41,
+    }};
+    const source_rows = [_][]const u8{
+        "{\"id\":\"s1\",\"source_id\":\"t1\",\"status\":\"ignored\",\"organization_id\":\"org:source-ignored\"}",
+        "{\"id\":\"s2\",\"source_id\":\"new1\",\"status\":\"ignored\",\"organization_id\":\"org:2\"}",
+    };
+
+    var write_plan = try lowerWritePlanAlloc(
+        alloc,
+        "MERGE INTO usage_records AS target USING usage_records AS source ON target.id = source.source_id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status, organization_id) VALUES (source.source_id, DEFAULT, source.organization_id) RETURNING id, status, organization_id",
+        schema,
+        &.{},
+        .{},
+    );
+    defer write_plan.deinit(alloc);
+
+    switch (write_plan) {
+        .merge_mutation => |merge| {
+            try std.testing.expectEqual(@as(usize, 1), merge.matched_arms[0].update_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, merge.matched_arms[0].update_expressions[0].expression.kind);
+            try std.testing.expectEqualStrings("\"active\"", merge.matched_arms[0].update_expressions[0].expression.value_json);
+            try std.testing.expectEqual(@as(usize, 1), merge.not_matched_arms[0].insert_expressions.len);
+            try std.testing.expectEqualStrings("\"active\"", merge.not_matched_arms[0].insert_expressions[0].expression.value_json);
+
+            var batch = try buildMergeMutationBatchAlloc(alloc, schema, schema, merge, target_rows[0..], source_rows[0..]);
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"active\",\"organization_id\":\"org:1\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"new1\",\"status\":\"active\",\"organization_id\":\"org:2\"}", batch.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "postgres sql adapter merge mutation batch resolves temporal primary targets" {

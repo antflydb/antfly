@@ -1097,8 +1097,10 @@ updates/deletes emit ordinary row-batch update/delete operations with
 expected-version OCC predicates, and unmatched inserts emit ordinary row-batch
 inserts. Target/source expression
 assignments are evaluated over the collected source and target row images before
-building the row-batch patch or insert row; final writes still run through the
-normal row-batch validator. Field-copy `RETURNING` and
+building the row-batch patch or insert row; explicit MERGE `DEFAULT`
+assignments resolve through the target column's Antfly default and are stored as
+literal typed expression values in the MERGE plan. Final writes still run
+through the normal row-batch validator. Field-copy `RETURNING` and
 `RETURNING *`, plus row-local expression `RETURNING`, are projected by the same
 row-batch returning path used by direct insert/update/delete. Applying the MERGE
 result therefore still flows through `db.batch`, preserving generated columns,

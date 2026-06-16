@@ -8041,6 +8041,17 @@
       "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, upper(source.status))"
     },
     {
+      "name": "merge mutation plan with default expressions",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "join_on": 1
+      },
+      "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0:matched_update_expr=1:not_matched_insert_expr=1",
+      "sql": "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = DEFAULT WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, DEFAULT)"
+    },
+    {
       "name": "merge mutation plan with expression arm predicates",
       "family": "merge_mutation",
       "summary": {
