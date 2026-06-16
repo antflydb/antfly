@@ -292,6 +292,9 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendUsizeLine(alloc, &out, "reseed_required_count", operator_plan.reseed_required_count);
             try appendUsizeLine(alloc, &out, "action_count", operator_plan.actions.len);
             try appendUsizeLine(alloc, &out, "condition_count", operator_plan.conditions.len);
+            for (operator_plan.actions, 0..) |action, idx| {
+                try appendOperatorActionLines(alloc, &out, idx, action);
+            }
             if (operator_plan.former_primary_assessment) |assessment| {
                 try appendLine(alloc, &out, "former_primary.action", @tagName(assessment.action));
                 try appendLine(alloc, &out, "former_primary.reason", @tagName(assessment.reason));
@@ -937,6 +940,33 @@ fn appendPromotionResultLines(
     try appendBoolLine(alloc, out, "forced", promotion_result.forced);
 }
 
+fn appendOperatorActionLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    idx: usize,
+    action: operator.Action,
+) !void {
+    try appendIndexedLine(alloc, out, "actions", idx, "kind", @tagName(action.kind));
+    try appendIndexedLine(alloc, out, "actions", idx, "phase", @tagName(action.phase));
+    try appendIndexedLine(alloc, out, "actions", idx, "executor", @tagName(action.executor));
+    try appendIndexedLine(alloc, out, "actions", idx, "reason", action.reason);
+    if (action.depends_on) |depends_on| try appendIndexedLine(alloc, out, "actions", idx, "depends_on", @tagName(depends_on));
+    if (action.fencing_precondition) |fence| {
+        try appendIndexedLine(alloc, out, "actions", idx, "fence_authority", @tagName(fence.authority));
+        try appendIndexedLine(alloc, out, "actions", idx, "fence_holder", fence.holder);
+        try appendIndexedU64Line(alloc, out, "actions", idx, "fence_generation", fence.generation);
+        try appendIndexedLine(alloc, out, "actions", idx, "fence_reason", fence.reason);
+    }
+    if (action.standby_name) |standby_name| try appendIndexedLine(alloc, out, "actions", idx, "standby_name", standby_name);
+    if (action.slot_name) |slot_name| try appendIndexedLine(alloc, out, "actions", idx, "slot_name", slot_name);
+    if (action.target_lsn) |target_lsn| try appendIndexedU64Line(alloc, out, "actions", idx, "target_lsn", target_lsn);
+    if (action.seed_manifest_path) |seed_manifest_path| try appendIndexedLine(alloc, out, "actions", idx, "seed_manifest_path", seed_manifest_path);
+    if (action.seed_content_root) |seed_content_root| try appendIndexedLine(alloc, out, "actions", idx, "seed_content_root", seed_content_root);
+    if (action.route_from) |route_from| try appendIndexedLine(alloc, out, "actions", idx, "route_from", route_from);
+    if (action.route_to) |route_to| try appendIndexedLine(alloc, out, "actions", idx, "route_to", route_to);
+    if (action.admin_url) |admin_url| try appendIndexedLine(alloc, out, "actions", idx, "admin_url", admin_url);
+}
+
 fn appendFenceReceiptLines(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1368,6 +1398,16 @@ test "storage.ha admin exec renders operator plan command" {
     try expectContains(table_body, "result=operator_plan\n");
     try expectContains(table_body, "automatic_promotion_allowed=true\n");
     try expectContains(table_body, "action_count=4\n");
+    try expectContains(table_body, "actions.0.kind=acquire_fence\n");
+    try expectContains(table_body, "actions.0.phase=fence\n");
+    try expectContains(table_body, "actions.0.executor=admin_command\n");
+    try expectContains(table_body, "actions.0.fence_authority=kubernetes_lease\n");
+    try expectContains(table_body, "actions.1.kind=promote_standby\n");
+    try expectContains(table_body, "actions.1.depends_on=acquire_fence\n");
+    try expectContains(table_body, "actions.2.kind=update_primary_endpoint\n");
+    try expectContains(table_body, "actions.2.executor=controller_action\n");
+    try expectContains(table_body, "actions.2.route_to=standby-a\n");
+    try expectContains(table_body, "actions.3.kind=demote_former_primary\n");
 }
 
 test "storage.ha admin exec operator plan assesses former primary rejoin" {
@@ -1418,6 +1458,9 @@ test "storage.ha admin exec operator plan assesses former primary rejoin" {
     try expectContains(table_body, "former_primary.action=rewind\n");
     try expectContains(table_body, "former_primary.reason=parent_timeline_retained\n");
     try expectContains(table_body, "former_primary.fork_lsn=10\n");
+    try expectContains(table_body, "actions.0.kind=rewind_former_primary\n");
+    try expectContains(table_body, "actions.0.phase=rejoin\n");
+    try expectContains(table_body, "actions.0.target_lsn=10\n");
 }
 
 test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
