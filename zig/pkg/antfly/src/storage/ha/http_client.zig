@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const routes = @import("../../raft/transport/routes.zig");
 const fencing = @import("fencing.zig");
@@ -34,6 +35,23 @@ pub const RenderedOutput = struct {
         alloc.free(self.body);
         self.* = undefined;
     }
+};
+
+pub fn ParsedOutput(comptime T: type) type {
+    return struct {
+        body: []u8,
+        parsed: std.json.Parsed(T),
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            self.parsed.deinit();
+            alloc.free(self.body);
+            self.* = undefined;
+        }
+    };
+}
+
+pub const PrimaryStatusOptions = struct {
+    max_lag_lsn: ?u64 = null,
 };
 
 pub const Client = struct {
@@ -94,6 +112,156 @@ pub const Client = struct {
         };
     }
 
+    pub fn getPrimaryStatus(
+        self: *Client,
+        base_uri: []const u8,
+        options: PrimaryStatusOptions,
+    ) !ParsedOutput(admin_api.openapi.HAPrimaryStatusResponse) {
+        var uri = try join(self.alloc, base_uri, admin_api.routes.ha_primary_status);
+        defer self.alloc.free(uri);
+        if (options.max_lag_lsn) |max_lag_lsn| {
+            uri = try appendQueryU64(self.alloc, uri, "max_lag_lsn", max_lag_lsn);
+        }
+
+        return try self.executeJson(admin_api.openapi.HAPrimaryStatusResponse, .{
+            .method = .GET,
+            .uri = uri,
+        });
+    }
+
+    pub fn getStandbyStatus(
+        self: *Client,
+        base_uri: []const u8,
+        upstream_lsn: ?u64,
+    ) !ParsedOutput(admin_api.openapi.HAStandbyStatusResponse) {
+        var uri = try join(self.alloc, base_uri, admin_api.routes.ha_standby_status);
+        defer self.alloc.free(uri);
+        if (upstream_lsn) |lsn| {
+            uri = try appendQueryU64(self.alloc, uri, "upstream_lsn", lsn);
+        }
+
+        return try self.executeJson(admin_api.openapi.HAStandbyStatusResponse, .{
+            .method = .GET,
+            .uri = uri,
+        });
+    }
+
+    pub fn listReplicationSlots(
+        self: *Client,
+        base_uri: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HAPrimaryStatusResponse) {
+        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
+        defer self.alloc.free(uri);
+        return try self.executeJson(admin_api.openapi.HAPrimaryStatusResponse, .{
+            .method = .GET,
+            .uri = uri,
+        });
+    }
+
+    pub fn createReplicationSlot(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+        initial_lsn: ?u64,
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(
+            self.alloc,
+            admin_api.openapi.ReplicationSlotCreateRequest{
+                .slot_name = slot_name,
+                .initial_lsn = if (initial_lsn) |lsn| @intCast(lsn) else null,
+            },
+            .{},
+        );
+        defer self.alloc.free(body);
+
+        return try self.executeJson(admin_api.openapi.HAReplicationSlotActionResponse, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+    }
+
+    pub fn pauseReplicationSlot(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+        return try self.replicationSlotLifecycle(base_uri, slot_name, .pause);
+    }
+
+    pub fn resumeReplicationSlot(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+        return try self.replicationSlotLifecycle(base_uri, slot_name, .@"resume");
+    }
+
+    pub fn dropReplicationSlot(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+        return try self.replicationSlotLifecycle(base_uri, slot_name, .drop);
+    }
+
+    fn replicationSlotLifecycle(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+        action: enum { pause, @"resume", drop },
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+        const path = switch (action) {
+            .pause => try admin_api.routes.replicationSlotPausePathAlloc(self.alloc, slot_name),
+            .@"resume" => try admin_api.routes.replicationSlotResumePathAlloc(self.alloc, slot_name),
+            .drop => try admin_api.routes.replicationSlotPathAlloc(self.alloc, slot_name),
+        };
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        return try self.executeJson(admin_api.openapi.HAReplicationSlotActionResponse, .{
+            .method = switch (action) {
+                .drop => .DELETE,
+                .pause, .@"resume" => .PUT,
+            },
+            .uri = uri,
+        });
+    }
+
+    fn executeJson(
+        self: *Client,
+        comptime T: type,
+        req: http_common.HttpRequest,
+    ) !ParsedOutput(T) {
+        var resp = try self.executeWithRetry(req);
+        errdefer resp.deinit(self.alloc);
+        try mapStatus(resp.status);
+
+        if (resp.content_type) |content_type| self.alloc.free(content_type);
+        resp.content_type = null;
+        for (resp.headers) |*header| header.deinit(self.alloc);
+        if (resp.headers.len > 0) self.alloc.free(resp.headers);
+        resp.headers = &.{};
+
+        const body = resp.body;
+        resp.body = &.{};
+        errdefer self.alloc.free(body);
+        const parsed = try std.json.parseFromSlice(
+            T,
+            self.alloc,
+            body,
+            .{ .ignore_unknown_fields = true },
+        );
+        return .{
+            .body = body,
+            .parsed = parsed,
+        };
+    }
+
     fn executeWithRetry(self: *Client, req: http_common.HttpRequest) !http_common.HttpResponse {
         var attempt: usize = 0;
         while (true) {
@@ -126,6 +294,13 @@ pub const Client = struct {
 
 fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     return try routes.Routes.join(alloc, base_uri, path);
+}
+
+fn appendQueryU64(alloc: Allocator, old_uri: []u8, key: []const u8, value: u64) ![]u8 {
+    const separator: []const u8 = if (std.mem.indexOfScalar(u8, old_uri, '?') == null) "?" else "&";
+    const next = try std.fmt.allocPrint(alloc, "{s}{s}{s}={d}", .{ old_uri, separator, key, value });
+    alloc.free(old_uri);
+    return next;
 }
 
 const TestPaths = struct {
@@ -212,6 +387,38 @@ test "storage.ha http client round trips admin commands" {
     try client.checkHealth("http://ha-admin.test");
     try client.checkReady("http://ha-admin.test");
 
+    var typed_primary_status = try client.getPrimaryStatus("http://ha-admin.test", .{ .max_lag_lsn = 1 });
+    defer typed_primary_status.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), typed_primary_status.parsed.value.schema_version);
+    try std.testing.expectEqualStrings("primary", typed_primary_status.parsed.value.snapshot.role);
+    try std.testing.expectEqual(@as(i64, 0), typed_primary_status.parsed.value.snapshot.current_lsn);
+
+    var typed_created = try client.createReplicationSlot("http://ha-admin.test", "standby-typed", 0);
+    defer typed_created.deinit(alloc);
+    try std.testing.expectEqualStrings("create", typed_created.parsed.value.slot_action);
+    try std.testing.expectEqualStrings("standby-typed", typed_created.parsed.value.slot.slot_name);
+    try std.testing.expect(typed_created.parsed.value.slot.active);
+
+    var typed_slots = try client.listReplicationSlots("http://ha-admin.test");
+    defer typed_slots.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), typed_slots.parsed.value.snapshot.slots.len);
+    try std.testing.expectEqualStrings("standby-typed", typed_slots.parsed.value.snapshot.slots[0].name);
+
+    var typed_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby-typed");
+    defer typed_paused.deinit(alloc);
+    try std.testing.expectEqualStrings("pause", typed_paused.parsed.value.slot_action);
+    try std.testing.expect(!typed_paused.parsed.value.slot.active);
+
+    var typed_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby-typed");
+    defer typed_resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("resume", typed_resumed.parsed.value.slot_action);
+    try std.testing.expect(typed_resumed.parsed.value.slot.active);
+
+    var typed_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby-typed");
+    defer typed_dropped.deinit(alloc);
+    try std.testing.expectEqualStrings("drop", typed_dropped.parsed.value.slot_action);
+    try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped);
+
     var created = try client.executeCommand("http://ha-admin.test/", &.{ "slot", "create", "standby-a", "--initial-lsn", "0" });
     defer created.deinit(alloc);
     try std.testing.expectEqualStrings("application/json", created.content_type);
@@ -237,6 +444,14 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("text/plain; charset=utf-8", streamed.content_type);
     try expectContains(streamed.body, "result=stream_once\n");
     try expectContains(streamed.body, "applied_lsn=1\n");
+
+    var typed_standby_status = try client.getStandbyStatus("http://ha-admin.test", 2);
+    defer typed_standby_status.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.schema_version);
+    try std.testing.expectEqualStrings("standby", typed_standby_status.parsed.value.snapshot.role);
+    try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.snapshot.applied_lsn);
+    try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn);
+    try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn);
 
     var operator_plan = try client.executeCommand("http://ha-admin.test", &.{
         "operator",
