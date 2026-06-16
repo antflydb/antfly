@@ -229,6 +229,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(createSlotJob).NotTo(BeNil())
 	g.Expect(createSlotJob.OwnerReferences).To(HaveLen(1))
 	g.Expect(createSlotJob.OwnerReferences[0].Name).To(Equal(cluster.Name))
+	g.Expect(createSlotJob.Annotations).NotTo(HaveKey("antfly.io/ha-action-depends-on"))
 	g.Expect(*createSlotJob.Spec.BackoffLimit).To(Equal(backoffLimit))
 	g.Expect(*createSlotJob.Spec.ActiveDeadlineSeconds).To(Equal(timeoutSeconds))
 	g.Expect(*createSlotJob.Spec.TTLSecondsAfterFinished).To(Equal(ttlSecondsAfterFinished))
@@ -281,6 +282,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 		}
 	}
 	g.Expect(seedJob).NotTo(BeNil())
+	g.Expect(seedJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-action-depends-on", string(haActionCreateSlot)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(seedJob.Name))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhasePending))

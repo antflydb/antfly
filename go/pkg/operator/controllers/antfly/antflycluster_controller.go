@@ -4041,20 +4041,24 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
 	args := append([]string{"ha", "--ha-url", action.AdminURL, "--"}, action.AdminCommand...)
 	labels := haAdminJobLabels(cluster, action)
+	annotations := map[string]string{
+		"antfly.io/ha-action-kind":  action.Kind,
+		"antfly.io/ha-admin-url":    action.AdminURL,
+		"antfly.io/ha-command-hash": haAdminActionHash(action),
+	}
+	if action.DependsOn != "" {
+		annotations["antfly.io/ha-action-depends-on"] = action.DependsOn
+	}
 	deadlineSeconds := haAdminJobTimeoutSeconds(admin)
 	backoffLimit := haAdminJobBackoffLimit(admin)
 	ttlSecondsAfterFinished := haAdminJobTTLSecondsAfterFinished(admin)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      haAdminJobName(cluster, action),
-			Namespace: cluster.Namespace,
-			Labels:    labels,
-			Annotations: map[string]string{
-				"antfly.io/ha-action-kind":  action.Kind,
-				"antfly.io/ha-admin-url":    action.AdminURL,
-				"antfly.io/ha-command-hash": haAdminActionHash(action),
-			},
+			Name:        haAdminJobName(cluster, action),
+			Namespace:   cluster.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Spec: batchv1.JobSpec{
 			ActiveDeadlineSeconds:   &deadlineSeconds,
