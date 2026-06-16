@@ -6630,6 +6630,36 @@ spec:
                           type: integer
                       type: object
                     type: array
+                  sync:
+                    description: Sync reports the observed synchronous durability
+                      policy state.
+                    properties:
+                      action:
+                        type: string
+                      candidates:
+                        format: int32
+                        type: integer
+                      degraded:
+                        type: boolean
+                      failurePolicy:
+                        description: HAFailurePolicy selects what happens when synchronous
+                          durability cannot be met.
+                        type: string
+                      mode:
+                        description: HADurabilityMode selects when a primary write
+                          may be acknowledged.
+                        type: string
+                      required:
+                        format: int32
+                        type: integer
+                      satisfied:
+                        format: int32
+                        type: integer
+                      selection:
+                        description: HAStandbySelection selects which named standbys
+                          satisfy synchronous commit.
+                        type: string
+                    type: object
                 type: object
               metadataNodesReady:
                 description: MetadataNodesReady represents the number of ready metadata

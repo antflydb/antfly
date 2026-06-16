@@ -281,10 +281,11 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 		{Name: "standby-c"},
 	}
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
-		Mode:         antflyv1.HADurabilityModeRemoteWrite,
-		Selection:    antflyv1.HAStandbySelectionAny,
-		Required:     2,
-		StandbyNames: []string{"standby-a", "standby-b", "standby-c"},
+		Mode:          antflyv1.HADurabilityModeRemoteWrite,
+		Selection:     antflyv1.HAStandbySelectionAny,
+		Required:      2,
+		StandbyNames:  []string{"standby-a", "standby-b", "standby-c"},
+		FailurePolicy: antflyv1.HAFailurePolicyFailClosed,
 	}
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryLSN: 10,
@@ -305,6 +306,16 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 	if degraded == nil || degraded.Status != metav1.ConditionFalse {
 		t.Fatalf("expected ANY remote-write sync policy to be satisfied by standby-a and standby-c, got %#v", degraded)
 	}
+	if cluster.Status.HAStatus.Sync.Mode != antflyv1.HADurabilityModeRemoteWrite ||
+		cluster.Status.HAStatus.Sync.Selection != antflyv1.HAStandbySelectionAny ||
+		cluster.Status.HAStatus.Sync.Required != 2 ||
+		cluster.Status.HAStatus.Sync.Satisfied != 2 ||
+		cluster.Status.HAStatus.Sync.Candidates != 3 ||
+		cluster.Status.HAStatus.Sync.FailurePolicy != antflyv1.HAFailurePolicyFailClosed ||
+		cluster.Status.HAStatus.Sync.Degraded ||
+		cluster.Status.HAStatus.Sync.Action != "Satisfied" {
+		t.Fatalf("unexpected satisfied sync status: %#v", cluster.Status.HAStatus.Sync)
+	}
 
 	cluster.Spec.HighAvailability.SyncPolicy.Selection = antflyv1.HAStandbySelectionFirst
 	reconciler.updateHAStatusAndConditions(cluster)
@@ -313,13 +324,23 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != antflyv1.ReasonHASyncPolicyUnsatisfied {
 		t.Fatalf("expected FIRST policy to require standby-a and standby-b, got %#v", degraded)
 	}
+	if cluster.Status.HAStatus.Sync.Satisfied != 1 ||
+		cluster.Status.HAStatus.Sync.Candidates != 2 ||
+		!cluster.Status.HAStatus.Sync.Degraded ||
+		cluster.Status.HAStatus.Sync.Action != "RejectWrites" {
+		t.Fatalf("unexpected fail-closed sync status: %#v", cluster.Status.HAStatus.Sync)
+	}
 
 	cluster.Spec.HighAvailability.SyncPolicy.Selection = antflyv1.HAStandbySelectionAll
+	cluster.Spec.HighAvailability.SyncPolicy.FailurePolicy = antflyv1.HAFailurePolicyDegradeToAsync
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	if degraded == nil || degraded.Status != metav1.ConditionTrue {
 		t.Fatalf("expected ALL policy to require every named standby, got %#v", degraded)
+	}
+	if cluster.Status.HAStatus.Sync.Action != "DegradeToAsync" {
+		t.Fatalf("expected degraded sync action to surface degrade-to-async, got %#v", cluster.Status.HAStatus.Sync)
 	}
 
 	cluster.Status.HAStatus.Standbys[1].ReceivedLSN = 10
@@ -328,6 +349,13 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	if degraded == nil || degraded.Status != metav1.ConditionFalse {
 		t.Fatalf("expected ALL policy to be satisfied after standby-b receives primary LSN, got %#v", degraded)
+	}
+	if cluster.Status.HAStatus.Sync.Required != 3 ||
+		cluster.Status.HAStatus.Sync.Satisfied != 3 ||
+		cluster.Status.HAStatus.Sync.Candidates != 3 ||
+		cluster.Status.HAStatus.Sync.Degraded ||
+		cluster.Status.HAStatus.Sync.Action != "Satisfied" {
+		t.Fatalf("unexpected satisfied ALL sync status: %#v", cluster.Status.HAStatus.Sync)
 	}
 }
 

@@ -1250,6 +1250,10 @@ type HAStatus struct {
 	// +optional
 	PlannedActions []HAPlannedActionStatus `json:"plannedActions,omitempty"`
 
+	// Sync reports the observed synchronous durability policy state.
+	// +optional
+	Sync HASyncStatus `json:"sync,omitempty"`
+
 	// Fencing reports the observed fencing authority state used for automatic promotion.
 	// +optional
 	Fencing HAFencingStatus `json:"fencing,omitempty"`
@@ -1292,6 +1296,25 @@ type HAStandbyStatus struct {
 	Status string `json:"status,omitempty"`
 
 	LastError string `json:"lastError,omitempty"`
+}
+
+// HASyncStatus reports the current synchronous durability policy state.
+type HASyncStatus struct {
+	Mode HADurabilityMode `json:"mode,omitempty"`
+
+	Selection HAStandbySelection `json:"selection,omitempty"`
+
+	Required int32 `json:"required,omitempty"`
+
+	Satisfied int32 `json:"satisfied,omitempty"`
+
+	Candidates int32 `json:"candidates,omitempty"`
+
+	FailurePolicy HAFailurePolicy `json:"failurePolicy,omitempty"`
+
+	Degraded bool `json:"degraded,omitempty"`
+
+	Action string `json:"action,omitempty"`
 }
 
 // HAFencingStatus reports the observed fencing state for automatic promotion.

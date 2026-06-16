@@ -37,6 +37,17 @@ type haPlannedAction struct {
 	Reason          string
 }
 
+type haSyncEvaluation struct {
+	Mode          antflyv1.HADurabilityMode
+	Selection     antflyv1.HAStandbySelection
+	Required      int32
+	Satisfied     int32
+	Candidates    int32
+	FailurePolicy antflyv1.HAFailurePolicy
+	Degraded      bool
+	Action        string
+}
+
 type haPlan struct {
 	Actions                   []haPlannedAction
 	AutomaticPromotionAllowed bool
@@ -47,6 +58,7 @@ type haPlan struct {
 	FencingReady              bool
 	PromotionStandbyName      string
 	SyncPolicyDegraded        bool
+	SyncPolicy                haSyncEvaluation
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -196,7 +208,8 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		}
 	}
 
-	plan.SyncPolicyDegraded = haSyncPolicyDegradedForStatus(ha, status)
+	plan.SyncPolicy = haEvaluateSyncPolicy(ha, status)
+	plan.SyncPolicyDegraded = plan.SyncPolicy.Degraded
 	plan.FencingReady = haFencingReady(ha, status)
 	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
@@ -262,7 +275,21 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
 	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions)
+	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	mergeConfiguredStandbys(cluster.Status.HAStatus, ha)
+}
+
+func haSyncStatus(evaluation haSyncEvaluation) antflyv1.HASyncStatus {
+	return antflyv1.HASyncStatus{
+		Mode:          evaluation.Mode,
+		Selection:     evaluation.Selection,
+		Required:      evaluation.Required,
+		Satisfied:     evaluation.Satisfied,
+		Candidates:    evaluation.Candidates,
+		FailurePolicy: evaluation.FailurePolicy,
+		Degraded:      evaluation.Degraded,
+		Action:        evaluation.Action,
+	}
 }
 
 func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActionStatus {
@@ -478,57 +505,92 @@ func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {
 	return plan.SyncPolicyDegraded
 }
 
-func haSyncPolicyDegradedForStatus(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
+func haEvaluateSyncPolicy(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) haSyncEvaluation {
+	evaluation := haSyncEvaluation{Action: "Satisfied"}
 	if ha == nil || ha.SyncPolicy == nil || ha.SyncPolicy.Mode == "" || ha.SyncPolicy.Mode == antflyv1.HADurabilityModeAsync {
-		return false
-	}
-	if status == nil {
-		return true
+		evaluation.Mode = antflyv1.HADurabilityModeAsync
+		return evaluation
 	}
 	policy := ha.SyncPolicy
-	required := policy.Required
-	if required == 0 {
-		required = 1
+	evaluation.Mode = policy.Mode
+	evaluation.Selection = policy.Selection
+	if evaluation.Selection == "" {
+		evaluation.Selection = antflyv1.HAStandbySelectionAny
+	}
+	evaluation.FailurePolicy = policy.FailurePolicy
+	if evaluation.FailurePolicy == "" {
+		evaluation.FailurePolicy = antflyv1.HAFailurePolicyBlock
+	}
+	evaluation.Required = policy.Required
+	if evaluation.Required == 0 {
+		evaluation.Required = 1
+	}
+	if status == nil {
+		evaluation.Degraded = true
+		evaluation.Action = haSyncFailureAction(evaluation.FailurePolicy)
+		return evaluation
 	}
 	standbys := haStandbyStatusByName(status)
-	switch policy.Selection {
+	switch evaluation.Selection {
 	case antflyv1.HAStandbySelectionAll:
 		if len(policy.StandbyNames) == 0 {
-			return true
+			evaluation.Degraded = true
+			break
 		}
-		for _, name := range policy.StandbyNames {
-			standby, ok := standbys[name]
-			if !ok || !standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
-				return true
-			}
-		}
-		return false
-	case antflyv1.HAStandbySelectionFirst:
-		var candidates int32
-		var satisfied int32
+		evaluation.Required = int32(len(policy.StandbyNames))
 		for _, name := range policy.StandbyNames {
 			standby, ok := standbys[name]
 			if !ok || !standbySyncEligible(standby) {
 				continue
 			}
-			candidates++
+			evaluation.Candidates++
 			if standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
-				satisfied++
+				evaluation.Satisfied++
 			}
-			if candidates == required {
+		}
+		evaluation.Degraded = evaluation.Satisfied < evaluation.Required
+	case antflyv1.HAStandbySelectionFirst:
+		for _, name := range policy.StandbyNames {
+			standby, ok := standbys[name]
+			if !ok || !standbySyncEligible(standby) {
+				continue
+			}
+			evaluation.Candidates++
+			if standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
+				evaluation.Satisfied++
+			}
+			if evaluation.Candidates == evaluation.Required {
 				break
 			}
 		}
-		return candidates < required || satisfied < required
+		evaluation.Degraded = evaluation.Candidates < evaluation.Required || evaluation.Satisfied < evaluation.Required
 	default:
-		var satisfied int32
 		for _, name := range policy.StandbyNames {
 			standby, ok := standbys[name]
-			if ok && standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
-				satisfied++
+			if !ok || !standbySyncEligible(standby) {
+				continue
+			}
+			evaluation.Candidates++
+			if standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
+				evaluation.Satisfied++
 			}
 		}
-		return satisfied < required
+		evaluation.Degraded = evaluation.Satisfied < evaluation.Required
+	}
+	if evaluation.Degraded {
+		evaluation.Action = haSyncFailureAction(evaluation.FailurePolicy)
+	}
+	return evaluation
+}
+
+func haSyncFailureAction(policy antflyv1.HAFailurePolicy) string {
+	switch policy {
+	case antflyv1.HAFailurePolicyFailClosed:
+		return "RejectWrites"
+	case antflyv1.HAFailurePolicyDegradeToAsync:
+		return "DegradeToAsync"
+	default:
+		return "BlockWrites"
 	}
 }
 
