@@ -3288,10 +3288,13 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 	if identity == nil {
 		return
 	}
-	for _, action := range cluster.Status.HAStatus.PlannedActions {
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.Kind != string(haActionPromoteStandby) ||
 			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			action.StandbyName == "" {
+			continue
+		}
+		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
 			continue
 		}
 		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
@@ -3337,10 +3340,13 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 	if cluster.Status.HAStatus == nil {
 		return
 	}
-	for _, action := range cluster.Status.HAStatus.PlannedActions {
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
 		if !haFormerPrimaryActionKind(action.Kind) ||
 			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			action.AdminJobName == "" {
+			continue
+		}
+		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
 			continue
 		}
 		if cluster.Status.HAStatus.FormerPrimary == nil {

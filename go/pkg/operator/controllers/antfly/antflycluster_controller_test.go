@@ -529,6 +529,55 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
 }
 
+func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionAcquireFence),
+					StandbyName:   "standby-a",
+					TargetLSN:     12,
+					AdminCommand:  []string{"fence", "acquire"},
+					AdminJobName:  "fence-job",
+					AdminJobPhase: haAdminJobPhasePending,
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceGeneration: 3,
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminJobName:    "promote-job",
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.LastPromotion.PromotedStandbyID).To(Equal("standby-a"))
+}
+
 func TestParseHAPromotionJobResult(t *testing.T) {
 	g := NewWithT(t)
 
@@ -627,6 +676,38 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(former.ReseedRequired).To(BeTrue())
 	g.Expect(former.Diverged).To(BeTrue())
 	g.Expect(former.Reason).To(Equal("parent_timeline_wal_expired"))
+}
+
+func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPromoteStandby),
+					AdminCommand:  []string{"promote", "--current-fence"},
+					AdminJobName:  "promote-job",
+					AdminJobPhase: haAdminJobPhasePending,
+				}, {
+					Kind:          string(haActionDemoteFormerPrimary),
+					StandbyName:   "primary-a",
+					AdminCommand:  []string{"rejoin", "assess"},
+					AdminJobName:  "demote-job",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 }
 
 func TestObserveHAPrimaryAdminStatus(t *testing.T) {
