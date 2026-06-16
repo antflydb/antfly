@@ -1756,18 +1756,34 @@ fn parseRowClaimRequestAlloc(
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const claim_value = parsed.value.object.get("claim") orelse return null;
     if (claim_value != .object) return error.InvalidQueryRequest;
+    try requireRowClaimObjectOnlyKeys(claim_value.object);
 
     const mode_value = claim_value.object.get("mode") orelse return error.InvalidQueryRequest;
     if (mode_value != .string) return error.InvalidQueryRequest;
     const mode: db_mod.types.RowClaimMode = if (std.mem.eql(u8, mode_value.string, "for_update"))
         .for_update
+    else if (std.mem.eql(u8, mode_value.string, "for_no_key_update"))
+        .for_no_key_update
     else
         return error.InvalidQueryRequest;
 
-    const skip_locked = if (claim_value.object.get("skip_locked")) |value| blk: {
+    const maybe_skip_locked = if (claim_value.object.get("skip_locked")) |value| blk: {
         if (value != .bool) return error.InvalidQueryRequest;
-        break :blk value.bool;
-    } else false;
+        break :blk @as(?bool, value.bool);
+    } else null;
+    const wait_policy = if (claim_value.object.get("wait_policy")) |value| blk: {
+        if (value != .string) return error.InvalidQueryRequest;
+        if (std.mem.eql(u8, value.string, "wait")) break :blk db_mod.types.RowClaimWaitPolicy.wait;
+        if (std.mem.eql(u8, value.string, "nowait")) break :blk db_mod.types.RowClaimWaitPolicy.nowait;
+        if (std.mem.eql(u8, value.string, "skip_locked")) break :blk db_mod.types.RowClaimWaitPolicy.skip_locked;
+        return error.InvalidQueryRequest;
+    } else if (maybe_skip_locked orelse false)
+        db_mod.types.RowClaimWaitPolicy.skip_locked
+    else
+        db_mod.types.RowClaimWaitPolicy.wait;
+    const skip_locked = maybe_skip_locked orelse (wait_policy == .skip_locked);
+    if (maybe_skip_locked != null and skip_locked != (wait_policy == .skip_locked)) return error.InvalidQueryRequest;
+
     const lease_ms = if (claim_value.object.get("lease_ms")) |value| blk: {
         const parsed_ms = switch (value) {
             .integer => |integer| if (integer > 0) @as(u64, @intCast(integer)) else return error.InvalidQueryRequest,
@@ -1787,11 +1803,30 @@ fn parseRowClaimRequestAlloc(
 
     return .{
         .mode = mode,
+        .wait_policy = wait_policy,
         .skip_locked = skip_locked,
         .lease_ms = lease_ms,
         .owner_id = try alloc.dupe(u8, owner_value.string),
         .txn_id = txn_id,
     };
+}
+
+fn requireRowClaimObjectOnlyKeys(object: std.json.ObjectMap) !void {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "mode") or
+            std.mem.eql(u8, key, "wait_policy") or
+            std.mem.eql(u8, key, "skip_locked") or
+            std.mem.eql(u8, key, "lease_ms") or
+            std.mem.eql(u8, key, "owner_id") or
+            std.mem.eql(u8, key, "transaction_id") or
+            std.mem.eql(u8, key, "txn_id"))
+        {
+            continue;
+        }
+        return error.InvalidQueryRequest;
+    }
 }
 
 fn parseTxnIdHex(text: []const u8) !db_mod.types.TxnId {
@@ -6980,6 +7015,23 @@ test "api query contract parses typed row claim request" {
     try std.testing.expectEqual(@as(u8, 0xff), claim.txn_id.?[15]);
     try std.testing.expectEqual(@as(u32, 5), parsed.req.limit);
 
+    var no_key_update = try parseQueryRequest(alloc, null, "jobs",
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_no_key_update","wait_policy":"nowait","lease_ms":30000,"owner_id":"session:2","transaction_id":"00112233445566778899aabbccddeeff"},"limit":5}
+    );
+    defer no_key_update.deinit(alloc);
+    const no_key_claim = no_key_update.req.row_claim orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_no_key_update, no_key_claim.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, no_key_claim.wait_policy);
+    try std.testing.expect(!no_key_claim.skip_locked);
+
+    var wait_policy_skip_locked = try parseQueryRequest(alloc, null, "jobs",
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_update","wait_policy":"skip_locked","lease_ms":30000,"owner_id":"session:3","transaction_id":"00112233445566778899aabbccddeeff"},"limit":5}
+    );
+    defer wait_policy_skip_locked.deinit(alloc);
+    const wait_policy_claim = wait_policy_skip_locked.req.row_claim orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, wait_policy_claim.wait_policy);
+    try std.testing.expect(wait_policy_claim.skip_locked);
+
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
         \\{"claim":{"mode":"for_update","owner_id":"","transaction_id":"00112233445566778899aabbccddeeff"}}
     ));
@@ -6988,6 +7040,15 @@ test "api query contract parses typed row claim request" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
         \\{"claim":{"mode":"share","owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff"}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"for_update","wait_policy":"wait","skip_locked":true,"owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff"}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"for_update","wait_policy":"share","owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff"}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
+        \\{"claim":{"mode":"for_update","owner_id":"session:1","transaction_id":"00112233445566778899aabbccddeeff","unexpected":true}}
     ));
 }
 

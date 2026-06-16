@@ -1992,10 +1992,13 @@ distributed planner can execute the same typed query independently on each
 table/range owner. The local coordinator contract accepts multiple
 non-overlapping owner spans, merges the hydrated
 candidate streams into one globally ordered row stream, and applies `OFFSET`,
-`LIMIT`, projection, and row claiming once after that merge. `wait_policy:
-"wait"` claims all returned base rows or fails with the underlying intent
-conflict. `wait_policy: "nowait"` uses the same durable conflict check but
-returns the conflict immediately when a selected row is already locked.
+`LIMIT`, projection, and row claiming once after that merge. Public row-plan
+parsing and the shared query-contract parser accept the same row-claim object,
+including `for_no_key_update`, `wait_policy`, and the `skip_locked`
+boolean alias. `wait_policy: "wait"` claims all returned base rows or fails with
+the underlying intent conflict. `wait_policy: "nowait"` uses the same durable
+conflict check but returns the conflict immediately when a selected row is
+already locked.
 `wait_policy: "skip_locked"` attempts claims in result order and keeps scanning
 past locked candidates until the requested limit is filled or the merged stream
 is exhausted. Row claiming is deliberately base-row only: aggregate sources,
