@@ -59348,6 +59348,10 @@ fn expectQuerySummary(summary: AppParityPlanSummary, query: db_mod.types.Relatio
     try expectOptionalUsize(summary.order_by, query.order_by.len);
     try expectOptionalU32(summary.limit, query.limit);
     if (summary.offset) |expected| try std.testing.expectEqual(expected, query.offset);
+    try expectRowClaimSummary(summary, query);
+}
+
+fn expectRowClaimSummary(summary: AppParityPlanSummary, query: db_mod.types.RelationalRowsQueryRequest) !void {
     if (summary.row_claim_skip_locked) |expected| {
         try std.testing.expect(query.row_claim != null);
         try std.testing.expectEqual(expected, query.row_claim.?.skip_locked);
@@ -59392,6 +59396,7 @@ fn expectCombinedQuerySourceSummary(
     try expectOptionalUsize(summary.expression_or_predicates, left.expression_or_predicates.len + right.expression_or_predicates.len);
     try expectOptionalUsize(summary.expression_not_predicates, left.expression_not_predicates.len + right.expression_not_predicates.len);
     try expectOptionalUsize(summary.expression_array_contains, left.expression_array_contains.len + right.expression_array_contains.len);
+    try expectRowClaimSummary(summary, left);
 }
 
 fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !void {
@@ -62765,6 +62770,16 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records",
         .params = &.{.{ .string = "u1" }},
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, expectCombinedQuerySourceSummary(.{
+        .row_claim_skip_locked = false,
+    }, .{}, .{}));
+
+    try expectCombinedQuerySourceSummary(.{
+        .row_claim_skip_locked = true,
+    }, .{
+        .row_claim = .{ .skip_locked = true },
+    }, .{});
 
     try validateAppParityFixtureMetadata(.{
         .name = "valid unsupported reason",
