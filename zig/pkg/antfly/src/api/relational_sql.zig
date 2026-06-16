@@ -62397,6 +62397,10 @@ fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureJoinSelectSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected);
+}
+
 fn appParityFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .join,
@@ -62435,12 +62439,26 @@ fn appParityFixtureAllowsLateralSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureLateralSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.lateral_correlations) |correlations| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":corr=", correlations)) return false;
+    }
+    if (entry.summary.right_offset) |right_offset| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":right_offset=", @intCast(right_offset))) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsWindowSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .window => true,
         .read, .explain => appParityReadPlanHasPrefix(entry, "read:window:"),
         else => false,
     };
+}
+
+fn appParityFixtureWindowSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return appParityPlanHasExactUsizeToken(entry.plan, ":windows=", expected);
 }
 
 fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) bool {
@@ -62894,6 +62912,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.join_select) |join_select| {
+        if (!appParityFixtureJoinSelectSummaryMatchesPlan(entry, join_select)) {
+            return error.TestUnexpectedResult;
+        }
+    }
     if (entry.summary.join_on != null and !appParityFixtureAllowsJoinOnSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -62907,8 +62930,16 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if (!appParityFixtureLateralSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.windows != null and !appParityFixtureAllowsWindowSummary(entry)) {
         return error.TestUnexpectedResult;
+    }
+    if (entry.summary.windows) |windows| {
+        if (!appParityFixtureWindowSummaryMatchesPlan(entry, windows)) {
+            return error.TestUnexpectedResult;
+        }
     }
     if ((entry.summary.select_all != null or entry.summary.distinct_on != null) and
         !appParityFixtureAllowsFullQueryOutputSummary(entry))
@@ -63408,6 +63439,14 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale join select summary",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .join_select = 1 },
+        .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=0:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "join lateral offset summary",
         .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
         .family = .join,
@@ -63435,7 +63474,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .name = "valid join on summary",
         .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
         .family = .join,
-        .summary = .{ .table_name = "usage_records", .join_on = 1 },
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .join_select = 1 },
         .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
     }, &seen, alloc);
 
@@ -63446,6 +63485,46 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .windows = 1 },
         .plan = "lateral:left=usage_records:right=archived_records:left_pred=0:right_pred=1:correlations=1:select=1:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale lateral correlation summary",
+        .sql = "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM archived_records WHERE archived_records.id = usage_records.id LIMIT 1) AS latest ON true",
+        .family = .lateral,
+        .summary = .{ .table_name = "usage_records", .lateral_correlations = 1, .join_select = 1 },
+        .plan = "lateral:left=usage_records:right=archived_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=0:right_order_expr=0:right_limit=1:corr=0:select=1:order=0:order_expr=0:limit=-1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale lateral right offset summary",
+        .sql = "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM archived_records WHERE archived_records.id = usage_records.id LIMIT 1 OFFSET 2) AS latest ON true",
+        .family = .lateral,
+        .summary = .{ .table_name = "usage_records", .lateral_correlations = 1, .join_select = 1, .right_offset = 2 },
+        .plan = "lateral:left=usage_records:right=archived_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=0:right_order_expr=0:right_limit=1:corr=1:select=1:order=0:order_expr=0:limit=-1:right_offset=1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid lateral stage summary",
+        .sql = "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM archived_records WHERE archived_records.id = usage_records.id LIMIT 1 OFFSET 2) AS latest ON true",
+        .family = .lateral,
+        .summary = .{ .table_name = "usage_records", .lateral_correlations = 1, .join_select = 1, .right_offset = 2 },
+        .plan = "lateral:left=usage_records:right=archived_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=0:right_order_expr=0:right_limit=1:corr=1:select=1:order=0:order_expr=0:limit=-1:right_offset=2",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale window summary",
+        .sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records",
+        .family = .window,
+        .summary = .{ .table_name = "usage_records", .select = 1, .windows = 1, .order_by = 1 },
+        .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=0:window_expr=0:window_default=0:window_frame_sig=0:select=1:order=1:limit=-1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid window summary",
+        .sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records",
+        .family = .window,
+        .summary = .{ .table_name = "usage_records", .select = 1, .windows = 1, .order_by = 1 },
+        .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=1:order=1:limit=-1",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "aggregate full query output summary",
