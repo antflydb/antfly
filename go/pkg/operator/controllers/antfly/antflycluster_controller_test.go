@@ -593,6 +593,78 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
 }
 
+func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name: "standby-a",
+					RouteSelector: map[string]string{
+						"app.kubernetes.io/name":      "antfly-database",
+						"app.kubernetes.io/component": "standby-a",
+						"app.kubernetes.io/instance":  "test-cluster",
+					},
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode: antflyv1.HAModeHotStandby,
+				PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+					CurrentTarget: "primary",
+					DesiredTarget: "standby-a",
+					Stale:         true,
+					Action:        string(haActionUpdatePrimaryRoute),
+				},
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPauseSlot),
+					AdminCommand:  []string{"slot", "pause"},
+					AdminJobPhase: haAdminJobPhaseFailed,
+				}, {
+					Kind:          string(haActionPromoteStandby),
+					StandbyName:   "standby-a",
+					AdminCommand:  []string{"promote", "--current-fence"},
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}, {
+					Kind:            string(haActionUpdatePrimaryRoute),
+					DependsOn:       string(haActionPromoteStandby),
+					StandbyName:     "standby-a",
+					RouteFrom:       "primary",
+					RouteTo:         "standby-a",
+					FenceGeneration: 7,
+				}},
+			},
+		},
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-public-api",
+			Namespace: "default",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+
+	observed := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Stale).To(BeFalse())
+}
+
 func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g := NewWithT(t)
 
@@ -696,6 +768,53 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.LastPromotion.PromotedStandbyID).To(Equal("standby-a"))
+}
+
+func TestUpdateHALastPromotionHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPauseSlot),
+					AdminCommand:  []string{"slot", "pause"},
+					AdminJobPhase: haAdminJobPhaseFailed,
+				}, {
+					Kind:          string(haActionAcquireFence),
+					AdminCommand:  []string{"fence", "acquire"},
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceGeneration: 3,
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminJobName:    "promote-job",
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
 	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.LastPromotion.PromotedStandbyID).To(Equal("standby-a"))
@@ -828,6 +947,38 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
+}
+
+func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPauseSlot),
+					AdminCommand:  []string{"slot", "pause"},
+					AdminJobPhase: haAdminJobPhaseFailed,
+				}, {
+					Kind:          string(haActionPromoteStandby),
+					AdminCommand:  []string{"promote", "--current-fence"},
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}, {
+					Kind:          string(haActionDemoteFormerPrimary),
+					DependsOn:     string(haActionPromoteStandby),
+					StandbyName:   "primary-a",
+					AdminCommand:  []string{"rejoin", "assess"},
+					AdminJobName:  "demote-job",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
