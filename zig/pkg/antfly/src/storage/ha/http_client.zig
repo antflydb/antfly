@@ -18,6 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const http_common = @import("../../common/http/http_common.zig");
 const routes = @import("../../raft/transport/routes.zig");
+const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
 const standby_mod = @import("standby.zig");
@@ -122,12 +123,14 @@ const TestPaths = struct {
     primary_slots: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
+    fence_wal: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
+        alloc.free(self.fence_wal);
     }
 };
 
@@ -141,6 +144,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_log);
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
     defer alloc.free(standby_progress);
+    const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
+    defer alloc.free(fence_wal);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -148,12 +153,14 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .fence_wal = try alloc.dupeZ(u8, fence_wal),
     };
 }
 
@@ -185,8 +192,10 @@ test "storage.ha http client round trips admin commands" {
     defer primary.close();
     var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer standby.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -217,6 +226,50 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("text/plain; charset=utf-8", streamed.content_type);
     try expectContains(streamed.body, "result=stream_once\n");
     try expectContains(streamed.body, "applied_lsn=1\n");
+
+    var fenced = try client.executeCommand("http://ha-admin.test", &.{
+        "--table",
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "100",
+        "--shard-id",
+        "10",
+        "--table-id",
+        "20",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "1",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-a",
+        "--new-timeline-id",
+        "2",
+        "--new-epoch",
+        "2",
+        "--required-lsn",
+        "1",
+        "--observed-lsn",
+        "1",
+        "--reason",
+        "http-client-test",
+    });
+    defer fenced.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", fenced.content_type);
+    try expectContains(fenced.body, "result=fence_acquire\n");
+    try expectContains(fenced.body, "promoted_node_id=standby-a\n");
+
+    var current_fence = try client.executeCommand("http://ha-admin.test", &.{ "--table", "fence", "current" });
+    defer current_fence.deinit(alloc);
+    try expectContains(current_fence.body, "result=fence_current\n");
+    try expectContains(current_fence.body, "held=true\n");
+
+    var promoted = try client.executeCommand("http://ha-admin.test", &.{ "--table", "promote", "--current-fence" });
+    defer promoted.deinit(alloc);
+    try expectContains(promoted.body, "result=promote_current_fence\n");
+    try expectContains(promoted.body, "promotion.new_identity.timeline_id=2\n");
 }
 
 test "storage.ha http client maps admin errors" {
