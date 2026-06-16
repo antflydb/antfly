@@ -165,6 +165,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.DuplicateManifestPath,
         error.ManifestFileSetMismatch,
         error.BackupStartNotDurable,
+        error.BackupCheckpointNotDurable,
         error.BackupStartMismatch,
         error.InitialLsnAheadOfPrimary,
         error.ManifestPathMissing,

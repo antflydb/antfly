@@ -385,6 +385,7 @@ pub const Primary = struct {
 
     fn validateBackupStart(self: *Primary, manifest: backup_manifest.Manifest) !void {
         if (manifest.backup_lsn > self.lastLsn()) return error.BackupStartNotDurable;
+        if (manifest.checkpoint_lsn > self.lastLsn()) return error.BackupCheckpointNotDurable;
         var entry = (try self.log.entryAt(self.alloc, manifest.backup_lsn)) orelse return error.BackupStartNotFound;
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .backup_start) return error.BackupStartNotFound;
@@ -825,6 +826,14 @@ test "storage.ha primary requires matching backup start record before backup end
         .manifest_id = "manifest-2",
         .backup_lsn = started.backup_lsn,
         .checkpoint_lsn = started.backup_lsn,
+        .files = &files,
+    }));
+
+    try std.testing.expectError(error.BackupCheckpointNotDurable, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-1",
+        .backup_lsn = started.backup_lsn,
+        .checkpoint_lsn = primary.lastLsn() + 1,
         .files = &files,
     }));
 }
