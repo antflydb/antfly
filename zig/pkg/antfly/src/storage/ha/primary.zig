@@ -402,6 +402,14 @@ pub const Primary = struct {
         if (start.epoch != self.identity.epoch) return error.BackupStartMismatch;
         if (start.backup_lsn != manifest.backup_lsn) return error.BackupStartMismatch;
         if (!std.mem.eql(u8, start.manifest_id, manifest.manifest_id)) return error.BackupStartMismatch;
+        try self.validateBackupSlotRetention(start);
+    }
+
+    fn validateBackupSlotRetention(self: *Primary, start: BackupStartPayload) !void {
+        const slot_state = self.slots.get(start.slot_name) orelse return error.BackupSlotNotFound;
+        if (!slot_state.active or slot_state.reseed_required) return error.BackupSlotNotRetained;
+        if (slot_state.timeline_id != self.identity.timeline_id) return error.BackupSlotNotRetained;
+        if (slot_state.restart_lsn > start.backup_lsn) return error.BackupSlotNotRetained;
     }
 };
 
@@ -834,6 +842,55 @@ test "storage.ha primary requires matching backup start record before backup end
         .manifest_id = "manifest-1",
         .backup_lsn = started.backup_lsn,
         .checkpoint_lsn = primary.lastLsn() + 1,
+        .files = &files,
+    }));
+}
+
+test "storage.ha primary requires backup slot retention before backup end" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-end-slot-retention");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = "store/manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+    };
+
+    const dropped = try primary.beginBaseBackup(.{
+        .slot_name = "standby-dropped",
+        .manifest_id = "manifest-dropped",
+    });
+    try primary.dropSlot("standby-dropped");
+    try std.testing.expectError(error.BackupSlotNotFound, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-dropped",
+        .backup_lsn = dropped.backup_lsn,
+        .checkpoint_lsn = dropped.backup_lsn,
+        .files = &files,
+    }));
+
+    const paused = try primary.beginBaseBackup(.{
+        .slot_name = "standby-paused",
+        .manifest_id = "manifest-paused",
+    });
+    try primary.pauseSlot("standby-paused");
+    try std.testing.expectError(error.BackupSlotNotRetained, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-paused",
+        .backup_lsn = paused.backup_lsn,
+        .checkpoint_lsn = paused.backup_lsn,
+        .files = &files,
+    }));
+
+    try primary.resumeSlot("standby-paused");
+    try primary.slots.markReseedRequired("standby-paused");
+    try std.testing.expectError(error.BackupSlotNotRetained, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-paused",
+        .backup_lsn = paused.backup_lsn,
+        .checkpoint_lsn = paused.backup_lsn,
         .files = &files,
     }));
 }
