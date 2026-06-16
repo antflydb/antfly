@@ -62428,6 +62428,15 @@ fn appParitySourceSchemaJsonIsValid(alloc: std.mem.Allocator, text: []const u8) 
     return true;
 }
 
+fn appParitySetupSqlIsValid(alloc: std.mem.Allocator, setup_sql: []const []const u8) !bool {
+    for (setup_sql) |sql| {
+        if (sql.len == 0) return false;
+    }
+    const schema_json = schemaJsonFromSetupSqlAlloc(alloc, setup_sql) catch return false;
+    defer alloc.free(schema_json);
+    return true;
+}
+
 fn validateAppParityFixtureMetadata(
     entry: AppParityCorpusEntry,
     seen_names: *std.StringHashMapUnmanaged(void),
@@ -62457,6 +62466,12 @@ fn validateAppParityFixtureMetadata(
         return error.TestUnexpectedResult;
     }
     if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.family == .ddl and entry.apply_setup_sql.len > 0 and entry.applied_plan.len == 0) {
         return error.TestUnexpectedResult;
     }
     if (entry.source_schema_json.len > 0 and !appParityFixtureFamilyAllowsSourceSchema(entry.family)) {
@@ -62579,6 +62594,33 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
         .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "empty setup sql",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .apply_setup_sql = &.{""},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "non-ddl setup sql",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .apply_setup_sql = &.{"SELECT id FROM usage_records"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ddl setup without applied plan",
+        .sql = "CREATE VIEW active_usage AS SELECT id FROM usage_records",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_view, .table_name = "active_usage" },
+        .plan = "ddl:create_view:name=active_usage:replace=false",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY)"},
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
