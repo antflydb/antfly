@@ -42,17 +42,24 @@ pub fn replicateAvailable(
     apply_fn: standby_mod.ApplyFn,
 ) !Result {
     const from_lsn = standby.nextReceiveLsn();
-    const entries = try primary.streamFrom(alloc, slot_name, from_lsn);
+    const entries = primary.streamFrom(alloc, slot_name, from_lsn) catch |err| {
+        primary.reportReplicationError(slot_name, @errorName(err)) catch {};
+        return err;
+    };
     defer replication_log.freeEntries(alloc, entries);
 
     var received_count: usize = 0;
     for (entries) |entry| {
-        _ = try standby.receive(entry.record);
+        _ = standby.receive(entry.record) catch |err| {
+            primary.reportReplicationError(slot_name, @errorName(err)) catch {};
+            return err;
+        };
         received_count += 1;
     }
 
     const applied_count = standby.applyAvailable(apply_ctx, apply_fn) catch |err| {
         try reportProgress(primary, slot_name, standby);
+        primary.reportReplicationError(slot_name, @errorName(err)) catch {};
         return err;
     };
 
@@ -224,6 +231,7 @@ test "storage.ha session reports durable receive progress when apply fails" {
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
 
     const names = [_][]const u8{"standby-a"};
     var decision = try primary.evaluateDurability(2, .{
@@ -249,6 +257,7 @@ test "storage.ha session reports durable receive progress when apply fails" {
     slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+    try std.testing.expect(slot.last_error == null);
 }
 
 test "storage.ha session resumes after primary and standby reopen" {

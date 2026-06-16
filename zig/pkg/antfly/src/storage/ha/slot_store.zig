@@ -59,6 +59,7 @@ pub const SlotState = struct {
     applied_lsn: u64,
     active: bool = true,
     reseed_required: bool = false,
+    last_error: ?[]const u8 = null,
 
     pub fn lagFrom(self: SlotState, primary_lsn: u64) u64 {
         return primary_lsn -| self.applied_lsn;
@@ -88,6 +89,7 @@ const OwnedSlot = struct {
 
     fn deinit(self: *OwnedSlot, alloc: Allocator) void {
         alloc.free(self.state.name);
+        if (self.state.last_error) |last_error| alloc.free(last_error);
         self.* = undefined;
     }
 };
@@ -157,7 +159,25 @@ pub const SlotStore = struct {
         next.applied_lsn = applied_lsn;
         next.restart_lsn = applied_lsn;
         next.reseed_required = false;
+        next.last_error = null;
         try self.createOrUpdate(next);
+    }
+
+    pub fn setLastError(self: *SlotStore, name: []const u8, last_error: []const u8) !void {
+        if (last_error.len == 0) return error.InvalidReplicationError;
+        const idx = self.findIndex(name) orelse return error.SlotNotFound;
+        const owned = try self.alloc.dupe(u8, last_error);
+        errdefer self.alloc.free(owned);
+        if (self.slots.items[idx].state.last_error) |previous| self.alloc.free(previous);
+        self.slots.items[idx].state.last_error = owned;
+    }
+
+    pub fn clearLastError(self: *SlotStore, name: []const u8) !void {
+        const idx = self.findIndex(name) orelse return error.SlotNotFound;
+        if (self.slots.items[idx].state.last_error) |previous| {
+            self.alloc.free(previous);
+            self.slots.items[idx].state.last_error = null;
+        }
     }
 
     pub fn markReseedRequired(self: *SlotStore, name: []const u8) !void {
@@ -200,13 +220,25 @@ pub const SlotStore = struct {
         const out = try alloc.alloc(SlotState, self.slots.items.len);
         var filled: usize = 0;
         errdefer {
-            for (out[0..filled]) |slot| alloc.free(slot.name);
+            for (out[0..filled]) |slot| {
+                alloc.free(slot.name);
+                if (slot.last_error) |last_error| alloc.free(last_error);
+            }
             alloc.free(out);
         }
 
         for (self.slots.items, 0..) |slot, idx| {
+            const owned_name = try alloc.dupe(u8, slot.state.name);
+            errdefer alloc.free(owned_name);
+            const owned_last_error = if (slot.state.last_error) |last_error|
+                try alloc.dupe(u8, last_error)
+            else
+                null;
+            errdefer if (owned_last_error) |last_error| alloc.free(last_error);
+
             out[idx] = slot.state;
-            out[idx].name = try alloc.dupe(u8, slot.state.name);
+            out[idx].name = owned_name;
+            out[idx].last_error = owned_last_error;
             filled += 1;
         }
         return out;
@@ -282,15 +314,28 @@ pub const SlotStore = struct {
                 if (self.findIndex(event.state.name)) |idx| {
                     const owned_name = try self.alloc.dupe(u8, event.state.name);
                     errdefer self.alloc.free(owned_name);
+                    const owned_last_error = if (event.state.last_error) |last_error|
+                        try self.alloc.dupe(u8, last_error)
+                    else
+                        null;
+                    errdefer if (owned_last_error) |last_error| self.alloc.free(last_error);
                     self.alloc.free(self.slots.items[idx].state.name);
+                    if (self.slots.items[idx].state.last_error) |last_error| self.alloc.free(last_error);
                     self.slots.items[idx].state = event.state;
                     self.slots.items[idx].state.name = owned_name;
+                    self.slots.items[idx].state.last_error = owned_last_error;
                     return;
                 }
                 const owned_name = try self.alloc.dupe(u8, event.state.name);
                 errdefer self.alloc.free(owned_name);
+                const owned_last_error = if (event.state.last_error) |last_error|
+                    try self.alloc.dupe(u8, last_error)
+                else
+                    null;
+                errdefer if (owned_last_error) |last_error| self.alloc.free(last_error);
                 var owned = OwnedSlot{ .state = event.state };
                 owned.state.name = owned_name;
+                owned.state.last_error = owned_last_error;
                 try self.slots.append(self.alloc, owned);
             },
             .drop => {
@@ -311,7 +356,10 @@ pub const SlotStore = struct {
 };
 
 pub fn freeSlotList(alloc: Allocator, slots: []SlotState) void {
-    for (slots) |slot| alloc.free(slot.name);
+    for (slots) |slot| {
+        alloc.free(slot.name);
+        if (slot.last_error) |last_error| alloc.free(last_error);
+    }
     alloc.free(slots);
 }
 
@@ -413,6 +461,36 @@ test "storage.ha slot store persists slot progress across reopen" {
         try std.testing.expectEqual(@as(u64, 8), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 7), slot.applied_lsn);
     }
+}
+
+test "storage.ha slot store tracks transient replication error until progress" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "last-error");
+    defer alloc.free(path);
+
+    var store = try SlotStore.open(alloc, path.ptr, .{});
+    defer store.close();
+    try store.createOrUpdate(.{
+        .name = "standby-a",
+        .timeline_id = 1,
+        .restart_lsn = 1,
+        .received_lsn = 1,
+        .applied_lsn = 1,
+    });
+    try store.setLastError("standby-a", "IntentionalApplyFailure");
+
+    const listed = try store.listAlloc(alloc);
+    defer freeSlotList(alloc, listed);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", listed[0].last_error.?);
+
+    try store.updateProgress("standby-a", 2, 2);
+    const progressed = store.get("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expect(progressed.last_error == null);
+
+    try store.setLastError("standby-a", "SlotInactive");
+    try store.clearLastError("standby-a");
+    const cleared = store.get("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expect(cleared.last_error == null);
 }
 
 test "storage.ha slot store computes retention floor from active slots" {

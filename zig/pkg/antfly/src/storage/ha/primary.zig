@@ -259,6 +259,14 @@ pub const Primary = struct {
         try self.slots.updateProgress(slot_name, received_lsn, applied_lsn);
     }
 
+    pub fn reportReplicationError(self: *Primary, slot_name: []const u8, last_error: []const u8) !void {
+        try self.slots.setLastError(slot_name, last_error);
+    }
+
+    pub fn clearReplicationError(self: *Primary, slot_name: []const u8) !void {
+        try self.slots.clearLastError(slot_name);
+    }
+
     pub fn retentionSnapshot(
         self: *Primary,
         policy: slot_store.RetentionPolicy,

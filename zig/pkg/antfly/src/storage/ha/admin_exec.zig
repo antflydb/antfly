@@ -672,6 +672,7 @@ fn appendSlotSnapshotLines(
     try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
     try appendIndexedLine(alloc, out, "slots", idx, "status", @tagName(slot.status));
+    try appendIndexedOptionalLine(alloc, out, "slots", idx, "last_error", slot.last_error);
 }
 
 fn appendStandbySnapshotLines(
@@ -908,6 +909,19 @@ fn appendIndexedLine(
     try appendLine(alloc, out, key, value);
 }
 
+fn appendIndexedOptionalLine(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    idx: usize,
+    suffix: []const u8,
+    value: ?[]const u8,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ prefix, idx, suffix });
+    defer alloc.free(key);
+    try appendLine(alloc, out, key, value orelse "-");
+}
+
 fn appendIndexedU64Line(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1068,6 +1082,17 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     var acked = try execute(alloc, .{ .primary = &primary }, ack_plan);
     defer acked.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), acked.standby_status_update.received_lsn);
+    try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
+
+    var primary_status_plan = try admin_cli.parse(alloc, &.{ "status", "primary", "--max-lag-lsn", "10" });
+    defer primary_status_plan.deinit(alloc);
+    var primary_status = try execute(alloc, .{ .primary = &primary }, primary_status_plan);
+    defer primary_status.deinit(alloc);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", primary_status.primary_status.slots[0].last_error.?);
+
+    const status_table = try renderTableAlloc(alloc, primary_status);
+    defer alloc.free(status_table);
+    try expectContains(status_table, "slots.0.last_error=IntentionalApplyFailure\n");
 
     var status_plan = try admin_cli.parse(alloc, &.{ "status", "primary", "--view", "metrics", "--max-lag-lsn", "10" });
     defer status_plan.deinit(alloc);

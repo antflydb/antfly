@@ -46,6 +46,7 @@ pub const SlotSnapshot = struct {
     apply_lag_lsn: u64,
     retention_lag_lsn: u64,
     status: slot_store.SlotStatus,
+    last_error: ?[]const u8 = null,
 };
 
 pub const PrimarySnapshot = struct {
@@ -57,7 +58,10 @@ pub const PrimarySnapshot = struct {
     durability: ?primary_mod.DurabilityDecision = null,
 
     pub fn deinit(self: *PrimarySnapshot, alloc: Allocator) void {
-        for (self.slots) |slot| alloc.free(slot.name);
+        for (self.slots) |slot| {
+            alloc.free(slot.name);
+            if (slot.last_error) |last_error| alloc.free(last_error);
+        }
         alloc.free(self.slots);
         self.* = undefined;
     }
@@ -152,10 +156,20 @@ pub fn primarySnapshot(
     errdefer alloc.free(slots);
 
     var filled: usize = 0;
-    errdefer for (slots[0..filled]) |slot| alloc.free(slot.name);
+    errdefer for (slots[0..filled]) |slot| {
+        alloc.free(slot.name);
+        if (slot.last_error) |last_error| alloc.free(last_error);
+    };
     for (slot_states, 0..) |slot, idx| {
+        const owned_name = try alloc.dupe(u8, slot.name);
+        errdefer alloc.free(owned_name);
+        const owned_last_error = if (slot.last_error) |last_error|
+            try alloc.dupe(u8, last_error)
+        else
+            null;
+        errdefer if (owned_last_error) |last_error| alloc.free(last_error);
         slots[idx] = .{
-            .name = try alloc.dupe(u8, slot.name),
+            .name = owned_name,
             .timeline_id = slot.timeline_id,
             .active = slot.active,
             .reseed_required = slot.reseed_required,
@@ -166,6 +180,7 @@ pub fn primarySnapshot(
             .apply_lag_lsn = current_lsn -| slot.applied_lsn,
             .retention_lag_lsn = current_lsn -| slot.restart_lsn,
             .status = slot.status(current_lsn, retention_policy.max_lag_lsn),
+            .last_error = owned_last_error,
         };
         filled += 1;
     }
@@ -328,6 +343,7 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     _ = try primary.append(.{ .payload = "three" });
     try primary.standbyStatusUpdate("a", identity.timeline_id, 3, 2);
     try primary.standbyStatusUpdate("b", identity.timeline_id, 1, 1);
+    try primary.reportReplicationError("b", "IntentionalApplyFailure");
 
     const names = [_][]const u8{ "a", "b" };
     var snapshot = try primarySnapshot(alloc, &primary, .{ .max_lag_lsn = 1 }, .{
@@ -350,6 +366,7 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     try std.testing.expect(slot_b.reseed_required);
     try std.testing.expectEqual(@as(u64, 2), slot_b.write_lag_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot_b.apply_lag_lsn);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", slot_b.last_error.?);
 
     const encoded = try renderPrimaryJsonAlloc(alloc, snapshot);
     defer alloc.free(encoded);
@@ -358,6 +375,7 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     try expectContains(encoded, "\"role\":\"primary\"");
     try expectContains(encoded, "\"current_lsn\":3");
     try expectContains(encoded, "\"reseed_required\"");
+    try expectContains(encoded, "\"last_error\":\"IntentionalApplyFailure\"");
 }
 
 test "storage.ha status snapshots standby lag and promotion readiness" {
