@@ -3797,6 +3797,18 @@ pub fn build(b: *std.Build) void {
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
+    const ha_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"storage.ha"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_ha_tests = b.addRunArtifact(ha_tests);
+    const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
+    ha_test_step.dependOn(&run_ha_tests.step);
+
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_storage_default_filters),
@@ -4072,6 +4084,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
+    unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 
