@@ -288,6 +288,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
         desired_count += 1;
         const slot = findSlot(observed.primary.slots, standby.name) orelse {
+            unhealthy_count += 1;
             try actions.append(alloc, .{
                 .kind = .seed_standby,
                 .standby_name = standby.name,
@@ -328,7 +329,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         }
 
         if (slot.status == .lagging) lagging_count += 1;
-        if (slot.active and slot.apply_lag_lsn == 0) healthy_count += 1;
+        if (slot.active and slot.last_error == null and slot.safe_read_lag_lsn == 0) healthy_count += 1;
     }
 
     const retention_pressure = observed.primary.retention.reseed_recommended > 0;
@@ -881,9 +882,13 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expectEqual(@as(?u64, 3), plan.actions[0].target_lsn);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
     try std.testing.expectEqual(@as(usize, 0), plan.healthy_standby_count);
+    try std.testing.expectEqual(@as(usize, 1), plan.unhealthy_standby_count);
     const available = condition(plan, .available) orelse return error.TestExpectedEqual;
     try std.testing.expect(!available.status);
     try std.testing.expectEqual(ConditionSeverity.warning, available.severity);
+    const unhealthy = condition(plan, .unhealthy) orelse return error.TestExpectedEqual;
+    try std.testing.expect(unhealthy.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, unhealthy.severity);
     try std.testing.expect(!plan.automatic_promotion_allowed);
 }
 
@@ -1388,10 +1393,14 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     });
     defer safe_read_lag.deinit(alloc);
     try std.testing.expect(!safe_read_lag.automatic_promotion_allowed);
+    try std.testing.expectEqual(@as(usize, 0), safe_read_lag.healthy_standby_count);
     try std.testing.expectEqualStrings(
         "StandbySafeReadLagExceedsPolicy",
         (condition(safe_read_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
+    const safe_read_lag_available = condition(safe_read_lag, .available) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!safe_read_lag_available.status);
+    try std.testing.expectEqualStrings("NoHealthyStandby", safe_read_lag_available.reason);
 
     var safe = try reconcile(alloc, .{
         .mode = .hot_standby,
