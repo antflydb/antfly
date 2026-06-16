@@ -62118,6 +62118,15 @@ fn appParityFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) b
     };
 }
 
+fn appParityFixtureFamilyAllowsSetupSql(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .unsupported_ddl,
+        .adapter_noop_ddl,
+        => false,
+        else => true,
+    };
+}
+
 fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .insert,
@@ -62633,6 +62642,9 @@ fn validateAppParityFixtureMetadata(
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
         return error.TestUnexpectedResult;
     }
+    if (entry.apply_setup_sql.len > 0 and !appParityFixtureFamilyAllowsSetupSql(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.family == .ddl and entry.apply_setup_sql.len > 0 and entry.applied_plan.len == 0) {
         return error.TestUnexpectedResult;
     }
@@ -63035,6 +63047,24 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "unsupported ddl setup sql",
+        .sql = "CREATE TABLE account_prices_history (id text PRIMARY KEY) WITH SYSTEM VERSIONING",
+        .family = .unsupported_ddl,
+        .classification_reason = "system_time_temporal_table",
+        .plan = "unsupported:ddl:requires=system_time_temporal_table",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY)"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "adapter noop setup sql",
+        .sql = "SET client_encoding = 'UTF8'",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "session_setting",
+        .plan = "adapter_noop:ddl:reason=session_setting",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY)"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "ignored source schema",
         .sql = "SELECT id FROM usage_records",
         .family = .query,
@@ -63249,6 +63279,19 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .adapter_noop_ddl,
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=session_setting",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid unsupported insert setup sql",
+        .sql = "INSERT INTO usage_records (id, email) VALUES ('u1', 'a@example.test') ON CONFLICT (email) DO UPDATE SET email = excluded.email",
+        .family = .unsupported_insert,
+        .classification_reason = "enforced_unique_conflict_target",
+        .plan = "unsupported:insert:requires=enforced_unique_conflict_target",
+        .apply_setup_sql = &.{
+            "CREATE TABLE usage_records (id text PRIMARY KEY, email text);",
+            "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);",
+        },
+        .resolver_exists = false,
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{
