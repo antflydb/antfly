@@ -166,6 +166,7 @@ pub const Primary = struct {
     }
 
     pub fn createSlot(self: *Primary, name: []const u8, initial_lsn: u64) !void {
+        if (self.slots.get(name) != null) return error.SlotAlreadyExists;
         try self.slots.createOrUpdate(.{
             .name = name,
             .timeline_id = self.identity.timeline_id,
@@ -543,6 +544,26 @@ test "storage.ha primary appends streams and persists standby status" {
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
     }
+}
+
+test "storage.ha primary rejects duplicate slot creation without regressing progress" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "duplicate-slot");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    try primary.createSlot("standby-a", 0);
+    try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 2, 2);
+
+    try std.testing.expectError(error.SlotAlreadyExists, primary.createSlot("standby-a", 0));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
 }
 
 test "storage.ha primary begins base backup with slot retention pin" {

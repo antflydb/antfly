@@ -136,6 +136,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.FenceStoreUnavailable,
         error.FenceAlreadyHeld,
         error.FenceReceiptMissing,
+        error.SlotAlreadyExists,
         error.SlotInactive,
         error.SlotRequiresReseed,
         error.WalNoLongerRetained,
@@ -299,6 +300,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), create.status);
     try std.testing.expectEqualStrings("application/json", create.content_type.?);
     try expectContains(create.body, "\"slot_name\":\"standby-a\"");
+
+    var duplicate_create = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"slot\",\"create\",\"standby-a\",\"--initial-lsn\",\"0\"]}",
+    });
+    defer duplicate_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), duplicate_create.status);
+    try expectContains(duplicate_create.body, "SlotAlreadyExists");
 
     try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
     var stream = try server.handle(.{
