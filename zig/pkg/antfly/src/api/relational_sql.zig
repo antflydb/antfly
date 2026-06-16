@@ -62158,6 +62158,13 @@ fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix
         std.mem.indexOf(u8, entry.plan, inner_prefix) != null;
 }
 
+fn appParityReadPlanHasPrefix(entry: AppParityCorpusEntry, read_prefix: []const u8) bool {
+    return (entry.family == .read and std.mem.startsWith(u8, entry.plan, read_prefix)) or
+        (entry.family == .explain and
+            std.mem.startsWith(u8, entry.plan, "explain:kind=read:") and
+            std.mem.indexOf(u8, entry.plan, read_prefix) != null);
+}
+
 fn appParityFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .insert_source,
@@ -62183,6 +62190,41 @@ fn appParityFixtureAllowsMergeArmSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .merge_mutation => true,
         .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsAggregateSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .aggregate => true,
+        .read, .explain => appParityReadPlanHasPrefix(entry, "read:aggregate:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .join,
+        .lateral,
+        => true,
+        .read, .explain => appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsLateralSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .lateral => true,
+        .read, .explain => appParityReadPlanHasPrefix(entry, "read:lateral:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsWindowSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .window => true,
+        .read, .explain => appParityReadPlanHasPrefix(entry, "read:window:"),
         else => false,
     };
 }
@@ -62417,6 +62459,29 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if ((entry.summary.group_by != null or
+        entry.summary.group_expressions != null or
+        entry.summary.aggregations != null or
+        entry.summary.filter_groups != null or
+        entry.summary.having != null or
+        entry.summary.having_expressions != null or
+        entry.summary.having_any != null or
+        entry.summary.having_not != null) and
+        !appParityFixtureAllowsAggregateSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
+    if ((entry.summary.lateral_correlations != null or entry.summary.right_offset != null) and
+        !appParityFixtureAllowsLateralSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.summary.windows != null and !appParityFixtureAllowsWindowSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
     }
@@ -62585,6 +62650,46 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .update_source,
         .summary = .{ .table_name = "usage_records", .matched_predicates = 1 },
         .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "query aggregate summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .group_by = 1 },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "generic read query aggregate summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .read,
+        .summary = .{ .table_name = "usage_records", .aggregations = 1 },
+        .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "aggregate join select summary",
+        .sql = "SELECT status, count(*) AS count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .join_select = 1 },
+        .plan = "aggregate:table=usage_records:ctes=0:source_cte=0:source_pred=0:group_by=1:group_expr=0:agg=1:filter_groups=0:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "join lateral offset summary",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .right_offset = 1 },
+        .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "lateral window summary",
+        .sql = "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM archived_records WHERE archived_records.id = usage_records.id LIMIT 1) AS latest ON true",
+        .family = .lateral,
+        .summary = .{ .table_name = "usage_records", .windows = 1 },
+        .plan = "lateral:left=usage_records:right=archived_records:left_pred=0:right_pred=1:correlations=1:select=1:order=0:limit=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
