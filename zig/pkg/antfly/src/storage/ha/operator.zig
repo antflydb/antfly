@@ -707,6 +707,7 @@ fn automaticPromotionStandby(spec: Spec, observed: Observed) ?[]const u8 {
         if (spec.auto_failover.require_remote_apply) {
             if (exceedsLagPolicy(slot.applied_lsn, primary.current_lsn, max_lag)) continue;
         }
+        if (exceedsLagPolicy(slot.safe_read_lsn, primary.current_lsn, max_lag)) continue;
         return standby.name;
     }
     return null;
@@ -828,6 +829,7 @@ fn automaticFailoverSlotReason(spec: Spec, primary: status.PrimarySnapshot, stan
     {
         return "StandbyApplyLagExceedsPolicy";
     }
+    if (exceedsLagPolicy(slot.safe_read_lsn, primary.current_lsn, max_lag)) return "StandbySafeReadLagExceedsPolicy";
     return null;
 }
 
@@ -1358,6 +1360,37 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings(
         "StandbyApplyLagExceedsPolicy",
         (condition(apply_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var safe_read_lag_slots = slots;
+    safe_read_lag_slots[0].safe_read_lsn = 11;
+    safe_read_lag_slots[0].safe_read_lag_lsn = 1;
+    var safe_read_lag_primary = primary;
+    safe_read_lag_primary.slots = safe_read_lag_slots[0..];
+    var safe_read_lag = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = safe_read_lag_primary,
+        .primary_admin_unavailable = true,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer safe_read_lag.deinit(alloc);
+    try std.testing.expect(!safe_read_lag.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "StandbySafeReadLagExceedsPolicy",
+        (condition(safe_read_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
     var safe = try reconcile(alloc, .{
