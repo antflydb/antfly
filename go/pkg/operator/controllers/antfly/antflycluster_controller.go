@@ -3307,6 +3307,12 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	if action == nil {
 		return false, nil
 	}
+	if !haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+		return false, nil
+	}
+	if err := haValidatePlannedActionAdminOperation(*action); err != nil {
+		return true, err
+	}
 	switch action.Kind {
 	case string(haActionCreateSlot):
 		slotName := haActionSlotName(*action)
@@ -3375,6 +3381,43 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	default:
 		return false, nil
 	}
+}
+
+func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
+	switch kind {
+	case haActionCreateSlot,
+		haActionPauseSlot,
+		haActionResumeSlot,
+		haActionDropSlot,
+		haActionSeedStandby,
+		haActionMarkReseed,
+		haActionAcquireFence,
+		haActionPromoteStandby,
+		haActionDemoteFormerPrimary,
+		haActionRewindFormerPrimary,
+		haActionReseedFormerPrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus) error {
+	if strings.TrimSpace(action.AdminMethod) == "" && strings.TrimSpace(action.AdminPath) == "" {
+		return nil
+	}
+	expectedMethod, expectedPath := haAdminOperation(haPlannedAction{
+		Kind:        haActionKind(action.Kind),
+		StandbyName: action.StandbyName,
+		SlotName:    action.SlotName,
+	})
+	if expectedMethod == "" || expectedPath == "" {
+		return fmt.Errorf("planned HA action %q has typed admin operation %s %s but no matching direct admin API operation", action.Kind, action.AdminMethod, action.AdminPath)
+	}
+	if strings.TrimSpace(action.AdminMethod) != expectedMethod || strings.TrimSpace(action.AdminPath) != expectedPath {
+		return fmt.Errorf("planned HA action %q typed admin operation mismatch: status has %s %s, expected %s %s", action.Kind, action.AdminMethod, action.AdminPath, expectedMethod, expectedPath)
+	}
+	return nil
 }
 
 func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (map[string]any, bool) {
