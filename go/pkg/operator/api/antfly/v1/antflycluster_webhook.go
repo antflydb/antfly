@@ -1181,6 +1181,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if admin.JobTTLSecondsAfterFinished != nil && *admin.JobTTLSecondsAfterFinished < 0 {
 			errors = append(errors, "spec.highAvailability.admin.jobTTLSecondsAfterFinished must not be negative")
 		}
+		errors = append(errors, validateHAAdminJobPodSpec(admin)...)
 		if admin.ExecutePlannedActions {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {
 				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")
@@ -1291,6 +1292,47 @@ func validateHARouteSelector(selector map[string]string, fieldPath string) []str
 		}
 		if valueErrs := utilvalidation.IsValidLabelValue(value); len(valueErrs) > 0 {
 			errors = append(errors, fmt.Sprintf("%s[%q] value %q is invalid: %s", fieldPath, key, value, strings.Join(valueErrs, "; ")))
+		}
+	}
+	return errors
+}
+
+func validateHAAdminJobPodSpec(admin *HAAdminSpec) []string {
+	var errors []string
+	for i, source := range admin.EnvFrom {
+		if err := validateEnvFromSource(source, fmt.Sprintf("spec.highAvailability.admin.envFrom[%d]", i)); err != nil {
+			errors = append(errors, err.Error())
+		}
+	}
+	volumes := map[string]struct{}{}
+	for i, volume := range admin.Volumes {
+		path := fmt.Sprintf("spec.highAvailability.admin.volumes[%d]", i)
+		name := strings.TrimSpace(volume.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.name is required", path))
+			continue
+		}
+		if nameErrs := utilvalidation.IsDNS1123Label(name); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s.name %q is invalid: %s", path, name, strings.Join(nameErrs, "; ")))
+			continue
+		}
+		if _, exists := volumes[name]; exists {
+			errors = append(errors, fmt.Sprintf("%s.name %q is duplicated", path, name))
+		}
+		volumes[name] = struct{}{}
+	}
+	for i, mount := range admin.VolumeMounts {
+		path := fmt.Sprintf("spec.highAvailability.admin.volumeMounts[%d]", i)
+		name := strings.TrimSpace(mount.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.name is required", path))
+			continue
+		}
+		if _, ok := volumes[name]; !ok {
+			errors = append(errors, fmt.Sprintf("%s.name %q must reference spec.highAvailability.admin.volumes", path, name))
+		}
+		if strings.TrimSpace(mount.MountPath) == "" {
+			errors = append(errors, fmt.Sprintf("%s.mountPath is required", path))
 		}
 	}
 	return errors

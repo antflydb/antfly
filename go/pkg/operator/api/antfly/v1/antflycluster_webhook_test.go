@@ -2065,6 +2065,43 @@ func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t 
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAdminJobPodSpecValidation(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			EnvFrom: []corev1.EnvFromSource{{
+				SecretRef: &corev1.SecretEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "backup-credentials"},
+				},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "ha-seed",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			}},
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:      "ha-seed",
+				MountPath: "/backup",
+			}},
+		},
+		Standbys: []HAStandbySpec{{Name: "standby-a"}},
+	}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid HA admin pod spec, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Admin.VolumeMounts[0].Name = "missing"
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected dangling volumeMount validation error")
+	}
+	if !strings.Contains(err.Error(), "volumeMounts[0].name \"missing\" must reference spec.highAvailability.admin.volumes") {
+		t.Fatalf("expected dangling volumeMount error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

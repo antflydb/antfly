@@ -584,6 +584,18 @@ type HAAdminSpec struct {
 	// JobTTLSecondsAfterFinished controls how long completed HA admin Jobs are retained.
 	// +optional
 	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
+
+	// EnvFrom is applied to HA admin Job containers, commonly for backup object-store credentials.
+	// +optional
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
+
+	// Volumes are added to HA admin Job pods, commonly for shared base-backup manifests and contents.
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// VolumeMounts are added to the HA admin Job container.
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
 // HAReplicationIdentitySpec identifies one replicated HA unit.

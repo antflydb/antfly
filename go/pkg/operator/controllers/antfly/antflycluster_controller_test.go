@@ -176,6 +176,21 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 					JobBackoffLimit:            &backoffLimit,
 					JobTimeoutSeconds:          &timeoutSeconds,
 					JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "backup-credentials"},
+						},
+					}},
+					Volumes: []corev1.Volume{{
+						Name: "ha-seed",
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
+						},
+					}},
+					VolumeMounts: []corev1.VolumeMount{{
+						Name:      "ha-seed",
+						MountPath: "/backup",
+					}},
 				},
 				Standbys: []antflyv1.HAStandbySpec{{
 					Name:       "standby-a",
@@ -220,8 +235,16 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
+	g.Expect(createSlotJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
+	g.Expect(createSlotJob.Spec.Template.Spec.Volumes[0].Name).To(Equal("ha-seed"))
 	container := createSlotJob.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Command).To(Equal([]string{"/antfly"}))
+	g.Expect(container.EnvFrom).To(HaveLen(1))
+	g.Expect(container.EnvFrom[0].SecretRef.Name).To(Equal("backup-credentials"))
+	g.Expect(container.VolumeMounts).To(Equal([]corev1.VolumeMount{{
+		Name:      "ha-seed",
+		MountPath: "/backup",
+	}}))
 	g.Expect(container.Args).To(Equal([]string{
 		"ha",
 		"--ha-url",
