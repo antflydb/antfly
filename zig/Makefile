@@ -126,9 +126,7 @@ openapi-generate:
 	$(ZIG) build regen-openapi
 
 openapi-check:
-	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
-	$(ZIG) build regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+	$(ZIG) build openapi-check
 
 snowball-generate:
 	$(ZIG) build regen-snowball
