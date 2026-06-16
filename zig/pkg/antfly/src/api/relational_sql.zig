@@ -62416,6 +62416,18 @@ fn appParityAppliedPlanIsStructured(plan: []const u8) bool {
     return index == plan.len;
 }
 
+fn appParityJsonTextIsObject(alloc: std.mem.Allocator, text: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
+fn appParitySourceSchemaJsonIsValid(alloc: std.mem.Allocator, text: []const u8) !bool {
+    var parsed = schema_api.parseValidatedTableSchema(alloc, text) catch return false;
+    defer parsed.deinit(alloc);
+    return true;
+}
+
 fn validateAppParityFixtureMetadata(
     entry: AppParityCorpusEntry,
     seen_names: *std.StringHashMapUnmanaged(void),
@@ -62450,13 +62462,22 @@ fn validateAppParityFixtureMetadata(
     if (entry.source_schema_json.len > 0 and !appParityFixtureFamilyAllowsSourceSchema(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.source_schema_json.len > 0 and !(try appParitySourceSchemaJsonIsValid(alloc, entry.source_schema_json))) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
+    }
+    for (entry.returning_rows) |returning_row| {
+        if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
     }
     if (!appParitySqlParameterCoverageMatches(entry.sql, entry.params.len)) {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_row_json.len > 0 and !(try appParityJsonTextIsObject(alloc, entry.resolver_row_json))) {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_exists == false and
@@ -62570,12 +62591,30 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed source schema",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "join:left=usage_records:right=archived_records:on=1",
+        .source_schema_json = "{\"fields\":",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "ignored returning rows",
         .sql = "SELECT id FROM usage_records",
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
         .returning_rows = &.{"{\"id\":\"u1\"}"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "non-object returning row",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        .returning_rows = &.{"[\"u1\"]"},
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -62596,6 +62635,16 @@ test "app parity fixture metadata requires typed summary anchors" {
         .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
         .resolver_version = 17,
         .resolver_exists = false,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "non-object resolver row",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+        .resolver_row_json = "[\"u1\"]",
+        .resolver_version = 17,
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
