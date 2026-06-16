@@ -179,6 +179,7 @@ pub const AdminCommand = struct {
 pub const Observed = struct {
     primary: status.PrimarySnapshot,
     current_primary_id: ?[]const u8 = null,
+    primary_admin_unavailable: bool = false,
     fencing: FencingObservation = .{},
     former_primary: ?rejoin.FormerPrimaryState = null,
     promotion_receipt: ?fencing.Receipt = null,
@@ -332,7 +333,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
     const retention_pressure = observed.primary.retention.reseed_recommended > 0;
     const degraded = isDegraded(observed.primary.durability);
-    const automatic_standby = automaticPromotionStandby(spec, observed.primary, observed.fencing);
+    const automatic_standby = automaticPromotionStandby(spec, observed);
     const automatic_allowed = automatic_standby != null;
 
     try conditions.append(alloc, .{
@@ -386,7 +387,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .type = .automatic_failover_ready,
         .status = automatic_allowed,
         .severity = if (automatic_allowed or !spec.auto_failover.enabled) .info else .warning,
-        .reason = automaticFailoverReason(spec, observed.primary, observed.fencing, automatic_allowed),
+        .reason = automaticFailoverReason(spec, observed, automatic_allowed),
         .message = if (automatic_allowed) "Automatic failover may acquire a fence and promote a caught-up standby" else "Automatic failover is disabled or missing a safe fencing/readiness prerequisite",
     });
 
@@ -677,15 +678,20 @@ fn unhealthyConditionReason(replication_error_count: usize, inactive_count: usiz
     return "NoUnhealthyStandby";
 }
 
-fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation) bool {
-    return automaticPromotionStandby(spec, primary, fencing_observed) != null;
+fn automaticPromotionAllowed(spec: Spec, observed: Observed) bool {
+    return automaticPromotionStandby(spec, observed) != null;
 }
 
-fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation) ?[]const u8 {
+fn automaticPromotionStandby(spec: Spec, observed: Observed) ?[]const u8 {
+    const primary = observed.primary;
+    const fencing_observed = observed.fencing;
     if (!spec.auto_failover.enabled) return null;
     if (spec.auto_failover.fencing_authority == .none) return null;
-    if (isDegraded(primary.durability)) return null;
     if (!fencingAuthorityReady(spec.auto_failover, fencing_observed)) return null;
+    if (!observed.primary_admin_unavailable) return null;
+    if (primary.current_lsn == 0) return null;
+    if (promotionAlreadyRecorded(observed)) return null;
+    if (isDegraded(primary.durability)) return null;
     const fence_holder = fencing_observed.holder orelse return null;
     _ = fencing_observed.generation orelse return null;
 
@@ -704,6 +710,21 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencin
         return standby.name;
     }
     return null;
+}
+
+fn promotionAlreadyRecorded(observed: Observed) bool {
+    const receipt = observed.promotion_receipt orelse return false;
+    const identity = observed.primary.identity;
+    return receipt.identity.cluster_id == identity.cluster_id and
+        receipt.identity.shard_id == identity.shard_id and
+        receipt.identity.table_id == identity.table_id and
+        receipt.parent_timeline_id == identity.timeline_id and
+        receipt.parent_epoch == identity.epoch and
+        receipt.old_primary_id.len > 0 and
+        receipt.promoted_node_id.len > 0 and
+        receipt.new_timeline_id != 0 and
+        receipt.new_epoch != 0 and
+        receipt.required_lsn != 0;
 }
 
 fn fencingAuthorityReady(policy: AutoFailoverPolicy, observed: FencingObservation) bool {
@@ -776,13 +797,18 @@ fn appendOwnedFmt(
     try argv.append(alloc, owned);
 }
 
-fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation, allowed: bool) []const u8 {
+fn automaticFailoverReason(spec: Spec, observed: Observed, allowed: bool) []const u8 {
+    const primary = observed.primary;
+    const fencing_observed = observed.fencing;
     if (allowed) return "FencedPromotionReady";
     if (!spec.auto_failover.enabled) return "AutomaticFailoverDisabled";
     if (spec.auto_failover.fencing_authority == .none) return "FencingAuthorityMissing";
-    if (isDegraded(primary.durability)) return "SyncPolicyUnsatisfied";
     if (fencing_observed.authority != .none and fencing_observed.authority != spec.auto_failover.fencing_authority) return "FencingAuthorityMismatch";
     if (!fencing_observed.ready) return "FencingAuthorityNotReady";
+    if (!observed.primary_admin_unavailable) return "PrimaryStillReachable";
+    if (primary.current_lsn == 0) return "PromotionBoundaryMissing";
+    if (promotionAlreadyRecorded(observed)) return "PromotionAlreadyRecorded";
+    if (isDegraded(primary.durability)) return "SyncPolicyUnsatisfied";
     const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
     _ = fencing_observed.generation orelse return "FencingGenerationMissing";
     if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
@@ -913,7 +939,17 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
             .enabled = true,
             .fencing_authority = .kubernetes_lease,
         },
-    }, .{ .primary = primary });
+    }, .{
+        .primary = primary,
+        .primary_admin_unavailable = true,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), plan.reseed_required_count);
@@ -1025,6 +1061,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1049,6 +1086,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1074,6 +1112,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1086,6 +1125,102 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings(
         "FencingGenerationMissing",
         (condition(generation_missing, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var primary_reachable = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer primary_reachable.deinit(alloc);
+    try std.testing.expect(!primary_reachable.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "PrimaryStillReachable",
+        (condition(primary_reachable, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var missing_boundary_primary = primary;
+    missing_boundary_primary.current_lsn = 0;
+    missing_boundary_primary.retention.primary_lsn = 0;
+    var missing_boundary = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = missing_boundary_primary,
+        .primary_admin_unavailable = true,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer missing_boundary.deinit(alloc);
+    try std.testing.expect(!missing_boundary.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "PromotionBoundaryMissing",
+        (condition(missing_boundary, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    const recorded_receipt = fencing.Receipt{
+        .identity = primary.identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .parent_timeline_id = primary.identity.timeline_id,
+        .parent_epoch = primary.identity.epoch,
+        .new_timeline_id = primary.identity.timeline_id + 1,
+        .new_epoch = primary.identity.epoch + 1,
+        .required_lsn = primary.current_lsn,
+        .observed_lsn = primary.current_lsn,
+        .generation = 6,
+        .forced = false,
+        .token = "token",
+        .reason = "LeaseAcquired",
+    };
+    var already_recorded = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .primary_admin_unavailable = true,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+        .promotion_receipt = recorded_receipt,
+    });
+    defer already_recorded.deinit(alloc);
+    try std.testing.expect(!already_recorded.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "PromotionAlreadyRecorded",
+        (condition(already_recorded, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
     var inactive_slots = slots;
@@ -1102,6 +1237,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = inactive_primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1135,6 +1271,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = error_primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1171,6 +1308,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = receive_lag_primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1206,6 +1344,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = apply_lag_primary,
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1232,6 +1371,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     }, .{
         .primary = primary,
         .current_primary_id = "primary-a",
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1330,6 +1470,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     }, .{
         .primary = primary,
         .current_primary_id = "primary-a",
+        .primary_admin_unavailable = true,
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,

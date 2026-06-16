@@ -252,6 +252,7 @@ test "storage.ha http client round trips admin commands" {
         "kubernetes-lease",
         "--current-primary-id",
         "primary-a",
+        "--primary-admin-unavailable",
         "--fence-authority",
         "kubernetes-lease",
         "--fence-ready",

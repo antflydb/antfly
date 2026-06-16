@@ -402,6 +402,7 @@ fn executeOperatorPlan(
     return try operator.reconcile(alloc, command.spec, .{
         .primary = snapshot,
         .current_primary_id = command.current_primary_id,
+        .primary_admin_unavailable = command.primary_admin_unavailable,
         .fencing = command.fencing,
         .former_primary = command.former_primary,
         .promotion_receipt = command.promotion_receipt,
@@ -1332,17 +1333,18 @@ test "storage.ha admin exec renders operator plan command" {
     try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 1);
 
     var plan = try admin_cli.parse(alloc, &.{
-        "operator",           "plan",
-        "--standby",          "standby-a",
-        "--sync-mode",        "remote-apply",
-        "--sync-standby",     "standby-a",
-        "--auto-failover",    "--fencing-authority",
-        "kubernetes-lease",   "--current-primary-id",
-        "primary-a",          "--fence-authority",
-        "kubernetes-lease",   "--fence-ready",
-        "--fence-holder",     "standby-a",
-        "--fence-generation", "9",
-        "--fence-reason",     "LeaseAcquired",
+        "operator",          "plan",
+        "--standby",         "standby-a",
+        "--sync-mode",       "remote-apply",
+        "--sync-standby",    "standby-a",
+        "--auto-failover",   "--fencing-authority",
+        "kubernetes-lease",  "--current-primary-id",
+        "primary-a",         "--primary-admin-unavailable",
+        "--fence-authority", "kubernetes-lease",
+        "--fence-ready",     "--fence-holder",
+        "standby-a",         "--fence-generation",
+        "9",                 "--fence-reason",
+        "LeaseAcquired",
     });
     defer plan.deinit(alloc);
 

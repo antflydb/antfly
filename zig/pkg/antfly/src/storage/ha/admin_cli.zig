@@ -119,6 +119,7 @@ pub const RejoinAssessCommand = struct {
 pub const OperatorPlanCommand = struct {
     spec: operator.Spec,
     current_primary_id: ?[]const u8 = null,
+    primary_admin_unavailable: bool = false,
     fencing: operator.FencingObservation = .{},
     former_primary: ?rejoin.FormerPrimaryState = null,
     promotion_receipt: ?fencing.Receipt = null,
@@ -791,6 +792,9 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--current-primary-id")) {
             _ = cursor.next();
             command.current_primary_id = try cursor.value("--current-primary-id");
+        } else if (std.mem.eql(u8, arg, "--primary-admin-unavailable")) {
+            _ = cursor.next();
+            command.primary_admin_unavailable = true;
         } else if (std.mem.eql(u8, arg, "--fence-authority")) {
             _ = cursor.next();
             command.fencing.authority = try parseFencingAuthority(try cursor.value("--fence-authority"));
@@ -1458,40 +1462,41 @@ test "storage.ha admin cli parses primary status with sync policy" {
 test "storage.ha admin cli parses operator plan command" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
-        "operator",                     "plan",
-        "--standby",                    "standby-a",
-        "--standby-initial-lsn",        "3",
-        "--standby-disabled",           "standby-b",
-        "--max-lag-lsn",                "50",
-        "--sync-mode",                  "remote-apply",
-        "--sync-standby",               "standby-a",
-        "--auto-failover",              "--fencing-authority",
-        "kubernetes-lease",             "--auto-max-lag-lsn",
-        "2",                            "--current-primary-id",
-        "primary-a",                    "--fence-authority",
-        "kubernetes_lease",             "--fence-ready",
-        "--fence-holder",               "standby-a",
-        "--fence-generation",           "7",
-        "--fence-reason",               "LeaseAcquired",
-        "--former-primary-id",          "primary-a",
-        "--former-cluster-id",          "100",
-        "--former-shard-id",            "10",
-        "--former-table-id",            "20",
-        "--former-timeline-id",         "1",
-        "--former-epoch",               "1",
-        "--former-last-lsn",            "12",
-        "--retained-from-lsn",          "8",
-        "--receipt-old-primary-id",     "primary-a",
-        "--receipt-promoted-node-id",   "standby-a",
-        "--receipt-parent-timeline-id", "1",
-        "--receipt-parent-epoch",       "1",
-        "--receipt-new-timeline-id",    "2",
-        "--receipt-new-epoch",          "2",
-        "--receipt-required-lsn",       "10",
-        "--receipt-observed-lsn",       "10",
-        "--receipt-generation",         "3",
-        "--receipt-token",              "token",
-        "--receipt-reason",             "operator-approved",
+        "operator",              "plan",
+        "--standby",             "standby-a",
+        "--standby-initial-lsn", "3",
+        "--standby-disabled",    "standby-b",
+        "--max-lag-lsn",         "50",
+        "--sync-mode",           "remote-apply",
+        "--sync-standby",        "standby-a",
+        "--auto-failover",       "--fencing-authority",
+        "kubernetes-lease",      "--auto-max-lag-lsn",
+        "2",                     "--current-primary-id",
+        "primary-a",             "--primary-admin-unavailable",
+        "--fence-authority",     "kubernetes_lease",
+        "--fence-ready",         "--fence-holder",
+        "standby-a",             "--fence-generation",
+        "7",                     "--fence-reason",
+        "LeaseAcquired",         "--former-primary-id",
+        "primary-a",             "--former-cluster-id",
+        "100",                   "--former-shard-id",
+        "10",                    "--former-table-id",
+        "20",                    "--former-timeline-id",
+        "1",                     "--former-epoch",
+        "1",                     "--former-last-lsn",
+        "12",                    "--retained-from-lsn",
+        "8",                     "--receipt-old-primary-id",
+        "primary-a",             "--receipt-promoted-node-id",
+        "standby-a",             "--receipt-parent-timeline-id",
+        "1",                     "--receipt-parent-epoch",
+        "1",                     "--receipt-new-timeline-id",
+        "2",                     "--receipt-new-epoch",
+        "2",                     "--receipt-required-lsn",
+        "10",                    "--receipt-observed-lsn",
+        "10",                    "--receipt-generation",
+        "3",                     "--receipt-token",
+        "token",                 "--receipt-reason",
+        "operator-approved",
     });
     defer plan.deinit(alloc);
 
@@ -1507,6 +1512,7 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.spec.auto_failover.fencing_authority);
     try std.testing.expectEqual(@as(u64, 2), command.spec.auto_failover.maximum_lag_lsn);
     try std.testing.expectEqualStrings("primary-a", command.current_primary_id.?);
+    try std.testing.expect(command.primary_admin_unavailable);
     try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.fencing.authority);
     try std.testing.expect(command.fencing.ready);
     try std.testing.expectEqualStrings("standby-a", command.fencing.holder.?);
