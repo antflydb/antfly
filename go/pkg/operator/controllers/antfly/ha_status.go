@@ -118,6 +118,7 @@ type haPlan struct {
 	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
 	FencingReady              bool
+	PromotionBoundaryReady    bool
 	PromotionStandbyName      string
 	PrimaryAdminUnavailable   bool
 	SyncPolicyDegraded        bool
@@ -417,6 +418,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.SyncPolicyDegraded = plan.SyncPolicy.Degraded
 	plan.FencingReady = haFencingReady(ha, status)
 	plan.PrimaryAdminUnavailable = haPrimaryAdminUnavailable(status)
+	plan.PromotionBoundaryReady = haPromotionBoundaryReady(status)
 	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
 	if plan.AutomaticPromotionAllowed {
@@ -994,6 +996,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if !haPrimaryAdminUnavailable(status) {
 		return ""
 	}
+	if !haPromotionBoundaryReady(status) {
+		return ""
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return ""
 	}
@@ -1029,6 +1034,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 
 func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
 	if ha == nil || ha.AutomaticFailover == nil || status == nil {
+		return ""
+	}
+	if !haPromotionBoundaryReady(status) {
 		return ""
 	}
 	sync := haEvaluateSyncPolicy(ha, status)
@@ -1120,6 +1128,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	if !plan.PrimaryAdminUnavailable {
 		return antflyv1.ReasonHAPrimaryStillReachable
 	}
+	if !plan.PromotionBoundaryReady {
+		return antflyv1.ReasonHAPromotionBoundaryMissing
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return antflyv1.ReasonHASyncPolicyUnsatisfied
 	}
@@ -1128,6 +1139,10 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 
 func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
 	return status != nil && !status.PrimaryAdminReachable && status.PrimaryAdminLastError != ""
+}
+
+func haPromotionBoundaryReady(status *antflyv1.HAStatus) bool {
+	return status != nil && status.PrimaryLSN > 0
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {

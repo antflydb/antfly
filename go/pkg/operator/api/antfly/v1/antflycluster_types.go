@@ -221,6 +221,9 @@ const (
 	// ReasonHAPrimaryStillReachable indicates automatic failover is blocked while the primary admin endpoint is reachable.
 	ReasonHAPrimaryStillReachable = "HAPrimaryStillReachable"
 
+	// ReasonHAPromotionBoundaryMissing indicates automatic failover lacks an observed primary LSN boundary.
+	ReasonHAPromotionBoundaryMissing = "HAPromotionBoundaryMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 

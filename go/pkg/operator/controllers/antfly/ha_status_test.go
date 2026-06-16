@@ -395,6 +395,19 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
+	observedPrimaryLSN := cluster.Status.HAStatus.PrimaryLSN
+	cluster.Status.HAStatus.PrimaryLSN = 0
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked without an observed primary LSN boundary")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPromotionBoundaryMissing {
+		t.Fatalf("expected promotion-boundary-missing condition, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.PrimaryLSN = observedPrimaryLSN
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
@@ -1019,6 +1032,23 @@ func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected no fencing lease without safe candidate, got lease=%#v err=%v", lease, err)
+	}
+}
+
+func TestReconcileHAFencingLeaseSkipsWithoutPromotionBoundary(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryLSN = 0
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease without promotion boundary, got lease=%#v err=%v", lease, err)
 	}
 }
 
