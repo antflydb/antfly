@@ -761,9 +761,16 @@ fn parseOperator(
     var fence_reason: []const u8 = &.{};
 
     while (cursor.peek()) |arg| {
-        if (std.mem.eql(u8, arg, "--standby")) {
+        if (std.mem.eql(u8, arg, "--primary-admin-url")) {
+            _ = cursor.next();
+            command.spec.primary_admin_url = try cursor.value("--primary-admin-url");
+        } else if (std.mem.eql(u8, arg, "--standby")) {
             _ = cursor.next();
             try standbys.append(alloc, .{ .name = try cursor.value("--standby") });
+        } else if (std.mem.eql(u8, arg, "--standby-admin-url")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            standbys.items[standbys.items.len - 1].admin_url = try cursor.value("--standby-admin-url");
         } else if (std.mem.eql(u8, arg, "--standby-initial-lsn")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
@@ -1476,11 +1483,14 @@ test "storage.ha admin cli parses operator plan command" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
         "operator",                     "plan",
+        "--primary-admin-url",          "http://primary-ha.default.svc:8081",
         "--standby",                    "standby-a",
+        "--standby-admin-url",          "http://standby-a-ha.default.svc:8081",
         "--standby-initial-lsn",        "3",
         "--standby-seed-manifest",      "/backup/base-standby-a-3.afha",
         "--standby-seed-content-root",  "/backup/base-standby-a-3",
         "--standby-disabled",           "standby-b",
+        "--standby-admin-url",          "http://standby-b-ha.default.svc:8081",
         "--standby-drop-slot",          "--max-lag-lsn",
         "50",                           "--sync-mode",
         "remote-apply",                 "--sync-standby",
@@ -1517,12 +1527,15 @@ test "storage.ha admin cli parses operator plan command" {
 
     const command = plan.command.operator_plan;
     try std.testing.expectEqual(operator.Mode.hot_standby, command.spec.mode);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", command.spec.primary_admin_url.?);
     try std.testing.expectEqual(@as(usize, 2), command.spec.standbys.len);
     try std.testing.expectEqualStrings("standby-a", command.spec.standbys[0].name);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", command.spec.standbys[0].admin_url.?);
     try std.testing.expectEqual(@as(?u64, 3), command.spec.standbys[0].initial_lsn);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", command.spec.standbys[0].seed_manifest_path.?);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3", command.spec.standbys[0].seed_content_root.?);
     try std.testing.expectEqualStrings("standby-b", command.spec.standbys[1].name);
+    try std.testing.expectEqualStrings("http://standby-b-ha.default.svc:8081", command.spec.standbys[1].admin_url.?);
     try std.testing.expect(!command.spec.standbys[1].desired);
     try std.testing.expect(command.spec.standbys[1].drop_slot_on_removal);
     try std.testing.expectEqual(@as(u64, 50), command.spec.retention_policy.max_lag_lsn);

@@ -61,6 +61,7 @@ pub const StandbySpec = struct {
     name: []const u8,
     desired: bool = true,
     drop_slot_on_removal: bool = false,
+    admin_url: ?[]const u8 = null,
     initial_lsn: ?u64 = null,
     seed_manifest_path: ?[]const u8 = null,
     seed_content_root: ?[]const u8 = null,
@@ -68,6 +69,7 @@ pub const StandbySpec = struct {
 
 pub const Spec = struct {
     mode: Mode = .disabled,
+    primary_admin_url: ?[]const u8 = null,
     standbys: []const StandbySpec = &.{},
     sync_policy: ?primary_mod.SyncPolicy = null,
     retention_policy: slot_store.RetentionPolicy = .{},
@@ -148,6 +150,7 @@ pub const Action = struct {
     seed_content_root: ?[]const u8 = null,
     route_from: ?[]const u8 = null,
     route_to: ?[]const u8 = null,
+    admin_url: ?[]const u8 = null,
     reason: []const u8,
 };
 
@@ -243,6 +246,44 @@ pub fn planDocument(plan: Plan) PlanDocument {
 
 pub fn renderJsonAlloc(alloc: Allocator, plan: Plan) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, planDocument(plan), .{});
+}
+
+fn assignActionAdminUrls(spec: Spec, actions: []Action) void {
+    for (actions) |*action| action.admin_url = adminUrlForAction(spec, action.*);
+}
+
+fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
+    return switch (action.kind) {
+        .create_slot,
+        .resume_slot,
+        .pause_slot,
+        .drop_slot,
+        .seed_standby,
+        .finish_standby_seed,
+        .mark_reseed,
+        => spec.primary_admin_url,
+
+        .acquire_fence => standbyAdminUrl(spec, action.standby_name) orelse spec.primary_admin_url,
+
+        .bootstrap_standby_seed,
+        .promote_standby,
+        => standbyAdminUrl(spec, action.standby_name),
+
+        .demote_former_primary,
+        .rewind_former_primary,
+        .reseed_former_primary,
+        => standbyAdminUrl(spec, action.standby_name) orelse spec.primary_admin_url,
+
+        .update_primary_endpoint => null,
+    };
+}
+
+fn standbyAdminUrl(spec: Spec, standby_name: ?[]const u8) ?[]const u8 {
+    const name = standby_name orelse return null;
+    for (spec.standbys) |standby| {
+        if (std.mem.eql(u8, standby.name, name)) return standby.admin_url;
+    }
+    return null;
 }
 
 pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
@@ -472,6 +513,8 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         try appendFormerPrimaryAction(alloc, &actions, assessment);
         break :blk assessment;
     } else null;
+
+    assignActionAdminUrls(spec, actions.items);
 
     return .{
         .actions = try actions.toOwnedSlice(alloc),
@@ -995,6 +1038,7 @@ test "storage.ha operator plans seed finish and bootstrap with manifest paths" {
     const standbys = [_]StandbySpec{
         .{
             .name = "standby-a",
+            .admin_url = "http://standby-a-ha.default.svc:8081",
             .initial_lsn = 3,
             .seed_manifest_path = "/backup/base-standby-a-3.afha",
             .seed_content_root = "/backup/base-standby-a-3",
@@ -1003,6 +1047,7 @@ test "storage.ha operator plans seed finish and bootstrap with manifest paths" {
 
     var plan = try reconcile(alloc, .{
         .mode = .hot_standby,
+        .primary_admin_url = "http://primary-ha.default.svc:8081",
         .standbys = &standbys,
     }, .{ .primary = primary });
     defer plan.deinit(alloc);
@@ -1017,6 +1062,10 @@ test "storage.ha operator plans seed finish and bootstrap with manifest paths" {
     try std.testing.expectEqual(@as(?ActionKind, .finish_standby_seed), plan.actions[3].depends_on);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", plan.actions[2].seed_manifest_path.?);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3", plan.actions[3].seed_content_root.?);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[0].admin_url.?);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[1].admin_url.?);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[2].admin_url.?);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", plan.actions[3].admin_url.?);
 
     var finish = (try adminCommandForAction(alloc, plan.actions[2], primary.identity, .{})) orelse return error.TestExpectedEqual;
     defer finish.deinit(alloc);
@@ -1127,7 +1176,7 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
         },
     };
     const standbys = [_]StandbySpec{
-        .{ .name = "standby-a" },
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
     };
 
     var plan = try reconcile(alloc, .{
@@ -1206,6 +1255,7 @@ test "storage.ha operator plans reseed finish and bootstrap with manifest paths"
     const standbys = [_]StandbySpec{
         .{
             .name = "standby-a",
+            .admin_url = "http://standby-a-ha.default.svc:8081",
             .seed_manifest_path = "/backup/reseed-standby-a-10.afha",
             .seed_content_root = "/backup/reseed-standby-a-10",
         },
@@ -1213,6 +1263,7 @@ test "storage.ha operator plans reseed finish and bootstrap with manifest paths"
 
     var plan = try reconcile(alloc, .{
         .mode = .hot_standby,
+        .primary_admin_url = "http://primary-ha.default.svc:8081",
         .standbys = &standbys,
     }, .{ .primary = primary });
     defer plan.deinit(alloc);
@@ -1232,6 +1283,9 @@ test "storage.ha operator plans reseed finish and bootstrap with manifest paths"
     try std.testing.expectEqualStrings("SlotRequiresReseed", plan.actions[2].reason);
     try std.testing.expectEqualStrings("/backup/reseed-standby-a-10.afha", plan.actions[1].seed_manifest_path.?);
     try std.testing.expectEqualStrings("/backup/reseed-standby-a-10", plan.actions[2].seed_content_root.?);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[0].admin_url.?);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[1].admin_url.?);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", plan.actions[2].admin_url.?);
 
     var finish = (try adminCommandForAction(alloc, plan.actions[1], primary.identity, .{})) orelse return error.TestExpectedEqual;
     defer finish.deinit(alloc);
@@ -1290,7 +1344,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     };
     const standbys = [_]StandbySpec{
-        .{ .name = "standby-a" },
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
     };
 
     var unsafe = try reconcile(alloc, .{
@@ -1670,6 +1724,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
 
     var safe = try reconcile(alloc, .{
         .mode = .hot_standby,
+        .primary_admin_url = "http://primary-ha.default.svc:8081",
         .standbys = &standbys,
         .auto_failover = .{
             .enabled = true,
@@ -1707,6 +1762,10 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[3].depends_on);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[0].admin_url.?);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[1].admin_url.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_url);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", safe.actions[3].admin_url.?);
     for (safe.actions) |action| {
         const precondition = action.fencing_precondition orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(FencingAuthority.kubernetes_lease, precondition.authority);
@@ -1765,11 +1824,12 @@ test "storage.ha operator renders versioned json plan for controllers" {
         },
     };
     const standbys = [_]StandbySpec{
-        .{ .name = "standby-a" },
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
     };
 
     var plan = try reconcile(alloc, .{
         .mode = .hot_standby,
+        .primary_admin_url = "http://primary-ha.default.svc:8081",
         .standbys = &standbys,
         .auto_failover = .{
             .enabled = true,
@@ -1804,7 +1864,9 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"executor\":\"admin_command\"");
+    try expectContains(rendered, "\"admin_url\":\"http://standby-a-ha.default.svc:8081\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
+    try expectContains(rendered, "\"admin_url\":\"http://primary-ha.default.svc:8081\"");
     try expectContains(rendered, "\"route_from\":\"primary-a\"");
     try expectContains(rendered, "\"route_to\":\"standby-a\"");
     try expectContains(rendered, "\"fencing_precondition\"");
