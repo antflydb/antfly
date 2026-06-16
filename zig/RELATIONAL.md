@@ -5228,11 +5228,15 @@ Stage-local read summaries follow the same rule. Aggregate summaries such as
 `group_by`, `group_expressions`, `aggregations`, `filter_groups`, `having`,
 `having_expressions`, `having_any`, and `having_not` are valid only on aggregate
 plans, generic read fingerprints whose resolved inner plan is an aggregate, or
-`EXPLAIN` wrappers around those plans. `join_select` is valid only on join or
-lateral plans. `lateral_correlations` and `right_offset` are valid only on
-lateral plans, and `windows` is valid only on window plans. This keeps the
-golden corpus tied to the REST/SDK-visible typed stage that actually owns each
-field.
+`EXPLAIN` wrappers around those plans. Nonzero aggregate summary counts must
+match the aggregate fingerprint tokens exactly: `group`, `group_expr`, `aggs`,
+`filter_groups`, `having`, `having_expr`, `having_any`, and `having_not`.
+Explicit zero summaries may use compact fingerprints that omit optional extended
+zero tokens, but a present token must still match exactly. `join_select` is valid
+only on join or lateral plans. `lateral_correlations` and `right_offset` are
+valid only on lateral plans, and `windows` is valid only on window plans. This
+keeps the golden corpus tied to the REST/SDK-visible typed stage that actually
+owns each field.
 
 Join predicate summaries are scoped separately. `join_on` is valid only on join
 read plans, joined mutation-source update/delete plans, merge mutation match

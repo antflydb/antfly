@@ -62343,6 +62343,49 @@ fn appParityFixtureAllowsAggregateSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityPlanHasUsizeToken(plan: []const u8, token: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const pos = index + token.len;
+        if (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') return true;
+        start = index + token.len;
+    }
+    return false;
+}
+
+fn appParityFixtureOptionalZeroSummaryMatchesPlan(plan: []const u8, token: []const u8, expected: usize) bool {
+    if (appParityPlanHasExactUsizeToken(plan, token, expected)) return true;
+    return expected == 0 and !appParityPlanHasUsizeToken(plan, token);
+}
+
+fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.group_by) |group_by| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":group=", group_by)) return false;
+    }
+    if (entry.summary.group_expressions) |group_expressions| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":group_expr=", group_expressions)) return false;
+    }
+    if (entry.summary.aggregations) |aggregations| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":aggs=", aggregations)) return false;
+    }
+    if (entry.summary.filter_groups) |filter_groups| {
+        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":filter_groups=", filter_groups)) return false;
+    }
+    if (entry.summary.having) |having| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":having=", having)) return false;
+    }
+    if (entry.summary.having_expressions) |having_expressions| {
+        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_expr=", having_expressions)) return false;
+    }
+    if (entry.summary.having_any) |having_any| {
+        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_any=", having_any)) return false;
+    }
+    if (entry.summary.having_not) |having_not| {
+        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_not=", having_not)) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .join,
@@ -62785,6 +62828,9 @@ fn validateAppParityFixtureMetadata(
         entry.summary.having_not != null) and
         !appParityFixtureAllowsAggregateSummary(entry))
     {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixtureAggregateSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
     if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
@@ -63317,6 +63363,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .aggregations = 1, .select_all = true },
         .plan = "aggregate:table=usage_records:ctes=0:source_cte=0:source_pred=0:group_by=1:group_expr=0:agg=1:filter_groups=0:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale aggregate group summary",
+        .sql = "SELECT status, count(*) AS count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1 },
+        .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=0:limit=-1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale aggregate filter summary",
+        .sql = "SELECT status, count(*) FILTER (WHERE enabled = true) AS enabled_count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1, .filter_groups = 2, .having_expressions = 0, .having_any = 0, .having_not = 0 },
+        .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:filter_groups=1:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=-1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid aggregate extended summary",
+        .sql = "SELECT status, count(*) FILTER (WHERE enabled = true) AS enabled_count FROM usage_records GROUP BY status HAVING enabled_count > 0",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1, .filter_groups = 1, .having_expressions = 0, .having_any = 0, .having_not = 0 },
+        .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:filter_groups=1:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=-1",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "join full query distinct summary",
