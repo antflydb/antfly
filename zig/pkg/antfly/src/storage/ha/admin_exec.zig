@@ -77,6 +77,16 @@ pub const ResultDocument = struct {
     result: Result,
 };
 
+pub const RenderedOutput = struct {
+    content_type: []const u8,
+    body: []u8,
+
+    pub fn deinit(self: *RenderedOutput, alloc: Allocator) void {
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
 pub fn resultDocument(result: Result) ResultDocument {
     return .{ .result = result };
 }
@@ -105,6 +115,26 @@ pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
         .standby_metrics => |metric_snapshot| try metrics.renderStandbyPrometheusAlloc(alloc, metric_snapshot),
         else => error.PrometheusUnsupportedForResult,
     };
+}
+
+pub fn renderOutputAlloc(alloc: Allocator, result: Result, output: admin_cli.OutputFormat) !RenderedOutput {
+    return switch (output) {
+        .json => .{
+            .content_type = "application/json",
+            .body = try renderJsonAlloc(alloc, result),
+        },
+        .prometheus => .{
+            .content_type = "text/plain; version=0.0.4",
+            .body = try renderPrometheusAlloc(alloc, result),
+        },
+        .table => error.TableOutputRequiresIntegration,
+    };
+}
+
+pub fn executeAndRenderAlloc(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !RenderedOutput {
+    var result = try execute(alloc, ctx, plan);
+    defer result.deinit(alloc);
+    return try renderOutputAlloc(alloc, result, plan.output);
 }
 
 pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
@@ -317,6 +347,13 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer alloc.free(prometheus_body);
     try expectContains(prometheus_body, "antfly_ha_primary_current_lsn 2\n");
     try expectContains(prometheus_body, "antfly_ha_slot_apply_lag_lsn{slot=\"standby-a\"} 1\n");
+
+    var rendered_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "status", "primary", "--view", "metrics", "--max-lag-lsn", "10" });
+    defer rendered_plan.deinit(alloc);
+    var rendered = try executeAndRenderAlloc(alloc, .{ .primary = &primary }, rendered_plan);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; version=0.0.4", rendered.content_type);
+    try expectContains(rendered.body, "antfly_ha_primary_current_lsn 2\n");
 }
 
 test "storage.ha admin exec runs read commit promote and rejoin commands" {
@@ -407,6 +444,17 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(read_json, "\"action\":\"serve_standby\"");
 
     try std.testing.expectError(error.PrometheusUnsupportedForResult, renderPrometheusAlloc(alloc, read));
+
+    var json_plan = try admin_cli.parse(alloc, &.{ "read", "check", "--at-least-lsn", "1" });
+    defer json_plan.deinit(alloc);
+    var rendered_json = try executeAndRenderAlloc(alloc, .{ .standby = &standby }, json_plan);
+    defer rendered_json.deinit(alloc);
+    try std.testing.expectEqualStrings("application/json", rendered_json.content_type);
+    try expectContains(rendered_json.body, "\"read_check\"");
+
+    var table_plan = try admin_cli.parse(alloc, &.{ "--table", "read", "check", "--at-least-lsn", "1" });
+    defer table_plan.deinit(alloc);
+    try std.testing.expectError(error.TableOutputRequiresIntegration, executeAndRenderAlloc(alloc, .{ .standby = &standby }, table_plan));
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
