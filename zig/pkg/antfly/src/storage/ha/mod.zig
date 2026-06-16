@@ -22,6 +22,7 @@ pub const backup_manifest = @import("backup_manifest.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const status = @import("status.zig");
 pub const replication_api = @import("replication_api.zig");
+pub const fencing = @import("fencing.zig");
 
 test {
     _ = replication_record;
@@ -34,4 +35,5 @@ test {
     _ = bootstrap;
     _ = status;
     _ = replication_api;
+    _ = fencing;
 }

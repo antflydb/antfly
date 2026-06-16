@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
@@ -182,6 +183,14 @@ pub fn assessPromotion(standby: *const standby_mod.Standby, check: PromotionChec
         .requires_force = requires_force,
         .can_promote = !requires_fencing and (!requires_force or check.force),
     };
+}
+
+pub fn assessPromotionWithFence(standby: *const standby_mod.Standby, receipt: fencing.Receipt) PromotionAssessment {
+    return assessPromotion(standby, .{
+        .required_lsn = receipt.required_lsn,
+        .fencing_confirmed = true,
+        .force = receipt.forced,
+    });
 }
 
 const TestPaths = struct {
@@ -354,6 +363,31 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expect(!safe.data_loss_possible);
     try std.testing.expect(safe.safe);
     try std.testing.expect(safe.can_promote);
+
+    const fenced = assessPromotionWithFence(&standby, .{
+        .identity = .{
+            .cluster_id = identity.cluster_id,
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+            .timeline_id = 2,
+            .epoch = 2,
+        },
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-b",
+        .parent_timeline_id = identity.timeline_id,
+        .parent_epoch = identity.epoch,
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .observed_lsn = 2,
+        .generation = 1,
+        .forced = false,
+        .token = "token",
+        .reason = "test",
+    });
+    try std.testing.expect(fenced.fencing_confirmed);
+    try std.testing.expect(fenced.safe);
+    try std.testing.expect(fenced.can_promote);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, ready, .{});
     defer alloc.free(encoded);
