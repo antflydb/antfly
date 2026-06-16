@@ -10,7 +10,7 @@
         "select": 7,
         "operations": 3
       },
-      "plan": "ddl:create_table:table=usage_records:columns=7:unique=1:fk=1:checks=1:if_not_exists=true",
+      "plan": "ddl:create_table:table=usage_records:columns=7:unique=1:fk=1:checks=1:if_not_exists=true:pk=1:defaults=3:generated=1",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE IF NOT EXISTS usage_records (\n  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,\n  tenant_id text COLLATE \"C\" NOT NULL,\n  quantity numeric(18, 2) DEFAULT 0::numeric CHECK (quantity >= 0::numeric),\n  metadata jsonb,\n  tags text[],\n  created_at timestamptz DEFAULT now(),\n  tenant_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,\n  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),\n  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE\n);"
     },
@@ -22,7 +22,7 @@
         "table_name": "casted_defaults",
         "select": 3
       },
-      "plan": "ddl:create_table:table=casted_defaults:columns=3:unique=0:fk=0:checks=0:if_not_exists=false",
+      "plan": "ddl:create_table:table=casted_defaults:columns=3:unique=0:fk=0:checks=0:if_not_exists=false:pk=1:defaults=2",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE casted_defaults (\n  id uuid PRIMARY KEY,\n  amount numeric DEFAULT '0'::numeric,\n  enabled boolean DEFAULT 'true'::boolean\n);"
     },
@@ -85,7 +85,7 @@
         "table_name": "account_prices",
         "select": 5
       },
-      "plan": "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0",
+      "plan": "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0:pk=2",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE account_prices (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  price numeric,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT account_prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS)\n);"
     },
@@ -123,7 +123,7 @@
         "table_name": "products",
         "select": 5
       },
-      "plan": "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0",
+      "plan": "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE products (\n  product_id int NOT NULL,\n  product_name text NOT NULL,\n  price numeric,\n  valid_at daterange NOT NULL,\n  PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)\n);"
     },
@@ -135,7 +135,7 @@
         "table_name": "price_adjustments",
         "select": 6
       },
-      "plan": "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+      "plan": "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE price_adjustments (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  amount numeric,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n);"
     },
@@ -147,7 +147,7 @@
         "table_name": "price_adjustments_cascade",
         "select": 5
       },
-      "plan": "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+      "plan": "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE price_adjustments_cascade (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE CASCADE\n);"
     },
@@ -159,7 +159,7 @@
         "table_name": "price_adjustments_set_null_delete",
         "select": 5
       },
-      "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+      "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE TABLE price_adjustments_set_null_delete (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE SET NULL\n);"
     },
@@ -185,7 +185,7 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true",
+      "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE OR REPLACE TABLE usage_records (id uuid PRIMARY KEY);"
     },

@@ -4622,7 +4622,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    in the typed plan and no-ops when the relational schema already exists.
    `CREATE OR REPLACE TABLE` is represented in the typed plan as schema
    replacement and, when applied over an existing catalog schema JSON, produces
-   explicit rebuild and validation work. Supported `CREATE INDEX` DDL, including `CONCURRENTLY`, now lowers to
+   explicit rebuild and validation work. SQL/API parity fingerprints for
+   `CREATE TABLE` include primary-key arity, defaulted columns, stored generated
+   columns, and table-owned update-policy columns in addition to ordinary column,
+   unique, FK, check, temporal, and replacement metadata, so materially different
+   schema plans cannot collapse to the same golden plan. Supported `CREATE INDEX` DDL, including `CONCURRENTLY`, now lowers to
    typed index plans for ordinary columns, btree `ASC`/`DESC` and `NULLS`
    clauses normalized to column membership, unique constraints, simple
    parenthesized/casted partial predicates, generated expression secondary

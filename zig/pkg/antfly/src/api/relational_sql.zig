@@ -57660,6 +57660,34 @@ fn appParityGeneratedExpressionOp(plan: CreateIndexPlan) ?[]const u8 {
     return @tagName(generated.op);
 }
 
+fn createTablePlanPrimaryKeyColumnCount(plan: CreateTablePlan) usize {
+    return if (plan.primary_key) |primary_key| primary_key.columns.len else 0;
+}
+
+fn createTablePlanDefaultColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.default_value != null) count += 1;
+    }
+    return count;
+}
+
+fn createTablePlanGeneratedColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.generated != null) count += 1;
+    }
+    return count;
+}
+
+fn createTablePlanUpdatePolicyColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.on_update_value != null) count += 1;
+    }
+    return count;
+}
+
 fn appendNonZeroU32FingerprintAlloc(
     alloc: std.mem.Allocator,
     owned_base: []u8,
@@ -58278,8 +58306,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
     return switch (lowered) {
         .adapter_noop => |plan| try adapterNoopFingerprintAlloc(alloc, "ddl", @tagName(plan.reason)),
         .create_table => |plan| blk: {
-            if (plan.periods.len > 0) {
-                break :blk try std.fmt.allocPrint(
+            var fingerprint = if (plan.periods.len > 0) temporal: {
+                break :temporal try std.fmt.allocPrint(
                     alloc,
                     "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}:periods={d}:temporal_pk={}:temporal_unique={d}:temporal_fk={d}",
                     .{
@@ -58295,19 +58323,22 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                         createTablePlanTemporalForeignKeyCount(plan),
                     },
                 );
-            }
-            if (plan.replace_existing) {
-                break :blk try std.fmt.allocPrint(
+            } else if (plan.replace_existing) replace: {
+                break :replace try std.fmt.allocPrint(
                     alloc,
                     "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}:replace=true",
                     .{ plan.table_name, plan.columns.len, plan.unique_constraints.len, plan.foreign_keys.len, plan.checks.len, plan.if_not_exists },
                 );
-            }
-            break :blk try std.fmt.allocPrint(
+            } else try std.fmt.allocPrint(
                 alloc,
                 "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}",
                 .{ plan.table_name, plan.columns.len, plan.unique_constraints.len, plan.foreign_keys.len, plan.checks.len, plan.if_not_exists },
             );
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "pk", createTablePlanPrimaryKeyColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            break :blk fingerprint;
         },
         .table_clone => |plan| try std.fmt.allocPrint(
             alloc,
@@ -64834,7 +64865,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema create table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 7, .operations = 3 },
-            .plan = "ddl:create_table:table=usage_records:columns=7:unique=1:fk=1:checks=1:if_not_exists=true",
+            .plan = "ddl:create_table:table=usage_records:columns=7:unique=1:fk=1:checks=1:if_not_exists=true:pk=1:defaults=3:generated=1",
             .sql =
             \\CREATE TABLE IF NOT EXISTS usage_records (
             \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -64853,7 +64884,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema casted primitive defaults",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "casted_defaults", .select = 3 },
-            .plan = "ddl:create_table:table=casted_defaults:columns=3:unique=0:fk=0:checks=0:if_not_exists=false",
+            .plan = "ddl:create_table:table=casted_defaults:columns=3:unique=0:fk=0:checks=0:if_not_exists=false:pk=1:defaults=2",
             .sql =
             \\CREATE TABLE casted_defaults (
             \\  id uuid PRIMARY KEY,
@@ -64907,7 +64938,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal parent table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "account_prices", .select = 5 },
-            .plan = "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0",
+            .plan = "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0:pk=2",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE account_prices (
@@ -64954,7 +64985,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal range-column parent table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "products", .select = 5 },
-            .plan = "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0",
+            .plan = "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE products (
@@ -64970,7 +65001,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal child table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments", .select = 6 },
-            .plan = "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+            .plan = "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE price_adjustments (
@@ -64992,7 +65023,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal foreign key cascade action",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_cascade", .select = 5 },
-            .plan = "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+            .plan = "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE price_adjustments_cascade (
@@ -65014,7 +65045,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal foreign key set-null delete action",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_set_null_delete", .select = 5 },
-            .plan = "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+            .plan = "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE price_adjustments_set_null_delete (
@@ -65073,7 +65104,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema replace table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 1 },
-            .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true",
+            .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE OR REPLACE TABLE usage_records (id uuid PRIMARY KEY);",
         },
