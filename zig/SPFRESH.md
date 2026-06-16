@@ -95,7 +95,9 @@ Current status:
   and keep specialized base-decode modes in live code. Non-adaptive delta-tail
   replay now also delays member-scratch growth until a live insert/replace
   record survives the base-generation filter, so stale folded tail values do
-  not grow query/materialization scratch.
+  not grow query/materialization scratch. Sorted medium-tail replay grows its
+  temporary delta-record scratch geometrically up to the compact-replay cap
+  instead of reallocating one record at a time.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full

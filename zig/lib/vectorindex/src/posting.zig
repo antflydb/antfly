@@ -2954,7 +2954,7 @@ pub const PostingStore = struct {
                     try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
                 } else if (comptime can_use_delta_record_scratch) {
                     if (scratch.deltaRecordCount() < compact_sorted_delta_scratch_max_records) {
-                        try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + 1);
+                        try ensureDeltaRecordSpareCapacity(alloc, scratch, compact_sorted_delta_scratch_max_records);
                         scratch.appendDeltaRecordAssumeCapacity(record);
                     } else {
                         use_overlay_plan = true;
@@ -3064,7 +3064,7 @@ pub const PostingStore = struct {
                 };
                 result.records += 1;
                 result.max_sequence = @max(result.max_sequence, record.sequence);
-                try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + 1);
+                try ensureDeltaRecordSpareCapacity(alloc, scratch, compact_sorted_delta_scratch_max_records);
                 scratch.appendDeltaRecordAssumeCapacity(record);
             }
             member_count.* = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
@@ -3104,6 +3104,17 @@ pub const PostingStore = struct {
         for (records) |record| {
             try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
         }
+    }
+
+    fn ensureDeltaRecordSpareCapacity(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        max_capacity: usize,
+    ) !void {
+        const needed = scratch.deltaRecordCount() + 1;
+        if (needed <= scratch.delta_records.len) return;
+        const doubled = scratch.delta_records.len *| 2;
+        try scratch.ensureDeltaRecordCapacity(alloc, @min(max_capacity, @max(needed, @max(doubled, @as(usize, 8)))));
     }
 
     fn applySortedCompactOpsToSortedScratch(
@@ -6261,6 +6272,7 @@ test "posting store canonical query replay uses sorted scratch records for mediu
         try std.testing.expectEqual(record.vector_id, materialized[base_members.len + i]);
     }
     try std.testing.expectEqual(@as(usize, records.len), scratch.deltaRecordCount());
+    try std.testing.expect(scratch.delta_records.len > records.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_removed_members.count());
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_positions.count());
     try std.testing.expectEqual(@as(u64, records.len), profile.posting_delta_replay_records);
